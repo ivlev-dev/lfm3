@@ -3,6 +3,8 @@ use std::path::Path;
 use serde_json::Value;
 use thiserror::Error as ThisError;
 
+mod ports;
+
 #[derive(Debug, ThisError)]
 pub enum Error {
     #[error("io error: {0}")]

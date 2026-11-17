@@ -1103,6 +1103,7 @@ name = "lfm-tokenizer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lfm-app",
  "serde_json",
  "thiserror 2.0.21",
  "tokenizers",

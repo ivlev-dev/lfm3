@@ -8,3 +8,4 @@ anyhow.workspace = true
 serde_json = "1"
 thiserror.workspace = true
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+lfm-app.workspace = true

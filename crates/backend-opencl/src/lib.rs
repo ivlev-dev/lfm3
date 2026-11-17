@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod prepack;
+mod ports;
 mod radix;
 
 pub use radix::{block_hash, chain_hashes, RadixCache, PAGE};

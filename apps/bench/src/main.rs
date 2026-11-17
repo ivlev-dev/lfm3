@@ -141,6 +141,18 @@ enum Cmd {
         #[arg(long)]
         id: u32,
     },
+    GpuPort {
+        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
+        model: PathBuf,
+        #[arg(long, default_value = "models/hf/tokenizer.json")]
+        tokenizer: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 32)]
+        tokens: usize,
+        #[arg(long, default_value_t = 2048)]
+        ctx: usize,
+    },
     GpuCheck {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -371,6 +383,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::GpuEmbed { model, id } => gpu_embed(&model, id),
+        Cmd::GpuPort {
+            model,
+            tokenizer,
+            prompt,
+            tokens,
+            ctx,
+        } => gpu_port(&model, &tokenizer, &prompt, tokens, ctx),
         Cmd::RefPpl {
             model,
             tokenizer,
@@ -2645,6 +2664,22 @@ fn gpu_cmp(model: &PathBuf, ids: &[u32], batch: usize) -> Result<()> {
     bi.sort_by(|a, b| bat[*b].partial_cmp(&bat[*a]).unwrap());
     println!("seq top5 {:?}", &si[..5]);
     println!("bat top5 {:?}", &bi[..5]);
+    Ok(())
+}
+
+fn gpu_port(
+    model: &PathBuf,
+    tokenizer: &PathBuf,
+    prompt: &str,
+    tokens: usize,
+    ctx: usize,
+) -> Result<()> {
+    let mut gpu = lfm_gpu::GpuModel::load(model, ctx)?;
+    let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
+    let out = lfm_app::Generate::new(&mut gpu, &tok).run(prompt, tokens)?;
+    println!("ids: {:?}", out.ids);
+    println!("finish: {:?}", out.finish);
+    println!("text: {}", out.text);
     Ok(())
 }
 
