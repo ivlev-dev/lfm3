@@ -14,7 +14,7 @@
 | M3 | paged KV, continuous batching, KV int8/int4 | 6 стримов без расхождений, ≥ 200 агрегат | paged KV + пер-последовательное состояние + батч шага; агрегат 4/6/8 стримов = 128/143/125 tok/s |
 | M4 | radix prefix cache, смешанный батч, FA3-prefill | 8192 prefill ≥ 300, prefix-hit TTFT < 10% | prefill 183 (512) / 166 (4096) / 152 (8192), prepack Q4 +5%; radix cache готов: повтор промпта 512 ток. — 193 мс против 2773 мс (×14), логиты бит-в-бит; осталось prefill ≥ 300 и смешанный батч |
 | M5 | OpenAI-сервер (SSE/WS/tools/thinking) + TUI | e2e openai-python, load-тест, TUI | сервер + планировщик continuous batching + `/metrics` + flow control h2; два TUI (in-process и клиент `lfm-tui`); load-тест 6 соединений без ошибок; осталось: tools/`tool_calls`, `/v1/completions`, e2e openai-python |
-| M6 | 3-tier слоёв и KV, TP+PP, PoCL CPU | конфиг 20/80/0, 2-device тесты | PP готов: 20/80/0 (GPU+PoCL) ids совпадают, logits cos 0.9998; TP остался |
+| M6 | 3-tier слоёв и KV, TP+PP, PoCL CPU | конфиг 20/80/0, 2-device тесты | PP (20/80/0) и full TP (головы/FFN/lm_head) готовы: ids совпадают, logits cos 0.9997 |
 | M7 | NPU-порт Hexagon v68, hardening, docs | feature-сборка, спека протокола | |
 
 ## Текущее состояние (сводка)
@@ -240,9 +240,15 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    (сервер и `gpu-pp`). Проверка: 20/80/0 (GPU 4 слоя + PoCL CPU 20) и 50/50 дают
    те же greedy-ids, что одиночный GPU (16 токенов), `logits cos 0.999824`, top-5
    совпадает; сервер с `LFM_TIERS` переиспользует кэш на обеих ступенях (reused 192).
-2. **Осталось: TP для decode** (all-reduce через host staging — P2P в rusticl нет).
+2. **Сделано: full TP (сессия 6).** q/k/v/g и gate делятся по головам,
+   `attn_output` — по столбцам (сумма партиалов), FFN: `up/gate` по строкам,
+   `down` по столбцам (сумма), lm_head — по словарю с host-gather. Синхронизация
+   `x/hq/hs` после каждой фазы (детерминизм между устройствами), `TpShard` в
+   загрузчике режет Q4/Q6-байты по строкам/блокам. `LFM_TP=0/1`/`gpu-tp`: ids
+   совпадают с single GPU (8/8), `logits cos 0.999745`; сервер с `LFM_TP`
+   отвечает. На GPU+CPU это корректность, не ускорение.
 3. DoD: конфиг 20/80/0 проходит `gpu-cmp`, 2-device тесты дают те же логиты —
-   для PP выполнено (ids/logits выше); TP ещё нет.
+   выполнено для PP и full TP (ids/logits выше).
 
 ### P5. M7 — NPU и hardening
 

@@ -169,6 +169,20 @@ enum Cmd {
         #[arg(long, default_value_t = 2048)]
         ctx: usize,
     },
+    GpuTp {
+        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
+        model: PathBuf,
+        #[arg(long, default_value = "models/hf/tokenizer.json")]
+        tokenizer: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 2)]
+        tokens: usize,
+        #[arg(long, default_value = "0/1")]
+        devices: String,
+        #[arg(long, default_value_t = 2048)]
+        ctx: usize,
+    },
     GpuCheck {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -415,6 +429,14 @@ fn main() -> Result<()> {
             tiers,
             ctx,
         } => gpu_pp(&model, &tokenizer, &prompt, tokens, &tiers, ctx),
+        Cmd::GpuTp {
+            model,
+            tokenizer,
+            prompt,
+            tokens,
+            devices,
+            ctx,
+        } => gpu_tp(&model, &tokenizer, &prompt, tokens, &devices, ctx),
         Cmd::RefPpl {
             model,
             tokenizer,
@@ -2729,6 +2751,40 @@ __kernel void probe(__global uint *out) {
             v[0], v[1], v[2], v[3], v[4], v[5], v[6]
         );
     }
+    Ok(())
+}
+
+fn gpu_tp(
+    model: &PathBuf,
+    tokenizer: &PathBuf,
+    prompt: &str,
+    tokens: usize,
+    devices: &str,
+    ctx: usize,
+) -> Result<()> {
+    let devices: Vec<usize> = devices
+        .split('/')
+        .filter_map(|d| d.parse::<usize>().ok())
+        .collect();
+    let mut tp = lfm_gpu::TpModel::load(model, ctx, &devices)?;
+    let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
+    let out = lfm_app::Generate::new(&mut tp, &tok).run(prompt, tokens)?;
+    println!("tp     ids: {:?}", out.ids);
+    println!("tp     text: {}", out.text);
+    let mut single = lfm_gpu::GpuModel::load(model, ctx)?;
+    let base = lfm_app::Generate::new(&mut single, &tok).run(prompt, tokens)?;
+    println!("single ids: {:?}", base.ids);
+    println!("equal: {}", out.ids == base.ids);
+    let ids = tok.encode(prompt, false)?;
+    let slot = tp.create_sequence()?;
+    let _ = tp.prefill(slot, &ids, true)?;
+    let tp_logits = tp.logits()?;
+    tp.free_sequence(slot)?;
+    let slot = single.create_sequence()?;
+    let _ = single.prefill(slot, &ids, true)?;
+    let one_logits = single.logits()?;
+    single.free_sequence(slot)?;
+    println!("logits cos {:.6}", cosine(&tp_logits, &one_logits));
     Ok(())
 }
 

@@ -47,7 +47,7 @@ impl PipelineModel {
             if from >= to {
                 continue;
             }
-            stages.push(GpuModel::load_stage(path, max_ctx, Some(device), Some((from, to)))?);
+            stages.push(GpuModel::load_stage(path, max_ctx, Some(device), Some((from, to)), None)?);
         }
         if stages.is_empty() {
             return Err(anyhow!("no pipeline stages"));

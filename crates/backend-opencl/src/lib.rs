@@ -11,10 +11,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod pipeline;
 mod prepack;
+mod tp;
 mod ports;
 mod radix;
 
 pub use pipeline::PipelineModel;
+pub use tp::TpModel;
 
 pub use radix::{block_hash, chain_hashes, RadixCache, PAGE};
 
@@ -109,6 +111,189 @@ struct Kernels {
     attn_b_h2: Kernel,
     attn_split_b_h: Kernel,
     attn_split_b_h4: Kernel,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TpShard {
+    pub rank: usize,
+    pub world: usize,
+    pub head_start: usize,
+    pub head_count: usize,
+    pub kv_head_start: usize,
+    pub kv_head_count: usize,
+    pub out_col_start: usize,
+    pub out_col_count: usize,
+    pub ffn_row_start: usize,
+    pub ffn_row_count: usize,
+    pub ffn_col_start: usize,
+    pub ffn_col_count: usize,
+    pub vocab_start: usize,
+    pub vocab_count: usize,
+    pub embed: bool,
+}
+
+impl TpShard {
+    pub fn attention(
+        rank: usize,
+        world: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        let qd = heads * head_dim;
+        let per = qd / world;
+        debug_assert!(per.is_multiple_of(256));
+        Self {
+            rank,
+            world,
+            head_start: rank * heads / world,
+            head_count: heads / world,
+            kv_head_start: rank * kv_heads / world,
+            kv_head_count: kv_heads / world,
+            out_col_start: rank * per / head_dim,
+            out_col_count: per / head_dim,
+            ffn_row_start: 0,
+            ffn_row_count: 0,
+            ffn_col_start: 0,
+            ffn_col_count: 0,
+            vocab_start: 0,
+            vocab_count: 0,
+            embed: rank == 0,
+        }
+    }
+
+    pub fn full(
+        rank: usize,
+        world: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        ffn: usize,
+        vocab: usize,
+    ) -> Self {
+        let mut shard = Self::attention(rank, world, heads, kv_heads, head_dim);
+        let per = ffn / world;
+        shard.ffn_row_start = rank * per;
+        shard.ffn_row_count = per;
+        shard.ffn_col_start = rank * per;
+        shard.ffn_col_count = per;
+        let vper = vocab / world;
+        shard.vocab_start = rank * vper;
+        shard.vocab_count = vper;
+        shard
+    }
+}
+
+enum ShardSlice {
+    Rows(usize, usize),
+    Blocks(usize, usize, usize, usize),
+}
+
+fn shard_slice(
+    name: &str,
+    rows: usize,
+    cols: usize,
+    head_dim: usize,
+    shard: &TpShard,
+) -> Option<ShardSlice> {
+    if let Some(rest) = name.strip_prefix("blk.") {
+        let (_, field) = rest.split_once('.')?;
+        return match field {
+            "attn_q.weight" => Some(ShardSlice::Rows(
+                shard.head_start * head_dim,
+                (shard.head_start + shard.head_count) * head_dim,
+            )),
+            "attn_k.weight" | "attn_v.weight" => Some(ShardSlice::Rows(
+                shard.kv_head_start * head_dim,
+                (shard.kv_head_start + shard.kv_head_count) * head_dim,
+            )),
+            "attn_gate.weight" => Some(ShardSlice::Rows(
+                shard.head_start,
+                shard.head_start + shard.head_count,
+            )),
+            "ffn_up.weight" | "ffn_gate.weight" => Some(ShardSlice::Rows(
+                shard.ffn_row_start,
+                shard.ffn_row_start + shard.ffn_row_count,
+            )),
+            "ffn_down.weight" => Some(ShardSlice::Blocks(
+                0,
+                rows,
+                shard.ffn_col_start / 256,
+                (shard.ffn_col_start + shard.ffn_col_count) / 256,
+            )),
+            "attn_output.weight" => {
+                if cols != shard.world * (cols / shard.world) {
+                    return None;
+                }
+                Some(ShardSlice::Blocks(
+                    0,
+                    rows,
+                    shard.out_col_start * head_dim / 256,
+                    (shard.out_col_start + shard.out_col_count) * head_dim / 256,
+                ))
+            }
+            _ => Some(ShardSlice::Rows(0, usize::MAX)),
+        };
+    }
+    if name == "token_embd.weight" {
+        return if shard.embed {
+            Some(ShardSlice::Rows(0, usize::MAX))
+        } else {
+            None
+        };
+    }
+    Some(ShardSlice::Rows(0, usize::MAX))
+}
+
+fn block_size(kind: GgmlType) -> usize {
+    match kind {
+        GgmlType::Q4_K => 144,
+        GgmlType::Q6_K => 210,
+        GgmlType::F32 => 4,
+        _ => 1,
+    }
+}
+
+fn slice_shard(
+    bytes: &[u8],
+    kind: GgmlType,
+    cols: usize,
+    spec: &ShardSlice,
+) -> Result<Vec<u8>> {
+    if matches!(kind, GgmlType::F32) {
+        if let ShardSlice::Rows(start, end) = *spec {
+            let stride = cols * 4;
+            let total = bytes.len() / stride.max(1);
+            let start = start.min(total);
+            let end = end.min(total);
+            return Ok(bytes[start * stride..end * stride].to_vec());
+        }
+        return Err(anyhow!("f32 shard supports rows only"));
+    }
+    let bs = block_size(kind);
+    let blocks = cols / 256;
+    if !cols.is_multiple_of(256) {
+        return Err(anyhow!("shard needs cols multiple of 256"));
+    }
+    match *spec {
+        ShardSlice::Rows(start, end) => {
+            let stride = blocks * bs;
+            let total = bytes.len() / stride;
+            let start = start.min(total);
+            let end = end.min(total);
+            Ok(bytes[start * stride..end * stride].to_vec())
+        }
+        ShardSlice::Blocks(r0, r1, b0, b1) => {
+            let stride = blocks * bs;
+            let out_stride = (b1 - b0) * bs;
+            let mut out = Vec::with_capacity((r1 - r0) * out_stride);
+            for row in r0..r1 {
+                let row_start = row * stride;
+                out.extend_from_slice(&bytes[row_start + b0 * bs..row_start + b1 * bs]);
+            }
+            Ok(out)
+        }
+    }
 }
 
 fn tensor_needed(
@@ -220,6 +405,7 @@ pub struct GpuModel {
     layer_end: usize,
     has_embed: bool,
     has_head: bool,
+    tp: Option<TpShard>,
     weights: HashMap<String, Weight>,
     prepacked: HashMap<String, Buffer<u8>>,
     prepack_on: bool,
@@ -277,7 +463,7 @@ fn pick_logits_rows(
 
 impl GpuModel {
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
-        Self::load_stage(path, max_ctx, None, None)
+        Self::load_stage(path, max_ctx, None, None, None)
     }
 
     pub fn load_stage(
@@ -285,6 +471,7 @@ impl GpuModel {
         max_ctx: usize,
         device: Option<usize>,
         layers: Option<(usize, usize)>,
+        shard: Option<TpShard>,
     ) -> Result<Self> {
         let profiling = std::env::var("LFM_PROFILE").map(|v| v == "1").unwrap_or(false);
         let device = match device {
@@ -315,17 +502,29 @@ impl GpuModel {
                 continue;
             }
             let bytes = file.tensor_bytes(&info.name)?;
+            let cols = info.dims[0] as usize;
+            let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
+            let data: std::borrow::Cow<[u8]> = if let Some(shard) = shard {
+                match shard_slice(&info.name, rows, cols, cfg.head_dim, &shard) {
+                    None => continue,
+                    Some(spec) => {
+                        std::borrow::Cow::Owned(slice_shard(&bytes, info.ggml_type, cols, &spec)?)
+                    }
+                }
+            } else {
+                std::borrow::Cow::Borrowed(&bytes)
+            };
             let weight = match info.ggml_type {
                 GgmlType::Q4_K => {
                     if prepack_on {
-                        let packed = prepack::prepack_q4_k(bytes);
+                        let packed = prepack::prepack_q4_k(data.as_ref());
                         prepacked.insert(info.name.clone(), gpu.upload_bytes(&packed)?);
                     }
-                    Weight::Q4(gpu.upload_bytes(bytes)?)
+                    Weight::Q4(gpu.upload_bytes(data.as_ref())?)
                 }
-                GgmlType::Q6_K => Weight::Q6(gpu.upload_bytes(bytes)?),
+                GgmlType::Q6_K => Weight::Q6(gpu.upload_bytes(data.as_ref())?),
                 GgmlType::F32 => {
-                    let data: Vec<f32> = bytes
+                    let data: Vec<f32> = data
                         .chunks_exact(4)
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
@@ -334,6 +533,27 @@ impl GpuModel {
                 _ => continue,
             };
             weights.insert(info.name.clone(), weight);
+        }
+        if let Some(shard) = shard {
+            let info = file
+                .tensor("token_embd.weight")
+                .ok_or_else(|| anyhow!("missing token_embd"))?
+                .clone();
+            let bytes = file.tensor_bytes("token_embd.weight")?;
+            let cols = info.dims[0] as usize;
+            let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
+            let spec = ShardSlice::Rows(
+                shard.vocab_start,
+                shard.vocab_start + shard.vocab_count,
+            );
+            let data = slice_shard(&bytes, info.ggml_type, cols, &spec)?;
+            let weight = match info.ggml_type {
+                GgmlType::Q4_K => Weight::Q4(gpu.upload_bytes(&data)?),
+                GgmlType::Q6_K => Weight::Q6(gpu.upload_bytes(&data)?),
+                other => return Err(anyhow!("unsupported lm_head type {other:?}")),
+            };
+            let _ = rows;
+            weights.insert("lm_head_shard".to_string(), weight);
         }
         for layer in layer_start..layer_end {
             let up_name = format!("blk.{layer}.ffn_up.weight");
@@ -346,18 +566,31 @@ impl GpuModel {
                 {
                     let gate_bytes = file.tensor_bytes(&gate_name)?;
                     let up_bytes = file.tensor_bytes(&up_name)?;
+                    let slice_ffn = |bytes: &[u8], info: &lfm_gguf::TensorInfo| -> Result<Vec<u8>> {
+                        if let Some(shard) = shard {
+                            let cols = info.dims[0] as usize;
+                            let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
+                            let spec = shard_slice(&info.name, rows, cols, cfg.head_dim, &shard)
+                                .ok_or_else(|| anyhow!("missing ffn shard spec"))?;
+                            slice_shard(bytes, info.ggml_type, cols, &spec)
+                        } else {
+                            Ok(bytes.to_vec())
+                        }
+                    };
+                    let gate_s = slice_ffn(&gate_bytes, gate_info)?;
+                    let up_s = slice_ffn(&up_bytes, up_info)?;
                     if prepack_on && up_info.ggml_type == GgmlType::Q4_K {
-                        let mut fused = prepack::prepack_q4_k(&gate_bytes);
-                        fused.extend_from_slice(&prepack::prepack_q4_k(&up_bytes));
+                        let mut fused = prepack::prepack_q4_k(&gate_s);
+                        fused.extend_from_slice(&prepack::prepack_q4_k(&up_s));
                         prepacked.insert(
                             format!("blk.{layer}.ffn_ug.weight"),
                             gpu.upload_bytes(&fused)?,
                         );
                     }
-                    let mut fused = gpu.alloc::<u8>(gate_bytes.len() + up_bytes.len())?;
+                    let mut fused = gpu.alloc::<u8>(gate_s.len() + up_s.len())?;
                     unsafe {
-                        gpu.queue.enqueue_write_buffer(&mut fused, 1, 0, gate_bytes, &[])?;
-                        gpu.queue.enqueue_write_buffer(&mut fused, 1, gate_bytes.len(), up_bytes, &[])?;
+                        gpu.queue.enqueue_write_buffer(&mut fused, 1, 0, &gate_s, &[])?;
+                        gpu.queue.enqueue_write_buffer(&mut fused, 1, gate_s.len(), &up_s, &[])?;
                     }
                     let weight = match up_info.ggml_type {
                         GgmlType::Q4_K => Weight::Q4(fused),
@@ -367,7 +600,7 @@ impl GpuModel {
                     weights.insert(format!("blk.{layer}.ffn_ug.weight"), weight);
                 }
             }
-            if !prepack_on || !fuse_on {
+            if !prepack_on || !fuse_on || shard.is_some() {
                 continue;
             }
             let q_name = format!("blk.{layer}.attn_q.weight");
@@ -602,6 +835,7 @@ impl GpuModel {
             layer_end,
             has_embed,
             has_head,
+            tp: shard,
             weights,
             prepacked,
             prepack_on,
@@ -1327,6 +1561,403 @@ impl GpuModel {
         }
         self.gpu.queue.finish()?;
         Ok(())
+    }
+
+    pub fn tp_set_x(&mut self, x: &[f32]) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        if x.len() != h {
+            return Err(anyhow!("hidden size mismatch"));
+        }
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.x, 1, 0, x, &[])?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_x(&self) -> Result<Vec<f32>> {
+        self.gpu.download(&self.bufs.x, self.cfg.hidden_size)
+    }
+
+    pub fn tp_embed(&mut self, token: u32) -> Result<()> {
+        if !self.has_embed {
+            return Err(anyhow!("tp shard has no embedding"));
+        }
+        let h = self.cfg.hidden_size;
+        let emb = match self.weight("token_embd.weight")? {
+            Weight::Q6(b) => b,
+            _ => return Err(anyhow!("token_embd must be Q6_K")),
+        };
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.embed,
+                h,
+                64,
+                &[
+                    Arg::Mem(emb.get()),
+                    Arg::Mem(self.bufs.x.get()),
+                    Arg::U32(token),
+                    Arg::U32(h as u32),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_norm_attn(&mut self, layer: usize) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        let w = self.f32_weight(&format!("blk.{layer}.attn_norm.weight"))?;
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.rms_quant,
+                64,
+                64,
+                &[
+                    Arg::Mem(self.bufs.x.get()),
+                    Arg::Mem(w.get()),
+                    Arg::Mem(self.bufs.hq.get()),
+                    Arg::Mem(self.bufs.hs.get()),
+                    Arg::U32(h as u32),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_norm_inputs(&self) -> Result<(Vec<f32>, Vec<i8>, Vec<f32>)> {
+        let h = self.cfg.hidden_size;
+        let x = self.gpu.download(&self.bufs.x, h)?;
+        let hq = self.gpu.download(&self.bufs.hq, h)?;
+        let hs = self.gpu.download(&self.bufs.hs, h / GROUP)?;
+        Ok((x, hq, hs))
+    }
+
+    pub fn tp_set_norm_inputs(&mut self, x: &[f32], hq: &[i8], hs: &[f32]) -> Result<()> {
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.x, 1, 0, x, &[])?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.hq, 1, 0, hq, &[])?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.hs, 1, 0, hs, &[])?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_conv(&mut self, layer: usize, slot: usize, pos: usize) -> Result<Vec<f32>> {
+        let (_, conv_off) = self.seq_launch_params(slot, pos + 1)?;
+        let prefix = format!("blk.{layer}");
+        let h = self.cfg.hidden_size;
+        self.gemv_auto(
+            &format!("{prefix}.shortconv.in_proj.weight"),
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.bcx,
+            3 * h,
+            h,
+        )?;
+        let conv_w = self.f32_weight(&format!("{prefix}.shortconv.conv.weight"))?;
+        let state = self
+            .layers[layer]
+            .conv
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing conv state"))?;
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.conv,
+                h,
+                256,
+                &[
+                    Arg::Mem(self.bufs.bcx.get()),
+                    Arg::Mem(conv_w.get()),
+                    Arg::Mem(state.get()),
+                    Arg::Mem(self.bufs.op.get()),
+                    Arg::U32(conv_off as u32),
+                    Arg::U32(h as u32),
+                    Arg::U32(self.cfg.conv_cache as u32),
+                ],
+            )?;
+        }
+        self.quantize(&self.bufs.op, &self.bufs.hq, &self.bufs.hs, h)?;
+        self.gemv_auto(
+            &format!("{prefix}.shortconv.out_proj.weight"),
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.tmp,
+            h,
+            h,
+        )?;
+        self.gpu.queue.finish()?;
+        self.gpu.download(&self.bufs.tmp, h)
+    }
+
+    pub fn tp_attn(&mut self, layer: usize, slot: usize, pos: usize) -> Result<Vec<f32>> {
+        let shard = self.tp.ok_or_else(|| anyhow!("not a tp shard"))?;
+        let (tbl_mem, _) = self.seq_launch_params(slot, pos + 1)?;
+        let prefix = format!("blk.{layer}");
+        let h = self.cfg.hidden_size;
+        let head_dim = self.cfg.head_dim;
+        let heads = shard.head_count;
+        let kv_heads = shard.kv_head_count;
+        let qd = heads * head_dim;
+        let kvd = kv_heads * head_dim;
+        self.gemv_auto(
+            &format!("{prefix}.attn_q.weight"),
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.q,
+            qd,
+            h,
+        )?;
+        self.gemv_auto(
+            &format!("{prefix}.attn_k.weight"),
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.kk,
+            kvd,
+            h,
+        )?;
+        self.gemv_auto(
+            &format!("{prefix}.attn_v.weight"),
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.vv,
+            kvd,
+            h,
+        )?;
+        self.gemv_auto(
+            &format!("{prefix}.attn_gate.weight"),
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.g16,
+            heads,
+            h,
+        )?;
+        let q_norm = self.f32_weight(&format!("{prefix}.attn_q_norm.weight"))?;
+        let k_norm = self.f32_weight(&format!("{prefix}.attn_k_norm.weight"))?;
+        let inv = if self.cfg.kind(layer) == LayerKind::SlidingAttention {
+            &self.rope_sliding
+        } else {
+            &self.rope_full
+        };
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.rms_rope_qk,
+                (heads + kv_heads) * 64,
+                64,
+                &[
+                    Arg::Mem(self.bufs.q.get()),
+                    Arg::Mem(self.bufs.kk.get()),
+                    Arg::Mem(q_norm.get()),
+                    Arg::Mem(k_norm.get()),
+                    Arg::Mem(inv.get()),
+                    Arg::U32(pos as u32),
+                    Arg::U32(head_dim as u32),
+                    Arg::U32(heads as u32),
+                    Arg::U32(kv_heads as u32),
+                ],
+            )?;
+        }
+        let (k_buf, v_buf) = {
+            let lb = &self.layers[layer];
+            (
+                lb.k.as_ref().ok_or_else(|| anyhow!("missing kv"))?,
+                lb.v.as_ref().ok_or_else(|| anyhow!("missing kv"))?,
+            )
+        };
+        unsafe {
+            self.gpu.launch(
+                self.kv_store_kernel(),
+                kvd,
+                256,
+                &[
+                    Arg::Mem(self.bufs.kk.get()),
+                    Arg::Mem(self.bufs.vv.get()),
+                    Arg::Mem(k_buf.mem()),
+                    Arg::Mem(v_buf.mem()),
+                    Arg::Mem(tbl_mem),
+                    Arg::U32(pos as u32),
+                    Arg::U32(kvd as u32),
+                ],
+            )?;
+        }
+        let start = if self.cfg.kind(layer) == LayerKind::SlidingAttention {
+            (pos + 1).saturating_sub(self.cfg.sliding_window)
+        } else {
+            0
+        };
+        let splits = attention_splits(pos + 1 - start);
+        if splits <= 1 {
+            unsafe {
+                self.gpu.launch(
+                    self.attn_kernel(false),
+                    heads * 64,
+                    64,
+                    &[
+                        Arg::Mem(self.bufs.q.get()),
+                        Arg::Mem(k_buf.mem()),
+                        Arg::Mem(v_buf.mem()),
+                        Arg::Mem(tbl_mem),
+                        Arg::Mem(self.bufs.g16.get()),
+                        Arg::Mem(self.bufs.attn.get()),
+                        Arg::U32((pos + 1) as u32),
+                        Arg::U32(start as u32),
+                        Arg::U32(kv_heads as u32),
+                        Arg::U32(head_dim as u32),
+                        Arg::U32(heads as u32),
+                    ],
+                )?;
+            }
+        } else {
+            unsafe {
+                self.gpu.launch(
+                    self.attn_kernel(true),
+                    heads * splits * 64,
+                    64,
+                    &[
+                        Arg::Mem(self.bufs.q.get()),
+                        Arg::Mem(k_buf.mem()),
+                        Arg::Mem(v_buf.mem()),
+                        Arg::Mem(tbl_mem),
+                        Arg::Mem(self.bufs.pacc.get()),
+                        Arg::Mem(self.bufs.pml.get()),
+                        Arg::U32((pos + 1) as u32),
+                        Arg::U32(start as u32),
+                        Arg::U32(kv_heads as u32),
+                        Arg::U32(head_dim as u32),
+                        Arg::U32(heads as u32),
+                        Arg::U32(splits as u32),
+                    ],
+                )?;
+                self.gpu.launch(
+                    &self.kernels.attn_combine,
+                    heads * 64,
+                    64,
+                    &[
+                        Arg::Mem(self.bufs.pacc.get()),
+                        Arg::Mem(self.bufs.pml.get()),
+                        Arg::Mem(self.bufs.g16.get()),
+                        Arg::Mem(self.bufs.attn.get()),
+                        Arg::U32(heads as u32),
+                        Arg::U32(head_dim as u32),
+                        Arg::U32(splits as u32),
+                    ],
+                )?;
+            }
+        }
+        self.quantize(&self.bufs.attn, &self.bufs.hq, &self.bufs.hs, qd)?;
+        self.gemv_auto(
+            &format!("{prefix}.attn_output.weight"),
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.tmp,
+            h,
+            qd,
+        )?;
+        self.gpu.queue.finish()?;
+        self.gpu.download(&self.bufs.tmp, h)
+    }
+
+    pub fn tp_attn_norm(&mut self, layer: usize, tmp: &[f32]) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.tmp, 1, 0, tmp, &[])?;
+        }
+        let prefix = format!("blk.{layer}");
+        let post = self.f32_weight(&format!("{prefix}.post_attention_norm.weight"))?;
+        let ffn_norm = self.f32_weight(&format!("{prefix}.ffn_norm.weight"))?;
+        self.norm_add_quant(&self.bufs.tmp, post, &self.bufs.x, ffn_norm, h)?;
+        self.gpu.queue.finish()?;
+        Ok(())
+    }
+
+    pub fn tp_ffn_local(&mut self, layer: usize) -> Result<Vec<f32>> {
+        let shard = self
+            .tp
+            .ok_or_else(|| anyhow!("not a tp shard"))?;
+        let h = self.cfg.hidden_size;
+        let ffn = if shard.ffn_row_count == 0 {
+            self.ffn
+        } else {
+            shard.ffn_row_count
+        };
+        let prefix = format!("blk.{layer}");
+        self.gemv_auto(
+            &format!("{prefix}.ffn_ug.weight"),
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.ug,
+            2 * ffn,
+            h,
+        )?;
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.silu_quant,
+                ffn / GROUP,
+                0,
+                &[
+                    Arg::Mem(self.bufs.ug.get()),
+                    Arg::Mem(self.bufs.actq.get()),
+                    Arg::Mem(self.bufs.acts.get()),
+                    Arg::U32(ffn as u32),
+                    Arg::U32(ffn as u32),
+                ],
+            )?;
+        }
+        self.gemv_auto(
+            &format!("{prefix}.ffn_down.weight"),
+            &self.bufs.actq,
+            &self.bufs.acts,
+            &self.bufs.tmp,
+            h,
+            ffn,
+        )?;
+        self.gpu.queue.finish()?;
+        self.gpu.download(&self.bufs.tmp, h)
+    }
+
+    pub fn tp_ffn_norm(&mut self, layer: usize, tmp: &[f32]) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.tmp, 1, 0, tmp, &[])?;
+        }
+        let prefix = format!("blk.{layer}");
+        let post_ffn = self.f32_weight(&format!("{prefix}.post_ffw_norm.weight"))?;
+        let next_w = if layer + 1 < self.cfg.num_layers {
+            self.f32_weight(&format!("blk.{}.attn_norm.weight", layer + 1))?
+        } else {
+            self.f32_weight("output_norm.weight")?
+        };
+        self.norm_add_quant(&self.bufs.tmp, post_ffn, &self.bufs.x, next_w, h)?;
+        self.gpu.queue.finish()?;
+        Ok(())
+    }
+
+    pub fn tp_lmhead_partial(&mut self) -> Result<Vec<f32>> {
+        let shard = self.tp.ok_or_else(|| anyhow!("not a tp shard"))?;
+        let h = self.cfg.hidden_size;
+        self.gemv_auto(
+            "lm_head_shard",
+            &self.bufs.hq,
+            &self.bufs.hs,
+            &self.bufs.logits,
+            shard.vocab_count,
+            h,
+        )?;
+        self.gpu.queue.finish()?;
+        self.gpu.download(&self.bufs.logits, shard.vocab_count)
+    }
+
+    pub fn tp_shard(&self) -> Option<TpShard> {
+        self.tp
     }
 
     pub fn batch_size(&self) -> usize {
