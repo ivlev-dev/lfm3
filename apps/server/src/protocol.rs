@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use lfm_domain::{Message, Role, SamplingParams};
+use lfm_domain::{Message, Role, SamplingParams, ToolCall, ToolDef};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +22,26 @@ pub struct ChatRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub chat_template_kwargs: Option<Value>,
+    #[serde(default)]
+    pub tools: Option<Vec<WireTool>>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WireTool {
+    #[serde(default)]
+    pub function: WireFunction,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WireFunction {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +49,23 @@ pub struct WireMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<Value>,
+    #[serde(default)]
+    pub tool_calls: Vec<WireToolCall>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WireToolCall {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub function: WireFunctionCall,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WireFunctionCall {
+    pub name: String,
+    pub arguments: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,9 +86,39 @@ impl ChatRequest {
                 "tool" => Role::Tool,
                 other => return Err(anyhow!("unsupported role {other}")),
             };
-            out.push(Message::text(role, wire_text(wire.content.as_ref())?));
+            let mut msg = Message::text(role, wire_text(wire.content.as_ref())?);
+            msg.tool_call_id = wire.tool_call_id.clone();
+            msg.tool_calls = wire
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                    arguments: wire_arguments(&tc.function.arguments),
+                })
+                .collect();
+            out.push(msg);
         }
         Ok(out)
+    }
+
+    pub fn to_tools(&self) -> Vec<ToolDef> {
+        if matches!(&self.tool_choice, Some(Value::String(s)) if s == "none") {
+            return Vec::new();
+        }
+        self.tools
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|t| !t.function.name.is_empty())
+            .map(|t| ToolDef {
+                name: t.function.name.clone(),
+                description: t.function.description.clone(),
+                parameters: t.function.parameters.clone().unwrap_or_else(
+                    || json!({"type": "object", "properties": {}}),
+                ),
+            })
+            .collect()
     }
 
     pub fn to_params(&self) -> SamplingParams {
@@ -100,6 +167,105 @@ fn wire_text(content: Option<&Value>) -> Result<String> {
     }
 }
 
+fn wire_arguments(value: &Value) -> Value {
+    match value {
+        Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
+        other => other.clone(),
+    }
+}
+
+fn tool_arguments_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+    }
+}
+
+fn openai_tool_call(tc: &ToolCall, index: usize) -> Value {
+    let id = tc.id.clone().unwrap_or_else(|| format!("call_{index}"));
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": tc.name,
+            "arguments": tool_arguments_text(&tc.arguments)
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompletionRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub prompt: Prompt,
+    #[serde(default)]
+    pub stream: bool,
+    pub max_tokens: Option<usize>,
+    pub temperature: Option<f32>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub stop: Option<Stop>,
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub n: Option<usize>,
+    #[serde(default)]
+    pub echo: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Prompt {
+    Text(String),
+    Texts(Vec<String>),
+    Tokens(Vec<u32>),
+}
+
+impl CompletionRequest {
+    pub fn to_prompts(&self) -> Result<Vec<String>> {
+        if self.n.unwrap_or(1) > 1 {
+            return Err(anyhow!("n > 1 is not supported"));
+        }
+        if self.echo.unwrap_or(false) {
+            return Err(anyhow!("echo is not supported"));
+        }
+        let prompts = match &self.prompt {
+            Prompt::Text(s) => vec![s.clone()],
+            Prompt::Texts(v) => v.clone(),
+            Prompt::Tokens(v) => {
+                return Err(anyhow!(
+                    "token array prompts are not supported ({} tokens)",
+                    v.len()
+                ))
+            }
+        };
+        if prompts.is_empty() || prompts.iter().any(|p| p.is_empty()) {
+            return Err(anyhow!("prompt must not be empty"));
+        }
+        Ok(prompts)
+    }
+
+    pub fn to_params(&self) -> SamplingParams {
+        let mut params = SamplingParams {
+            temperature: self.temperature.unwrap_or(0.7),
+            top_k: self.top_k.unwrap_or(40),
+            top_p: self.top_p.unwrap_or(0.95),
+            ..SamplingParams::default()
+        };
+        if let Some(stop) = &self.stop {
+            match stop {
+                Stop::One(s) => params.stop = vec![s.clone()],
+                Stop::Many(v) => params.stop = v.clone(),
+            }
+        }
+        if let Some(seed) = self.seed {
+            params.seed = seed;
+        }
+        params.max_tokens = self.max_tokens.unwrap_or(256).max(1);
+        params
+    }
+}
+
 pub struct CompletionMeta {
     pub id: String,
     pub created: u64,
@@ -108,11 +274,19 @@ pub struct CompletionMeta {
 
 impl CompletionMeta {
     pub fn new(model: &str) -> Self {
+        Self::with_prefix("chatcmpl-", model)
+    }
+
+    pub fn new_completion(model: &str) -> Self {
+        Self::with_prefix("cmpl-", model)
+    }
+
+    fn with_prefix(prefix: &str, model: &str) -> Self {
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let id = format!("chatcmpl-{created}");
+        let id = format!("{prefix}{created}");
         Self {
             id,
             created,
@@ -131,7 +305,41 @@ impl CompletionMeta {
         .to_string()
     }
 
-    pub fn response(&self, text: &str, prompt_tokens: usize, completion_tokens: usize) -> String {
+    pub fn tool_chunk(&self, index: usize, tc: &ToolCall) -> String {
+        let delta = json!({ "tool_calls": [{
+            "index": index,
+            "id": tc.id.clone().unwrap_or_else(|| format!("call_{index}")),
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": tool_arguments_text(&tc.arguments)
+            }
+        }]});
+        self.chunk(delta, None)
+    }
+
+    pub fn message_response(
+        &self,
+        text: &str,
+        tool_calls: &[ToolCall],
+        finish_reason: &str,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    ) -> String {
+        let content = if text.is_empty() && !tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text.to_string())
+        };
+        let mut message = json!({ "role": "assistant", "content": content });
+        if !tool_calls.is_empty() {
+            let calls: Vec<Value> = tool_calls
+                .iter()
+                .enumerate()
+                .map(|(i, tc)| openai_tool_call(tc, i))
+                .collect();
+            message["tool_calls"] = Value::Array(calls);
+        }
         json!({
             "id": self.id,
             "object": "chat.completion",
@@ -139,9 +347,48 @@ impl CompletionMeta {
             "model": self.model,
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": text },
-                "finish_reason": "stop"
+                "message": message,
+                "finish_reason": finish_reason
             }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        })
+        .to_string()
+    }
+
+    pub fn completion_chunk(&self, text: &str, finish: Option<&str>) -> String {
+        json!({
+            "id": self.id,
+            "object": "text_completion",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{ "index": 0, "text": text, "logprobs": Value::Null, "finish_reason": finish }]
+        })
+        .to_string()
+    }
+
+    pub fn completion_response(
+        &self,
+        choices: &[(String, String)],
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    ) -> String {
+        let items: Vec<Value> = choices
+            .iter()
+            .enumerate()
+            .map(|(i, (text, finish))| {
+                json!({ "index": i, "text": text, "logprobs": Value::Null, "finish_reason": finish })
+            })
+            .collect();
+        json!({
+            "id": self.id,
+            "object": "text_completion",
+            "created": self.created,
+            "model": self.model,
+            "choices": items,
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -260,7 +507,7 @@ mod tests {
         assert_eq!(v["choices"][0]["delta"]["content"], "hi");
         assert!(v["choices"][0]["finish_reason"].is_null());
 
-        let resp = meta.response("hello", 3, 2);
+        let resp = meta.message_response("hello", &[], "stop", 3, 2);
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["content"], "hello");
@@ -352,5 +599,118 @@ mod tests {
         assert_eq!(v["cache_hits"], 6);
         assert_eq!(v["reused_tokens"], 8);
         assert_eq!(v["uptime_s"].as_f64(), Some(9.25));
+    }
+
+    #[test]
+    fn parses_tools_and_tool_choice() {
+        let req = parse(
+            r#"{"messages":[],"tools":[{"type":"function","function":{"name":"weather","description":"get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"tool_choice":"auto"}"#,
+        );
+        let tools = req.to_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "weather");
+        assert_eq!(tools[0].description.as_deref(), Some("get weather"));
+        assert_eq!(tools[0].parameters["properties"]["city"]["type"], "string");
+
+        let none = parse(
+            r#"{"messages":[],"tools":[{"type":"function","function":{"name":"weather"}}],"tool_choice":"none"}"#,
+        );
+        assert!(none.to_tools().is_empty());
+    }
+
+    #[test]
+    fn parses_tool_call_history() {
+        let req = parse(
+            r#"{"messages":[
+                {"role":"user","content":"weather?"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"sunny"}
+            ]}"#,
+        );
+        let msgs = req.to_messages().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].tool_calls.len(), 1);
+        assert_eq!(msgs[1].tool_calls[0].name, "weather");
+        assert_eq!(msgs[1].tool_calls[0].arguments["city"], "Paris");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn message_response_carries_tool_calls() {
+        let meta = CompletionMeta::new("lfm3");
+        let calls = vec![ToolCall {
+            id: Some("call_1".into()),
+            name: "weather".into(),
+            arguments: json!({"city": "Paris"}),
+        }];
+        let resp = meta.message_response("", &calls, "tool_calls", 5, 7);
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        assert!(v["choices"][0]["message"]["content"].is_null());
+        assert_eq!(v["choices"][0]["message"]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+    }
+
+    #[test]
+    fn tool_delta_chunk_shape() {
+        let meta = CompletionMeta::new("lfm3");
+        let tc = ToolCall {
+            id: None,
+            name: "weather".into(),
+            arguments: json!({"city": "Paris"}),
+        };
+        let chunk = meta.tool_chunk(2, &tc);
+        let v: Value = serde_json::from_str(&chunk).unwrap();
+        assert_eq!(v["choices"][0]["delta"]["tool_calls"][0]["index"], 2);
+        assert_eq!(v["choices"][0]["delta"]["tool_calls"][0]["id"], "call_2");
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+    }
+
+    #[test]
+    fn parses_completion_prompts() {
+        let one = parse_completion(r#"{"prompt":"Hello","max_tokens":4}"#);
+        assert_eq!(one.to_prompts().unwrap(), vec!["Hello".to_string()]);
+        assert_eq!(one.to_params().max_tokens, 4);
+
+        let many = parse_completion(r#"{"prompt":["a","b"]}"#);
+        assert_eq!(many.to_prompts().unwrap(), vec!["a".to_string(), "b".to_string()]);
+
+        let tokens = parse_completion(r#"{"prompt":[1,2,3]}"#);
+        assert!(tokens.to_prompts().is_err());
+
+        let n = parse_completion(r#"{"prompt":"a","n":2}"#);
+        assert!(n.to_prompts().is_err());
+
+        let echo = parse_completion(r#"{"prompt":"a","echo":true}"#);
+        assert!(echo.to_prompts().is_err());
+
+        let empty = parse_completion(r#"{"prompt":""}"#);
+        assert!(empty.to_prompts().is_err());
+    }
+
+    #[test]
+    fn completion_response_and_stream_shapes() {
+        let meta = CompletionMeta::new_completion("lfm3");
+        let resp = meta.completion_response(&[("hello".to_string(), "stop".to_string())], 3, 2);
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["object"], "text_completion");
+        assert_eq!(v["choices"][0]["text"], "hello");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["total_tokens"], 5);
+
+        let chunk = meta.completion_chunk("hi", None);
+        let v: Value = serde_json::from_str(&chunk).unwrap();
+        assert_eq!(v["choices"][0]["text"], "hi");
+        assert!(v["choices"][0]["finish_reason"].is_null());
+    }
+
+    fn parse_completion(body: &str) -> CompletionRequest {
+        serde_json::from_str(body).expect("completion request")
     }
 }

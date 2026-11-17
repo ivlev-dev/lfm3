@@ -1,6 +1,8 @@
 use crate::engine::{ChatJob, Engine, Event};
 use crate::hpack::{self, HpackCtx};
-use crate::protocol::{metrics_json, models_json, ChatRequest, CompletionMeta};
+use crate::protocol::{
+    metrics_json, models_json, ChatRequest, CompletionMeta, CompletionRequest,
+};
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::collections::HashMap;
@@ -633,6 +635,7 @@ enum Route {
     Health,
     Models,
     Chat,
+    Completions,
     Metrics,
     NotFound,
 }
@@ -642,6 +645,7 @@ fn route(method: &str, path: &str) -> Route {
         ("GET", "/health") => Route::Health,
         ("GET", "/v1/models") => Route::Models,
         ("POST", "/v1/chat/completions") => Route::Chat,
+        ("POST", "/v1/completions") => Route::Completions,
         ("GET", "/metrics") => Route::Metrics,
         _ => Route::NotFound,
     }
@@ -652,6 +656,7 @@ fn handle(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result
         Route::Health => send_json(conn, req.id, "200", r#"{"status":"ok"}"#),
         Route::Models => send_json(conn, req.id, "200", &models_json(model, 0)),
         Route::Chat => chat(conn, engine, model, req),
+        Route::Completions => completions(conn, engine, model, req),
         Route::Metrics => send_json(conn, req.id, "200", &metrics_json(model, &engine.metrics())),
         Route::NotFound => send_json(
             conn,
@@ -686,11 +691,12 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
         }
     };
     let params = parsed.to_params();
-    let events = engine.submit(ChatJob {
+    let events = engine.submit(ChatJob::chat(
         messages,
         params,
-        thinking: parsed.thinking(),
-    })?;
+        parsed.thinking(),
+        parsed.to_tools(),
+    ))?;
     let name = parsed.model.as_deref().unwrap_or(model);
     let meta = CompletionMeta::new(name);
     if parsed.stream {
@@ -700,6 +706,8 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
             ("cache-control", "no-cache".to_string()),
         ]);
         conn.send_headers(req.id, &block, false)?;
+        let mut tool_index = 0usize;
+        let mut finish_reason = "stop";
         for event in events {
             let payload = match event {
                 Event::Delta(text) => {
@@ -709,7 +717,18 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
                     "data: {}\n\n",
                     meta.chunk(json!({"reasoning_content": text}), None)
                 ),
-                Event::Final { .. } => continue,
+                Event::ToolCall(tc) => {
+                    let payload = format!("data: {}\n\n", meta.tool_chunk(tool_index, &tc));
+                    tool_index += 1;
+                    payload
+                }
+                Event::Final {
+                    finish_reason: reason,
+                    ..
+                } => {
+                    finish_reason = reason;
+                    continue;
+                }
                 Event::Error(e) => format!(
                     "data: {}\n\n",
                     meta.chunk(json!({"content": format!("\n[error] {e}")}), None)
@@ -725,21 +744,27 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
         }
         let finish = format!(
             "data: {}\n\ndata: [DONE]\n\n",
-            meta.chunk(json!({}), Some("stop"))
+            meta.chunk(json!({}), Some(finish_reason))
         );
         conn.send_data(req.id, finish.as_bytes(), true)?;
         return Ok(());
     }
     let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut finish_reason = "stop";
     let mut usage = (0usize, 0usize);
     for event in events {
         match event {
             Event::Final {
                 text: t,
+                tool_calls: calls,
+                finish_reason: reason,
                 prompt_tokens,
                 completion_tokens,
             } => {
                 text = t;
+                tool_calls = calls;
+                finish_reason = reason;
                 usage = (prompt_tokens, completion_tokens);
             }
             Event::Error(e) => {
@@ -750,10 +775,136 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
                     &json!({"error": {"message": e}}).to_string(),
                 )
             }
-            Event::Delta(_) | Event::Thinking(_) => {}
+            Event::Delta(_) | Event::Thinking(_) | Event::ToolCall(_) => {}
         }
     }
-    send_json(conn, req.id, "200", &meta.response(&text, usage.0, usage.1))
+    send_json(
+        conn,
+        req.id,
+        "200",
+        &meta.message_response(&text, &tool_calls, finish_reason, usage.0, usage.1),
+    )
+}
+
+fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<()> {
+    let parsed: CompletionRequest = match serde_json::from_slice(&req.body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return send_json(
+                conn,
+                req.id,
+                "400",
+                &json!({"error": {"message": format!("bad json: {e}")}}).to_string(),
+            )
+        }
+    };
+    let prompts = match parsed.to_prompts() {
+        Ok(prompts) => prompts,
+        Err(e) => {
+            return send_json(
+                conn,
+                req.id,
+                "400",
+                &json!({"error": {"message": format!("{e}")}}).to_string(),
+            )
+        }
+    };
+    let params = parsed.to_params();
+    let name = parsed.model.as_deref().unwrap_or(model);
+    let meta = CompletionMeta::new_completion(name);
+    if parsed.stream {
+        if prompts.len() != 1 {
+            return send_json(
+                conn,
+                req.id,
+                "400",
+                &json!({"error": {"message": "streaming requires a single prompt"}}).to_string(),
+            );
+        }
+        let events = engine.submit(ChatJob::completion(prompts[0].clone(), params))?;
+        let block = hpack::encode(&[
+            (":status", "200".to_string()),
+            ("content-type", "text/event-stream".to_string()),
+            ("cache-control", "no-cache".to_string()),
+        ]);
+        conn.send_headers(req.id, &block, false)?;
+        let first = format!("data: {}\n\n", meta.completion_chunk("", None));
+        conn.send_data(req.id, first.as_bytes(), false)?;
+        let mut finish_reason = "stop";
+        for event in events {
+            let payload = match event {
+                Event::Delta(text) => format!(
+                    "data: {}\n\n",
+                    meta.completion_chunk(&text, None)
+                ),
+                Event::Final {
+                    finish_reason: reason,
+                    ..
+                } => {
+                    finish_reason = reason;
+                    continue;
+                }
+                Event::Error(e) => format!(
+                    "data: {}\n\n",
+                    meta.completion_chunk(&format!("\n[error] {e}"), None)
+                ),
+                Event::Thinking(_) | Event::ToolCall(_) => continue,
+            };
+            conn.send_data(req.id, payload.as_bytes(), false)?;
+            if conn.peer_gone {
+                return Ok(());
+            }
+            if !conn.flow.has_stream(req.id) {
+                return Ok(());
+            }
+        }
+        let finish = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            meta.completion_chunk("", Some(finish_reason))
+        );
+        conn.send_data(req.id, finish.as_bytes(), true)?;
+        return Ok(());
+    }
+    let mut choices = Vec::with_capacity(prompts.len());
+    let mut prompt_tokens = 0usize;
+    let mut completion_tokens = 0usize;
+    for prompt in prompts {
+        let events = engine.submit(ChatJob::completion(prompt, params.clone()))?;
+        let mut text = String::new();
+        let mut finish_reason = "stop";
+        for event in events {
+            match event {
+                Event::Final {
+                    text: t,
+                    finish_reason: reason,
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                    ..
+                } => {
+                    text = t;
+                    finish_reason = reason;
+                    prompt_tokens += p;
+                    completion_tokens += c;
+                }
+                Event::Error(e) => {
+                    return send_json(
+                        conn,
+                        req.id,
+                        "500",
+                        &json!({"error": {"message": e}}).to_string(),
+                    )
+                }
+                Event::Delta(_) | Event::Thinking(_) | Event::ToolCall(_) => {}
+            }
+        }
+        choices.push((text, finish_reason.to_string()));
+    }
+    send_json(
+        conn,
+        req.id,
+        "200",
+        &meta.completion_response(&choices, prompt_tokens, completion_tokens),
+    )
 }
 
 #[cfg(test)]
@@ -1073,6 +1224,7 @@ mod tests {
         assert_eq!(route("GET", "/health"), Route::Health);
         assert_eq!(route("GET", "/v1/models"), Route::Models);
         assert_eq!(route("POST", "/v1/chat/completions"), Route::Chat);
+        assert_eq!(route("POST", "/v1/completions"), Route::Completions);
         assert_eq!(route("GET", "/unknown"), Route::NotFound);
     }
 

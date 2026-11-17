@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::Parser;
 use engine::{ChatJob, Engine, Event, ServeConfig};
 use http::{end_sse, read_request, start_sse, write_event, write_json, Request};
-use protocol::{metrics_json, models_json, ChatRequest, CompletionMeta};
+use protocol::{metrics_json, models_json, ChatRequest, CompletionMeta, CompletionRequest};
 use serde_json::json;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -73,6 +73,7 @@ enum Route {
     Health,
     Models,
     Chat,
+    Completions,
     Metrics,
     Ws,
     NotFound,
@@ -83,6 +84,7 @@ fn route(method: &str, path: &str) -> Route {
         ("GET", "/health") => Route::Health,
         ("GET", "/v1/models") => Route::Models,
         ("POST", "/v1/chat/completions") => Route::Chat,
+        ("POST", "/v1/completions") => Route::Completions,
         ("GET", "/metrics") => Route::Metrics,
         ("GET", "/ws") => Route::Ws,
         _ => Route::NotFound,
@@ -103,6 +105,7 @@ fn handle(mut stream: TcpStream, engine: &Engine, model: &str) -> Result<()> {
         Route::Health => write_json(&mut stream, 200, r#"{"status":"ok"}"#),
         Route::Models => write_json(&mut stream, 200, &models_json(model, 0)),
         Route::Chat => chat(stream, engine, model, &request),
+        Route::Completions => completions(stream, engine, model, &request),
         Route::Metrics => write_json(&mut stream, 200, &metrics_json(model, &engine.metrics())),
         Route::Ws => ws_session(stream, engine, &request),
         Route::NotFound => write_json(&mut stream, 404, &error_body("not found")),
@@ -119,11 +122,7 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
         Err(e) => return write_json(&mut stream, 400, &error_body(&format!("{e}"))),
     };
     let params = parsed.to_params();
-    let job = ChatJob {
-        messages,
-        params,
-        thinking: parsed.thinking(),
-    };
+    let job = ChatJob::chat(messages, params, parsed.thinking(), parsed.to_tools());
     let events = engine.submit(job)?;
     let name = parsed.model.as_deref().unwrap_or(model);
     let meta = CompletionMeta::new(name);
@@ -133,6 +132,8 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
             &mut stream,
             &meta.chunk(json!({ "role": "assistant", "content": "" }), None),
         )?;
+        let mut tool_index = 0usize;
+        let mut finish_reason = "stop";
         for event in events {
             match event {
                 Event::Delta(text) => {
@@ -144,7 +145,14 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
                         &meta.chunk(json!({ "reasoning_content": text }), None),
                     )?;
                 }
-                Event::Final { .. } => {}
+                Event::ToolCall(tc) => {
+                    write_event(&mut stream, &meta.tool_chunk(tool_index, &tc))?;
+                    tool_index += 1;
+                }
+                Event::Final {
+                    finish_reason: reason,
+                    ..
+                } => finish_reason = reason,
                 Event::Error(e) => {
                     write_event(
                         &mut stream,
@@ -153,27 +161,117 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
                 }
             }
         }
-        write_event(&mut stream, &meta.chunk(json!({}), Some("stop")))?;
+        write_event(&mut stream, &meta.chunk(json!({}), Some(finish_reason)))?;
         write_event(&mut stream, "[DONE]")?;
         return end_sse(&mut stream);
     }
     let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut finish_reason = "stop";
     let mut usage = (0usize, 0usize);
     for event in events {
         match event {
             Event::Final {
                 text: t,
+                tool_calls: calls,
+                finish_reason: reason,
                 prompt_tokens,
                 completion_tokens,
             } => {
                 text = t;
+                tool_calls = calls;
+                finish_reason = reason;
                 usage = (prompt_tokens, completion_tokens);
             }
             Event::Error(e) => return write_json(&mut stream, 500, &error_body(&e)),
-            Event::Delta(_) | Event::Thinking(_) => {}
+            Event::Delta(_) | Event::Thinking(_) | Event::ToolCall(_) => {}
         }
     }
-    write_json(&mut stream, 200, &meta.response(&text, usage.0, usage.1))
+    write_json(
+        &mut stream,
+        200,
+        &meta.message_response(&text, &tool_calls, finish_reason, usage.0, usage.1),
+    )
+}
+
+fn completions(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) -> Result<()> {
+    let parsed: CompletionRequest = match serde_json::from_slice(&request.body) {
+        Ok(parsed) => parsed,
+        Err(e) => return write_json(&mut stream, 400, &error_body(&format!("bad json: {e}"))),
+    };
+    let prompts = match parsed.to_prompts() {
+        Ok(prompts) => prompts,
+        Err(e) => return write_json(&mut stream, 400, &error_body(&format!("{e}"))),
+    };
+    let params = parsed.to_params();
+    let name = parsed.model.as_deref().unwrap_or(model);
+    let meta = CompletionMeta::new_completion(name);
+    if parsed.stream {
+        if prompts.len() != 1 {
+            return write_json(
+                &mut stream,
+                400,
+                &error_body("streaming requires a single prompt"),
+            );
+        }
+        let events = engine.submit(ChatJob::completion(prompts[0].clone(), params))?;
+        start_sse(&mut stream)?;
+        write_event(&mut stream, &meta.completion_chunk("", None))?;
+        let mut finish_reason = "stop";
+        for event in events {
+            match event {
+                Event::Delta(text) => {
+                    write_event(&mut stream, &meta.completion_chunk(&text, None))?;
+                }
+                Event::Final {
+                    finish_reason: reason,
+                    ..
+                } => finish_reason = reason,
+                Event::Error(e) => {
+                    write_event(
+                        &mut stream,
+                        &meta.completion_chunk(&format!("\n[error] {e}"), None),
+                    )?;
+                }
+                Event::Thinking(_) | Event::ToolCall(_) => {}
+            }
+        }
+        write_event(&mut stream, &meta.completion_chunk("", Some(finish_reason)))?;
+        write_event(&mut stream, "[DONE]")?;
+        return end_sse(&mut stream);
+    }
+    let mut choices = Vec::with_capacity(prompts.len());
+    let mut prompt_tokens = 0usize;
+    let mut completion_tokens = 0usize;
+    for prompt in prompts {
+        let events = engine.submit(ChatJob::completion(prompt, params.clone()))?;
+        let mut text = String::new();
+        let mut finish_reason = "stop";
+        for event in events {
+            match event {
+                Event::Final {
+                    text: t,
+                    finish_reason: reason,
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                    ..
+                } => {
+                    text = t;
+                    finish_reason = reason;
+                    prompt_tokens += p;
+                    completion_tokens += c;
+                }
+                Event::Error(e) => return write_json(&mut stream, 500, &error_body(&e)),
+                Event::Delta(_) | Event::Thinking(_) | Event::ToolCall(_) => {}
+            }
+        }
+        choices.push((text, finish_reason.to_string()));
+    }
+    write_json(
+        &mut stream,
+        200,
+        &meta.completion_response(&choices, prompt_tokens, completion_tokens),
+    )
 }
 
 fn ws_session(mut stream: TcpStream, engine: &Engine, request: &Request) -> Result<()> {
@@ -206,11 +304,12 @@ fn ws_session(mut stream: TcpStream, engine: &Engine, request: &Request) -> Resu
             }
         };
         let params = parsed.to_params();
-        let events = engine.submit(ChatJob {
+        let events = engine.submit(ChatJob::chat(
             messages,
             params,
-            thinking: parsed.thinking(),
-        })?;
+            parsed.thinking(),
+            parsed.to_tools(),
+        ))?;
         for event in events {
             match event {
                 Event::Delta(text) => {
@@ -219,7 +318,19 @@ fn ws_session(mut stream: TcpStream, engine: &Engine, request: &Request) -> Resu
                 Event::Thinking(text) => {
                     conn.send_text(&json!({ "type": "thinking", "content": text }).to_string())?;
                 }
+                Event::ToolCall(tc) => {
+                    conn.send_text(
+                        &json!({
+                            "type": "tool_call",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        })
+                        .to_string(),
+                    )?;
+                }
                 Event::Final {
+                    finish_reason,
                     prompt_tokens,
                     completion_tokens,
                     ..
@@ -227,7 +338,7 @@ fn ws_session(mut stream: TcpStream, engine: &Engine, request: &Request) -> Resu
                     conn.send_text(
                         &json!({
                             "type": "done",
-                            "finish_reason": "stop",
+                            "finish_reason": finish_reason,
                             "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens }
                         })
                         .to_string(),
@@ -289,6 +400,7 @@ mod tests {
         assert_eq!(route("GET", "/health"), Route::Health);
         assert_eq!(route("GET", "/v1/models"), Route::Models);
         assert_eq!(route("POST", "/v1/chat/completions"), Route::Chat);
+        assert_eq!(route("POST", "/v1/completions"), Route::Completions);
         assert_eq!(route("GET", "/ws"), Route::Ws);
         assert_eq!(route("GET", "/nope"), Route::NotFound);
     }

@@ -4,7 +4,7 @@ use lfm_app::{
     ActiveSeq, JobId,
 };
 use lfm_chat::ChatTemplate;
-use lfm_domain::{Message, SamplingParams};
+use lfm_domain::{Message, SamplingParams, ToolCall, ToolDef};
 use lfm_gpu::{GpuModel, StepReq};
 use lfm_tokenizer::LfmTokenizer;
 use std::collections::HashMap;
@@ -28,14 +28,46 @@ pub struct ChatJob {
     pub messages: Vec<Message>,
     pub params: SamplingParams,
     pub thinking: bool,
+    pub tools: Vec<ToolDef>,
+    pub raw_prompt: Option<String>,
+}
+
+impl ChatJob {
+    pub fn chat(
+        messages: Vec<Message>,
+        params: SamplingParams,
+        thinking: bool,
+        tools: Vec<ToolDef>,
+    ) -> Self {
+        Self {
+            messages,
+            params,
+            thinking,
+            tools,
+            raw_prompt: None,
+        }
+    }
+
+    pub fn completion(prompt: String, params: SamplingParams) -> Self {
+        Self {
+            messages: Vec::new(),
+            params,
+            thinking: false,
+            tools: Vec::new(),
+            raw_prompt: Some(prompt),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum Event {
     Delta(String),
     Thinking(String),
+    ToolCall(ToolCall),
     Final {
         text: String,
+        tool_calls: Vec<ToolCall>,
+        finish_reason: &'static str,
         prompt_tokens: usize,
         completion_tokens: usize,
     },
@@ -213,7 +245,10 @@ struct RequestState {
     slot: usize,
     prompt: Vec<u32>,
     sampler: Sampler,
-    session: ChatSession,
+    session: Option<ChatSession>,
+    raw: bool,
+    tool_calls: Vec<ToolCall>,
+    finish: &'static str,
     tx: Sender<Event>,
     stops: Vec<String>,
     hold: usize,
@@ -228,6 +263,27 @@ struct RequestState {
 }
 
 impl RequestState {
+    fn push_text(&mut self, text: &str) -> TokenFlow {
+        self.content.push_str(text);
+        if let Some(pos) = first_stop(&self.content, &self.stops) {
+            self.stop_at = Some(pos);
+            return TokenFlow::Stop;
+        }
+        let safe = self.content.len().saturating_sub(self.hold);
+        let mut cut = safe.max(self.sent);
+        while cut > self.sent && !self.content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut > self.sent {
+            let chunk = self.content[self.sent..cut].to_string();
+            if self.tx.send(Event::Delta(chunk)).is_err() {
+                return TokenFlow::Cancelled;
+            }
+            self.sent = cut;
+        }
+        TokenFlow::Continue
+    }
+
     fn process_token(&mut self, tok: &LfmTokenizer, token: u32) -> TokenFlow {
         self.tokens.push(token);
         let Ok(text) = tok.decode(&self.tokens, true) else {
@@ -238,33 +294,31 @@ impl RequestState {
         }
         let delta = text[self.printed.len()..].to_string();
         self.printed = text;
-        for event in self.session.feed(&delta) {
+        if self.raw {
+            return self.push_text(&delta);
+        }
+        let events = match self.session.as_mut() {
+            Some(session) => session.feed(&delta),
+            None => Vec::new(),
+        };
+        for event in events {
             match event {
                 SessionEvent::Thinking(text) => {
                     if self.tx.send(Event::Thinking(text)).is_err() {
                         return TokenFlow::Cancelled;
                     }
                 }
-                SessionEvent::Content(text) => {
-                    self.content.push_str(&text);
-                    if let Some(pos) = first_stop(&self.content, &self.stops) {
-                        self.stop_at = Some(pos);
-                        return TokenFlow::Stop;
-                    }
-                    let safe = self.content.len().saturating_sub(self.hold);
-                    let mut cut = safe.max(self.sent);
-                    while cut > self.sent && !self.content.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    if cut > self.sent {
-                        let chunk = self.content[self.sent..cut].to_string();
-                        if self.tx.send(Event::Delta(chunk)).is_err() {
-                            return TokenFlow::Cancelled;
-                        }
-                        self.sent = cut;
+                SessionEvent::Content(text) => match self.push_text(&text) {
+                    TokenFlow::Continue => {}
+                    other => return other,
+                },
+                SessionEvent::ToolCall(tc) => {
+                    self.tool_calls.push(tc.clone());
+                    if self.tx.send(Event::ToolCall(tc)).is_err() {
+                        return TokenFlow::Cancelled;
                     }
                 }
-                _ => {}
+                SessionEvent::Finished => {}
             }
         }
         TokenFlow::Continue
@@ -278,14 +332,17 @@ impl RequestState {
             }
             TokenFlow::Stop => {
                 self.next_token = None;
+                self.finish = "stop";
                 Commit::Stop
             }
             TokenFlow::Continue if token == self.eos => {
                 self.next_token = None;
+                self.finish = "stop";
                 Commit::Eos
             }
             TokenFlow::Continue if self.tokens.len() >= self.max_new => {
                 self.next_token = None;
+                self.finish = "length";
                 Commit::Limit
             }
             TokenFlow::Continue => {
@@ -471,16 +528,22 @@ impl Worker {
             messages,
             params,
             thinking,
+            tools,
+            raw_prompt,
         } = chat;
-        let mut all = Vec::with_capacity(messages.len() + 1);
-        if !self.system.is_empty() {
-            all.push(Message::system(self.system.clone()));
-        }
-        all.extend(messages);
-        let prompt = self
-            .chat
-            .render(&all, &[], true, thinking, false)
-            .and_then(|text| self.tok.encode(&text, false));
+        let raw = raw_prompt.is_some();
+        let prompt = if let Some(text) = raw_prompt {
+            self.tok.encode(&text, false)
+        } else {
+            let mut all = Vec::with_capacity(messages.len() + 1);
+            if !self.system.is_empty() {
+                all.push(Message::system(self.system.clone()));
+            }
+            all.extend(messages);
+            self.chat
+                .render(&all, &tools, true, thinking, false)
+                .and_then(|text| self.tok.encode(&text, false))
+        };
         let prompt = match prompt {
             Ok(prompt) => prompt,
             Err(e) => {
@@ -495,9 +558,13 @@ impl Worker {
                 return;
             }
         };
-        let mut session = ChatSession::new();
-        if thinking {
-            session.begin_thinking();
+        let mut session = None;
+        if !raw {
+            let mut chat_session = ChatSession::new();
+            if thinking {
+                chat_session.begin_thinking();
+            }
+            session = Some(chat_session);
         }
         let mut sampler = Sampler::new(params.clone());
         for &token in &prompt {
@@ -512,6 +579,9 @@ impl Worker {
                 prompt,
                 sampler,
                 session,
+                raw,
+                tool_calls: Vec::new(),
+                finish: "stop",
                 tx,
                 stops: params.stop,
                 hold,
@@ -722,8 +792,15 @@ impl Worker {
         let text = state.content[..final_end].to_string();
         let prompt_tokens = state.prompt.len();
         let completion_tokens = state.tokens.len();
+        let finish_reason = if state.tool_calls.is_empty() {
+            state.finish
+        } else {
+            "tool_calls"
+        };
         let _ = state.tx.send(Event::Final {
             text,
+            tool_calls: state.tool_calls.clone(),
+            finish_reason,
             prompt_tokens,
             completion_tokens,
         });
@@ -797,7 +874,10 @@ mod tests {
             slot: 0,
             prompt: vec![1, 2, 3],
             sampler: Sampler::new(SamplingParams::default()),
-            session: ChatSession::new(),
+            session: Some(ChatSession::new()),
+            raw: false,
+            tool_calls: Vec::new(),
+            finish: "stop",
             tx,
             stops: Vec::new(),
             hold: 0,
