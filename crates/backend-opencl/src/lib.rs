@@ -203,6 +203,7 @@ pub struct GpuModel {
     rgemv_b: usize,
     wg: usize,
     wg_b: usize,
+    subgroup: usize,
     kv_blocks: usize,
     cache: RadixCache,
     cache_on: bool,
@@ -380,6 +381,7 @@ impl GpuModel {
             .filter(|v: &usize| (64..=512).contains(v))
             .map(|v| v / 64 * 64)
             .unwrap_or(64);
+        let subgroup = gpu.caps.sub_group_size.max(1);
         let options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
         let program: Program = gpu.build(KERNELS, &options)?;
         let kernels = Kernels {
@@ -542,6 +544,7 @@ impl GpuModel {
             rgemv_b,
             wg,
             wg_b,
+            subgroup,
             kv_blocks,
             cache: RadixCache::new(kv_blocks),
             cache_on,
@@ -583,7 +586,7 @@ impl GpuModel {
             Weight::Q4(b) | Weight::Q6(b) => b,
             Weight::F32(_) => unreachable!(),
         };
-        let per_wg = (self.wg / 64) * self.rgemv;
+        let per_wg = (self.wg / self.subgroup).max(1) * self.rgemv;
         let grid = rows.div_ceil(per_wg) * self.wg;
         unsafe {
             self.gpu.launch(
@@ -626,7 +629,7 @@ impl GpuModel {
             (Weight::Q6(b), _) => (&self.kernels.q6_b, b),
             (Weight::F32(_), _) => return Err(anyhow!("gemv on f32 weight {name}")),
         };
-        let per_wg = (self.wg_b / 64) * self.rgemv_b;
+        let per_wg = (self.wg_b / self.subgroup).max(1) * self.rgemv_b;
         let grid = rows.div_ceil(per_wg) * self.wg_b;
         unsafe {
             self.gpu.launch(
@@ -670,7 +673,7 @@ impl GpuModel {
             .get(name)
             .ok_or_else(|| anyhow!("missing fused weight {name}"))?;
         let rows = r1 + r2 + r3 + r4;
-        let per_wg = (self.wg_b / 64) * 4;
+        let per_wg = (self.wg_b / self.subgroup).max(1) * 4;
         let grid = rows.div_ceil(per_wg) * self.wg_b;
         unsafe {
             self.gpu.launch(
@@ -2072,6 +2075,7 @@ impl GpuModel {
                     Arg::Mem(conv_w.get()),
                     Arg::Mem(state.get()),
                     Arg::Mem(self.bufs.op.get()),
+                    Arg::U32(0),
                     Arg::U32(hsize as u32),
                     Arg::U32(self.cfg.conv_cache as u32),
                 ],

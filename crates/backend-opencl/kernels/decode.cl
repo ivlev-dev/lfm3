@@ -518,6 +518,7 @@ __kernel void norm_add_quant(__global const float *op, __global const float *pos
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         float scale = rsqrt(red[0] / (float)n + 1e-5f);
+        barrier(CLK_LOCAL_MEM_FENCE);
         float4 v0 = (float4)(0.0f);
         float4 v1 = (float4)(0.0f);
         float s2 = 0.0f;
@@ -542,6 +543,7 @@ __kernel void norm_add_quant(__global const float *op, __global const float *pos
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         float scale2 = rsqrt(red[0] / (float)n + 1e-5f);
+        barrier(CLK_LOCAL_MEM_FENCE);
         float4 w0 = (float4)(0.0f);
         float4 w1 = (float4)(0.0f);
         float amax = 0.0f;

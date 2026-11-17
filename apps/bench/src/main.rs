@@ -153,6 +153,7 @@ enum Cmd {
         #[arg(long, default_value_t = 2048)]
         ctx: usize,
     },
+    SgProbe,
     GpuCheck {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -390,6 +391,7 @@ fn main() -> Result<()> {
             tokens,
             ctx,
         } => gpu_port(&model, &tokenizer, &prompt, tokens, ctx),
+        Cmd::SgProbe => sg_probe(),
         Cmd::RefPpl {
             model,
             tokenizer,
@@ -2664,6 +2666,46 @@ fn gpu_cmp(model: &PathBuf, ids: &[u32], batch: usize) -> Result<()> {
     bi.sort_by(|a, b| bat[*b].partial_cmp(&bat[*a]).unwrap());
     println!("seq top5 {:?}", &si[..5]);
     println!("bat top5 {:?}", &bi[..5]);
+    Ok(())
+}
+
+fn sg_probe() -> Result<()> {
+    let gpu = Gpu::open(0)?;
+    println!("device: {}", gpu.caps.name);
+    let src = r#"
+__kernel void probe(__global uint *out) {
+    uint sgs = get_sub_group_size();
+    uint nsg = get_num_sub_groups();
+    uint lid = get_local_id(0);
+    uint sgid = get_sub_group_id();
+    uint slane = get_sub_group_local_id();
+    float s1 = sub_group_reduce_add(1.0f);
+    float s2 = sub_group_reduce_add(get_global_id(0) == 1u ? 1.0f : 0.0f);
+    if (get_global_id(0) == 0u) {
+        out[0] = sgs;
+        out[1] = nsg;
+        out[2] = lid;
+        out[3] = sgid;
+        out[4] = slane;
+        out[5] = (uint)s1;
+        out[6] = (uint)s2;
+    }
+}
+"#;
+    let program = gpu.build(src, "-cl-std=CL3.0")?;
+    let kernel = Kernel::create(&program, "probe")?;
+    let out = gpu.alloc::<u32>(8)?;
+    for wg in [64usize, 128, 256] {
+        unsafe {
+            gpu.launch(&kernel, wg, wg, &[Arg::Mem(out.get())])?;
+        }
+        gpu.queue.finish()?;
+        let v = gpu.download(&out, 7)?;
+        println!(
+            "wg={wg} sgs={} nsg={} lid={} sgid={} slane={} sum1={} sum_lane1={}",
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6]
+        );
+    }
     Ok(())
 }
 
