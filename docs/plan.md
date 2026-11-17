@@ -9,7 +9,7 @@
 | Этап | Содержание | DoD | Статус |
 |---|---|---|---|
 | M0 | спайк: ПСП, int8/fp16 пики, GEMV Q4_K/Q6_K, диспатч, карта тензоров | таблица замеров, выбран путь ядер | готов |
-| M1 | GGUF+HF+tokenizer+chat, CPU-эталон, oracle llama.cpp | логиты близки к llama.cpp, текст совпадает на 5 промптах | parity по F16 достигнут: 5 промптов × 64 greedy-id, cos 1.000000; остались порты |
+| M1 | GGUF+HF+tokenizer+chat, CPU-эталон, oracle llama.cpp | логиты близки к llama.cpp, текст совпадает на 5 промптах | parity по F16 достигнут, порты и Generate готовы |
 | M2 | OpenCL decode-граф, сэмплер, CLI one-shot | ≥ 70 tok/s на 1 стриме | 82.7 tok/s (ctx 64), 74.8 (512), 71.4 (4096), 65.5 (8192); цель 70 на 8192 не взята |
 | M3 | paged KV, continuous batching, KV int8/int4 | 6 стримов без расхождений, ≥ 200 агрегат | paged KV + пер-последовательное состояние + батч шага; агрегат 4/6/8 стримов = 128/143/125 tok/s |
 | M4 | radix prefix cache, смешанный батч, FA3-prefill | 8192 prefill ≥ 300, prefix-hit TTFT < 10% | prefill 183 (512) / 166 (4096) / 152 (8192), prepack Q4 +5%; radix cache готов: повтор промпта 512 ток. — 193 мс против 2773 мс (×14), логиты бит-в-бит; осталось prefill ≥ 300 и смешанный батч |
@@ -22,7 +22,7 @@
 - 13 членов workspace: 10 крейтов (`domain`, `application`, `infra-gguf/quant/cpu/hf/
   tokenizer/chat/opencl`, `backend-opencl`) и 3 приложения (`apps/bench`, `apps/server`,
   `apps/tui`).
-- 240 тестов зелёных, сборка без предупреждений.
+- 245 тестов зелёных, сборка без предупреждений.
 - KV хранится в fp16 (`LFM_KV=f32` — старый путь): VRAM под кэш вдвое меньше,
   A/B на 8192 даёт +4–10% decode.
 - decode: 82.7 / 74.8 / 71.4 / 65.5 tok/s на ctx 64 / 512 / 4096 / 8192
@@ -196,7 +196,7 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    без разбора `<think>`/`<tool_call>`). `/v1/completions`: строка или массив промптов,
    стрим (один промпт), `usage`, те же сэмплинг-параметры; HTTP/1.1 и h2c.
    E2E `openai-python` 3.52: chat, stream, tools (не-stream и stream), completions
-   (не-stream и stream), многоходовой tool-ответ. Тестов стало 240.
+   (не-stream и stream), многоходовой tool-ответ. Тестов стало 245.
 7. **Сделано: радикс-кэш в chunked prefill (сессия 4).** `GpuModel::prefill_begin`
    забирает кэшированный префикс и хранит `PendingPrefill` в `Sequence`;
    `forward_impl` сам пишет снапшоты conv на границах страниц; `prefill_finish`
@@ -244,8 +244,9 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
 
 1. ~~Token-parity~~ — сделано: 5 промптов × 64 greedy-id против F16 GGUF, cos 1.000000,
    `max|dlogit| 0.0055` (`tools/oracle/parity.py`).
-2. Порты `InferenceBackend`/`TokenizerPort` и use-case `Generate` с фейками — чтобы
-   сервер и TUI зависели только от портов.
+2. ~~Порты~~ — сделано: `InferenceBackend`/`TokenizerPort`, `Generate` с фейками,
+   адаптеры `GpuModel`/`LfmTokenizer`, CLI `gpu-port`. Перевод сервера целиком на
+   порты — отдельная задача (движку нужны также метрики KV/планировщика).
 
 ## Инженерные правила
 
@@ -254,7 +255,7 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
   `gpu-check` (CPU-эталон). Для бит-точных задач обязательны cos и top-5.
 - Любая оптимизация сначала измеряется на целевой точке (8192 / 6 стримов), потом
   либо остаётся, либо удаляется (как PB=7/8 и 4-головое внимание).
-- Один прогон тестов в конце: `cargo test --workspace` (240 тестов) + сборка без
+- Один прогон тестов в конце: `cargo test --workspace` (245 тестов) + сборка без
   предупреждений.
 
 ## M0 — итог
@@ -400,8 +401,14 @@ QK-norm, partial RoPE, shortconv, GQA-внимание (online softmax), FFN, ti
    (`vec_dot_q4_K_q8_K`, ~0.5% на матвек, накапливается за 24 слоя) — точный oracle
    для нашей f32-математики только F16/BF16 GGUF. Инструменты: `parity.py`,
    `compare_prompt.py`, `greedy.cpp`, `logits.cpp`, `ref-ppl`.
-2. **Осталось: порты** `InferenceBackend`/`TokenizerPort` и use-case `Generate`
-   с фейками (P6).
+2. **Сделано: порты и use-case.** `lfm-app::ports`: `InferenceBackend` (`create/free
+   sequence`, `prefill`, `step`, `logits`, `logits_row`) и `TokenizerPort`
+   (`encode/decode/eos_id`) на типах application (без зависимости на инфру).
+   Use-case `Generate` — greedy prompt→ids/text с обязательным `free_sequence`.
+   Адаптеры: `impl InferenceBackend for GpuModel`, `impl TokenizerPort for LfmTokenizer`.
+   5 тестов с фейками (happy path, EOS, max_tokens=0, ошибка backend, пустой промпт)
+   и CLI `gpu-port` против реальной модели. Серверный движок пока работает с
+   `GpuModel` напрямую — перевод на трейты отдельная задача.
 
 Найденные по пути особенности LFM3/GGUF:
 - conv-ядро в GGUF циклически сдвинуто на 1 относительно PyTorch: текущий токен

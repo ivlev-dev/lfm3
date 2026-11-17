@@ -115,6 +115,14 @@ apps/bench (CLI), apps/server, apps/tui (клиент к серверу)   ко�
   Дальше: тайловый prefill-attention (K/V блоками в LDS), KV int8/int4.
 - План по KV: int8/int4, K — per-group scale + Hadamard-ротация, V — per-token.
 
+### Порты и use-cases
+- `lfm-app::ports`: `InferenceBackend` (`create/free sequence`, `prefill`, `step`,
+  `logits`, `logits_row`) и `TokenizerPort` (`encode/decode/eos_id`) — только типы
+  application, без зависимостей на инфру.
+- `lfm-app::Generate` — greedy prompt→ids/text с гарантированным освобождением слота.
+  Адаптеры: `GpuModel` (backend-opencl) и `LfmTokenizer` (infra-tokenizer); фейки в
+  `crates/application/tests/generate.rs`, смоук через `lfm-bench gpu-port`.
+
 ### Планировщик
 - Реализован (`crates/application/src/scheduler.rs` + `apps/server/src/engine.rs`):
   один поток-движок, `step_mixed` на все активные декоды, chunked prefill в бюджете,

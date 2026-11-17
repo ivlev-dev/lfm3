@@ -51,8 +51,9 @@
   совпадает с llama.cpp по greedy-ids: **5 промптов × 64 токена**, логиты `cos 1.000000`,
   `max|dlogit| 0.0055`; найден и исправлен сдвиг conv-ядра в GGUF. Инструменты —
   `tools/oracle/` (`parity.py`, `compare_prompt.py`, `greedy.cpp`). На Q4 расхождение
-  остаётся из-за квантования активаций — точный oracle только F16. Осталось: порты
-  `InferenceBackend`/`TokenizerPort` и use-case `Generate` с фейками.
+  остаётся из-за квантования активаций — точный oracle только F16. Порты
+  `InferenceBackend`/`TokenizerPort` и use-case `Generate` готовы (адаптеры для
+  `GpuModel`/`LfmTokenizer`, фейки в тестах, CLI `gpu-port`).
 - **M5 (сервер, планировщик и TUI) — готов.** `lfm-server` отдаёт
   `/v1/models`, `/v1/chat/completions` (обычный ответ и SSE, stop, usage, thinking,
   `tools`/`tool_calls` с `finish_reason: tool_calls`), `/v1/completions` (строка или
@@ -67,7 +68,7 @@
   посчитанный при активном декоде, даёт повтору reused 160 токенов с тем же ответом.
   Два TUI: `gpu-chat --tui` (in-process: скролл, история ввода, resize, Ctrl+C-стоп)
   и `lfm-tui` (`apps/tui`, клиент к серверу: SSE, `/metrics` в статусе, `/save`/`/load`).
-- **Тесты:** 240 зелёных (`cargo test --workspace`), сборка без предупреждений.
+- **Тесты:** 245 зелёных (`cargo test --workspace`), сборка без предупреждений.
 
 ## Что дальше
 
@@ -114,7 +115,8 @@ split-K внимание добавляет ~1.8 мс (трафик KV).
 ```
 crates/
   domain/           модель, конфиг, чат/тулколлы, сэмплинг (без I/O)
-  application/      порты и use-cases: сессия чата, планировщик, движок
+  application/      порты и use-cases: сессия чата, планировщик, движок,
+                    `InferenceBackend`/`TokenizerPort`, `Generate`
   infra-gguf/       парсер GGUF + адаптер метаданных
   infra-quant/      эталонная деквантизация Q4_K/Q6_K/Q8_0
   infra-cpu/        CPU-эталон forward (f32)
@@ -151,7 +153,7 @@ cargo run --release -p lfm-bench -- sweep
 
 # 5. Проверка корректности и производительности GPU-графа
 cargo run --release -p lfm-bench -- gpu-gen --tokens 64      # текст + tok/s
-cargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
+cargo run --release -p lfm-bench -- gpu-port --tokens 24     # через порты + Generatecargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
 cargo run --release -p lfm-bench -- gpu-chat --user "What is the capital of Japan?"
 cargo run --release -p lfm-bench -- gpu-multi --seqs 6 --tokens 48   # 6 стримов
 cargo run --release -p lfm-bench -- gpu-cmp --ids 597,5205,302 --batch 5  # batch == seq
