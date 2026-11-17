@@ -77,6 +77,7 @@ cargo test --workspace                     # 245 тестов
 | Q6/PB тюнинг | Q6-RGEMV 2/3/8 против 5 — 5 быстрее; PB=7 — 145 против 232 tok/s (спиллы); оставлено 5/6 |
 | FlashInfer-fusion | отклонено: `kv_store` и attention текущего токена требуют глобального барьера между workgroup; page-table lookups — шум |
 | M6/PoCL | CPU-тир PoCL заработал: причины были в хосте (`per_wg` считался как `wg/64`, а PoCL даёт подгруппу = всему workgroup) и в гонках `norm_add_quant` (чтение `red[0]` без барьера перед перезаписью). Теперь `gpu-check` cos 0.9993, `gpu-gen` ids совпадают с AMD, `gpu-cmp` batch cos 0.9994. Intel runtime удалён (iGPU в системе нет) |
+| M6/PP | `GpuModel::load_stage` (диапазон слоёв, embed/head), `PipelineModel` (host-handoff, синхронные prefill/кэш), `LFM_DEVICE`/`LFM_TIERS`, CLI `gpu-pp`. 20/80/0 и 50/50 дают ids как single GPU (16 токенов), logits cos 0.999824, top-5; сервер с `LFM_TIERS` переиспользует кэш на обеих ступенях (reused 192). TP ещё нет |
 
 ## Проверки, которые уже прогонялись (и чем повторять)
 
@@ -168,7 +169,9 @@ P1 — только после перемера на простое.
 - **M1 — готов**: token-parity по F16 (5×64, cos 1.000000), порты
   `InferenceBackend`/`TokenizerPort`, `Generate` с адаптерами/фейками и серверный
   движок на портах (composition root — `main.rs`).
-- M6: 3-tier + TP/PP; M7: NPU Hexagon, fuzz парсеров, спека протокола.
+- **M6 PP — готов**: `PipelineModel`, `LFM_TIERS=20/80/0`, ids/logits совпадают
+  с одиночным GPU, кэш работает на обеих ступенях. Осталось TP (host all-reduce).
+- M7: NPU Hexagon, fuzz парсеров, спека протокола.
 
 ## Подводные камни
 
@@ -186,6 +189,9 @@ P1 — только после перемера на простое.
 - `models/` (4.4 ГБ) в git не попадает — качать по README.
 - **`LFM_DEVICE`**: 0 — rusticl GPU, 1 — PoCL CPU (при обоих ICD). Проверка:
   `LFM_DEVICE=1 ./target/release/lfm-bench gpu-gen --tokens 4`.
+- **`LFM_TIERS`** (PP): проценты слоёв по устройствам, например `20/80/0`
+  (GPU 4 слоя + PoCL CPU 20). Работает в сервере и `gpu-pp`; CPU-ступень медленная,
+  поэтому для серверных тестов брать короткие ответы.
 - **PoCL CPU**: установлен из репозитория, CPU-девайс работает. Ключевые отличия:
   `get_sub_group_size()` может равняться всему workgroup (nsg=1), поэтому сетку
   GEMV нужно считать как `wg / subgroup`, а не `wg / 64`; в `norm_add_quant` нужен
@@ -234,10 +240,14 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 ## Файлы, изменённые в сессии 6
 
 - `crates/backend-opencl/src/lib.rs` — `per_wg` по фактическому `sub_group_size`
-  (PoCL: подгруппа = рабочая группа), исправлен `debug_conv` (7 аргументов).
+  (PoCL: подгруппа = рабочая группа), исправлен `debug_conv` (7 аргументов),
+  `load_stage`/hidden-входы/выход для PP.
 - `crates/backend-opencl/kernels/decode.cl`, `batch.cl` — барьеры после чтения
   `red[0]` в `norm_add_quant`/`_b`; Q6-GEMV считает блоки по `get_sub_group_size`.
-- `apps/bench/src/main.rs` — диагностика `sg-probe` (subgroup size/reduce).
+- `crates/backend-opencl/src/pipeline.rs` (новый) — `PipelineModel` (PP по слоям,
+  синхронные prefill/кэш, копирование hidden через host).
+- `apps/bench/src/main.rs` — `gpu-pp` и диагностика `sg-probe`.
+- `apps/server/src/main.rs` — загрузчик по `LFM_TIERS` (composition root).
 - KV int8 (+Hadamard), unroll/fast-math, Q6-RGEMV и PB-варианты реализованы,
   замерены и полностью откачены.
 - `docs/plan.md`, этот файл — результаты экспериментов и PoCL-совместимости.

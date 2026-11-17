@@ -9,9 +9,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod pipeline;
 mod prepack;
 mod ports;
 mod radix;
+
+pub use pipeline::PipelineModel;
 
 pub use radix::{block_hash, chain_hashes, RadixCache, PAGE};
 
@@ -108,6 +111,30 @@ struct Kernels {
     attn_split_b_h4: Kernel,
 }
 
+fn tensor_needed(
+    name: &str,
+    start: usize,
+    end: usize,
+    has_embed: bool,
+    has_head: bool,
+) -> bool {
+    if let Some(rest) = name.strip_prefix("blk.") {
+        if let Some((idx, _)) = rest.split_once('.') {
+            if let Ok(layer) = idx.parse::<usize>() {
+                return (start..end).contains(&layer);
+            }
+        }
+        return false;
+    }
+    if name == "token_embd.weight" {
+        return has_embed || has_head;
+    }
+    if name == "output_norm.weight" {
+        return has_head;
+    }
+    true
+}
+
 struct Bufs {
     x: Buffer<f32>,
     h: Buffer<f32>,
@@ -189,6 +216,10 @@ pub struct GpuModel {
     gpu: Gpu,
     pub cfg: ModelConfig,
     pub max_ctx: usize,
+    layer_start: usize,
+    layer_end: usize,
+    has_embed: bool,
+    has_head: bool,
     weights: HashMap<String, Weight>,
     prepacked: HashMap<String, Buffer<u8>>,
     prepack_on: bool,
@@ -246,19 +277,43 @@ fn pick_logits_rows(
 
 impl GpuModel {
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
+        Self::load_stage(path, max_ctx, None, None)
+    }
+
+    pub fn load_stage(
+        path: &Path,
+        max_ctx: usize,
+        device: Option<usize>,
+        layers: Option<(usize, usize)>,
+    ) -> Result<Self> {
         let profiling = std::env::var("LFM_PROFILE").map(|v| v == "1").unwrap_or(false);
-        let device: usize = std::env::var("LFM_DEVICE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let device = match device {
+            Some(device) => device,
+            None => std::env::var("LFM_DEVICE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        };
         let gpu = Gpu::open_with(device, profiling)?;
         let file = GgufFile::open(path)?;
         let cfg = ModelConfig::from_metadata(&file).map_err(|e| anyhow!("config: {e}"))?;
+        let (layer_start, layer_end) = layers.unwrap_or((0, cfg.num_layers));
+        if layer_start >= layer_end || layer_end > cfg.num_layers {
+            return Err(anyhow!(
+                "bad layer range {layer_start}..{layer_end} of {}",
+                cfg.num_layers
+            ));
+        }
+        let has_embed = layer_start == 0;
+        let has_head = layer_end == cfg.num_layers;
         let prepack_on = std::env::var("LFM_PREPACK").map(|v| v != "0").unwrap_or(true);
         let fuse_on = std::env::var("LFM_FUSE").map(|v| v != "0").unwrap_or(true);
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         for info in file.tensors() {
+            if !tensor_needed(&info.name, layer_start, layer_end, has_embed, has_head) {
+                continue;
+            }
             let bytes = file.tensor_bytes(&info.name)?;
             let weight = match info.ggml_type {
                 GgmlType::Q4_K => {
@@ -280,7 +335,7 @@ impl GpuModel {
             };
             weights.insert(info.name.clone(), weight);
         }
-        for layer in 0..cfg.num_layers {
+        for layer in layer_start..layer_end {
             let up_name = format!("blk.{layer}.ffn_up.weight");
             let gate_name = format!("blk.{layer}.ffn_gate.weight");
             let up_info = file.tensor(&up_name);
@@ -500,6 +555,15 @@ impl GpuModel {
         };
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
+            if i < layer_start || i >= layer_end {
+                layers.push(LayerBufs {
+                    conv: None,
+                    snap: None,
+                    k: None,
+                    v: None,
+                });
+                continue;
+            }
             let layer = match cfg.kind(i) {
                 LayerKind::Conv => LayerBufs {
                     conv: Some(gpu.alloc::<f32>(max_seqs * (cfg.conv_cache - 1) * h)?),
@@ -534,6 +598,10 @@ impl GpuModel {
             gpu,
             cfg,
             max_ctx,
+            layer_start,
+            layer_end,
+            has_embed,
+            has_head,
             weights,
             prepacked,
             prepack_on,
@@ -914,6 +982,34 @@ impl GpuModel {
     }
 
     pub fn forward_seq(&mut self, slot: usize, token: u32, pos: usize) -> Result<()> {
+        if !self.has_embed {
+            return Err(anyhow!("stage has no embedding"));
+        }
+        self.forward_step(slot, Some(token), None, pos, true)
+    }
+
+    pub fn forward_hidden_seq(
+        &mut self,
+        slot: usize,
+        hidden: &[f32],
+        pos: usize,
+        need_logits: bool,
+    ) -> Result<()> {
+        self.forward_step(slot, None, Some(hidden), pos, need_logits)
+    }
+
+    pub fn stage_hidden(&self) -> Result<Vec<f32>> {
+        self.gpu.download(&self.bufs.x, self.cfg.hidden_size)
+    }
+
+    fn forward_step(
+        &mut self,
+        slot: usize,
+        token: Option<u32>,
+        hidden: Option<&[f32]>,
+        pos: usize,
+        need_logits: bool,
+    ) -> Result<()> {
         if pos >= self.max_ctx {
             return Err(anyhow!(
                 "context overflow: pos {pos} >= max_ctx {}",
@@ -927,26 +1023,36 @@ impl GpuModel {
         let kvd = self.cfg.kv_dim();
         let heads = self.cfg.num_heads;
         let head_dim = self.cfg.head_dim;
-        let emb = match self.weight("token_embd.weight")? {
-            Weight::Q6(b) => b,
-            _ => return Err(anyhow!("token_embd must be Q6_K for gpu embed")),
-        };
-        unsafe {
-            self.gpu.launch(
-                &self.kernels.embed,
-                h,
-                64,
-                &[
-                    Arg::Mem(emb.get()),
-                    Arg::Mem(self.bufs.x.get()),
-                    Arg::U32(token),
-                    Arg::U32(h as u32),
-                ],
-            )?;
+        if let Some(token) = token {
+            let emb = match self.weight("token_embd.weight")? {
+                Weight::Q6(b) => b,
+                _ => return Err(anyhow!("token_embd must be Q6_K for gpu embed")),
+            };
+            unsafe {
+                self.gpu.launch(
+                    &self.kernels.embed,
+                    h,
+                    64,
+                    &[
+                        Arg::Mem(emb.get()),
+                        Arg::Mem(self.bufs.x.get()),
+                        Arg::U32(token),
+                        Arg::U32(h as u32),
+                    ],
+                )?;
+            }
+        } else if let Some(hidden) = hidden {
+            unsafe {
+                self.gpu
+                    .queue
+                    .enqueue_write_buffer(&mut self.bufs.x, 1, 0, hidden, &[])?;
+            }
+        } else {
+            return Err(anyhow!("no token or hidden input"));
         }
-        for layer in 0..self.cfg.num_layers {
+        for layer in self.layer_start..self.layer_end {
             let prefix = format!("blk.{layer}");
-            if layer == 0 {
+            if layer == self.layer_start {
                 let attn_norm = self.f32_weight(&format!("{prefix}.attn_norm.weight"))?;
                 unsafe {
                     self.gpu.launch(
@@ -1195,10 +1301,12 @@ impl GpuModel {
                 self.ffn,
             )?;
             let post_ffn = self.f32_weight(&format!("{prefix}.post_ffw_norm.weight"))?;
-            let next_w = if layer + 1 < self.cfg.num_layers {
+            let next_w = if layer + 1 < self.layer_end {
                 self.f32_weight(&format!("blk.{}.attn_norm.weight", layer + 1))?
-            } else {
+            } else if self.has_head {
                 self.f32_weight("output_norm.weight")?
+            } else {
+                self.f32_weight(&format!("{prefix}.post_ffw_norm.weight"))?
             };
             self.norm_add_quant(&self.bufs.tmp, post_ffn, &self.bufs.x, next_w, h)?;
             if self.trace {
@@ -1207,14 +1315,16 @@ impl GpuModel {
                 self.traced.push(v);
             }
         }
-        self.gemv_auto(
-            "token_embd.weight",
-            &self.bufs.hq,
-            &self.bufs.hs,
-            &self.bufs.logits,
-            self.cfg.vocab_size,
-            h,
-        )?;
+        if need_logits && self.has_head {
+            self.gemv_auto(
+                "token_embd.weight",
+                &self.bufs.hq,
+                &self.bufs.hs,
+                &self.bufs.logits,
+                self.cfg.vocab_size,
+                h,
+            )?;
+        }
         self.gpu.queue.finish()?;
         Ok(())
     }
@@ -1331,8 +1441,45 @@ impl GpuModel {
         self.forward_mixed(reqs, need_logits, None)
     }
 
+    pub fn step_mixed_input(
+        &mut self,
+        reqs: &[StepReq],
+        hidden: &[f32],
+        need_logits: bool,
+    ) -> Result<()> {
+        self.forward_impl(reqs, need_logits, None, None, None, Some(hidden))
+    }
+
+    pub fn forward_batch_hidden(
+        &mut self,
+        slot: usize,
+        hidden: &[f32],
+        pos0: usize,
+        need_logits: bool,
+    ) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        if hidden.is_empty() || !hidden.len().is_multiple_of(h) {
+            return Err(anyhow!("hidden batch has wrong size"));
+        }
+        let ntok = hidden.len() / h;
+        let reqs: Vec<StepReq> = (0..ntok)
+            .map(|i| StepReq {
+                slot,
+                token: 0,
+                pos: pos0 + i,
+            })
+            .collect();
+        let row = need_logits.then_some(ntok - 1);
+        self.forward_impl(&reqs, need_logits, row, None, None, Some(hidden))
+    }
+
+    pub fn stage_hidden_batch(&self, ntok: usize) -> Result<Vec<f32>> {
+        self.gpu
+            .download(&self.bufs.xb, ntok * self.cfg.hidden_size)
+    }
+
     pub fn step_mixed_rows(&mut self, reqs: &[StepReq], logits_rows: &[usize]) -> Result<()> {
-        self.forward_impl(reqs, !logits_rows.is_empty(), None, Some(logits_rows), None)
+        self.forward_impl(reqs, !logits_rows.is_empty(), None, Some(logits_rows), None, None)
     }
 
     pub fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
@@ -1346,7 +1493,7 @@ impl GpuModel {
         need_logits: bool,
         logits_row: Option<usize>,
     ) -> Result<()> {
-        self.forward_impl(reqs, need_logits, logits_row, None, None)
+        self.forward_impl(reqs, need_logits, logits_row, None, None, None)
     }
 
     fn forward_impl(
@@ -1356,6 +1503,7 @@ impl GpuModel {
         logits_row: Option<usize>,
         logits_rows: Option<&[usize]>,
         snap: Option<&[u32]>,
+        input: Option<&[f32]>,
     ) -> Result<()> {
         let ntok = reqs.len();
         if ntok == 0 {
@@ -1448,28 +1596,36 @@ impl GpuModel {
         let heads = self.cfg.num_heads;
         let head_dim = self.cfg.head_dim;
         let ffn = self.ffn;
-        let emb = match self.weight("token_embd.weight")? {
-            Weight::Q6(b) => b,
-            _ => return Err(anyhow!("token_embd must be Q6_K for gpu embed")),
-        };
         let n32 = ntok as u32;
-        unsafe {
-            self.gpu.launch(
-                &self.kernels.embed_b,
-                ntok * h,
-                64,
-                &[
-                    Arg::Mem(emb.get()),
-                    Arg::Mem(self.bufs.xb.get()),
-                    Arg::Mem(self.bufs.tokens.get()),
-                    Arg::U32(n32),
-                    Arg::U32(h as u32),
-                ],
-            )?;
+        if let Some(hidden) = input {
+            unsafe {
+                self.gpu
+                    .queue
+                    .enqueue_write_buffer(&mut self.bufs.xb, 1, 0, hidden, &[])?;
+            }
+        } else {
+            let emb = match self.weight("token_embd.weight")? {
+                Weight::Q6(b) => b,
+                _ => return Err(anyhow!("token_embd must be Q6_K for gpu embed")),
+            };
+            unsafe {
+                self.gpu.launch(
+                    &self.kernels.embed_b,
+                    ntok * h,
+                    64,
+                    &[
+                        Arg::Mem(emb.get()),
+                        Arg::Mem(self.bufs.xb.get()),
+                        Arg::Mem(self.bufs.tokens.get()),
+                        Arg::U32(n32),
+                        Arg::U32(h as u32),
+                    ],
+                )?;
+            }
         }
-        for layer in 0..self.cfg.num_layers {
+        for layer in self.layer_start..self.layer_end {
             let prefix = format!("blk.{layer}");
-            if layer == 0 {
+            if layer == self.layer_start {
                 let attn_norm = self.f32_weight(&format!("{prefix}.attn_norm.weight"))?;
                 unsafe {
                     self.gpu.launch(
@@ -1884,10 +2040,12 @@ impl GpuModel {
                 0,
             )?;
             let post_ffn = self.f32_weight(&format!("{prefix}.post_ffw_norm.weight"))?;
-            let next_w = if layer + 1 < self.cfg.num_layers {
+            let next_w = if layer + 1 < self.layer_end {
                 self.f32_weight(&format!("blk.{}.attn_norm.weight", layer + 1))?
-            } else {
+            } else if self.has_head {
                 self.f32_weight("output_norm.weight")?
+            } else {
+                self.f32_weight(&format!("{prefix}.post_ffw_norm.weight"))?
             };
             unsafe {
                 self.gpu.launch(
@@ -1913,7 +2071,7 @@ impl GpuModel {
                 self.traced.push(v);
             }
         }
-        if need_logits {
+        if need_logits && self.has_head {
             let sel = pick_logits_rows(need_logits, logits_rows, logits_row, ntok)?
                 .ok_or_else(|| anyhow!("missing logits selection"))?;
             if sel.is_empty() {
@@ -2320,7 +2478,7 @@ impl GpuModel {
                 .collect();
             let last = end == prompt.len();
             let row = last.then_some(reqs.len() - 1);
-            self.forward_impl(&reqs, need_logits && last, row, None, None)?;
+            self.forward_impl(&reqs, need_logits && last, row, None, None, None)?;
             pos = end;
         }
         self.prefill_finish(slot)?;

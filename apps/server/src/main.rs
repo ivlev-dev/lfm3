@@ -36,9 +36,23 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let backend: lfm_app::BackendLoader = Box::new(|path, ctx| {
-        Ok(Box::new(lfm_gpu::GpuModel::load(path, ctx)?))
-    });
+    let backend: lfm_app::BackendLoader = match std::env::var("LFM_TIERS") {
+        Ok(tiers) if !tiers.is_empty() => Box::new(move |path, ctx| {
+            let percents: Vec<usize> = tiers
+                .split('/')
+                .filter_map(|p| p.parse::<usize>().ok())
+                .collect();
+            let plan: Vec<(usize, usize)> = percents
+                .iter()
+                .enumerate()
+                .map(|(device, &percent)| (device, percent))
+                .collect();
+            Ok(Box::new(lfm_gpu::PipelineModel::load_tiers(
+                path, ctx, &plan,
+            )?))
+        }),
+        _ => Box::new(|path, ctx| Ok(Box::new(lfm_gpu::GpuModel::load(path, ctx)?))),
+    };
     let tokenizer: lfm_app::TokenizerLoader = Box::new(|path| {
         Ok(Box::new(lfm_tokenizer::LfmTokenizer::from_file(path)?))
     });

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use lfm_app::InferenceBackend;
 use lfm_opencl::{Arg, Buffer, ClMem, Event, Gpu, Kernel, Program, Stats};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -154,6 +155,20 @@ enum Cmd {
         ctx: usize,
     },
     SgProbe,
+    GpuPp {
+        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
+        model: PathBuf,
+        #[arg(long, default_value = "models/hf/tokenizer.json")]
+        tokenizer: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 4)]
+        tokens: usize,
+        #[arg(long, default_value = "12/12")]
+        tiers: String,
+        #[arg(long, default_value_t = 2048)]
+        ctx: usize,
+    },
     GpuCheck {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -392,6 +407,14 @@ fn main() -> Result<()> {
             ctx,
         } => gpu_port(&model, &tokenizer, &prompt, tokens, ctx),
         Cmd::SgProbe => sg_probe(),
+        Cmd::GpuPp {
+            model,
+            tokenizer,
+            prompt,
+            tokens,
+            tiers,
+            ctx,
+        } => gpu_pp(&model, &tokenizer, &prompt, tokens, &tiers, ctx),
         Cmd::RefPpl {
             model,
             tokenizer,
@@ -2706,6 +2729,57 @@ __kernel void probe(__global uint *out) {
             v[0], v[1], v[2], v[3], v[4], v[5], v[6]
         );
     }
+    Ok(())
+}
+
+fn gpu_pp(
+    model: &PathBuf,
+    tokenizer: &PathBuf,
+    prompt: &str,
+    tokens: usize,
+    tiers: &str,
+    ctx: usize,
+) -> Result<()> {
+    let percents: Vec<usize> = tiers
+        .split('/')
+        .map(|p| p.parse::<usize>())
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|_| anyhow!("bad tiers {tiers}"))?;
+    let plan: Vec<(usize, usize)> = percents
+        .iter()
+        .enumerate()
+        .map(|(device, &percent)| (device, percent))
+        .collect();
+    let mut pipe = lfm_gpu::PipelineModel::load_tiers(model, ctx, &plan)?;
+    let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
+    let out = lfm_app::Generate::new(&mut pipe, &tok).run(prompt, tokens)?;
+    println!("pp     ids: {:?}", out.ids);
+    println!("pp     text: {}", out.text);
+    let mut single = lfm_gpu::GpuModel::load(model, ctx)?;
+    let base = lfm_app::Generate::new(&mut single, &tok).run(prompt, tokens)?;
+    println!("single ids: {:?}", base.ids);
+    println!("equal: {}", out.ids == base.ids);
+    let ids = tok.encode(prompt, false)?;
+    let slot = pipe.create_sequence()?;
+    let _ = pipe.prefill(slot, &ids, true)?;
+    let pp_logits = pipe.logits()?;
+    pipe.free_sequence(slot)?;
+    let slot = single.create_sequence()?;
+    let _ = single.prefill(slot, &ids, true)?;
+    let one_logits = single.logits()?;
+    single.free_sequence(slot)?;
+    println!("logits cos {:.6}", cosine(&pp_logits, &one_logits));
+    let top = |v: &[f32]| {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|a, b| v[*b].partial_cmp(&v[*a]).unwrap());
+        idx[..5].to_vec()
+    };
+    println!(
+        "top5 equal: {} {:?} {:?}",
+        top(&pp_logits) == top(&one_logits),
+        top(&pp_logits),
+        top(&one_logits)
+    );
     Ok(())
 }
 

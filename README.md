@@ -47,6 +47,13 @@
   `gpu-chat` рендерит `chat_template.jinja`, стримит ответ и разбирает `<think`/`<tool_call>`
   через `ChatSession`. Замер: 28-токенный промпт + 45 токенов ответа — prefill 0.16 с,
   decode 78 tok/s.
+- **M6 (pipeline parallel) — база готова.** `GpuModel::load_stage` грузит диапазон
+  слоёв (embed только на первой, lm_head только на последней), `PipelineModel`
+  гоняет PP по слоям через host-handoff; устройство задаётся `LFM_DEVICE`, раскладка —
+  `LFM_TIERS=20/80/0` (GPU/PoCL-CPU/заглушка). Проверка: `gpu-pp --tiers 20/80/0`
+  даёт те же greedy-ids, что одиночный GPU (16 токенов), `logits cos 0.999824`,
+  top-5 совпадает; сервер с `LFM_TIERS` отдаёт ответы и переиспользует радикс-кэш
+  на обеих ступенях (повтор — reused 192 токена). TP ещё не реализован.
 - **M1 (эталон/токенизация) — parity достигнут.** CPU-эталон LFM3 (f32) по F16 GGUF
   совпадает с llama.cpp по greedy-ids: **5 промптов × 64 токена**, логиты `cos 1.000000`,
   `max|dlogit| 0.0055`; найден и исправлен сдвиг conv-ядра в GGUF. Инструменты —
@@ -91,8 +98,8 @@
 4. **P3. Остаток M5**: e2e openai-python уже покрыт (chat/stream/tools/completions),
    chunked prefill публикует страницы в радикс-кэш, pipelined HEADERS в h2 буферизуются;
    остался только TLS по требованию.
-5. **P4–P6. M6/M7 и остаток M1**: 3-tier + TP/PP, NPU Hexagon, token-parity по F16 GGUF,
-   порты `InferenceBackend`/`TokenizerPort`.
+5. **P4–P6. M6/M7**: PP по слоям готов (`LFM_TIERS=20/80/0`), остался TP для decode;
+   далее M7 — NPU Hexagon, fuzz парсеров, спека протокола.
 
 ## Железо и целевые показатели
 
@@ -154,7 +161,8 @@ cargo run --release -p lfm-bench -- sweep
 
 # 5. Проверка корректности и производительности GPU-графа
 cargo run --release -p lfm-bench -- gpu-gen --tokens 64      # текст + tok/s
-cargo run --release -p lfm-bench -- gpu-port --tokens 24     # через порты + Generatecargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
+cargo run --release -p lfm-bench -- gpu-port --tokens 24     # через порты + Generate
+cargo run --release -p lfm-bench -- gpu-pp --tokens 8 --tiers 20/80/0  # PP: GPU+PoCLcargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
 cargo run --release -p lfm-bench -- gpu-chat --user "What is the capital of Japan?"
 cargo run --release -p lfm-bench -- gpu-multi --seqs 6 --tokens 48   # 6 стримов
 cargo run --release -p lfm-bench -- gpu-cmp --ids 597,5205,302 --batch 5  # batch == seq
@@ -189,6 +197,7 @@ cargo run --release -p lfm-bench -- gpu-embed --id 597       # сверка от
 prefill-attention), `LFM_WG` / `LFM_WG_B` (workgroup decode/batch GEMV, по умолчанию
 256/64), `LFM_RGEMV` / `LFM_RGEMV_B` (строк на подгруппу decode/batch, 4/5),
 `LFM_DEVICE` (индекс OpenCL-устройства: 0 — rusticl GPU, 1 — PoCL CPU),
+`LFM_TIERS=20/80/0` (PP-раскладка по устройствам; сейчас PP, TP отдельно),
 `LFM_PREFILL_BUDGET` (prefill-токенов
 на шаг планировщика, по умолчанию 12), `LFM_SCHED_LOG=1` (лог шагов планировщика).
 

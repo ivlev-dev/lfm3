@@ -14,7 +14,7 @@
 | M3 | paged KV, continuous batching, KV int8/int4 | 6 стримов без расхождений, ≥ 200 агрегат | paged KV + пер-последовательное состояние + батч шага; агрегат 4/6/8 стримов = 128/143/125 tok/s |
 | M4 | radix prefix cache, смешанный батч, FA3-prefill | 8192 prefill ≥ 300, prefix-hit TTFT < 10% | prefill 183 (512) / 166 (4096) / 152 (8192), prepack Q4 +5%; radix cache готов: повтор промпта 512 ток. — 193 мс против 2773 мс (×14), логиты бит-в-бит; осталось prefill ≥ 300 и смешанный батч |
 | M5 | OpenAI-сервер (SSE/WS/tools/thinking) + TUI | e2e openai-python, load-тест, TUI | сервер + планировщик continuous batching + `/metrics` + flow control h2; два TUI (in-process и клиент `lfm-tui`); load-тест 6 соединений без ошибок; осталось: tools/`tool_calls`, `/v1/completions`, e2e openai-python |
-| M6 | 3-tier слоёв и KV, TP+PP, PoCL CPU | конфиг 20/80/0, 2-device тесты | |
+| M6 | 3-tier слоёв и KV, TP+PP, PoCL CPU | конфиг 20/80/0, 2-device тесты | PP готов: 20/80/0 (GPU+PoCL) ids совпадают, logits cos 0.9998; TP остался |
 | M7 | NPU-порт Hexagon v68, hardening, docs | feature-сборка, спека протокола | |
 
 ## Текущее состояние (сводка)
@@ -232,14 +232,17 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
 
 ### P4. M6 — устройства и раскладка
 
-1. `DeviceSet`: 3-tier слоёв и KV, конфиг 20/80/0 (GPU / CPU через PoCL / заглушка).
-2. TP для decode (all-reduce через host staging — P2P в rusticl нет), PP по слоям.
-3. DoD: конфиг 20/80/0 проходит `gpu-cmp`, 2-device тесты дают те же логиты.
-4. **Подготовка (сессия 6):** PoCL CPU-тир заработал: сетка GEMV считается по
-   фактическому `sub_group_size` (в PoCL он равен workgroup), в `norm_add_quant`
-   добавлены барьеры (гонка `red[0]` → перезапись). `gpu-check` cos 0.9993,
-   `gpu-gen` ids совпадают с AMD. Intel NEO удалён (iGPU в системе отсутствует).
-   Можно переходить к PP/TP.
+1. **Сделано: PP по слоям (сессия 6).** `GpuModel::load_stage` грузит диапазон слоёв
+   (embed на первой ступени, lm_head на последней, остальные веса не читаются);
+   `PipelineModel` передаёт hidden через host, синхронизирует `prefill_begin/finish`
+   и радикс-кэш (одинаковые хэши → одинаковые страницы), `step` прогоняет батч через
+   все ступени. `LFM_DEVICE` выбирает устройство, `LFM_TIERS=20/80/0` — раскладку
+   (сервер и `gpu-pp`). Проверка: 20/80/0 (GPU 4 слоя + PoCL CPU 20) и 50/50 дают
+   те же greedy-ids, что одиночный GPU (16 токенов), `logits cos 0.999824`, top-5
+   совпадает; сервер с `LFM_TIERS` переиспользует кэш на обеих ступенях (reused 192).
+2. **Осталось: TP для decode** (all-reduce через host staging — P2P в rusticl нет).
+3. DoD: конфиг 20/80/0 проходит `gpu-cmp`, 2-device тесты дают те же логиты —
+   для PP выполнено (ids/logits выше); TP ещё нет.
 
 ### P5. M7 — NPU и hardening
 
