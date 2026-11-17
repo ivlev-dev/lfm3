@@ -9,7 +9,7 @@
 | Этап | Содержание | DoD | Статус |
 |---|---|---|---|
 | M0 | спайк: ПСП, int8/fp16 пики, GEMV Q4_K/Q6_K, диспатч, карта тензоров | таблица замеров, выбран путь ядер | готов |
-| M1 | GGUF+HF+tokenizer+chat, CPU-эталон, oracle llama.cpp | логиты близки к llama.cpp, текст совпадает на 5 промптах | эталон связный, parity частичный |
+| M1 | GGUF+HF+tokenizer+chat, CPU-эталон, oracle llama.cpp | логиты близки к llama.cpp, текст совпадает на 5 промптах | parity по F16 достигнут: 5 промптов × 64 greedy-id, cos 1.000000; остались порты |
 | M2 | OpenCL decode-граф, сэмплер, CLI one-shot | ≥ 70 tok/s на 1 стриме | 82.7 tok/s (ctx 64), 74.8 (512), 71.4 (4096), 65.5 (8192); цель 70 на 8192 не взята |
 | M3 | paged KV, continuous batching, KV int8/int4 | 6 стримов без расхождений, ≥ 200 агрегат | paged KV + пер-последовательное состояние + батч шага; агрегат 4/6/8 стримов = 128/143/125 tok/s |
 | M4 | radix prefix cache, смешанный батч, FA3-prefill | 8192 prefill ≥ 300, prefix-hit TTFT < 10% | prefill 183 (512) / 166 (4096) / 152 (8192), prepack Q4 +5%; radix cache готов: повтор промпта 512 ток. — 193 мс против 2773 мс (×14), логиты бит-в-бит; осталось prefill ≥ 300 и смешанный батч |
@@ -242,8 +242,8 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
 
 ### P6. M1 — остаток
 
-1. Token-parity на 5 промптах против F16/BF16 GGUF (единственный точный oracle для
-   нашей f32-математики; у квантованного llama.cpp активации int8 дают ~0.5% на матвек).
+1. ~~Token-parity~~ — сделано: 5 промптов × 64 greedy-id против F16 GGUF, cos 1.000000,
+   `max|dlogit| 0.0055` (`tools/oracle/parity.py`).
 2. Порты `InferenceBackend`/`TokenizerPort` и use-case `Generate` с фейками — чтобы
    сервер и TUI зависели только от портов.
 
@@ -391,17 +391,17 @@ QK-norm, partial RoPE, shortconv, GQA-внимание (online softmax), FFN, ti
   регистровое давление и тяжёлая LDS-редукция съели экономию барьеров. Код удалён,
   оставлены 2 позиции.
 
-## M1 — что осталось
+## M1 — parity достигнут, остались порты
 
-1. Довести token-parity: сейчас совпадают top-1/top-2 на первых позициях, дальше
-   расхождение ~0.2% за слой. Кандидаты: порядок состояния conv, f16-KV у llama.cpp,
-   квантование активаций. Инструменты: `tools/oracle/compare_prompt.py`, `ref-ppl`.
-   Важно: для квантованных весов llama.cpp считает через `vec_dot_q4_K_q8_K`, то есть
-   квантует активации в int8 — это само по себе даёт ~0.5% ошибки на матвек и
-   накапливается за 24 слоя (cosine логитов ~0.94 при совпадающих top-1/top-2).
-   Поэтому точным oracle для нашей f32-математики является только F16/BF16 GGUF.
-2. Token-parity с llama.cpp на 5 промптах (greedy).
-3. Порты `InferenceBackend`/`TokenizerPort` и use-case `Generate` с фейками.
+1. **Сделано: token-parity по F16 GGUF.** CPU-эталон (f32) и llama.cpp дают одинаковые
+   greedy-ids на 5 промптах × 64 токена (`tools/oracle/parity.py`), логиты последней
+   позиции: `cosine 1.000000`, `max|dlogit| 0.0055` (`compare_prompt.py`). На Q4
+   расхождение остаётся принципиально: llama.cpp квантует активации в int8
+   (`vec_dot_q4_K_q8_K`, ~0.5% на матвек, накапливается за 24 слоя) — точный oracle
+   для нашей f32-математики только F16/BF16 GGUF. Инструменты: `parity.py`,
+   `compare_prompt.py`, `greedy.cpp`, `logits.cpp`, `ref-ppl`.
+2. **Осталось: порты** `InferenceBackend`/`TokenizerPort` и use-case `Generate`
+   с фейками (P6).
 
 Найденные по пути особенности LFM3/GGUF:
 - conv-ядро в GGUF циклически сдвинуто на 1 относительно PyTorch: текущий токен

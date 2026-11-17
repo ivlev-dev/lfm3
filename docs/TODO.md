@@ -1,6 +1,6 @@
 # TODO — продолжить с пустой сессии
 
-Состояние на 17.11.2026 (конец четвёртой сессии подряд). Всё собирается и тестируется:
+Состояние на 17.11.2026 (конец пятой сессии подряд). Всё собирается и тестируется:
 
 ```bash
 cd /home/ivlev98/Проекты/PC/lfm3
@@ -57,6 +57,15 @@ cargo test --workspace                     # 240 тестов
 | h2 pipelined HEADERS | `wait_for_window` буферизует HEADERS/CONTINUATION/DATA (тело и окна не теряются, лимит 64 кадра/1 МиБ), главный цикл обрабатывает отложенные кадры первыми; +1 тест |
 | Тесты | 240 зелёных (+7: protocol×6, h2 defer) |
 
+## Сессия 5 (M1: token-parity)
+
+| Блок | Итог |
+|---|---|
+| llama.cpp oracle | собран CPU-only в `/tmp/llama.cpp`; новый `tools/oracle/greedy.cpp` (greedy-ids через llama API) и `tools/oracle/parity.py` (5 промптов, exit code при расхождении) |
+| Parity | F16 GGUF: **5/5 промптов × 64 greedy-токена** совпадают с llama.cpp; логиты `cosine 1.000000`, `max|dlogit| 0.0055` |
+| Q4 | расхождение принципиально (llama.cpp квантует активации int8), точный oracle только F16/BF16 |
+| Осталось | порты `InferenceBackend`/`TokenizerPort` и use-case `Generate` с фейками |
+
 ## Проверки, которые уже прогонялись (и чем повторять)
 
 ```bash
@@ -67,10 +76,10 @@ cargo test --workspace                     # 240 тестов
 ./target/release/lfm-bench gpu-multi --seqs 6 --tokens 48 # 0/6 расхождений
 ./target/release/lfm-bench gpu-cache --tokens 512 --reps 2# повтор бит-в-бит, reused 480/512
 ./target/release/lfm-bench gpu-mix --tokens 24            # cos 1.0
+python3 tools/oracle/parity.py --tokens 64                # 5/5 против llama.cpp (F16)
 
 # скорость (машина шумит ±10%, мерить парами/сериями)
-./target/release/lfm-bench bw --mb 512                    # ПСП: 112–118 ГБ/с сейчас (в M0 было 125)
-LFM_PROFILE=1 ./target/release/lfm-bench gpu-prefill --tokens 8192 --decode 8   # по ядрам
+./target/release/lfm-bench bw --mb 512                    # ПСП: 112–118 ГБ/с сейчас (в M0 было 125)LFM_PROFILE=1 ./target/release/lfm-bench gpu-prefill --tokens 8192 --decode 8   # по ядрам
 ./target/release/lfm-bench gpu-prefill --tokens 8192 --decode 24
 ./target/release/lfm-bench gpu-prefill --tokens 512 --decode 32
 ./target/release/lfm-bench gpu-multi --seqs 6 --tokens 48
@@ -143,8 +152,9 @@ P1 — только после перемера на простое.
 
 ### 6. P6 — M1 и M6/M7
 
-- Token-parity с llama.cpp на 5 промптах по F16 GGUF (точный oracle для f32-математики).
-- Порты `InferenceBackend`/`TokenizerPort`, use-case `Generate` с фейками.
+- **M1 parity — сделано**: 5 промптов × 64 greedy-id по F16 GGUF, cos 1.000000,
+  `max|dlogit| 0.0055`; см. `tools/oracle/README.md`.
+- Осталось: порты `InferenceBackend`/`TokenizerPort`, use-case `Generate` с фейками.
 - M6: 3-tier + TP/PP; M7: NPU Hexagon, fuzz парсеров, спека протокола.
 
 ## Подводные камни
@@ -199,6 +209,13 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 - `apps/tui/**` (новый крейт), корневой `Cargo.toml`.
 - `tools/loadtest.py` (новый).
 - `README.md`, `docs/plan.md`, `docs/architecture.md`, этот файл.
+
+## Файлы, изменённые в сессии 5
+
+- `tools/oracle/greedy.cpp` (новый) — greedy-ids через llama API для сверки.
+- `tools/oracle/parity.py` (новый) — parity-скрипт на 5 промптах.
+- `tools/oracle/README.md` — сборка `greedy.cpp`, запуск parity, результаты F16.
+- `README.md`, `docs/plan.md`, этот файл — статус M1.
 
 ## Файлы, изменённые в сессии 4
 

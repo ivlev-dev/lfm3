@@ -47,9 +47,12 @@
   `gpu-chat` рендерит `chat_template.jinja`, стримит ответ и разбирает `<think`/`<tool_call>`
   через `ChatSession`. Замер: 28-токенный промпт + 45 токенов ответа — prefill 0.16 с,
   decode 78 tok/s.
-- **M1 (эталон/токенизация) — почти готов.** CPU-эталон LFM3 (f32) генерирует связный
-  текст; найден и исправлен сдвиг conv-ядра в GGUF. Точный token-parity с llama.cpp
-  ещё не достигнут (см. `docs/plan.md`); инструменты сверки — в `tools/oracle/`.
+- **M1 (эталон/токенизация) — parity достигнут.** CPU-эталон LFM3 (f32) по F16 GGUF
+  совпадает с llama.cpp по greedy-ids: **5 промптов × 64 токена**, логиты `cos 1.000000`,
+  `max|dlogit| 0.0055`; найден и исправлен сдвиг conv-ядра в GGUF. Инструменты —
+  `tools/oracle/` (`parity.py`, `compare_prompt.py`, `greedy.cpp`). На Q4 расхождение
+  остаётся из-за квантования активаций — точный oracle только F16. Осталось: порты
+  `InferenceBackend`/`TokenizerPort` и use-case `Generate` с фейками.
 - **M5 (сервер, планировщик и TUI) — готов.** `lfm-server` отдаёт
   `/v1/models`, `/v1/chat/completions` (обычный ответ и SSE, stop, usage, thinking,
   `tools`/`tool_calls` с `finish_reason: tool_calls`), `/v1/completions` (строка или
