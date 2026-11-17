@@ -114,8 +114,9 @@
    chunked prefill публикует страницы в радикс-кэш, pipelined HEADERS в h2 буферизуются;
    остался только TLS по требованию.
 5. **P4–P6. M6/M7**: PP (`LFM_TIERS`) и full TP (`LFM_TP`) готовы; CPU-бэкенд
-   (W4A8/AVX2) готов. Дальше — Vulkan и ROCm бэкенды (`docs/backends.md`),
-   затем M7 — NPU Hexagon, fuzz парсеров, спека протокола.
+   (W4A8/AVX2) готов, Vulkan-каркас с Q4-GEMV. Цель — обогнать llama.cpp
+   (`benchmarks/llama-cpp.md`): Vulkan 1393 pp512 / 91 tg128, CPU 142 / 23;
+   главный разрыв — prefill (GEMM). Дальше — остальные ядра Vulkan, ROCm, M7.
 
 ## Железо и целевые показатели
 

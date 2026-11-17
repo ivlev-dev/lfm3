@@ -180,6 +180,14 @@ enum Cmd {
         #[arg(long)]
         ones: bool,
     },
+    CpuPrefill {
+        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
+        model: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        tokens: usize,
+        #[arg(long, default_value_t = 1024)]
+        ctx: usize,
+    },
     CpuPort {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -467,6 +475,7 @@ fn main() -> Result<()> {
             rows,
             ones,
         } => vulkan_gemv(&model, &tensor, rows, ones),
+        Cmd::CpuPrefill { model, tokens, ctx } => cpu_prefill(&model, tokens, ctx),
         Cmd::CpuPort {
             model,
             tokenizer,
@@ -2856,6 +2865,17 @@ fn vulkan_gemv(model: &PathBuf, tensor: &str, rows: usize, ones: bool) -> Result
         }
     }
     println!("rows {rows}: max_rel {max_rel:.2e}");
+    Ok(())
+}
+
+fn cpu_prefill(model: &PathBuf, tokens: usize, ctx: usize) -> Result<()> {
+    let mut backend = lfm_backend_cpu::CpuBackend::load(model, ctx)?;
+    let ids: Vec<u32> = (0..tokens).map(|i| ((i * 2654435761usize) % 60000) as u32 + 100).collect();
+    let slot = backend.create_sequence()?;
+    let started = Instant::now();
+    let _ = backend.prefill(slot, &ids, false)?;
+    let elapsed = started.elapsed().as_secs_f64();
+    println!("cpu prefill {tokens} tok in {elapsed:.3}s ({:.1} tok/s)", tokens as f64 / elapsed);
     Ok(())
 }
 

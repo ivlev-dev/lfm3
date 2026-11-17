@@ -167,7 +167,15 @@ P1 — только после перемера на простое.
   `--device`/`LFM_DEVICE` (или скрыть rusticl). CPU-эталон `ref-*` живёт отдельно
   (`infra-cpu`, ~1.5 tok/s), к серверу/TUI не подключён.
 
-### 6. Бэкенды
+### 6. Бэкенды и обгон llama.cpp
+
+- **Бейзлайн** (`benchmarks/llama-cpp.md`): llama.cpp Vulkan pp512 1393 / tg128 91,
+  pp8192 1236 / tg64 94; CPU pp512 142 / tg128 23.
+- **Наши**: OpenCL ~205 pp512 / 159 pp8192 / 64 tg; CPU 10 pp512 / 6.9 tg;
+  Vulkan — только Q4-GEMV.
+- Цель: на каждом бэкенде prefill и decode ≥ llama.cpp. Главный разрыв — prefill
+  (GEMM/батчевый Q4): нужен GEMM-тайлинг/subgroup (GPU) и батчевый AVX2-GEMM (CPU).
+
 
 - **CPU готов**: W4A8 AVX2, `LFM_BACKEND=cpu`; дальше оптимизации (Q6 AVX2, prefetch,
   f16-KV, аллокации) и NEON-ветка.
