@@ -22,14 +22,27 @@ g++ -O2 -std=c++17 logits.cpp \
   -Wl,-rpath,/tmp/llama.cpp/build/bin -o /tmp/logits
 ```
 
+`greedy.cpp` печатает greedy-ids (тот же формат, что `lfm-bench ref-gen`):
+
+```bash
+g++ -O2 -std=c++17 greedy.cpp \
+  -I /tmp/llama.cpp/include -I /tmp/llama.cpp/ggml/include \
+  -L /tmp/llama.cpp/build/bin \
+  -lllama -lggml -lggml-base -lggml-cpu \
+  -Wl,-rpath,/tmp/llama.cpp/build/bin -o /tmp/greedy
+```
+
 ## Сравнение
 
 ```bash
 python3 compare_prompt.py "The capital of France is" models/LFM3-1.7B-Q4_K_M.gguf
+python3 parity.py --model models/LFM3-1.7B-F16.gguf --tokens 64
 ```
 
-Скрипт токенизирует промпт через `llama-tokenize`, считает логиты обеими
-реализациями и печатает cosine, корреляцию и top-5.
+`compare_prompt.py` токенизирует промпт через `llama-tokenize`, считает логиты обеими
+реализациями и печатает cosine, корреляцию и top-5. `parity.py` сравнивает greedy-ids
+на 5 промптах и возвращает ненулевой код при расхождении.
 
 Для численной проверки без эффекта квантования используйте F16-веса:
-`models/LFM3-1.7B-F16.gguf`.
+`models/LFM3-1.7B-F16.gguf`. На F16 достигнут token-parity 5/5 × 64 токена,
+логиты: `cosine 1.000000`, `max|dlogit| 0.0055`.
