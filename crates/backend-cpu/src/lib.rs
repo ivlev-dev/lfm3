@@ -1,0 +1,794 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{anyhow, Context, Result};
+use lfm_app::{CacheStats, InferenceBackend, SequenceStep};
+use lfm_domain::{LayerKind, ModelConfig};
+use lfm_gguf::{GgmlType, GgufFile};
+use rayon::prelude::*;
+
+const GROUP: usize = 32;
+
+#[derive(Clone)]
+struct Q4Block {
+    scales: [f32; 8],
+    mins: [f32; 8],
+    q: [u8; 256],
+}
+
+#[derive(Clone)]
+struct Q6Block {
+    scales: [f32; 16],
+    q: [u8; 256],
+}
+
+enum Matrix {
+    Q4(Vec<Q4Block>),
+    Q6(Vec<Q6Block>),
+}
+
+struct Quant {
+    rows: usize,
+    cols: usize,
+    data: Matrix,
+}
+
+struct Act {
+    q: Vec<i8>,
+    s: Vec<f32>,
+    sum32: Vec<i32>,
+    sum16: Vec<i32>,
+}
+
+pub struct CpuBackend {
+    cfg: ModelConfig,
+    max_ctx: usize,
+    quant: HashMap<String, Quant>,
+    f32: HashMap<String, Vec<f32>>,
+    dims: HashMap<String, (usize, usize)>,
+    rope_full: Vec<f32>,
+    rope_sliding: Vec<f32>,
+    slots: Vec<Option<SeqState>>,
+    last_logits: Vec<f32>,
+    row_logits: Vec<Vec<f32>>,
+}
+
+struct SeqState {
+    len: usize,
+    layers: Vec<LayerState>,
+}
+
+struct LayerState {
+    conv: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
+impl CpuBackend {
+    pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
+        let file = GgufFile::open(path).with_context(|| format!("open {}", path.display()))?;
+        let cfg = ModelConfig::from_metadata(&file).map_err(|e| anyhow!("config: {e}"))?;
+        let mut quant = HashMap::new();
+        let mut f32s = HashMap::new();
+        let mut dims = HashMap::new();
+        for info in file.tensors() {
+            if info.dims.is_empty() || info.dims.len() > 2 {
+                continue;
+            }
+            let cols = info.dims[0] as usize;
+            let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
+            let bytes = file.tensor_bytes(&info.name)?;
+            match info.ggml_type {
+                GgmlType::Q4_K => {
+                    let blocks = bytes.len() / 144;
+                    if blocks != rows * cols / 256 {
+                        return Err(anyhow!("q4 shape mismatch {}", info.name));
+                    }
+                    let mut out = Vec::with_capacity(blocks);
+                    for b in bytes.chunks_exact(144) {
+                        out.push(prep_q4(b));
+                    }
+                    quant.insert(
+                        info.name.clone(),
+                        Quant {
+                            rows,
+                            cols,
+                            data: Matrix::Q4(out),
+                        },
+                    );
+                }
+                GgmlType::Q6_K => {
+                    let blocks = bytes.len() / 210;
+                    let mut out = Vec::with_capacity(blocks);
+                    for b in bytes.chunks_exact(210) {
+                        out.push(prep_q6(b));
+                    }
+                    quant.insert(
+                        info.name.clone(),
+                        Quant {
+                            rows,
+                            cols,
+                            data: Matrix::Q6(out),
+                        },
+                    );
+                }
+                GgmlType::F32 => {
+                    let data: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    f32s.insert(info.name.clone(), data);
+                    dims.insert(info.name.clone(), (cols, rows));
+                }
+                GgmlType::F16 => {
+                    let data: Vec<f32> = bytes
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                        .collect();
+                    f32s.insert(info.name.clone(), data);
+                    dims.insert(info.name.clone(), (cols, rows));
+                }
+                _ => continue,
+            }
+        }
+        let rope_full = cfg.rope_full.inv_freq();
+        let rope_sliding = cfg.rope_sliding.inv_freq();
+        let slots = (0..cfg.num_layers.max(8)).map(|_| None).collect();
+        Ok(Self {
+            cfg,
+            max_ctx,
+            quant,
+            f32: f32s,
+            dims,
+            rope_full,
+            rope_sliding,
+            slots,
+            last_logits: Vec::new(),
+            row_logits: Vec::new(),
+        })
+    }
+
+    fn t(&self, name: &str) -> Result<&Quant> {
+        self.quant
+            .get(name)
+            .ok_or_else(|| anyhow!("missing tensor {name}"))
+    }
+
+    fn f(&self, name: &str) -> Result<&[f32]> {
+        self.f32
+            .get(name)
+            .map(Vec::as_slice)
+            .ok_or_else(|| anyhow!("missing tensor {name}"))
+    }
+
+    fn row_f32(&self, name: &str) -> Result<(usize, usize)> {
+        self.dims
+            .get(name)
+            .copied()
+            .ok_or_else(|| anyhow!("missing dims {name}"))
+    }
+
+    fn new_state(&self) -> SeqState {
+        let cfg = &self.cfg;
+        let layers = (0..cfg.num_layers)
+            .map(|i| match cfg.kind(i) {
+                LayerKind::Conv => LayerState {
+                    conv: vec![0.0; (cfg.conv_cache - 1) * cfg.hidden_size],
+                    k: Vec::new(),
+                    v: Vec::new(),
+                },
+                _ => LayerState {
+                    conv: Vec::new(),
+                    k: Vec::new(),
+                    v: Vec::new(),
+                },
+            })
+            .collect();
+        SeqState { len: 0, layers }
+    }
+
+    fn forward(&self, seq: &mut SeqState, token: u32, pos: usize) -> Result<Vec<f32>> {
+        if pos >= self.max_ctx {
+            return Err(anyhow!("context overflow {pos} >= {}", self.max_ctx));
+        }
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let emb = self.t("token_embd.weight")?;
+        let mut x = embed_row(emb, token as usize)?;
+        for layer in 0..cfg.num_layers {
+            let prefix = format!("blk.{layer}");
+            let residual = x.clone();
+            let attn_norm = self.f(&format!("{prefix}.attn_norm.weight"))?;
+            let h_norm = rms_norm(&x, attn_norm, cfg.norm_eps);
+            let act = quantize(&h_norm);
+            let op = match cfg.kind(layer) {
+                LayerKind::Conv => {
+                    self.conv_block(layer, &act, &mut seq.layers[layer], h_norm.len())?
+                }
+                _ => self.attn_block(layer, &act, &mut seq.layers[layer], pos, &h_norm)?,
+            };
+            let post = self.f(&format!("{prefix}.post_attention_norm.weight"))?;
+            let mut merged: Vec<f32> = rms_norm(&op, post, cfg.norm_eps)
+                .iter()
+                .zip(&residual)
+                .map(|(a, b)| a + b)
+                .collect();
+            let ffn_norm = self.f(&format!("{prefix}.ffn_norm.weight"))?;
+            let ffn_in = quantize(&rms_norm(&merged, ffn_norm, cfg.norm_eps));
+            let up = self.t(&format!("{prefix}.ffn_up.weight"))?;
+            let gate = self.t(&format!("{prefix}.ffn_gate.weight"))?;
+            let down = self.t(&format!("{prefix}.ffn_down.weight"))?;
+            let u = matvec(up, &ffn_in);
+            let g = matvec(gate, &ffn_in);
+            let act: Vec<f32> = u.iter().zip(&g).map(|(u, g)| silu(*g) * u).collect();
+            let ffn_out = matvec(down, &quantize(&act));
+            let post_ffn = self.f(&format!("{prefix}.post_ffw_norm.weight"))?;
+            let ffn_post = rms_norm(&ffn_out, post_ffn, cfg.norm_eps);
+            for i in 0..h {
+                merged[i] += ffn_post[i];
+            }
+            x = merged;
+        }
+        seq.len += 1;
+        let norm = self.f("output_norm.weight")?;
+        let x = rms_norm(&x, norm, cfg.norm_eps);
+        Ok(matvec(self.t("token_embd.weight")?, &quantize(&x)))
+    }
+
+    fn conv_block(
+        &self,
+        layer: usize,
+        x: &Act,
+        st: &mut LayerState,
+        h: usize,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let prefix = format!("blk.{layer}");
+        let in_proj = self.t(&format!("{prefix}.shortconv.in_proj.weight"))?;
+        let bcx = matvec(in_proj, x);
+        let b = &bcx[0..h];
+        let c = &bcx[h..2 * h];
+        let xv = &bcx[2 * h..3 * h];
+        let bx: Vec<f32> = b.iter().zip(xv).map(|(a, b)| a * b).collect();
+        let kernel = cfg.conv_cache;
+        let (wcols, wrows) = self.row_f32(&format!("{prefix}.shortconv.conv.weight"))?;
+        let w = self.f(&format!("{prefix}.shortconv.conv.weight"))?;
+        if wcols != kernel || wrows < h {
+            return Err(anyhow!("bad conv weight shape"));
+        }
+        let mut out = vec![0.0f32; h];
+        out.par_iter_mut().enumerate().for_each(|(ch, o)| {
+            let wrow = &w[ch * kernel..(ch + 1) * kernel];
+            let mut acc = wrow[kernel - 1] * bx[ch];
+            for t in 0..kernel - 1 {
+                acc += wrow[t] * st.conv[t * h + ch];
+            }
+            *o = acc;
+        });
+        st.conv.extend_from_slice(&bx);
+        if st.conv.len() > (kernel - 1) * h {
+            let excess = st.conv.len() - (kernel - 1) * h;
+            st.conv.drain(0..excess);
+        }
+        let y: Vec<f32> = c.iter().zip(&out).map(|(a, b)| a * b).collect();
+        Ok(matvec(self.t(&format!("{prefix}.shortconv.out_proj.weight"))?, &quantize(&y)))
+    }
+
+    fn attn_block(
+        &self,
+        layer: usize,
+        x: &Act,
+        st: &mut LayerState,
+        pos: usize,
+        xf: &[f32],
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let prefix = format!("blk.{layer}");
+        let n_heads = cfg.num_heads;
+        let head_dim = cfg.head_dim;
+        let kv_heads = cfg.kv_heads_of(layer);
+        let group = n_heads / kv_heads.max(1);
+        let inv_freq = match cfg.kind(layer) {
+            LayerKind::SlidingAttention => &self.rope_sliding,
+            _ => &self.rope_full,
+        };
+        let q = self.t(&format!("{prefix}.attn_q.weight"))?;
+        let k = self.t(&format!("{prefix}.attn_k.weight"))?;
+        let v = self.t(&format!("{prefix}.attn_v.weight"))?;
+        let gate_w = self.t(&format!("{prefix}.attn_gate.weight"))?;
+        let mut qv = matvec(q, x);
+        let mut kv = matvec(k, x);
+        let vv = matvec(v, x);
+        let q_norm = self.f(&format!("{prefix}.attn_q_norm.weight"))?;
+        let k_norm = self.f(&format!("{prefix}.attn_k_norm.weight"))?;
+        for head in 0..n_heads {
+            let base = head * head_dim;
+            let normed = rms_norm(&qv[base..base + head_dim], q_norm, cfg.norm_eps);
+            qv[base..base + head_dim].copy_from_slice(&normed);
+            rope_inplace(&mut qv[base..base + head_dim], pos, inv_freq);
+        }
+        for head in 0..kv_heads {
+            let base = head * head_dim;
+            let normed = rms_norm(&kv[base..base + head_dim], k_norm, cfg.norm_eps);
+            kv[base..base + head_dim].copy_from_slice(&normed);
+            rope_inplace(&mut kv[base..base + head_dim], pos, inv_freq);
+        }
+        st.k.extend_from_slice(&kv);
+        st.v.extend_from_slice(&vv);
+        let total = st.k.len() / (kv_heads * head_dim);
+        let window = if cfg.kind(layer) == LayerKind::SlidingAttention {
+            cfg.sliding_window.min(total)
+        } else {
+            total
+        };
+        let start = total - window;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut attn = vec![0.0f32; n_heads * head_dim];
+        for head in 0..n_heads {
+            let kvh = head / group;
+            let qh = &qv[head * head_dim..(head + 1) * head_dim];
+            let mut scores = vec![0.0f32; window];
+            for (j, slot) in (start..total).enumerate() {
+                let base = slot * kv_heads * head_dim + kvh * head_dim;
+                scores[j] = dot_f32(&st.k[base..base + head_dim], qh) * scale;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max).exp();
+                sum += *s;
+            }
+            let inv = 1.0 / sum;
+            for s in scores.iter_mut() {
+                *s *= inv;
+            }
+            let out = &mut attn[head * head_dim..(head + 1) * head_dim];
+            for (j, slot) in (start..total).enumerate() {
+                let base = slot * kv_heads * head_dim + kvh * head_dim;
+                let vh = &st.v[base..base + head_dim];
+                let w = scores[j];
+                for d in 0..head_dim {
+                    out[d] += w * vh[d];
+                }
+            }
+        }
+        let gates = matvec(gate_w, &quantize(xf));
+        for head in 0..n_heads {
+            let g = sigmoid(gates[head]);
+            for d in 0..head_dim {
+                attn[head * head_dim + d] *= g;
+            }
+        }
+        Ok(matvec(
+            self.t(&format!("{prefix}.attn_output.weight"))?,
+            &quantize(&attn),
+        ))
+    }
+}
+
+impl InferenceBackend for CpuBackend {
+    fn create_sequence(&mut self) -> Result<usize> {
+        if let Some(slot) = self.slots.iter().position(|s| s.is_none()) {
+            let state = self.new_state();
+            self.slots[slot] = Some(state);
+            return Ok(slot);
+        }
+        let state = self.new_state();
+        self.slots.push(Some(state));
+        Ok(self.slots.len() - 1)
+    }
+
+    fn free_sequence(&mut self, slot: usize) -> Result<()> {
+        if let Some(entry) = self.slots.get_mut(slot) {
+            *entry = None;
+        }
+        Ok(())
+    }
+
+    fn prefill(&mut self, slot: usize, tokens: &[u32], need_logits: bool) -> Result<usize> {
+        let reused = self.prefill_begin(slot, tokens)?;
+        let mut state = self
+            .slots
+            .get_mut(slot)
+            .and_then(|s| s.take())
+            .ok_or_else(|| anyhow!("empty cpu sequence {slot}"))?;
+        let mut logits = Vec::new();
+        let result = (|| -> Result<()> {
+            for (pos, &token) in tokens.iter().enumerate().skip(reused) {
+                logits = self.forward(&mut state, token, pos)?;
+            }
+            Ok(())
+        })();
+        self.slots[slot] = Some(state);
+        result?;
+        self.prefill_finish(slot)?;
+        if need_logits {
+            self.last_logits = logits;
+        }
+        Ok(reused)
+    }
+
+    fn prefill_begin(&mut self, _slot: usize, _tokens: &[u32]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn prefill_finish(&mut self, _slot: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn step(&mut self, steps: &[SequenceStep], need_logits: bool) -> Result<()> {
+        self.row_logits.clear();
+        for step in steps {
+            let mut state = self
+                .slots
+                .get_mut(step.slot)
+                .and_then(|s| s.take())
+                .ok_or_else(|| anyhow!("empty cpu sequence {}", step.slot))?;
+            let logits = self.forward(&mut state, step.token, step.pos);
+            self.slots[step.slot] = Some(state);
+            let logits = logits?;
+            if need_logits {
+                self.last_logits = logits.clone();
+                self.row_logits.push(logits);
+            } else {
+                self.row_logits.push(Vec::new());
+            }
+        }
+        Ok(())
+    }
+
+    fn logits(&self) -> Result<Vec<f32>> {
+        Ok(self.last_logits.clone())
+    }
+
+    fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
+        self.row_logits
+            .get(row)
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| anyhow!("no cpu logits for row {row}"))
+    }
+
+    fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
+    fn free_pages(&self) -> usize {
+        self.max_ctx.div_ceil(32)
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        CacheStats::default()
+    }
+}
+
+fn prep_q4(block: &[u8]) -> Q4Block {
+    let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+    let dmin = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
+    let mut scales = [0.0f32; 8];
+    let mut mins = [0.0f32; 8];
+    let mut q = [0u8; 256];
+    let mut q_off = 0usize;
+    let mut is = 0usize;
+    let mut g = 0usize;
+    for j in (0..256).step_by(64) {
+        let (sc1, m1) = scale_min(block, is);
+        let (sc2, m2) = scale_min(block, is + 1);
+        scales[g] = d * f32::from(sc1);
+        mins[g] = dmin * f32::from(m1);
+        for l in 0..32 {
+            q[j + l] = block[16 + q_off + l] & 0x0F;
+        }
+        g += 1;
+        scales[g] = d * f32::from(sc2);
+        mins[g] = dmin * f32::from(m2);
+        for l in 0..32 {
+            q[j + 32 + l] = block[16 + q_off + l] >> 4;
+        }
+        g += 1;
+        q_off += 32;
+        is += 2;
+    }
+    Q4Block { scales, mins, q }
+}
+
+fn scale_min(block: &[u8], j: usize) -> (u8, u8) {
+    let q = &block[4..16];
+    let jm = j & 3;
+    let h = j >> 2;
+    let a = q[jm];
+    let b = q[jm + 4];
+    let c = q[jm + 8];
+    let lo_d = a & 63;
+    let lo_m = b & 63;
+    let hi_d = (c & 15) | ((a >> 6) << 4);
+    let hi_m = (c >> 4) | ((b >> 6) << 4);
+    if h == 0 {
+        (lo_d, lo_m)
+    } else {
+        (hi_d, hi_m)
+    }
+}
+
+fn prep_q6(block: &[u8]) -> Q6Block {
+    let d = half::f16::from_bits(u16::from_le_bytes([block[208], block[209]])).to_f32();
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let sc = &block[192..208];
+    let mut q = [0u8; 256];
+    let mut scales = [0.0f32; 16];
+    let mut ql_off = 0usize;
+    let mut qh_off = 0usize;
+    let mut sc_off = 0usize;
+    let mut base = 0usize;
+    for _n in 0..2 {
+        for l in 0..32usize {
+            let is = l / 16;
+            let q1 = ((ql[ql_off + l] & 0x0F) as i32 | (((qh[qh_off + l] & 3) as i32) << 4)) - 32;
+            let q2 = ((ql[ql_off + l + 32] & 0x0F) as i32
+                | ((((qh[qh_off + l] >> 2) & 3) as i32) << 4))
+                - 32;
+            let q3 = ((ql[ql_off + l] >> 4) as i32
+                | ((((qh[qh_off + l] >> 4) & 3) as i32) << 4))
+                - 32;
+            let q4 = ((ql[ql_off + l + 32] >> 4) as i32
+                | ((((qh[qh_off + l] >> 6) & 3) as i32) << 4))
+                - 32;
+            q[base + l] = (q1 + 32) as u8;
+            q[base + l + 32] = (q2 + 32) as u8;
+            q[base + l + 64] = (q3 + 32) as u8;
+            q[base + l + 96] = (q4 + 32) as u8;
+            scales[base / 16 + l / 16] = d * (sc[sc_off + is] as i8 as f32);
+            scales[base / 16 + 2 + l / 16] = d * (sc[sc_off + is + 2] as i8 as f32);
+            scales[base / 16 + 4 + l / 16] = d * (sc[sc_off + is + 4] as i8 as f32);
+            scales[base / 16 + 6 + l / 16] = d * (sc[sc_off + is + 6] as i8 as f32);
+        }
+        ql_off += 64;
+        qh_off += 32;
+        sc_off += 8;
+        base += 128;
+    }
+    Q6Block { scales, q }
+}
+
+fn quantize(x: &[f32]) -> Act {
+    let groups = x.len().div_ceil(GROUP);
+    let mut q = vec![0i8; x.len()];
+    let mut s = vec![0.0f32; groups];
+    let mut sum32 = vec![0i32; groups];
+    let mut sum16 = vec![0i32; groups * 2];
+    for g in 0..groups {
+        let start = g * GROUP;
+        let end = (start + GROUP).min(x.len());
+        let mut amax = 0.0f32;
+        for &v in &x[start..end] {
+            amax = amax.max(v.abs());
+        }
+        let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        s[g] = scale;
+        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        for (i, &v) in x[start..end].iter().enumerate() {
+            q[start + i] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+        for i in 0..(end - start) {
+            sum32[g] += i32::from(q[start + i]);
+            sum16[g * 2 + i / 16] += i32::from(q[start + i]);
+        }
+    }
+    Act { q, s, sum32, sum16 }
+}
+
+fn matvec(w: &Quant, x: &Act) -> Vec<f32> {
+    let blocks = w.cols / 256;
+    (0..w.rows)
+        .into_par_iter()
+        .map(|row| match &w.data {
+            Matrix::Q4(data) => {
+                let mut acc = 0.0f32;
+                let base = row * blocks;
+                for b in 0..blocks {
+                    let blk = &data[base + b];
+                    let xb = b * 256;
+                    for g in 0..8 {
+                        let off = xb + g * 32;
+                        let dot = dot_u8_i8_32(&blk.q[g * 32..g * 32 + 32], &x.q[off..off + 32]);
+                        acc += x.s[g + b * 8]
+                            * (blk.scales[g] * dot as f32 - blk.mins[g] * x.sum32[g + b * 8] as f32);
+                    }
+                }
+                acc
+            }
+            Matrix::Q6(data) => {
+                let mut acc = 0.0f32;
+                let base = row * blocks;
+                for b in 0..blocks {
+                    let blk = &data[base + b];
+                    let xb = b * 256;
+                    for k in 0..16 {
+                        let off = xb + k * 16;
+                        let dot = dot_u8_i8_16(&blk.q[k * 16..k * 16 + 16], &x.q[off..off + 16]);
+                        let sum = x.sum16[b * 16 + k];
+                        acc += x.s[(b * 8) + k / 2] * blk.scales[k] * (dot - 32 * sum) as f32;
+                    }
+                }
+                acc
+            }
+        })
+        .collect()
+}
+
+fn embed_row(w: &Quant, row: usize) -> Result<Vec<f32>> {
+    let blocks = w.cols / 256;
+    match &w.data {
+        Matrix::Q6(data) => {
+            let base = row * blocks;
+            let mut out = Vec::with_capacity(w.cols);
+            for b in 0..blocks {
+                let blk = &data[base + b];
+                for k in 0..16 {
+                    let scale = blk.scales[k];
+                    for i in 0..16 {
+                        out.push((f32::from(blk.q[k * 16 + i]) - 32.0) * scale);
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(anyhow!("embedding must be q6")),
+    }
+}
+
+fn dot_u8_i8_32(q: &[u8], x: &[i8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                return dot_u8_i8_32_avx2(q.as_ptr(), x.as_ptr());
+            }
+        }
+    }
+    let mut acc = 0i32;
+    for i in 0..q.len() {
+        acc += i32::from(q[i]) * i32::from(x[i]);
+    }
+    acc
+}
+
+fn dot_u8_i8_16(q: &[u8], x: &[i8]) -> i32 {
+    let mut acc = 0i32;
+    for i in 0..q.len() {
+        acc += i32::from(q[i]) * i32::from(x[i]);
+    }
+    acc
+}
+
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe {
+                return dot_f32_avx2(a.as_ptr(), b.as_ptr(), a.len());
+            }
+        }
+    }
+    a.iter().zip(b).map(|(a, b)| a * b).sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_u8_i8_32_avx2(q: *const u8, x: *const i8) -> i32 {
+    use std::arch::x86_64::*;
+    let qv = _mm256_loadu_si256(q as *const __m256i);
+    let xv = _mm256_loadu_si256(x as *const __m256i);
+    let pairs = _mm256_maddubs_epi16(qv, xv);
+    let ones = _mm256_set1_epi16(1);
+    let sums = _mm256_madd_epi16(pairs, ones);
+    let mut out = [0i32; 8];
+    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, sums);
+    out.iter().sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(a: *const f32, b: *const f32, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let av = _mm256_loadu_ps(a.add(i));
+        let bv = _mm256_loadu_ps(b.add(i));
+        acc = _mm256_fmadd_ps(av, bv, acc);
+        i += 8;
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum: f32 = lanes.iter().sum();
+    while i < n {
+        sum += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    sum
+}
+
+fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let sum: f32 = x.iter().map(|v| v * v).sum();
+    let scale = 1.0 / (sum / x.len() as f32 + eps).sqrt();
+    x.iter().zip(w).map(|(v, w)| v * scale * w).collect()
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn rope_inplace(x: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    let half = x.len() / 2;
+    for i in 0..half {
+        let freq = inv_freq.get(i).copied().unwrap_or(0.0) * pos as f32;
+        let (s, c) = freq.sin_cos();
+        let a = x[i];
+        let b = x[i + half];
+        x[i] = a * c - b * s;
+        x[i + half] = b * c + a * s;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qblock(seed: u8) -> Vec<u8> {
+        let mut b = vec![0u8; 144];
+        b[0..2].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+        b[2..4].copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+        for (i, slot) in b.iter_mut().enumerate().skip(4) {
+            *slot = seed.wrapping_add((i as u8).wrapping_mul(17));
+        }
+        b
+    }
+
+    #[test]
+    fn q4_prepack_matches_scalar_dequant() {
+        let raw = qblock(3);
+        let mut arr = [0u8; 144];
+        arr.copy_from_slice(&raw);
+        let expect = lfm_quant::dequant_q4_k(&arr);
+        let prep = prep_q4(&raw);
+        for g in 0..8 {
+            for i in 0..32 {
+                let idx = g * 32 + i;
+                let got = prep.scales[g] * f32::from(prep.q[idx]) - prep.mins[g];
+                assert!((got - expect[idx]).abs() < 1e-4, "idx {idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn quantize_roundtrip_and_sums() {
+        let x: Vec<f32> = (0..96).map(|i| (i as f32 * 0.37).sin()).collect();
+        let a = quantize(&x);
+        assert_eq!(a.q.len(), 96);
+        assert_eq!(a.s.len(), 3);
+        let sum32: i32 = a.q[0..32].iter().map(|v| i32::from(*v)).sum();
+        assert_eq!(a.sum32[0], sum32);
+        let sum16: i32 = a.q[16..32].iter().map(|v| i32::from(*v)).sum();
+        assert_eq!(a.sum16[1], sum16);
+        for i in 0..96 {
+            let deq = f32::from(a.q[i]) * a.s[i / 32];
+            assert!((deq - x[i]).abs() <= a.s[i / 32] + 1e-5);
+        }
+    }
+
+    #[test]
+    fn dot_avx2_matches_scalar() {
+        let q: Vec<u8> = (0..32u8).map(|v| v % 16).collect();
+        let x: Vec<i8> = (0..32).map(|i| ((i * 7) % 255) as i8).collect();
+        let scalar: i32 = q.iter().zip(&x).map(|(a, b)| i32::from(*a) * i32::from(*b)).sum();
+        assert_eq!(dot_u8_i8_32(&q, &x), scalar);
+    }
+}

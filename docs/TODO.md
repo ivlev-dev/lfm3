@@ -1,11 +1,11 @@
 # TODO — продолжить с пустой сессии
 
-Состояние на 17.11.2026 (конец шестой сессии подряд). Всё собирается и тестируется:
+Состояние на 18.11.2026 (конец седьмой сессии подряд). Всё собирается и тестируется:
 
 ```bash
 cd /home/ivlev98/Проекты/PC/lfm3
 cargo build --release --workspace          # без предупреждений
-cargo test --workspace                     # 245 тестов
+cargo test --workspace                     # 248 тестов
 ```
 
 `main` = `origin/main`, рабочее дерево чистое, незакоммиченных экспериментов нет.
@@ -78,6 +78,7 @@ cargo test --workspace                     # 245 тестов
 | FlashInfer-fusion | отклонено: `kv_store` и attention текущего токена требуют глобального барьера между workgroup; page-table lookups — шум |
 | M6/PoCL | CPU-тир PoCL заработал: причины были в хосте (`per_wg` считался как `wg/64`, а PoCL даёт подгруппу = всему workgroup) и в гонках `norm_add_quant` (чтение `red[0]` без барьера перед перезаписью). Теперь `gpu-check` cos 0.9993, `gpu-gen` ids совпадают с AMD, `gpu-cmp` batch cos 0.9994. Intel runtime удалён (iGPU в системе нет) |
 | M6/PP | `GpuModel::load_stage` (диапазон слоёв, embed/head), `PipelineModel` (host-handoff, синхронные prefill/кэш), `LFM_DEVICE`/`LFM_TIERS`, CLI `gpu-pp`. 20/80/0 и 50/50 дают ids как single GPU (16 токенов), logits cos 0.999824, top-5; сервер с `LFM_TIERS` переиспользует кэш на обеих ступенях (reused 192) |
+| Бэкенды | новый `backend-cpu` (W4A8, AVX2): Q4/Q6 предпак в u8+скейлы, активации i8 по 32, runtime AVX2/FMA + scalar fallback, Rayon; `parse/forward/attention/conv` pure Rust; `InferenceBackend` + `LFM_BACKEND=cpu` + `cpu-port`. ids = GPU Q4 (8 токенов), ~6.9 tok/s; архитектура — `docs/backends.md` |
 | M6/TP | full TP: головы q/k/v/g/gate и `attn_output` по столбцам, FFN `up/gate` по строкам + `down` по столбцам, lm_head по словарю с host-gather; `TpShard` режет Q4/Q6 по строкам/блокам, `x/hq/hs` синхронизируются после фаз. `LFM_TP=0/1`/`gpu-tp`: ids как single (8/8), logits cos 0.999745; сервер отвечает |
 
 ## Проверки, которые уже прогонялись (и чем повторять)
@@ -165,7 +166,15 @@ P1 — только после перемера на простое.
   `--device`/`LFM_DEVICE` (или скрыть rusticl). CPU-эталон `ref-*` живёт отдельно
   (`infra-cpu`, ~1.5 tok/s), к серверу/TUI не подключён.
 
-### 6. P6 — M1 и M6/M7
+### 6. Бэкенды
+
+- **CPU готов**: W4A8 AVX2, `LFM_BACKEND=cpu`; дальше оптимизации (Q6 AVX2, prefetch,
+  f16-KV, аллокации) и NEON-ветка.
+- **Vulkan**: `ash` + SPIR-V, порт GEMV/attention, parity-набор и A/B.
+- **ROCm**: HIP, порт ядер, сравнение с OpenCL/Vulkan.
+- Архитектура и DoD — `docs/backends.md`.
+
+### 7. P6 — M1 и M6/M7
 
 - **M1 — готов**: token-parity по F16 (5×64, cos 1.000000), порты
   `InferenceBackend`/`TokenizerPort`, `Generate` с адаптерами/фейками и серверный
@@ -194,6 +203,8 @@ P1 — только после перемера на простое.
 - **`LFM_TIERS`** (PP): проценты слоёв по устройствам, например `20/80/0`
   (GPU 4 слоя + PoCL CPU 20). Работает в сервере и `gpu-pp`; CPU-ступень медленная,
   поэтому для серверных тестов брать короткие ответы.
+- **`LFM_BACKEND=cpu`**: pure-Rust CPU-бэкенд; веса предпакованы, загрузка ~0.7 с,
+  память ~1.6 ГБ, AVX2 определяется в рантайме. Для бенча — `cpu-port`.
 - **`LFM_TP`** (TP): список устройств через `/`, например `0/1`; full TP
   (головы/FFN/lm_head), работает в сервере и `gpu-tp`. На GPU+CPU это корректность,
   а не скорость: каждый токен синхронизируется через host.
@@ -242,6 +253,13 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 - `tools/loadtest.py` (новый).
 - `README.md`, `docs/plan.md`, `docs/architecture.md`, этот файл.
 
+## Файлы, изменённые в сессии 7
+
+- `crates/backend-cpu/**` (новый крейт): W4A8-веса, AVX2-ядра, forward, `CpuBackend`.
+- `Cargo.toml`/`Cargo.lock` — член workspace, зависимости (`rayon`, `lfm-backend-cpu`).
+- `apps/server/src/main.rs` — `LFM_BACKEND=cpu`; `apps/bench/src/main.rs` — `cpu-port`.
+- `docs/backends.md` (новый), `README.md`, `docs/plan.md`, этот файл.
+
 ## Файлы, изменённые в сессии 6
 
 - `crates/backend-opencl/src/lib.rs` — `per_wg` по фактическому `sub_group_size`
@@ -255,7 +273,7 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 - `crates/backend-opencl/src/tp.rs` (новый) — full TP: `TpShard` (головы/FFN/словарь),
   `TpModel` (all-reduce/gather через host, синхронизация `x/hq/hs`).
 - `apps/server/src/main.rs` — загрузчик по `LFM_TIERS`/`LFM_TP` (composition root).
-- `apps/bench/src/main.rs` — `gpu-tp`.
+- `apps/bench/src/main.rs` — `gpu-tp`, `cpu-port`.
 - KV int8 (+Hadamard), unroll/fast-math, Q6-RGEMV и PB-варианты реализованы,
   замерены и полностью откачены.
 - `docs/plan.md`, этот файл — результаты экспериментов и PoCL-совместимости.
