@@ -102,6 +102,7 @@ struct Kernels {
     attn_split_b: Kernel,
     attn_combine_b: Kernel,
     attn_b_h: Kernel,
+    attn_b_h2: Kernel,
     attn_split_b_h: Kernel,
     attn_split_b_h4: Kernel,
 }
@@ -196,6 +197,7 @@ pub struct GpuModel {
     cache_on: bool,
     kv_f16: bool,
     attn4: bool,
+    attn2: bool,
     max_seqs: usize,
     seqs: Vec<Option<Sequence>>,
     logits_off: Option<usize>,
@@ -386,6 +388,7 @@ impl GpuModel {
             attn_split_b: Kernel::create(&program, "attention_split_b")?,
             attn_combine_b: Kernel::create(&program, "attention_combine_b")?,
             attn_b_h: Kernel::create(&program, "attention_b_h")?,
+            attn_b_h2: Kernel::create(&program, "attention_b_h2")?,
             attn_split_b_h: Kernel::create(&program, "attention_split_b_h")?,
             attn_split_b_h4: Kernel::create(&program, "attention_split_b_h4")?,
         };
@@ -407,6 +410,7 @@ impl GpuModel {
                 .map(|v| v != "f32")
                 .unwrap_or(true);
         let attn4 = std::env::var("LFM_ATTN4").map(|v| v != "0").unwrap_or(true);
+        let attn2 = std::env::var("LFM_ATTN2").map(|v| v != "0").unwrap_or(true);
         let bufs = Bufs {
             x: gpu.alloc::<f32>(h)?,
             h: gpu.alloc::<f32>(h)?,
@@ -506,6 +510,7 @@ impl GpuModel {
             cache_on,
             kv_f16,
             attn4,
+            attn2,
             max_seqs,
             seqs: (0..max_seqs).map(|_| None).collect(),
             logits_off: None,
@@ -1642,8 +1647,17 @@ impl GpuModel {
                         let span_max = if window > 0 { window.min(last) } else { last };
                         let splits = (span_max / 512).clamp(1, MAX_SPLITS);
                         if splits <= 1 {
+                            let use2 = self.attn2
+                                && self.kv_f16
+                                && head_dim == 128
+                                && heads % 4 == 0;
+                            let kernel = if use2 {
+                                &self.kernels.attn_b_h2
+                            } else {
+                                self.attn_b_kernel(false)
+                            };
                             self.gpu.launch(
-                                self.attn_b_kernel(false),
+                                kernel,
                                 ntok * (heads / 4) * 256,
                                 256,
                                 &[

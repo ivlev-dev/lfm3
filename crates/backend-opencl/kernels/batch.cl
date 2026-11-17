@@ -904,6 +904,100 @@ __kernel void attention_b_h(__global const float *q, __global const half *kbuf, 
     o[2u * lane + 1u] = (acc1 / l) * gs;
 }
 
+__kernel void attention_b_h2(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
+    uint lid = get_local_id(0);
+    uint lane = lid & 63u;
+    uint grp = lid >> 6;
+    uint hg = n_heads >> 2;
+    uint gid = get_group_id(0);
+    uint t = gid / hg;
+    uint head = (gid % hg) * 4u + grp;
+    if (t >= ntok) {
+        return;
+    }
+    __local float sred[512];
+    uint kvh = head / (n_heads / kv_heads);
+    uint len = pos_b[t] + 1u;
+    uint start = (window > 0u && len > window) ? len - window : 0u;
+    uint toff = tbl_off[t];
+    __global const float *qh = q + (ulong)t * n_heads * head_dim + head * head_dim;
+    float q0 = qh[2u * lane];
+    float q1 = qh[2u * lane + 1u];
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float scale = 1.0f / sqrt((float)head_dim);
+    uint kv_stride = kv_heads * head_dim;
+    uint pos = start;
+    for (; pos + 1u < len; pos += 2u) {
+        ulong slot0 = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
+        ulong slot1 = (ulong)((tbl[toff + ((pos + 1u) >> 5)] << 5) | ((pos + 1u) & 31u));
+        __global const half *kp0 = kbuf + slot0 * kv_stride + kvh * head_dim;
+        __global const half *kp1 = kbuf + slot1 * kv_stride + kvh * head_dim;
+        float2 k0 = vload_half2(lane, kp0);
+        float2 k1 = vload_half2(lane, kp1);
+        sred[lid] = q0 * k0.x + q1 * k0.y;
+        sred[256u + lid] = q0 * k1.x + q1 * k1.y;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint st = 32u; st > 0u; st >>= 1) {
+            if (lane < st) {
+                sred[lid] += sred[lid + st];
+                sred[256u + lid] += sred[256u + lid + st];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        __global const half *vp0 = vbuf + slot0 * kv_stride + kvh * head_dim;
+        __global const half *vp1 = vbuf + slot1 * kv_stride + kvh * head_dim;
+        float s0 = sred[grp * 64u] * scale;
+        float m_new = fmax(m, s0);
+        float corr = exp(m - m_new);
+        float wgt = exp(s0 - m_new);
+        l = l * corr + wgt;
+        float2 v0 = vload_half2(lane, vp0);
+        acc0 = acc0 * corr + wgt * v0.x;
+        acc1 = acc1 * corr + wgt * v0.y;
+        m = m_new;
+        float s1 = sred[256u + grp * 64u] * scale;
+        m_new = fmax(m, s1);
+        corr = exp(m - m_new);
+        wgt = exp(s1 - m_new);
+        l = l * corr + wgt;
+        float2 v1 = vload_half2(lane, vp1);
+        acc0 = acc0 * corr + wgt * v1.x;
+        acc1 = acc1 * corr + wgt * v1.y;
+        m = m_new;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (pos < len) {
+        ulong slots = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
+        __global const half *kp = kbuf + slots * kv_stride + kvh * head_dim;
+        float2 k = vload_half2(lane, kp);
+        sred[lid] = q0 * k.x + q1 * k.y;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint st = 32u; st > 0u; st >>= 1) {
+            if (lane < st) {
+                sred[lid] += sred[lid + st];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        float sv = sred[grp * 64u] * scale;
+        float m_new = fmax(m, sv);
+        float corr = exp(m - m_new);
+        float wgt = exp(sv - m_new);
+        l = l * corr + wgt;
+        __global const half *vp = vbuf + slots * kv_stride + kvh * head_dim;
+        float2 v = vload_half2(lane, vp);
+        acc0 = acc0 * corr + wgt * v.x;
+        acc1 = acc1 * corr + wgt * v.y;
+        m = m_new;
+    }
+    float gs = 1.0f / (1.0f + exp(-gate[t * n_heads + head]));
+    __global float *o = out + (ulong)t * n_heads * head_dim + head * head_dim;
+    o[2u * lane] = (acc0 / l) * gs;
+    o[2u * lane + 1u] = (acc1 / l) * gs;
+}
+
 __kernel void attention_split_b_h(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);
@@ -1276,3 +1370,4 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
         }
     }
 }
+
