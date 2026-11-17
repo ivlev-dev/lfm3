@@ -59,13 +59,17 @@ Env/CLI (composition root):
 - Дальше по CPU: AVX2 для Q6, блочный prefetch, f16-KV, отказ от аллокаций в forward,
   NEON-ветка (aarch64).
 
-## backend-vulkan
+## backend-vulkan (каркас готов)
 
-- `ash` (или `vulkano`), один device/queue, host-visible staging + device-local buffers.
-- Ядра — GLSL/HLSL → SPIR-V (build.rs / `shaderc`), порт GEMV Q4_K/Q6_K и attention;
-  push-constants для размеров, storage buffers для весов/KV.
-- Кэш шейдеров на диск (pipeline cache), MSAA не нужен.
-- Проверки: тот же parity-набор, что у OpenCL (`gpu-cmp`-аналог), затем A/B по tok/s.
+- `ash`, инстанс/физическое устройство (RADV), compute-очередь, host-visible
+  SSBO-буферы, descriptor sets, push-constants.
+- Шейдеры — GLSL, сборка в SPIR-V через `glslc` (build.rs); первое ядро
+  `gemv_q4.comp` (Q4_K, W4A8) уже даёт **бит-в-бит** результат с CPU на реальном
+  тензоре (`vulkan-gemv`, max_rel ≤ 1.6e-6), synthetic/real тесты в крейте.
+- CLI: `vulkan-info`, `vulkan-gemv --rows N`.
+- Дальше: Q6_K-GEMV, нормы/silu/quant, attention/KV, lm_head, сборка полного
+  forward; затем переход с host-visible на device-local + staging, subgroup-редукции,
+  несколько строк на workgroup и pipeline cache. Проверки — тот же parity-набор.
 
 ## backend-rocm
 

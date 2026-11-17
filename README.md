@@ -60,6 +60,10 @@
   Rayon по строкам. `cpu-port` даёт те же greedy-ids, что GPU Q4 (8 токенов),
   ~6.9 tok/s на i5-10400; сервер запускается с `LFM_BACKEND=cpu`. Архитектура и
   план Vulkan/ROCm — `docs/backends.md`.
+- **Vulkan-каркас готов.** `backend-vulkan` (`ash` + GLSL→SPIR-V через `glslc`):
+  устройство/память/пайплайн, первое ядро Q4_K-GEMV (W4A8) — бит-в-бит с CPU
+  (`vulkan-gemv`, max_rel ≤ 1.6e-6), `vulkan-info`. Дальше — остальные ядра и
+  полный forward бэкенда.
 - **M6 (tensor parallel) — готов.** Full TP на двух устройствах: q/k/v/g и gate —
   по головам, `attn_output` — по столбцам, FFN — `up/gate` по строкам и `down`
   по столбцам, lm_head — по словарю с host-gather. `LFM_TP=0/1`/`gpu-tp`: ids
@@ -87,7 +91,7 @@
   посчитанный при активном декоде, даёт повтору reused 160 токенов с тем же ответом.
   Два TUI: `gpu-chat --tui` (in-process: скролл, история ввода, resize, Ctrl+C-стоп)
   и `lfm-tui` (`apps/tui`, клиент к серверу: SSE, `/metrics` в статусе, `/save`/`/load`).
-- **Тесты:** 248 зелёных (`cargo test --workspace`), сборка без предупреждений.
+- **Тесты:** 251 зелёный (`cargo test --workspace`), сборка без предупреждений.
 
 ## Что дальше
 
@@ -139,6 +143,7 @@ crates/
                     `InferenceBackend`/`TokenizerPort`, `Generate`
   backend-cpu/      pure Rust CPU: W4A8, AVX2 (NEON — позже), Rayon
   backend-opencl/   GPU через OpenCL (rusticl/PoCL)
+  backend-vulkan/   GPU через Vulkan compute (каркас + Q4-GEMV)
   infra-gguf/       парсер GGUF + адаптер метаданных
   infra-quant/      эталонная деквантизация Q4_K/Q6_K/Q8_0
   infra-cpu/        CPU-эталон forward (f32)
@@ -178,7 +183,9 @@ cargo run --release -p lfm-bench -- gpu-gen --tokens 64      # текст + tok/
 cargo run --release -p lfm-bench -- gpu-port --tokens 24     # через порты + Generate
 cargo run --release -p lfm-bench -- gpu-pp --tokens 8 --tiers 20/80/0  # PP: GPU+PoCL
 cargo run --release -p lfm-bench -- gpu-tp --tokens 8 --devices 0/1      # full TP
-cargo run --release -p lfm-bench -- cpu-port --tokens 8                   # CPU W4A8/AVX2cargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
+cargo run --release -p lfm-bench -- cpu-port --tokens 8                   # CPU W4A8/AVX2
+cargo run --release -p lfm-bench -- vulkan-info                           # Vulkan устройства
+cargo run --release -p lfm-bench -- vulkan-gemv --rows 8                  # Q4-GEMV vs CPUcargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
 cargo run --release -p lfm-bench -- gpu-chat --user "What is the capital of Japan?"
 cargo run --release -p lfm-bench -- gpu-multi --seqs 6 --tokens 48   # 6 стримов
 cargo run --release -p lfm-bench -- gpu-cmp --ids 597,5205,302 --batch 5  # batch == seq

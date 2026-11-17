@@ -169,6 +169,17 @@ enum Cmd {
         #[arg(long, default_value_t = 2048)]
         ctx: usize,
     },
+    VulkanInfo,
+    VulkanGemv {
+        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
+        model: PathBuf,
+        #[arg(long, default_value = "blk.2.attn_q.weight")]
+        tensor: String,
+        #[arg(long, default_value_t = 4)]
+        rows: usize,
+        #[arg(long)]
+        ones: bool,
+    },
     CpuPort {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -449,6 +460,13 @@ fn main() -> Result<()> {
             devices,
             ctx,
         } => gpu_tp(&model, &tokenizer, &prompt, tokens, &devices, ctx),
+        Cmd::VulkanInfo => vulkan_info(),
+        Cmd::VulkanGemv {
+            model,
+            tensor,
+            rows,
+            ones,
+        } => vulkan_gemv(&model, &tensor, rows, ones),
         Cmd::CpuPort {
             model,
             tokenizer,
@@ -2770,6 +2788,74 @@ __kernel void probe(__global uint *out) {
             v[0], v[1], v[2], v[3], v[4], v[5], v[6]
         );
     }
+    Ok(())
+}
+
+fn vulkan_info() -> Result<()> {
+    for d in lfm_backend_vulkan::Vk::devices()? {
+        println!(
+            "vulkan device {}: {} ({}, {} MiB)",
+            d.index, d.name, d.kind, d.memory_mb
+        );
+    }
+    Ok(())
+}
+
+fn quantize_x(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let groups = x.len().div_ceil(32);
+    let mut q = vec![0i8; x.len()];
+    let mut s = vec![0.0f32; groups];
+    for g in 0..groups {
+        let start = g * 32;
+        let end = (start + 32).min(x.len());
+        let amax = x[start..end].iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let sc = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        s[g] = sc;
+        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        for (i, &v) in x[start..end].iter().enumerate() {
+            q[start + i] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    (q, s)
+}
+
+fn vulkan_gemv(model: &PathBuf, tensor: &str, rows: usize, ones: bool) -> Result<()> {
+    let gguf = lfm_gguf::GgufFile::open(model)?;
+    let info = gguf
+        .tensor(tensor)
+        .ok_or_else(|| anyhow!("tensor {tensor} not found"))?
+        .clone();
+    if info.ggml_type != lfm_gguf::GgmlType::Q4_K {
+        return Err(anyhow!("only Q4_K supported"));
+    }
+    let cols = info.dims[0] as usize;
+    let bytes = gguf.tensor_bytes(tensor)?;
+    let x = make_x(cols);
+    let (xq, xs) = if ones {
+        (vec![127i8; cols], vec![1.0f32 / 127.0; cols / 32])
+    } else {
+        quantize_x(&x)
+    };
+    let vk = lfm_backend_vulkan::Vk::open(None)?;
+    println!("device: {}", vk.name());
+    let gemv = lfm_backend_vulkan::GemvQ4::new(&vk)?;
+    let got = gemv.run(&vk, &bytes, &xq, &xs, rows, cols, 0)?;
+    let row_bytes = cols / 256 * 144;
+    let mut max_rel = 0.0f32;
+    for (r, &g) in got.iter().enumerate() {
+        let deq = lfm_quant::dequant_row_q4_k(&bytes[r * row_bytes..(r + 1) * row_bytes], cols)?;
+        let expect: f32 = deq
+            .iter()
+            .enumerate()
+            .map(|(d, v)| v * f32::from(xq[d]) * xs[d / 32])
+            .sum();
+        let rel = (g - expect).abs() / expect.abs().max(1e-6);
+        max_rel = max_rel.max(rel);
+        if r < 2 {
+            println!("row {r}: vulkan {g:.6} cpu {expect:.6} rel {rel:.2e}");
+        }
+    }
+    println!("rows {rows}: max_rel {max_rel:.2e}");
     Ok(())
 }
 
