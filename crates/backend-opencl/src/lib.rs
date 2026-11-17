@@ -103,6 +103,7 @@ struct Kernels {
     attn_combine_b: Kernel,
     attn_b_h: Kernel,
     attn_split_b_h: Kernel,
+    attn_split_b_h4: Kernel,
 }
 
 struct Bufs {
@@ -194,6 +195,7 @@ pub struct GpuModel {
     cache: RadixCache,
     cache_on: bool,
     kv_f16: bool,
+    attn4: bool,
     max_seqs: usize,
     seqs: Vec<Option<Sequence>>,
     logits_off: Option<usize>,
@@ -385,6 +387,7 @@ impl GpuModel {
             attn_combine_b: Kernel::create(&program, "attention_combine_b")?,
             attn_b_h: Kernel::create(&program, "attention_b_h")?,
             attn_split_b_h: Kernel::create(&program, "attention_split_b_h")?,
+            attn_split_b_h4: Kernel::create(&program, "attention_split_b_h4")?,
         };
         let h = cfg.hidden_size;
         let qd = cfg.q_dim();
@@ -403,6 +406,7 @@ impl GpuModel {
             && std::env::var("LFM_KV")
                 .map(|v| v != "f32")
                 .unwrap_or(true);
+        let attn4 = std::env::var("LFM_ATTN4").map(|v| v != "0").unwrap_or(true);
         let bufs = Bufs {
             x: gpu.alloc::<f32>(h)?,
             h: gpu.alloc::<f32>(h)?,
@@ -501,6 +505,7 @@ impl GpuModel {
             cache: RadixCache::new(kv_blocks),
             cache_on,
             kv_f16,
+            attn4,
             max_seqs,
             seqs: (0..max_seqs).map(|_| None).collect(),
             logits_off: None,
@@ -1658,9 +1663,21 @@ impl GpuModel {
                                 ],
                             )?;
                         } else {
+                            let use4 = self.attn4
+                                && self.kv_f16
+                                && heads == kv_heads * 4
+                                && head_dim == 128;
+                            let (kernel, grid) = if use4 {
+                                (
+                                    &self.kernels.attn_split_b_h4,
+                                    ntok * kv_heads * splits * 64,
+                                )
+                            } else {
+                                (self.attn_b_kernel(true), ntok * heads * splits * 64)
+                            };
                             self.gpu.launch(
-                                self.attn_b_kernel(true),
-                                ntok * heads * splits * 64,
+                                kernel,
+                                grid,
                                 64,
                                 &[
                                     Arg::Mem(self.bufs.qb.get()),
