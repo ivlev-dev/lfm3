@@ -166,6 +166,7 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
         return end_sse(&mut stream);
     }
     let mut text = String::new();
+    let mut thinking: Option<String> = None;
     let mut tool_calls = Vec::new();
     let mut finish_reason = "stop";
     let mut usage = (0usize, 0usize);
@@ -173,12 +174,14 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
         match event {
             Event::Final {
                 text: t,
+                thinking: th,
                 tool_calls: calls,
                 finish_reason: reason,
                 prompt_tokens,
                 completion_tokens,
             } => {
                 text = t;
+                thinking = th;
                 tool_calls = calls;
                 finish_reason = reason;
                 usage = (prompt_tokens, completion_tokens);
@@ -190,7 +193,14 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
     write_json(
         &mut stream,
         200,
-        &meta.message_response(&text, &tool_calls, finish_reason, usage.0, usage.1),
+        &meta.message_response(
+            &text,
+            thinking.as_deref(),
+            &tool_calls,
+            finish_reason,
+            usage.0,
+            usage.1,
+        ),
     )
 }
 

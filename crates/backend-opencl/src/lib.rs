@@ -169,6 +169,12 @@ pub struct Sequence {
     tbl: Buffer<u32>,
     block_table: Vec<u32>,
     tbl_dirty: bool,
+    pending: Option<PendingPrefill>,
+}
+
+struct PendingPrefill {
+    hashes: Vec<u64>,
+    reused_pages: usize,
 }
 
 struct LayerBufs {
@@ -793,6 +799,7 @@ impl GpuModel {
             tbl,
             block_table: Vec::new(),
             tbl_dirty: false,
+            pending: None,
         });
         Ok(slot)
     }
@@ -1389,7 +1396,35 @@ impl GpuModel {
         let token_host: Vec<u32> = reqs.iter().map(|r| r.token).collect();
         let snap_host: Vec<u32> = match snap {
             Some(s) if self.layers.iter().any(|l| l.snap.is_some()) => s.to_vec(),
-            _ => vec![u32::MAX; ntok],
+            Some(_) => vec![u32::MAX; ntok],
+            None => {
+                if self.cache_on && self.layers.iter().any(|l| l.snap.is_some()) {
+                    reqs.iter()
+                        .map(|r| {
+                            if (r.pos + 1) % KV_PAGE != 0 {
+                                return u32::MAX;
+                            }
+                            let pending = self
+                                .seqs
+                                .get(r.slot)
+                                .and_then(|s| s.as_ref())
+                                .and_then(|s| s.pending.as_ref())
+                                .is_some();
+                            if !pending {
+                                return u32::MAX;
+                            }
+                            self.seqs
+                                .get(r.slot)
+                                .and_then(|s| s.as_ref())
+                                .and_then(|s| s.block_table.get(r.pos / KV_PAGE))
+                                .copied()
+                                .unwrap_or(u32::MAX)
+                        })
+                        .collect()
+                } else {
+                    vec![u32::MAX; ntok]
+                }
+            }
         };
         unsafe {
             self.gpu.queue.enqueue_write_buffer(&mut self.bufs.tokens, 1, 0, &token_host, &[])?;
@@ -2263,6 +2298,27 @@ impl GpuModel {
     }
 
     pub fn prefill(&mut self, slot: usize, prompt: &[u32], need_logits: bool) -> Result<usize> {
+        let reused = self.prefill_begin(slot, prompt)?;
+        let mut pos = reused;
+        while pos < prompt.len() {
+            let end = (pos + self.pb).min(prompt.len());
+            let reqs: Vec<StepReq> = (pos..end)
+                .map(|p| StepReq {
+                    slot,
+                    token: prompt[p],
+                    pos: p,
+                })
+                .collect();
+            let last = end == prompt.len();
+            let row = last.then_some(reqs.len() - 1);
+            self.forward_impl(&reqs, need_logits && last, row, None, None)?;
+            pos = end;
+        }
+        self.prefill_finish(slot)?;
+        Ok(reused)
+    }
+
+    pub fn prefill_begin(&mut self, slot: usize, prompt: &[u32]) -> Result<usize> {
         if prompt.is_empty() {
             return Err(anyhow!("empty prompt"));
         }
@@ -2275,6 +2331,12 @@ impl GpuModel {
         }
         if self.seqs.get(slot).map(|s| s.is_none()).unwrap_or(true) {
             return Err(anyhow!("sequence slot {slot} is empty"));
+        }
+        if let Some(pending) = self.seqs[slot]
+            .as_ref()
+            .and_then(|s| s.pending.as_ref())
+        {
+            return Ok(pending.reused_pages * KV_PAGE);
         }
         let fresh = self
             .seqs
@@ -2313,51 +2375,39 @@ impl GpuModel {
             self.restore_conv(slot, page)?;
         }
         self.seq_ensure(slot, prompt.len())?;
-        let mut snap = vec![u32::MAX; prompt.len() - reused];
-        if self.cache_on {
-            for (i, hint) in snap.iter_mut().enumerate() {
-                let pos = reused + i;
-                if (pos + 1) % KV_PAGE == 0 {
-                    if let Some(seq) = self.seqs[slot].as_ref() {
-                        *hint = seq.block_table[pos / KV_PAGE];
-                    }
-                }
-            }
-        }
-        let mut pos = reused;
-        while pos < prompt.len() {
-            let end = (pos + self.pb).min(prompt.len());
-            let reqs: Vec<StepReq> = (pos..end)
-                .map(|p| StepReq {
-                    slot,
-                    token: prompt[p],
-                    pos: p,
-                })
-                .collect();
-            let last = end == prompt.len();
-            let row = Some(reqs.len() - 1);
-            self.forward_impl(
-                &reqs,
-                need_logits && last,
-                if last { row } else { None },
-                None,
-                Some(&snap[pos - reused..end - reused]),
-            )?;
-            pos = end;
-        }
-        if self.cache_on {
-            for (i, &hash) in hashes.iter().enumerate().skip(reused_pages) {
-                let page = self
-                    .seqs
-                    .get(slot)
-                    .and_then(|s| s.as_ref())
-                    .and_then(|s| s.block_table.get(i))
-                    .copied()
-                    .ok_or_else(|| anyhow!("missing page {i}"))? as usize;
-                self.cache.publish(page, hash);
-            }
+        if let Some(seq) = self.seqs[slot].as_mut() {
+            seq.pending = Some(PendingPrefill {
+                hashes,
+                reused_pages,
+            });
         }
         Ok(reused)
+    }
+
+    pub fn prefill_finish(&mut self, slot: usize) -> Result<()> {
+        let Some(pending) = self
+            .seqs
+            .get_mut(slot)
+            .and_then(|s| s.as_mut())
+            .and_then(|s| s.pending.take())
+        else {
+            return Ok(());
+        };
+        if !self.cache_on {
+            return Ok(());
+        }
+        let pages = self
+            .seqs
+            .get(slot)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.block_table.clone())
+            .unwrap_or_default();
+        for (i, &hash) in pending.hashes.iter().enumerate().skip(pending.reused_pages) {
+            if let Some(&page) = pages.get(i) {
+                self.cache.publish(page as usize, hash);
+            }
+        }
+        Ok(())
     }
 
     fn restore_conv(&mut self, slot: usize, page: usize) -> Result<()> {

@@ -66,6 +66,7 @@ pub enum Event {
     ToolCall(ToolCall),
     Final {
         text: String,
+        thinking: Option<String>,
         tool_calls: Vec<ToolCall>,
         finish_reason: &'static str,
         prompt_tokens: usize,
@@ -256,6 +257,7 @@ struct RequestState {
     tokens: Vec<u32>,
     printed: String,
     content: String,
+    thinking: String,
     sent: usize,
     stop_at: Option<usize>,
     next_token: Option<u32>,
@@ -301,9 +303,14 @@ impl RequestState {
             Some(session) => session.feed(&delta),
             None => Vec::new(),
         };
+        self.apply_session_events(events)
+    }
+
+    fn apply_session_events(&mut self, events: Vec<SessionEvent>) -> TokenFlow {
         for event in events {
             match event {
                 SessionEvent::Thinking(text) => {
+                    self.thinking.push_str(&text);
                     if self.tx.send(Event::Thinking(text)).is_err() {
                         return TokenFlow::Cancelled;
                     }
@@ -589,6 +596,7 @@ impl Worker {
                 tokens: Vec::new(),
                 printed: String::new(),
                 content: String::new(),
+                thinking: String::new(),
                 sent: 0,
                 stop_at: None,
                 next_token: None,
@@ -606,6 +614,21 @@ impl Worker {
                     Ok(slot) => {
                         if let Some(state) = self.reqs.get_mut(&id) {
                             state.slot = slot;
+                        }
+                        let prompt = self.reqs.get(&id).map(|s| s.prompt.clone());
+                        let reused = match prompt {
+                            Some(prompt) => match self.gpu.prefill_begin(slot, &prompt) {
+                                Ok(reused) => reused,
+                                Err(e) => {
+                                    self.fail_request(id, format!("{e}"));
+                                    continue;
+                                }
+                            },
+                            None => 0,
+                        };
+                        if reused > 0 {
+                            self.sched.advance_prefill(id, reused);
+                            self.metrics.reuse(reused);
                         }
                     }
                     Err(e) => self.fail_request(id, format!("{e}")),
@@ -737,6 +760,13 @@ impl Worker {
                             continue;
                         }
                     };
+                    let slot = self.reqs.get(&row.id).map(|state| state.slot);
+                    if let Some(slot) = slot {
+                        if let Err(e) = self.gpu.prefill_finish(slot) {
+                            self.fail_request(row.id, format!("{e}"));
+                            continue;
+                        }
+                    }
                     self.sched.complete_prefill(row.id);
                     self.accept_token(row.id, logits);
                 }
@@ -779,6 +809,10 @@ impl Worker {
         };
         self.release_slot(&mut state);
         self.sched.finish(id);
+        if let Some(mut session) = state.session.take() {
+            let events = session.finish();
+            let _ = state.apply_session_events(events);
+        }
         let final_end = state.stop_at.unwrap_or(state.content.len());
         let mut cut = final_end.max(state.sent);
         while cut > state.sent && !state.content.is_char_boundary(cut) {
@@ -799,6 +833,11 @@ impl Worker {
         };
         let _ = state.tx.send(Event::Final {
             text,
+            thinking: if state.thinking.is_empty() {
+                None
+            } else {
+                Some(state.thinking.clone())
+            },
             tool_calls: state.tool_calls.clone(),
             finish_reason,
             prompt_tokens,
@@ -885,6 +924,7 @@ mod tests {
             tokens: Vec::new(),
             printed: String::new(),
             content: String::new(),
+            thinking: String::new(),
             sent: 0,
             stop_at: None,
             next_token: None,

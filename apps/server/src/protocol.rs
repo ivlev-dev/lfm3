@@ -321,6 +321,7 @@ impl CompletionMeta {
     pub fn message_response(
         &self,
         text: &str,
+        thinking: Option<&str>,
         tool_calls: &[ToolCall],
         finish_reason: &str,
         prompt_tokens: usize,
@@ -332,6 +333,9 @@ impl CompletionMeta {
             Value::String(text.to_string())
         };
         let mut message = json!({ "role": "assistant", "content": content });
+        if let Some(thinking) = thinking.filter(|t| !t.is_empty()) {
+            message["reasoning_content"] = Value::String(thinking.to_string());
+        }
         if !tool_calls.is_empty() {
             let calls: Vec<Value> = tool_calls
                 .iter()
@@ -507,7 +511,7 @@ mod tests {
         assert_eq!(v["choices"][0]["delta"]["content"], "hi");
         assert!(v["choices"][0]["finish_reason"].is_null());
 
-        let resp = meta.message_response("hello", &[], "stop", 3, 2);
+        let resp = meta.message_response("hello", None, &[], "stop", 3, 2);
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["content"], "hello");
@@ -643,7 +647,7 @@ mod tests {
             name: "weather".into(),
             arguments: json!({"city": "Paris"}),
         }];
-        let resp = meta.message_response("", &calls, "tool_calls", 5, 7);
+        let resp = meta.message_response("", None, &calls, "tool_calls", 5, 7);
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
         assert!(v["choices"][0]["message"]["content"].is_null());
