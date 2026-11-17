@@ -38,7 +38,9 @@
   (цель 300 на чанке ≥ 4096; PB 8–10 упирается в регистры и замерен как −31/−54%).
   Тайлинг prefill-attention (общий K/V на 4 q-головы в split-ядре + 2 позиции
   за итерацию в sliding) дал **+2.8–3.6%** на 8192 (3/3 пары, логиты без изменений);
-  отключение — `LFM_ATTN4=0`, `LFM_ATTN2=0`.
+  отключение — `LFM_ATTN4=0`, `LFM_ATTN2=0`. Аудит батчевых GEMV: workgroup 256→64
+  и RGEMV 4→5 дали ещё **+6.8%** на 8192 (3/3 пары); хвост строк при RGEMV, не
+  делящем `rows`, теперь пересчитывается с перекрытием, а не теряется.
 - **Сэмплинг и чат работают.** `gpu-gen` принимает temperature/top-k/top-p/repeat-penalty/seed,
   `gpu-chat` рендерит `chat_template.jinja`, стримит ответ и разбирает `<think`/`<tool_call>`
   через `ChatSession`. Замер: 28-токенный промпт + 45 токенов ответа — prefill 0.16 с,
@@ -64,9 +66,8 @@
 [`docs/TODO.md`](docs/TODO.md). Кратко:
 
 1. **P0. Prefill 8192 → 300 tok/s** (сейчас 152–159): тайловый prefill-attention уже
-   сделан (+2.8–3.6% на 8192), attention теперь 23% профиля, `q4p_b` — 61%.
-   Остаток — батчевый Q4-GEMV: нужен другой способ распаковки/загрузки (SoA и
-   фьюжны запусков замерены и откачены).
+   сделан (+2.8–3.6% на 8192), аудит батчевых GEMV дал ещё +6.8% (WG=64, RGEMV=5).
+   Дальше — x-вектор в LDS и новые схемы загрузок Q4; цель пока не достигнута.
 2. **P1. Decode 8192 → 70 tok/s**: KV fp16 уже даёт −50% VRAM под кэш и +4–10%
    к decode; остаток упирается в GEMV (в текущем состоянии машины int8-пик
    8.8 TOPS против 12.3 в M0, поэтому абсолютные tok/s ниже записанных ранее).
@@ -166,7 +167,9 @@ cargo run --release -p lfm-bench -- gpu-embed --id 597       # сверка от
 `LFM_KV=f32` (хранить KV во float вместо half — для A/B и отладки),
 `LFM_FUSE=0` (не сливать q/k/gate GEMV), `LFM_ATTN4=0` (не шарить K/V на 4 q-головы
 в split prefill-attention), `LFM_ATTN2=0` (не обрабатывать пары позиций в sliding
-prefill-attention), `LFM_PREFILL_BUDGET` (prefill-токенов
+prefill-attention), `LFM_WG` / `LFM_WG_B` (workgroup decode/batch GEMV, по умолчанию
+256/64), `LFM_RGEMV` / `LFM_RGEMV_B` (строк на подгруппу decode/batch, 4/5),
+`LFM_PREFILL_BUDGET` (prefill-токенов
 на шаг планировщика, по умолчанию 12), `LFM_SCHED_LOG=1` (лог шагов планировщика).
 
 ## Ключевые решения (M0)
