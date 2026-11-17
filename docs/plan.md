@@ -22,7 +22,7 @@
 - 13 членов workspace: 10 крейтов (`domain`, `application`, `infra-gguf/quant/cpu/hf/
   tokenizer/chat/opencl`, `backend-opencl`) и 3 приложения (`apps/bench`, `apps/server`,
   `apps/tui`).
-- 233 теста зелёные, сборка без предупреждений.
+- 239 тестов зелёных, сборка без предупреждений.
 - KV хранится в fp16 (`LFM_KV=f32` — старый путь): VRAM под кэш вдвое меньше,
   A/B на 8192 даёт +4–10% decode.
 - decode: 82.7 / 74.8 / 71.4 / 65.5 tok/s на ctx 64 / 512 / 4096 / 8192
@@ -148,7 +148,7 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    main ждёт готовности), очередь запросов через канал. Эндпоинты: `GET /health`,
    `GET /v1/models`, `POST /v1/chat/completions` в обычном и потоковом виде
    (`Transfer-Encoding: chunked`, формат `chat.completion.chunk` + `[DONE]`),
-   `GET /ws` (WebSocket) и HTTP/2 без TLS (h2c).
+   `POST /v1/completions`, `GET /ws` (WebSocket) и HTTP/2 без TLS (h2c).
    Поддержаны `stream`, `max_tokens`, `temperature`, `top_k`, `top_p`, `stop`
    (строка или массив, с удержанием хвоста, чтобы не отдать кусок стопа), `seed`,
    `chat_template_kwargs.enable_thinking` (thinking уходит в `reasoning_content`),
@@ -188,6 +188,15 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    (active/waiting, KV used/free, cache hits, TTFT, tok/s), `/save`/`/load`.
    59 тестов крейта, pty-смоук против живого сервера: «Paris», `lfm3 ctx 4096`,
    182 мс TTFT, 59 tok/s, «прервано» без выхода.
+6. **Сделано: tools/`tool_calls` и `/v1/completions` (P3, сессия 4).**
+   Protocol: `tools`/`tool_choice` (auto/none), `tool_calls`+`tool_call_id` в истории,
+   `finish_reason: tool_calls`, стриминговые дельты `tool_calls` по индексам.
+   Engine: tools уходят в чат-шаблон, `SessionEvent::ToolCall` транслируется наружу,
+   `Final` несёт `tool_calls` и причину; raw-режим для completions (без шаблона и
+   без разбора `<think>`/`<tool_call>`). `/v1/completions`: строка или массив промптов,
+   стрим (один промпт), `usage`, те же сэмплинг-параметры; HTTP/1.1 и h2c.
+   E2E `openai-python` 3.52: chat, stream, tools (не-stream и stream), completions
+   (не-stream и stream), многоходовой tool-ответ. Тестов стало 239.
 6. **Сделано: `GET /metrics`** (HTTP/1.1 и h2): атомарный снимок из воркера
    (`active/waiting`, `steps`, `avg_step_ms`, KV-страницы, `cache_hits`,
    `reused_tokens`, `uptime_s`), строгая JSON-схема, тесты на сериализацию и роуты.
@@ -229,7 +238,7 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
   `gpu-check` (CPU-эталон). Для бит-точных задач обязательны cos и top-5.
 - Любая оптимизация сначала измеряется на целевой точке (8192 / 6 стримов), потом
   либо остаётся, либо удаляется (как PB=7/8 и 4-головое внимание).
-- Один прогон тестов в конце: `cargo test --workspace` (233 теста) + сборка без
+- Один прогон тестов в конце: `cargo test --workspace` (239 тестов) + сборка без
   предупреждений.
 
 ## M0 — итог

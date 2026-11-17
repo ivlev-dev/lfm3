@@ -1,11 +1,11 @@
 # TODO — продолжить с пустой сессии
 
-Состояние на 17.11.2026 (конец третьей сессии подряд). Всё собирается и тестируется:
+Состояние на 17.11.2026 (конец четвёртой сессии подряд). Всё собирается и тестируется:
 
 ```bash
 cd /home/ivlev98/Проекты/PC/lfm3
 cargo build --release --workspace          # без предупреждений
-cargo test --workspace                     # 233 теста
+cargo test --workspace                     # 239 тестов
 ```
 
 `main` = `origin/main`, рабочее дерево чистое, незакоммиченных экспериментов нет.
@@ -44,6 +44,15 @@ cargo test --workspace                     # 233 теста
 | WG батчевых GEMV | 256→64: на 8192 128 vs 256 +2.9…+5.8% (3/3), 128→64 ещё +0.1…+2.3% (9/9 на 512/2048/8192); decode оставлен на 256 (`LFM_WG_B`) |
 | RGEMV batch | 4→5: 8192 +6.2…+9.0% (3/3, медиана +6.8%), 512 +3.0…+8.1%; decode — 4; найдена и исправлена потеря хвостовых строк при `rows % RGEMV != 0` (`LFM_RGEMV_B`) |
 | Итого сессии | против исходной конфигурации: prefill 8192 +14.9%, 512 +14.9%, агрегат 6 стримов +12% (3/3 пары во всех режимах) |
+
+## Сессия 4 (P3: tools и completions)
+
+| Блок | Итог |
+|---|---|
+| tools в chat | `tools`/`tool_choice` в запросе, `tool_calls`/`tool_call_id` в истории, рендер шаблона с tools, `finish_reason: tool_calls`, стриминговые дельты `tool_calls` по индексам; `/ws` тоже отдаёт `tool_call` |
+| `/v1/completions` | raw-режим движка (без шаблона и разбора тегов), строка или массив промптов, stream (один промпт), `usage`, HTTP/1.1 и h2c |
+| E2E | `openai-python` 3.52.0: chat, stream, tools (обычный/стрим), completions (обычный/стрим), многоходовой tool-ответ; curl по h2c |
+| Тесты | 239 зелёных (+6 protocol: tools, tool-история, форма ответа/дельт, completions) |
 
 ## Проверки, которые уже прогонялись (и чем повторять)
 
@@ -117,13 +126,10 @@ P1 — только после перемера на простое.
 
 ### 4. P3 — остаток M5
 
-- `tools`/`tool_calls` в запросе и ответе OpenAI API, `/v1/completions`.
-- e2e openai-python (обычный ответ, стриминг, thinking) — пока проверено curl/loadtest.
-- Chunked prefill при активных декодах **не публикует** страницы в радикс-кэш: нужен
-  `GpuModel::prefill_chunk(slot, tokens, pos0, need_logits)` с публикацией блоков.
-- h2: `wait_for_window` игнорирует pipelined HEADERS во время ожидания окна —
-  буферизовать или отвечать ошибкой (для OpenAI-клиентов не критично).
-- TLS не поддерживается (h2c по prior knowledge) — по требованию.
+- **Сделано (сессия 4)**: `tools`/`tool_calls`, `/v1/completions`, e2e openai-python.
+- Осталось: chunked prefill при активных декодах **не публикует** страницы в радикс-кэш
+  (нужен `GpuModel::prefill_chunk(slot, tokens, pos0, need_logits)` с публикацией);
+  h2 `wait_for_window` игнорирует pipelined HEADERS; TLS не поддерживается (h2c).
 
 ### 5. Выбор устройства / CPU
 
@@ -156,6 +162,9 @@ P1 — только после перемера на простое.
   последнюю группу с перекрытием (иначе терялись строки); 4p-ядро `q4x4p_b` оставлено
   на RGEMV=4 — его группы не должны пересекать границы сегментов q/k/v/g (qd/kvg/heads
   делятся на 4, но не на 5).
+- **`/v1/completions` — raw-режим**: без чат-шаблона и без BOS (`encode(..., false)`),
+  поэтому для instruct-модели это чистое продолжение текста; для диалогов нужен
+  `/v1/chat/completions`. Стрим поддерживает только один промпт.
 
 ## Запуск
 
@@ -186,6 +195,16 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 - `apps/tui/**` (новый крейт), корневой `Cargo.toml`.
 - `tools/loadtest.py` (новый).
 - `README.md`, `docs/plan.md`, `docs/architecture.md`, этот файл.
+
+## Файлы, изменённые в сессии 4
+
+- `apps/server/src/protocol.rs` — tools/tool_calls, tool_choice, finish_reason
+  `tool_calls`, `CompletionRequest`, формы ответов/дельт и 6 новых тестов.
+- `apps/server/src/engine.rs` — tools в шаблоне, `Event::ToolCall`, `Final` с
+  `tool_calls`/`finish_reason`, raw-режим, `ChatJob::chat/completion`.
+- `apps/server/src/main.rs`, `h2.rs` — маршрут `/v1/completions`, tools и tool-дельты
+  в HTTP/1.1, h2c и WebSocket.
+- `README.md`, `docs/plan.md`, этот файл.
 
 ## Файлы, изменённые в сессии 3
 

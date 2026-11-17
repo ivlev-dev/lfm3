@@ -50,16 +50,19 @@
 - **M1 (эталон/токенизация) — почти готов.** CPU-эталон LFM3 (f32) генерирует связный
   текст; найден и исправлен сдвиг conv-ядра в GGUF. Точный token-parity с llama.cpp
   ещё не достигнут (см. `docs/plan.md`); инструменты сверки — в `tools/oracle/`.
-- **M5 (сервер, планировщик и TUI) — готов, кроме tools.** `lfm-server` отдаёт
-  `/v1/models`, `/v1/chat/completions` (обычный ответ и SSE, stop, usage, thinking),
-  `/metrics` (телеметрия движка), `/ws` и HTTP/2 h2c с flow control.
+- **M5 (сервер, планировщик и TUI) — готов.** `lfm-server` отдаёт
+  `/v1/models`, `/v1/chat/completions` (обычный ответ и SSE, stop, usage, thinking,
+  `tools`/`tool_calls` с `finish_reason: tool_calls`), `/v1/completions` (строка или
+  массив промптов, стрим), `/metrics` (телеметрия движка), `/ws` и HTTP/2 h2c
+  с flow control. История с assistant-`tool_calls` и `role: tool` проходит через
+  шаблон; e2e проверен `openai-python` (chat, stream, tools, completions).
   Планировщик continuous batching (`crates/application/src/scheduler.rs`):
   общий `step_mixed` на все активные декоды, chunked prefill, admission по свободным
   KV-страницам, отмена по разрыву соединения; нагрузка 6×24 — 45 tok/s агрегата,
   0 ошибок, второй запрос стартует до конца первого.
   Два TUI: `gpu-chat --tui` (in-process: скролл, история ввода, resize, Ctrl+C-стоп)
   и `lfm-tui` (`apps/tui`, клиент к серверу: SSE, `/metrics` в статусе, `/save`/`/load`).
-- **Тесты:** 233 зелёных (`cargo test --workspace`), сборка без предупреждений.
+- **Тесты:** 239 зелёных (`cargo test --workspace`), сборка без предупреждений.
 
 ## Что дальше
 
@@ -78,8 +81,9 @@
    (−31/−54%, спиллы). SoA-раскладка Q4_K замерена и откачена (−4–5% prefill,
    −5% decode 2048). Слияния запусков замерены и откачены (~1%: запуск ~4–5 мкс,
    а не 28). Остаток — ALU батчевого GEMV.
-4. **P3. Остаток M5**: tools/`tool_calls` в запросе и ответе, `/v1/completions`;
-   нагрузочные метрики очереди в TUI уже есть через `/metrics`.
+4. **P3. Остаток M5**: e2e openai-python уже покрыт (chat/stream/tools/completions);
+   остались публикация страниц при chunked prefill в радикс-кэш, pipelined HEADERS
+   в h2 `wait_for_window` и TLS по требованию.
 5. **P4–P6. M6/M7 и остаток M1**: 3-tier + TP/PP, NPU Hexagon, token-parity по F16 GGUF,
    порты `InferenceBackend`/`TokenizerPort`.
 
@@ -158,6 +162,11 @@ curl -s http://127.0.0.1:8000/metrics
 curl -s --http2-prior-knowledge http://127.0.0.1:8000/health
 curl -sN -X POST http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"stream":true,"messages":[{"role":"user","content":"Hi"}]}'
+# tool calling и /v1/completions:
+curl -s -X POST http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'
+curl -s -X POST http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
+  -d '{"prompt":"The capital of France is","max_tokens":16}'
 python3 tools/loadtest.py --conns 6                            # нагрузка на сервер
 cargo run --release -p lfm-bench -- gpu-embed --id 597       # сверка отдельных ядер
 ```
