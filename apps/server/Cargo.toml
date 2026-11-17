@@ -1,0 +1,15 @@
+[package]
+name = "lfm-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lfm-domain.workspace = true
+lfm-app.workspace = true
+lfm-tokenizer.workspace = true
+lfm-chat.workspace = true
+lfm-gpu.workspace = true

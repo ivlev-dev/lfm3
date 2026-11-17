@@ -1,0 +1,12 @@
+[package]
+name = "lfm-gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+lfm-app.workspace = true
+lfm-domain.workspace = true
+lfm-gguf.workspace = true
+lfm-opencl.workspace = true

@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/infra-gguf",
+    "crates/infra-quant",
+    "crates/infra-opencl",
+    "crates/backend-opencl",
+    "crates/domain",
+    "crates/application",
+    "crates/infra-hf",
+    "crates/infra-tokenizer",
+    "crates/infra-chat",
+    "crates/infra-cpu",
+    "apps/bench",
+    "apps/server",
+    "apps/tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
+opencl3 = "0.12"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lfm-gguf = { path = "crates/infra-gguf" }
+lfm-quant = { path = "crates/infra-quant" }
+lfm-opencl = { path = "crates/infra-opencl" }
+lfm-gpu = { path = "crates/backend-opencl" }
+lfm-domain = { path = "crates/domain" }
+lfm-app = { path = "crates/application" }
+lfm-hf = { path = "crates/infra-hf" }
+lfm-tokenizer = { path = "crates/infra-tokenizer" }
+lfm-chat = { path = "crates/infra-chat" }
+lfm-cpu = { path = "crates/infra-cpu" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

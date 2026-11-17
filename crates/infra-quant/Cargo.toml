@@ -1,0 +1,8 @@
+[package]
+name = "lfm-quant"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+half.workspace = true
+thiserror.workspace = true

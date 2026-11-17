@@ -1,0 +1,972 @@
+use anyhow::{anyhow, Result};
+use lfm_app::{
+    ChatSession, Sampler, Scheduler, SchedulerConfig, SessionEvent, StepPlan, StepRow, StepToken,
+    ActiveSeq, JobId,
+};
+use lfm_chat::ChatTemplate;
+use lfm_domain::{Message, SamplingParams};
+use lfm_gpu::{GpuModel, StepReq};
+use lfm_tokenizer::LfmTokenizer;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{
+    channel, Receiver, RecvTimeoutError, Sender, TryRecvError,
+};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+pub struct ServeConfig {
+    pub model: PathBuf,
+    pub tokenizer: PathBuf,
+    pub template: PathBuf,
+    pub ctx: usize,
+    pub system: String,
+}
+
+pub struct ChatJob {
+    pub messages: Vec<Message>,
+    pub params: SamplingParams,
+    pub thinking: bool,
+}
+
+#[derive(Debug)]
+pub enum Event {
+    Delta(String),
+    Thinking(String),
+    Final {
+        text: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
+    Error(String),
+}
+
+struct Job {
+    chat: ChatJob,
+    tx: Sender<Event>,
+}
+
+#[derive(Clone)]
+pub struct Engine {
+    tx: Sender<Job>,
+    metrics: Arc<EngineMetrics>,
+}
+
+pub struct EngineMetrics {
+    started: Instant,
+    ctx: AtomicUsize,
+    active: AtomicU32,
+    waiting: AtomicU32,
+    steps: AtomicU64,
+    avg_step_us: AtomicU64,
+    kv_used_pages: AtomicU64,
+    kv_free_pages: AtomicU64,
+    kv_cached_pages: AtomicU64,
+    cache_hits: AtomicU64,
+    reused_tokens: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MetricsUpdate {
+    pub ctx: usize,
+    pub active: u32,
+    pub waiting: u32,
+    pub steps: u64,
+    pub avg_step_us: u64,
+    pub kv_used_pages: u64,
+    pub kv_free_pages: u64,
+    pub kv_cached_pages: u64,
+    pub cache_hits: u64,
+    pub reused_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EngineMetricsSnapshot {
+    pub ctx: usize,
+    pub active: u32,
+    pub waiting: u32,
+    pub steps: u64,
+    pub avg_step_ms: f64,
+    pub kv_used_pages: u64,
+    pub kv_free_pages: u64,
+    pub kv_cached_pages: u64,
+    pub cache_hits: u64,
+    pub reused_tokens: u64,
+    pub uptime_s: f64,
+}
+
+impl EngineMetrics {
+    fn new(ctx: usize) -> Self {
+        Self {
+            started: Instant::now(),
+            ctx: AtomicUsize::new(ctx),
+            active: AtomicU32::new(0),
+            waiting: AtomicU32::new(0),
+            steps: AtomicU64::new(0),
+            avg_step_us: AtomicU64::new(0),
+            kv_used_pages: AtomicU64::new(0),
+            kv_free_pages: AtomicU64::new(0),
+            kv_cached_pages: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            reused_tokens: AtomicU64::new(0),
+        }
+    }
+
+    fn apply(&self, update: MetricsUpdate) {
+        self.ctx.store(update.ctx, Ordering::Relaxed);
+        self.active.store(update.active, Ordering::Relaxed);
+        self.waiting.store(update.waiting, Ordering::Relaxed);
+        self.steps.store(update.steps, Ordering::Relaxed);
+        self.avg_step_us.store(update.avg_step_us, Ordering::Relaxed);
+        self.kv_used_pages
+            .store(update.kv_used_pages, Ordering::Relaxed);
+        self.kv_free_pages
+            .store(update.kv_free_pages, Ordering::Relaxed);
+        self.kv_cached_pages
+            .store(update.kv_cached_pages, Ordering::Relaxed);
+        self.cache_hits.store(update.cache_hits, Ordering::Relaxed);
+        self.reused_tokens
+            .store(update.reused_tokens, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> EngineMetricsSnapshot {
+        EngineMetricsSnapshot {
+            ctx: self.ctx.load(Ordering::Relaxed),
+            active: self.active.load(Ordering::Relaxed),
+            waiting: self.waiting.load(Ordering::Relaxed),
+            steps: self.steps.load(Ordering::Relaxed),
+            avg_step_ms: self.avg_step_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            kv_used_pages: self.kv_used_pages.load(Ordering::Relaxed),
+            kv_free_pages: self.kv_free_pages.load(Ordering::Relaxed),
+            kv_cached_pages: self.kv_cached_pages.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            reused_tokens: self.reused_tokens.load(Ordering::Relaxed),
+            uptime_s: self.started.elapsed().as_secs_f64(),
+        }
+    }
+}
+
+const IDLE_POLL: Duration = Duration::from_millis(20);
+
+impl Engine {
+    pub fn spawn(cfg: ServeConfig) -> Result<Self> {
+        let (job_tx, job_rx) = channel::<Job>();
+        let (ready_tx, ready_rx) = channel::<Result<()>>();
+        let metrics = Arc::new(EngineMetrics::new(cfg.ctx));
+        let worker_metrics = Arc::clone(&metrics);
+        std::thread::Builder::new()
+            .name("engine".to_string())
+            .spawn(move || {
+                let mut worker = match Worker::load(cfg, worker_metrics) {
+                    Ok(worker) => {
+                        let _ = ready_tx.send(Ok(()));
+                        worker
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                worker.run(job_rx);
+            })?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx: job_tx,
+                metrics,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(anyhow!("engine thread stopped during load")),
+        }
+    }
+
+    pub fn submit(&self, chat: ChatJob) -> Result<Receiver<Event>> {
+        let (tx, rx) = channel();
+        self.tx
+            .send(Job { chat, tx })
+            .map_err(|_| anyhow!("engine is not running"))?;
+        Ok(rx)
+    }
+
+    pub fn metrics(&self) -> EngineMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenFlow {
+    Continue,
+    Stop,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Commit {
+    Continue,
+    Stop,
+    Eos,
+    Limit,
+    Cancelled,
+}
+
+struct RequestState {
+    slot: usize,
+    prompt: Vec<u32>,
+    sampler: Sampler,
+    session: ChatSession,
+    tx: Sender<Event>,
+    stops: Vec<String>,
+    hold: usize,
+    max_new: usize,
+    tokens: Vec<u32>,
+    printed: String,
+    content: String,
+    sent: usize,
+    stop_at: Option<usize>,
+    next_token: Option<u32>,
+    eos: u32,
+}
+
+impl RequestState {
+    fn process_token(&mut self, tok: &LfmTokenizer, token: u32) -> TokenFlow {
+        self.tokens.push(token);
+        let Ok(text) = tok.decode(&self.tokens, true) else {
+            return TokenFlow::Continue;
+        };
+        if !(text.len() > self.printed.len() && text.starts_with(&self.printed)) {
+            return TokenFlow::Continue;
+        }
+        let delta = text[self.printed.len()..].to_string();
+        self.printed = text;
+        for event in self.session.feed(&delta) {
+            match event {
+                SessionEvent::Thinking(text) => {
+                    if self.tx.send(Event::Thinking(text)).is_err() {
+                        return TokenFlow::Cancelled;
+                    }
+                }
+                SessionEvent::Content(text) => {
+                    self.content.push_str(&text);
+                    if let Some(pos) = first_stop(&self.content, &self.stops) {
+                        self.stop_at = Some(pos);
+                        return TokenFlow::Stop;
+                    }
+                    let safe = self.content.len().saturating_sub(self.hold);
+                    let mut cut = safe.max(self.sent);
+                    while cut > self.sent && !self.content.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    if cut > self.sent {
+                        let chunk = self.content[self.sent..cut].to_string();
+                        if self.tx.send(Event::Delta(chunk)).is_err() {
+                            return TokenFlow::Cancelled;
+                        }
+                        self.sent = cut;
+                    }
+                }
+                _ => {}
+            }
+        }
+        TokenFlow::Continue
+    }
+
+    fn commit_token(&mut self, token: u32, flow: TokenFlow) -> Commit {
+        match flow {
+            TokenFlow::Cancelled => {
+                self.next_token = None;
+                Commit::Cancelled
+            }
+            TokenFlow::Stop => {
+                self.next_token = None;
+                Commit::Stop
+            }
+            TokenFlow::Continue if token == self.eos => {
+                self.next_token = None;
+                Commit::Eos
+            }
+            TokenFlow::Continue if self.tokens.len() >= self.max_new => {
+                self.next_token = None;
+                Commit::Limit
+            }
+            TokenFlow::Continue => {
+                self.next_token = Some(token);
+                Commit::Continue
+            }
+        }
+    }
+}
+
+struct Metrics {
+    enabled: bool,
+    steps: u64,
+    step_us: u128,
+    batch_max: usize,
+    active_max: usize,
+    reused_tokens: usize,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let enabled = std::env::var("LFM_SCHED_LOG")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        Self {
+            enabled,
+            steps: 0,
+            step_us: 0,
+            batch_max: 0,
+            active_max: 0,
+            reused_tokens: 0,
+        }
+    }
+
+    fn record(&mut self, elapsed: Duration, batch: usize, active: usize) {
+        self.steps += 1;
+        self.step_us += elapsed.as_micros();
+        self.batch_max = self.batch_max.max(batch);
+        self.active_max = self.active_max.max(active);
+    }
+
+    fn reuse(&mut self, tokens: usize) {
+        self.reused_tokens += tokens;
+    }
+
+    fn avg_step_us(&self) -> u64 {
+        if self.steps == 0 {
+            0
+        } else {
+            u64::try_from(self.step_us / u128::from(self.steps)).unwrap_or(u64::MAX)
+        }
+    }
+
+    fn update(&self, sched: &Scheduler, gpu: &GpuModel) -> MetricsUpdate {
+        let (cached, used, hits) = gpu.cache_stats();
+        MetricsUpdate {
+            ctx: gpu.max_ctx(),
+            active: saturating_u32(sched.active_len()),
+            waiting: saturating_u32(sched.waiting_len()),
+            steps: self.steps,
+            avg_step_us: self.avg_step_us(),
+            kv_used_pages: saturating_u64(used),
+            kv_free_pages: saturating_u64(gpu.free_pages()),
+            kv_cached_pages: saturating_u64(cached),
+            cache_hits: hits,
+            reused_tokens: saturating_u64(self.reused_tokens),
+        }
+    }
+
+    fn log_final(&self, id: JobId, prompt: usize, completion: usize, active: usize) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "sched: id={} prompt_tokens={} completion_tokens={} active={} active_max={} batch_max={} steps={} avg_step_us={} reused_tokens={}",
+            id.0,
+            prompt,
+            completion,
+            active,
+            self.active_max,
+            self.batch_max,
+            self.steps,
+            self.avg_step_us(),
+            self.reused_tokens
+        );
+    }
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+struct Worker {
+    gpu: GpuModel,
+    tok: LfmTokenizer,
+    chat: ChatTemplate,
+    system: String,
+    sched: Scheduler,
+    reqs: HashMap<JobId, RequestState>,
+    metrics: Metrics,
+    shared: Arc<EngineMetrics>,
+}
+
+impl Worker {
+    fn load(cfg: ServeConfig, shared: Arc<EngineMetrics>) -> Result<Self> {
+        let gpu = GpuModel::load(&cfg.model, cfg.ctx)?;
+        let max_batch = env_range("LFM_PB", 6, 1, 12);
+        let max_active = env_range("LFM_SEQS", 8, 1, 16);
+        let prefill_budget = env_usize("LFM_PREFILL_BUDGET", 12).clamp(1, 64);
+        let sched = Scheduler::new(SchedulerConfig::new(
+            gpu.max_ctx(),
+            max_active,
+            max_batch,
+            prefill_budget,
+        ));
+        let tok = LfmTokenizer::from_file(&cfg.tokenizer)?;
+        let chat = ChatTemplate::from_file(&cfg.template)?;
+        let worker = Self {
+            gpu,
+            tok,
+            chat,
+            system: cfg.system,
+            sched,
+            reqs: HashMap::new(),
+            metrics: Metrics::new(),
+            shared,
+        };
+        worker.publish();
+        Ok(worker)
+    }
+
+    fn publish(&self) {
+        self.shared
+            .apply(self.metrics.update(&self.sched, &self.gpu));
+    }
+
+    fn run(&mut self, job_rx: Receiver<Job>) {
+        let mut closed = false;
+        loop {
+            if !closed {
+                loop {
+                    match job_rx.try_recv() {
+                        Ok(job) => self.register(job),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            closed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if self.sched.is_empty() {
+                if closed {
+                    break;
+                }
+                match job_rx.recv_timeout(IDLE_POLL) {
+                    Ok(job) => self.register(job),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => closed = true,
+                }
+                continue;
+            }
+            self.admit();
+            if self.sched.active_len() > 0 {
+                self.step();
+            }
+            self.publish();
+        }
+        let pending: Vec<JobId> = self.reqs.keys().copied().collect();
+        for id in pending {
+            self.abort(id);
+        }
+        self.publish();
+    }
+
+    fn register(&mut self, job: Job) {
+        let Job { chat, tx } = job;
+        let ChatJob {
+            messages,
+            params,
+            thinking,
+        } = chat;
+        let mut all = Vec::with_capacity(messages.len() + 1);
+        if !self.system.is_empty() {
+            all.push(Message::system(self.system.clone()));
+        }
+        all.extend(messages);
+        let prompt = self
+            .chat
+            .render(&all, &[], true, thinking, false)
+            .and_then(|text| self.tok.encode(&text, false));
+        let prompt = match prompt {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                let _ = tx.send(Event::Error(format!("{e}")));
+                return;
+            }
+        };
+        let enqueued = match self.sched.enqueue(prompt.len(), params.max_tokens) {
+            Ok(enqueued) => enqueued,
+            Err(e) => {
+                let _ = tx.send(Event::Error(format!("{e}")));
+                return;
+            }
+        };
+        let mut session = ChatSession::new();
+        if thinking {
+            session.begin_thinking();
+        }
+        let mut sampler = Sampler::new(params.clone());
+        for &token in &prompt {
+            sampler.push(token);
+        }
+        let hold = params.stop.iter().map(|stop| stop.len()).max().unwrap_or(0);
+        let eos = self.tok.eos_id();
+        self.reqs.insert(
+            enqueued.id,
+            RequestState {
+                slot: usize::MAX,
+                prompt,
+                sampler,
+                session,
+                tx,
+                stops: params.stop,
+                hold,
+                max_new: enqueued.max_new,
+                tokens: Vec::new(),
+                printed: String::new(),
+                content: String::new(),
+                sent: 0,
+                stop_at: None,
+                next_token: None,
+                eos,
+            },
+        );
+        self.publish();
+    }
+
+    fn admit(&mut self) {
+        let outcomes = self.sched.admit(self.gpu.free_pages());
+        for outcome in outcomes {
+            match outcome {
+                lfm_app::AdmitOutcome::Admitted(id) => match self.gpu.create_sequence() {
+                    Ok(slot) => {
+                        if let Some(state) = self.reqs.get_mut(&id) {
+                            state.slot = slot;
+                        }
+                    }
+                    Err(e) => self.fail_request(id, format!("{e}")),
+                },
+                lfm_app::AdmitOutcome::Rejected(id, e) => self.fail_request(id, format!("{e}")),
+            }
+        }
+    }
+
+    fn step(&mut self) {
+        let started = Instant::now();
+        let plan = self.sched.plan_step();
+        let batch = plan.rows().len();
+        match plan {
+            StepPlan::Idle => return,
+            StepPlan::AtomicPrefill(id) => self.atomic_prefill(id),
+            StepPlan::Mixed { rows, need_logits } => self.mixed_step(&rows, need_logits),
+        }
+        self.metrics
+            .record(started.elapsed(), batch, self.sched.active_len());
+    }
+
+    fn atomic_prefill(&mut self, id: JobId) {
+        let Some(state) = self.reqs.get(&id) else {
+            self.sched.finish(id);
+            return;
+        };
+        let slot = state.slot;
+        let prompt = state.prompt.clone();
+        let reused = match self.gpu.prefill(slot, &prompt, true) {
+            Ok(reused) => reused,
+            Err(e) => {
+                self.fail_request(id, format!("{e}"));
+                return;
+            }
+        };
+        self.metrics.reuse(reused);
+        let logits = match self.gpu.logits() {
+            Ok(logits) => logits,
+            Err(e) => {
+                self.fail_request(id, format!("{e}"));
+                return;
+            }
+        };
+        self.sched.complete_prefill(id);
+        self.accept_token(id, logits);
+    }
+
+    fn mixed_step(&mut self, rows: &[StepRow], _need_logits: bool) {
+        let max_batch = self.sched.config().max_batch.max(1);
+        for slice in rows.chunks(max_batch) {
+            if !self.mixed_slice(slice) {
+                return;
+            }
+        }
+    }
+
+    fn mixed_slice(&mut self, rows: &[StepRow]) -> bool {
+        let need_logits = rows.iter().any(|row| match row.token {
+            StepToken::Decode => true,
+            StepToken::Prompt(index) => self
+                .reqs
+                .get(&row.id)
+                .map(|state| index + 1 >= state.prompt.len())
+                .unwrap_or(false),
+        });
+        let mut reqs = Vec::with_capacity(rows.len());
+        let mut failure: Option<(JobId, String)> = None;
+        for row in rows {
+            let Some(state) = self.reqs.get(&row.id) else {
+                failure = Some((row.id, "scheduler lost sequence".to_string()));
+                break;
+            };
+            let token = match row.token {
+                StepToken::Prompt(index) => match state.prompt.get(index) {
+                    Some(token) => *token,
+                    None => {
+                        failure = Some((row.id, "prompt index out of range".to_string()));
+                        break;
+                    }
+                },
+                StepToken::Decode => match state.next_token {
+                    Some(token) => token,
+                    None => {
+                        failure = Some((row.id, "missing pending token".to_string()));
+                        break;
+                    }
+                },
+            };
+            reqs.push(StepReq {
+                slot: state.slot,
+                token,
+                pos: row.pos,
+            });
+        }
+        if let Some((id, reason)) = failure {
+            self.fail_request(id, reason);
+            return false;
+        }
+        if let Err(e) = self.gpu.step_mixed(&reqs, need_logits) {
+            let mut ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
+            ids.sort();
+            ids.dedup();
+            for id in ids {
+                self.fail_request(id, format!("{e}"));
+            }
+            return false;
+        }
+        for (row_index, row) in rows.iter().enumerate() {
+            match row.token {
+                StepToken::Prompt(_) => {
+                    self.sched.advance_prefill(row.id, 1);
+                    let done = self
+                        .sched
+                        .active_seq(row.id)
+                        .map(ActiveSeq::is_prefill_done)
+                        .unwrap_or(false);
+                    if !done {
+                        continue;
+                    }
+                    if !need_logits {
+                        self.fail_request(row.id, "prefill completion without logits".to_string());
+                        continue;
+                    }
+                    let logits = match self.gpu.logits_row(row_index) {
+                        Ok(logits) => logits,
+                        Err(e) => {
+                            self.fail_request(row.id, format!("{e}"));
+                            continue;
+                        }
+                    };
+                    self.sched.complete_prefill(row.id);
+                    self.accept_token(row.id, logits);
+                }
+                StepToken::Decode => {
+                    let logits = match self.gpu.logits_row(row_index) {
+                        Ok(logits) => logits,
+                        Err(e) => {
+                            self.fail_request(row.id, format!("{e}"));
+                            continue;
+                        }
+                    };
+                    self.accept_token(row.id, logits);
+                }
+            }
+        }
+        true
+    }
+
+    fn accept_token(&mut self, id: JobId, mut logits: Vec<f32>) {
+        let tok = &self.tok;
+        let Some(state) = self.reqs.get_mut(&id) else {
+            return;
+        };
+        let token = state.sampler.sample(&mut logits);
+        state.sampler.push(token);
+        let flow = state.process_token(tok, token);
+        let commit = state.commit_token(token, flow);
+        self.sched.record_token(id);
+        match commit {
+            Commit::Continue => {}
+            Commit::Cancelled => self.abort(id),
+            Commit::Stop | Commit::Eos | Commit::Limit => self.finish_ok(id),
+        }
+    }
+
+    fn finish_ok(&mut self, id: JobId) {
+        let Some(mut state) = self.reqs.remove(&id) else {
+            self.sched.finish(id);
+            return;
+        };
+        self.release_slot(&mut state);
+        self.sched.finish(id);
+        let final_end = state.stop_at.unwrap_or(state.content.len());
+        let mut cut = final_end.max(state.sent);
+        while cut > state.sent && !state.content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut > state.sent {
+            let _ = state
+                .tx
+                .send(Event::Delta(state.content[state.sent..cut].to_string()));
+        }
+        let text = state.content[..final_end].to_string();
+        let prompt_tokens = state.prompt.len();
+        let completion_tokens = state.tokens.len();
+        let _ = state.tx.send(Event::Final {
+            text,
+            prompt_tokens,
+            completion_tokens,
+        });
+        self.metrics
+            .log_final(id, prompt_tokens, completion_tokens, self.sched.active_len());
+    }
+
+    fn fail_request(&mut self, id: JobId, message: String) {
+        self.sched.finish(id);
+        let Some(mut state) = self.reqs.remove(&id) else {
+            return;
+        };
+        self.release_slot(&mut state);
+        let _ = state.tx.send(Event::Error(message));
+    }
+
+    fn abort(&mut self, id: JobId) {
+        self.sched.finish(id);
+        if let Some(mut state) = self.reqs.remove(&id) {
+            self.release_slot(&mut state);
+        }
+    }
+
+    fn release_slot(&mut self, state: &mut RequestState) {
+        if state.slot != usize::MAX {
+            let _ = self.gpu.free_sequence(state.slot);
+            state.slot = usize::MAX;
+        }
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_range(name: &str, default: usize, low: usize, high: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (low..=high).contains(value))
+        .unwrap_or(default)
+}
+
+fn first_stop(content: &str, stops: &[String]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for stop in stops {
+        if stop.is_empty() {
+            continue;
+        }
+        if let Some(pos) = content.find(stop) {
+            best = Some(match best {
+                Some(cur) => cur.min(pos),
+                None => pos,
+            });
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state(max_new: usize, eos: u32) -> RequestState {
+        let (tx, _rx) = channel();
+        RequestState {
+            slot: 0,
+            prompt: vec![1, 2, 3],
+            sampler: Sampler::new(SamplingParams::default()),
+            session: ChatSession::new(),
+            tx,
+            stops: Vec::new(),
+            hold: 0,
+            max_new,
+            tokens: Vec::new(),
+            printed: String::new(),
+            content: String::new(),
+            sent: 0,
+            stop_at: None,
+            next_token: None,
+            eos,
+        }
+    }
+
+    #[test]
+    fn stop_scan_picks_earliest() {
+        let stops = vec!["END".to_string(), "bye".to_string()];
+        assert_eq!(first_stop("hello END bye", &stops), Some(6));
+        assert_eq!(first_stop("hello bye END", &stops), Some(6));
+        assert_eq!(first_stop("hello", &stops), None);
+        assert_eq!(first_stop("hello", &[]), None);
+        assert_eq!(first_stop("x", &["".to_string()]), None);
+    }
+
+    #[test]
+    fn commit_token_sets_pending_token_after_prefill() {
+        let mut state = test_state(8, 999);
+        assert_eq!(state.next_token, None);
+        let commit = state.commit_token(42, TokenFlow::Continue);
+        assert_eq!(commit, Commit::Continue);
+        assert_eq!(state.next_token, Some(42));
+    }
+
+    #[test]
+    fn commit_token_replaces_pending_token_each_decode() {
+        let mut state = test_state(8, 999);
+        state.tokens.push(7);
+        assert_eq!(state.commit_token(7, TokenFlow::Continue), Commit::Continue);
+        assert_eq!(state.next_token, Some(7));
+        state.tokens.push(8);
+        assert_eq!(state.commit_token(8, TokenFlow::Continue), Commit::Continue);
+        assert_eq!(state.next_token, Some(8));
+        state.tokens.push(9);
+        assert_eq!(state.commit_token(9, TokenFlow::Continue), Commit::Continue);
+        assert_eq!(state.next_token, Some(9));
+    }
+
+    #[test]
+    fn commit_token_clears_pending_on_terminal_outcomes() {
+        let mut state = test_state(4, 2);
+        state.tokens.push(7);
+        assert_eq!(state.commit_token(7, TokenFlow::Stop), Commit::Stop);
+        assert_eq!(state.next_token, None);
+
+        state.tokens.push(8);
+        assert_eq!(
+            state.commit_token(8, TokenFlow::Cancelled),
+            Commit::Cancelled
+        );
+        assert_eq!(state.next_token, None);
+
+        assert_eq!(state.commit_token(2, TokenFlow::Continue), Commit::Eos);
+        assert_eq!(state.next_token, None);
+
+        state.tokens = vec![7, 8, 9, 10];
+        assert_eq!(state.commit_token(11, TokenFlow::Continue), Commit::Limit);
+        assert_eq!(state.next_token, None);
+    }
+
+    #[test]
+    fn commit_token_keeps_pending_below_limit() {
+        let mut state = test_state(4, 2);
+        state.tokens = vec![7, 8];
+        assert_eq!(state.commit_token(9, TokenFlow::Continue), Commit::Continue);
+        assert_eq!(state.next_token, Some(9));
+    }
+
+    #[test]
+    fn fresh_metrics_snapshot_is_zeroed() {
+        let metrics = EngineMetrics::new(4096);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.ctx, 4096);
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.waiting, 0);
+        assert_eq!(snapshot.steps, 0);
+        assert_eq!(snapshot.avg_step_ms, 0.0);
+        assert_eq!(snapshot.kv_used_pages, 0);
+        assert_eq!(snapshot.kv_free_pages, 0);
+        assert_eq!(snapshot.kv_cached_pages, 0);
+        assert_eq!(snapshot.cache_hits, 0);
+        assert_eq!(snapshot.reused_tokens, 0);
+        assert!(snapshot.uptime_s >= 0.0);
+    }
+
+    #[test]
+    fn apply_publishes_step_active_and_cache_counters() {
+        let metrics = EngineMetrics::new(1024);
+        metrics.apply(MetricsUpdate {
+            ctx: 2048,
+            active: 3,
+            waiting: 2,
+            steps: 11,
+            avg_step_us: 2500,
+            kv_used_pages: 7,
+            kv_free_pages: 9,
+            kv_cached_pages: 4,
+            cache_hits: 12,
+            reused_tokens: 128,
+        });
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.ctx, 2048);
+        assert_eq!(snapshot.active, 3);
+        assert_eq!(snapshot.waiting, 2);
+        assert_eq!(snapshot.steps, 11);
+        assert_eq!(snapshot.avg_step_ms, 2.5);
+        assert_eq!(snapshot.kv_used_pages, 7);
+        assert_eq!(snapshot.kv_free_pages, 9);
+        assert_eq!(snapshot.kv_cached_pages, 4);
+        assert_eq!(snapshot.cache_hits, 12);
+        assert_eq!(snapshot.reused_tokens, 128);
+    }
+
+    #[test]
+    fn metrics_shared_across_clones_see_updates() {
+        let metrics = Arc::new(EngineMetrics::new(512));
+        let reader = Arc::clone(&metrics);
+        assert_eq!(reader.snapshot().steps, 0);
+        metrics.apply(MetricsUpdate {
+            ctx: 512,
+            active: 1,
+            waiting: 0,
+            steps: 1,
+            avg_step_us: 1000,
+            kv_used_pages: 2,
+            kv_free_pages: 30,
+            kv_cached_pages: 1,
+            cache_hits: 0,
+            reused_tokens: 32,
+        });
+        let snapshot = reader.snapshot();
+        assert_eq!(snapshot.steps, 1);
+        assert_eq!(snapshot.active, 1);
+        assert_eq!(snapshot.avg_step_ms, 1.0);
+        assert_eq!(snapshot.kv_used_pages, 2);
+        assert_eq!(snapshot.kv_free_pages, 30);
+        assert_eq!(snapshot.kv_cached_pages, 1);
+        assert_eq!(snapshot.reused_tokens, 32);
+    }
+
+    #[test]
+    fn record_accumulates_steps_and_average() {
+        let mut metrics = Metrics::new();
+        assert_eq!(metrics.avg_step_us(), 0);
+        metrics.record(Duration::from_micros(400), 3, 2);
+        metrics.record(Duration::from_micros(600), 1, 4);
+        assert_eq!(metrics.steps, 2);
+        assert_eq!(metrics.avg_step_us(), 500);
+        assert_eq!(metrics.batch_max, 3);
+        assert_eq!(metrics.active_max, 4);
+        metrics.reuse(64);
+        metrics.reuse(36);
+        assert_eq!(metrics.reused_tokens, 100);
+    }
+
+    #[test]
+    fn saturating_helpers_clamp_at_limit() {
+        assert_eq!(saturating_u32(7), 7);
+        assert_eq!(saturating_u32(usize::MAX), u32::MAX);
+        assert_eq!(saturating_u64(7), 7);
+        assert_eq!(saturating_u64(usize::MAX), u64::MAX);
+    }
+}

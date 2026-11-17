@@ -1,0 +1,9 @@
+[package]
+name = "lfm-opencl"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+opencl3.workspace = true
