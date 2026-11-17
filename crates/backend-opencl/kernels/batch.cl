@@ -1,8 +1,12 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 
-#ifndef RGEMV
-#define RGEMV 4
+#ifndef RGEMV_B
+#define RGEMV_B 5
+#endif
+
+#ifndef RGEMV4P
+#define RGEMV4P 4
 #endif
 
 #ifndef PB
@@ -233,10 +237,12 @@ __kernel void gemv_q4_k_i8_b(__global const uchar *w, __global const char *xq, _
     uint sgs = get_sub_group_size();
     uint sgid = get_sub_group_id();
     uint nsg = get_num_sub_groups();
-    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV;
-    bool valid = row0 + RGEMV <= rows;
-    if (!valid) {
-        row0 = rows - RGEMV;
+    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV_B;
+    if (rows < RGEMV_B) {
+        return;
+    }
+    if (row0 + RGEMV_B > rows) {
+        row0 = rows - RGEMV_B;
     }
     uint u = lane & 7u;
     uint bpi = sgs >> 3;
@@ -247,11 +253,11 @@ __kernel void gemv_q4_k_i8_b(__global const uchar *w, __global const char *xq, _
     uint sb_lo = (u >> 1) << 1;
     uint wbase = (u >> 1) * 64u + (u & 1u) * 16u;
     const char4 ones = (char4)(1);
-    float acc[PB][RGEMV];
+    float acc[PB][RGEMV_B];
     #pragma unroll
     for (uint t = 0u; t < PB; ++t) {
         #pragma unroll
-        for (uint r = 0u; r < RGEMV; ++r) {
+        for (uint r = 0u; r < RGEMV_B; ++r) {
             acc[t][r] = 0.0f;
         }
     }
@@ -287,7 +293,7 @@ __kernel void gemv_q4_k_i8_b(__global const uchar *w, __global const char *xq, _
                 }
             }
             #pragma unroll
-            for (uint r = 0u; r < RGEMV; ++r) {
+            for (uint r = 0u; r < RGEMV_B; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 144ul;
                 __global const uchar *scp = blk + 4;
                 float d = (float)vload_half(0, (__global const half *)blk);
@@ -329,9 +335,9 @@ __kernel void gemv_q4_k_i8_b(__global const uchar *w, __global const char *xq, _
     for (uint t = 0u; t < PB; ++t) {
         if (t >= tok0 && t < ntok) {
             #pragma unroll
-            for (uint r = 0u; r < RGEMV; ++r) {
+            for (uint r = 0u; r < RGEMV_B; ++r) {
                 float total = sub_group_reduce_add(acc[t][r]);
-                if (lane == 0u && valid) {
+                if (lane == 0u) {
                     y[(ulong)t * rows + row0 + r] = total;
                 }
             }
@@ -344,10 +350,12 @@ __kernel void gemv_q4_k_i8_p_b(__global const uchar *w, __global const char *xq,
     uint sgs = get_sub_group_size();
     uint sgid = get_sub_group_id();
     uint nsg = get_num_sub_groups();
-    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV;
-    bool valid = row0 + RGEMV <= rows;
-    if (!valid) {
-        row0 = rows - RGEMV;
+    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV_B;
+    if (rows < RGEMV_B) {
+        return;
+    }
+    if (row0 + RGEMV_B > rows) {
+        row0 = rows - RGEMV_B;
     }
     uint u = lane & 7u;
     uint bpi = sgs >> 3;
@@ -358,11 +366,11 @@ __kernel void gemv_q4_k_i8_p_b(__global const uchar *w, __global const char *xq,
     uint sb_lo = (u >> 1) << 1;
     uint wbase = (u >> 1) * 64u + (u & 1u) * 16u;
     const char4 ones = (char4)(1);
-    float acc[PB][RGEMV];
+    float acc[PB][RGEMV_B];
     #pragma unroll
     for (uint t = 0u; t < PB; ++t) {
         #pragma unroll
-        for (uint r = 0u; r < RGEMV; ++r) {
+        for (uint r = 0u; r < RGEMV_B; ++r) {
             acc[t][r] = 0.0f;
         }
     }
@@ -398,7 +406,7 @@ __kernel void gemv_q4_k_i8_p_b(__global const uchar *w, __global const char *xq,
                 }
             }
             #pragma unroll
-            for (uint r = 0u; r < RGEMV; ++r) {
+            for (uint r = 0u; r < RGEMV_B; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 148ul;
                 float d = (float)vload_half(0, (__global const half *)blk);
                 float dmin = (float)vload_half(0, (__global const half *)(blk + 2));
@@ -434,9 +442,9 @@ __kernel void gemv_q4_k_i8_p_b(__global const uchar *w, __global const char *xq,
     for (uint t = 0u; t < PB; ++t) {
         if (t >= tok0 && t < ntok) {
             #pragma unroll
-            for (uint r = 0u; r < RGEMV; ++r) {
+            for (uint r = 0u; r < RGEMV_B; ++r) {
                 float total = sub_group_reduce_add(acc[t][r]);
-                if (lane == 0u && valid) {
+                if (lane == 0u) {
                     y[(ulong)t * rows + row0 + r] = total;
                 }
             }
@@ -449,10 +457,12 @@ __kernel void gemv_q6_k_i8_b(__global const uchar *w, __global const char *xq, _
     uint lane = get_sub_group_local_id();
     uint sgid = get_sub_group_id();
     uint nsg = get_num_sub_groups();
-    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV;
-    bool valid = row0 + RGEMV <= rows;
-    if (!valid) {
-        row0 = rows - RGEMV;
+    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV_B;
+    if (rows < RGEMV_B) {
+        return;
+    }
+    if (row0 + RGEMV_B > rows) {
+        row0 = rows - RGEMV_B;
     }
     uint sub = lane & 15u;
     uint n = sub >> 3;
@@ -462,11 +472,11 @@ __kernel void gemv_q6_k_i8_b(__global const uchar *w, __global const char *xq, _
     uint ngs = cols >> 5;
     ulong row_stride = (ulong)blocks * 210ul;
     __global const uchar *base_w = w + (ulong)row0 * row_stride;
-    float acc[PB][RGEMV];
+    float acc[PB][RGEMV_B];
     #pragma unroll
     for (uint t = 0u; t < PB; ++t) {
         #pragma unroll
-        for (uint r = 0u; r < RGEMV; ++r) {
+        for (uint r = 0u; r < RGEMV_B; ++r) {
             acc[t][r] = 0.0f;
         }
     }
@@ -507,7 +517,7 @@ __kernel void gemv_q6_k_i8_b(__global const uchar *w, __global const char *xq, _
                 }
             }
             #pragma unroll
-            for (uint r = 0u; r < RGEMV; ++r) {
+            for (uint r = 0u; r < RGEMV_B; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 210ul;
                 __global const char *sc = (__global const char *)(blk + 192u);
                 float d = (float)vload_half(0, (__global const half *)(blk + 208u));
@@ -541,9 +551,9 @@ __kernel void gemv_q6_k_i8_b(__global const uchar *w, __global const char *xq, _
     for (uint t = 0u; t < PB; ++t) {
         if (t >= tok0 && t < ntok) {
             #pragma unroll
-            for (uint r = 0u; r < RGEMV; ++r) {
+            for (uint r = 0u; r < RGEMV_B; ++r) {
                 float total = sub_group_reduce_add(acc[t][r]);
-                if (lane == 0u && valid) {
+                if (lane == 0u) {
                     y[(ulong)t * rows + row0 + r] = total;
                 }
             }
@@ -1255,10 +1265,12 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
     uint sgid = get_sub_group_id();
     uint nsg = get_num_sub_groups();
     uint rows = r1 + r2 + r3 + r4;
-    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV;
-    bool valid = row0 + RGEMV <= rows;
-    if (!valid) {
-        row0 = rows - RGEMV;
+    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV4P;
+    if (rows < RGEMV4P) {
+        return;
+    }
+    if (row0 + RGEMV4P > rows) {
+        row0 = rows - RGEMV4P;
     }
     uint u = lane & 7u;
     uint bpi = sgs >> 3;
@@ -1269,11 +1281,11 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
     uint sb_lo = (u >> 1) << 1;
     uint wbase = (u >> 1) * 64u + (u & 1u) * 16u;
     const char4 ones = (char4)(1);
-    float acc[PB][RGEMV];
+    float acc[PB][RGEMV4P];
     #pragma unroll
     for (uint t = 0u; t < PB; ++t) {
         #pragma unroll
-        for (uint r = 0u; r < RGEMV; ++r) {
+        for (uint r = 0u; r < RGEMV4P; ++r) {
             acc[t][r] = 0.0f;
         }
     }
@@ -1309,7 +1321,7 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
                 }
             }
             #pragma unroll
-            for (uint r = 0u; r < RGEMV; ++r) {
+            for (uint r = 0u; r < RGEMV4P; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 148ul;
                 float d = (float)vload_half(0, (__global const half *)blk);
                 float dmin = (float)vload_half(0, (__global const half *)(blk + 2));
@@ -1361,9 +1373,9 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
     for (uint t = 0u; t < PB; ++t) {
         if (t < ntok) {
             #pragma unroll
-            for (uint r = 0u; r < RGEMV; ++r) {
+            for (uint r = 0u; r < RGEMV4P; ++r) {
                 float total = sub_group_reduce_add(acc[t][r]);
-                if (lane == 0u && valid) {
+                if (lane == 0u) {
                     yd[(ulong)t * stride + rofs + r] = total;
                 }
             }

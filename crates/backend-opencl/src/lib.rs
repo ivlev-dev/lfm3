@@ -192,6 +192,10 @@ pub struct GpuModel {
     layers: Vec<LayerBufs>,
     ffn: usize,
     pb: usize,
+    rgemv: usize,
+    rgemv_b: usize,
+    wg: usize,
+    wg_b: usize,
     kv_blocks: usize,
     cache: RadixCache,
     cache_on: bool,
@@ -347,7 +351,29 @@ impl GpuModel {
             .and_then(|v| v.parse().ok())
             .filter(|v: &usize| (1..=12).contains(v))
             .unwrap_or(6);
-        let options = format!("-cl-std=CL3.0 -DRGEMV=4 -DPB={pb}");
+        let rgemv: usize = std::env::var("LFM_RGEMV")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| (1..=8).contains(v))
+            .unwrap_or(4);
+        let rgemv_b: usize = std::env::var("LFM_RGEMV_B")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| (1..=8).contains(v))
+            .unwrap_or(5);
+        let wg: usize = std::env::var("LFM_WG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| (64..=512).contains(v))
+            .map(|v| v / 64 * 64)
+            .unwrap_or(256);
+        let wg_b: usize = std::env::var("LFM_WG_B")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| (64..=512).contains(v))
+            .map(|v| v / 64 * 64)
+            .unwrap_or(64);
+        let options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
         let program: Program = gpu.build(KERNELS, &options)?;
         let kernels = Kernels {
             embed: Kernel::create(&program, "embed_q6k")?,
@@ -505,6 +531,10 @@ impl GpuModel {
             layers,
             ffn,
             pb,
+            rgemv,
+            rgemv_b,
+            wg,
+            wg_b,
             kv_blocks,
             cache: RadixCache::new(kv_blocks),
             cache_on,
@@ -546,13 +576,13 @@ impl GpuModel {
             Weight::Q4(b) | Weight::Q6(b) => b,
             Weight::F32(_) => unreachable!(),
         };
-        let per_wg = 4 * 4;
-        let grid = rows.div_ceil(per_wg) * 256;
+        let per_wg = (self.wg / 64) * self.rgemv;
+        let grid = rows.div_ceil(per_wg) * self.wg;
         unsafe {
             self.gpu.launch(
                 kernel,
                 grid,
-                256,
+                self.wg,
                 &[
                     Arg::Mem(buffer.get()),
                     Arg::Mem(xq.get()),
@@ -589,13 +619,13 @@ impl GpuModel {
             (Weight::Q6(b), _) => (&self.kernels.q6_b, b),
             (Weight::F32(_), _) => return Err(anyhow!("gemv on f32 weight {name}")),
         };
-        let per_wg = 4 * 4;
-        let grid = rows.div_ceil(per_wg) * 256;
+        let per_wg = (self.wg_b / 64) * self.rgemv_b;
+        let grid = rows.div_ceil(per_wg) * self.wg_b;
         unsafe {
             self.gpu.launch(
                 kernel,
                 grid,
-                256,
+                self.wg_b,
                 &[
                     Arg::Mem(buffer.get()),
                     Arg::Mem(xq.get()),
@@ -633,13 +663,13 @@ impl GpuModel {
             .get(name)
             .ok_or_else(|| anyhow!("missing fused weight {name}"))?;
         let rows = r1 + r2 + r3 + r4;
-        let per_wg = 4 * 4;
-        let grid = rows.div_ceil(per_wg) * 256;
+        let per_wg = (self.wg_b / 64) * 4;
+        let grid = rows.div_ceil(per_wg) * self.wg_b;
         unsafe {
             self.gpu.launch(
                 &self.kernels.q4x4p_b,
                 grid,
-                256,
+                self.wg_b,
                 &[
                     Arg::Mem(packed.get()),
                     Arg::Mem(xq.get()),
@@ -1223,8 +1253,10 @@ impl GpuModel {
 
     pub fn kernel_stats(&self) -> Vec<(String, u64)> {
         let dev = self.gpu.device.id();
-        let list: [(&str, &Kernel); 17] = [
+        let list: [(&str, &Kernel); 20] = [
             ("q4", &self.kernels.q4),
+            ("q4p_b", &self.kernels.q4p_b),
+            ("q4x4p_b", &self.kernels.q4x4p_b),
             ("q6", &self.kernels.q6),
             ("q4_b", &self.kernels.q4_b),
             ("q6_b", &self.kernels.q6_b),
@@ -1235,6 +1267,7 @@ impl GpuModel {
             ("attn_b", &self.kernels.attn_b),
             ("attn_split_b", &self.kernels.attn_split_b),
             ("attn_b_h", &self.kernels.attn_b_h),
+            ("attn_b_h2", &self.kernels.attn_b_h2),
             ("attn_split_b_h", &self.kernels.attn_split_b_h),
             ("norm_add_quant", &self.kernels.norm_add_quant),
             ("norm_add_quant_b", &self.kernels.norm_add_quant_b),
