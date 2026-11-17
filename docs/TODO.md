@@ -5,7 +5,7 @@
 ```bash
 cd /home/ivlev98/Проекты/PC/lfm3
 cargo build --release --workspace          # без предупреждений
-cargo test --workspace                     # 239 тестов
+cargo test --workspace                     # 240 тестов
 ```
 
 `main` = `origin/main`, рабочее дерево чистое, незакоммиченных экспериментов нет.
@@ -54,7 +54,8 @@ cargo test --workspace                     # 239 тестов
 | E2E | `openai-python` 3.52.0: chat, stream, tools (обычный/стрим), completions (обычный/стрим), многоходовой tool-ответ; curl по h2c |
 | Chunked prefill + кэш | `prefill_begin`/`prefill_finish`, `PendingPrefill` в `Sequence`, авто-снапшоты conv на границах страниц; admission сдвигает `prefilled`, завершение публикует хэши. Проверка: промпт 191 токен при активном декоде → 5 страниц, повтор reused 160, ответ совпадает; `gpu-cache` 480/512 |
 | Хвост сессии | `ChatSession::finish()` вызывается на EOS/лимите (thinking/маркер больше не теряются), не-stream отдаёт `reasoning_content` |
-| Тесты | 239 зелёных (+6 protocol: tools, tool-история, форма ответа/дельт, completions) |
+| h2 pipelined HEADERS | `wait_for_window` буферизует HEADERS/CONTINUATION/DATA (тело и окна не теряются, лимит 64 кадра/1 МиБ), главный цикл обрабатывает отложенные кадры первыми; +1 тест |
+| Тесты | 240 зелёных (+7: protocol×6, h2 defer) |
 
 ## Проверки, которые уже прогонялись (и чем повторять)
 
@@ -129,9 +130,10 @@ P1 — только после перемера на простое.
 ### 4. P3 — остаток M5
 
 - **Сделано (сессия 4)**: `tools`/`tool_calls`, `/v1/completions`, e2e openai-python,
-  радикс-кэш в chunked prefill, flush сессии и `reasoning_content`.
-- Осталось: h2 `wait_for_window` игнорирует pipelined HEADERS; TLS не поддерживается
-  (h2c по prior knowledge). Для OpenAI-клиентов не критично.
+  радикс-кэш в chunked prefill, flush сессии и `reasoning_content`, pipelined HEADERS
+  в h2 `wait_for_window`.
+- Осталось только TLS (h2c по prior knowledge) — по требованию; для OpenAI-клиентов
+  не критично.
 
 ### 5. Выбор устройства / CPU
 

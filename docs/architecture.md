@@ -133,6 +133,9 @@ apps/bench (CLI), apps/server, apps/tui (клиент к серверу)   ко�
 ### Транспорт и телеметрия
 - `lfm-server`: HTTP/1.1 и HTTP/2 h2c (свой HPACK + flow control отправки, чтение
   SETTINGS/PING/WINDOW_UPDATE во время ожидания окна), SSE, WebSocket.
+- Pipelined HEADERS/DATA, пришедшие во время ожидания окна, буферизуются в соединении
+  (до 64 кадров / 1 МиБ) и обрабатываются главным циклом после отправки; окна
+  принимающей стороны обновляются один раз.
 - `GET /metrics`: атомарный снимок из потока-движка (`active/waiting`, `steps`,
   `avg_step_ms`, KV-страницы, `cache_hits`, `reused_tokens`, `uptime_s`), без
   блокировки генерации; один и тот же JSON по HTTP/1.1 и h2.

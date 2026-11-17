@@ -64,7 +64,7 @@
   посчитанный при активном декоде, даёт повтору reused 160 токенов с тем же ответом.
   Два TUI: `gpu-chat --tui` (in-process: скролл, история ввода, resize, Ctrl+C-стоп)
   и `lfm-tui` (`apps/tui`, клиент к серверу: SSE, `/metrics` в статусе, `/save`/`/load`).
-- **Тесты:** 239 зелёных (`cargo test --workspace`), сборка без предупреждений.
+- **Тесты:** 240 зелёных (`cargo test --workspace`), сборка без предупреждений.
 
 ## Что дальше
 
@@ -84,8 +84,8 @@
    −5% decode 2048). Слияния запусков замерены и откачены (~1%: запуск ~4–5 мкс,
    а не 28). Остаток — ALU батчевого GEMV.
 4. **P3. Остаток M5**: e2e openai-python уже покрыт (chat/stream/tools/completions),
-   chunked prefill публикует страницы в радикс-кэш; остались pipelined HEADERS
-   в h2 `wait_for_window` и TLS по требованию.
+   chunked prefill публикует страницы в радикс-кэш, pipelined HEADERS в h2 буферизуются;
+   остался только TLS по требованию.
 5. **P4–P6. M6/M7 и остаток M1**: 3-tier + TP/PP, NPU Hexagon, token-parity по F16 GGUF,
    порты `InferenceBackend`/`TokenizerPort`.
 
