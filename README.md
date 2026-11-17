@@ -188,6 +188,7 @@ cargo run --release -p lfm-bench -- gpu-embed --id 597       # сверка от
 в split prefill-attention), `LFM_ATTN2=0` (не обрабатывать пары позиций в sliding
 prefill-attention), `LFM_WG` / `LFM_WG_B` (workgroup decode/batch GEMV, по умолчанию
 256/64), `LFM_RGEMV` / `LFM_RGEMV_B` (строк на подгруппу decode/batch, 4/5),
+`LFM_DEVICE` (индекс OpenCL-устройства: 0 — rusticl GPU, 1 — PoCL CPU),
 `LFM_PREFILL_BUDGET` (prefill-токенов
 на шаг планировщика, по умолчанию 12), `LFM_SCHED_LOG=1` (лог шагов планировщика).
 

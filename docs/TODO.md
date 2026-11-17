@@ -76,7 +76,7 @@ cargo test --workspace                     # 245 тестов
 | Marlin-микротрюки | `#pragma unroll 2` — −1.5% (8192), `-cl-mad-enable -cl-fast-relaxed-math` — −3.4% (512): удалено |
 | Q6/PB тюнинг | Q6-RGEMV 2/3/8 против 5 — 5 быстрее; PB=7 — 145 против 232 tok/s (спиллы); оставлено 5/6 |
 | FlashInfer-fusion | отклонено: `kv_store` и attention текущего токена требуют глобального барьера между workgroup; page-table lookups — шум |
-| M6/PoCL | PoCL CPU поднят локально (`OCL_ICD_VENDORS`, без root), но наши ядра дают неверный forward (embed/norm cos 1.0, логиты мусор) → M6 отложен |
+| M6/PoCL | CPU-тир PoCL заработал: причины были в хосте (`per_wg` считался как `wg/64`, а PoCL даёт подгруппу = всему workgroup) и в гонках `norm_add_quant` (чтение `red[0]` без барьера перед перезаписью). Теперь `gpu-check` cos 0.9993, `gpu-gen` ids совпадают с AMD, `gpu-cmp` batch cos 0.9994. Intel runtime удалён (iGPU в системе нет) |
 
 ## Проверки, которые уже прогонялись (и чем повторять)
 
@@ -184,10 +184,14 @@ P1 — только после перемера на простое.
 - **Долгие прогоны** (prefill 8192 ~55 с) греют GPU и занижают decode сразу после —
   для decode-замеров делать паузу или мерить на коротком контексте.
 - `models/` (4.4 ГБ) в git не попадает — качать по README.
-- **PoCL CPU / Intel**: `pocl` и `intel-compute-runtime` установлены из репозиториев
-  (CachyOS). CPU-девайс виден, но Q6-GEMV на PoCL считает неверно (Q4-GEMV,
-  embed и нормы совпадают; проблема в subgroup-пути Q6) — до M6 нужен фикс Q6.
-  Intel NEO стоит, но iGPU в системе отсутствует (`lspci` — только AMD).
+- **`LFM_DEVICE`**: 0 — rusticl GPU, 1 — PoCL CPU (при обоих ICD). Проверка:
+  `LFM_DEVICE=1 ./target/release/lfm-bench gpu-gen --tokens 4`.
+- **PoCL CPU**: установлен из репозитория, CPU-девайс работает. Ключевые отличия:
+  `get_sub_group_size()` может равняться всему workgroup (nsg=1), поэтому сетку
+  GEMV нужно считать как `wg / subgroup`, а не `wg / 64`; в `norm_add_quant` нужен
+  барьер после чтения `red[0]` перед перезаписью `red` (на GPU-лейнах гонка не
+  проявлялась). Проверка: `gpu-check` cos 0.9993, `gpu-gen` ids = AMD.
+  Intel NEO удалён (iGPU отсутствует).
 - `LFM_PB` дублируется в `GpuModel` и в движке (`LFM_PB`, `LFM_SEQS`) — менять синхронно.
 - **RGEMV и хвосты**: одиночные batch-GEMV при `rows % RGEMV != 0` пересчитывают
   последнюю группу с перекрытием (иначе терялись строки); 4p-ядро `q4x4p_b` оставлено
@@ -229,9 +233,14 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 
 ## Файлы, изменённые в сессии 6
 
-- Код движка не изменился: KV int8 (+Hadamard), unroll/fast-math, Q6-RGEMV и PB-варианты
-  реализованы, замерены и полностью откачены (рабочее дерево чистое).
-- `docs/plan.md`, этот файл — результаты шести экспериментов и выводы.
+- `crates/backend-opencl/src/lib.rs` — `per_wg` по фактическому `sub_group_size`
+  (PoCL: подгруппа = рабочая группа), исправлен `debug_conv` (7 аргументов).
+- `crates/backend-opencl/kernels/decode.cl`, `batch.cl` — барьеры после чтения
+  `red[0]` в `norm_add_quant`/`_b`; Q6-GEMV считает блоки по `get_sub_group_size`.
+- `apps/bench/src/main.rs` — диагностика `sg-probe` (subgroup size/reduce).
+- KV int8 (+Hadamard), unroll/fast-math, Q6-RGEMV и PB-варианты реализованы,
+  замерены и полностью откачены.
+- `docs/plan.md`, этот файл — результаты экспериментов и PoCL-совместимости.
 
 ## Файлы, изменённые в сессии 5
 

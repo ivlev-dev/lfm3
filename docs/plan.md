@@ -235,10 +235,11 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
 1. `DeviceSet`: 3-tier слоёв и KV, конфиг 20/80/0 (GPU / CPU через PoCL / заглушка).
 2. TP для decode (all-reduce через host staging — P2P в rusticl нет), PP по слоям.
 3. DoD: конфиг 20/80/0 проходит `gpu-cmp`, 2-device тесты дают те же логиты.
-4. **Подготовка (сессия 6):** `pocl` и `intel-compute-runtime` установлены; CPU-девайс
-   виден. Intel iGPU отсутствует в системе. На PoCL Q4-GEMV/embed/нормы корректны,
-   а Q6-GEMV — нет (subgroup-путь; после обобщения на `get_sub_group_size` ошибка
-   осталась) — перед M6 нужен фикс Q6, затем PP/TP.
+4. **Подготовка (сессия 6):** PoCL CPU-тир заработал: сетка GEMV считается по
+   фактическому `sub_group_size` (в PoCL он равен workgroup), в `norm_add_quant`
+   добавлены барьеры (гонка `red[0]` → перезапись). `gpu-check` cos 0.9993,
+   `gpu-gen` ids совпадают с AMD. Intel NEO удалён (iGPU в системе отсутствует).
+   Можно переходить к PP/TP.
 
 ### P5. M7 — NPU и hardening
 

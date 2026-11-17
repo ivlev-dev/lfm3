@@ -247,7 +247,11 @@ fn pick_logits_rows(
 impl GpuModel {
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
         let profiling = std::env::var("LFM_PROFILE").map(|v| v == "1").unwrap_or(false);
-        let gpu = Gpu::open_with(0, profiling)?;
+        let device: usize = std::env::var("LFM_DEVICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let gpu = Gpu::open_with(device, profiling)?;
         let file = GgufFile::open(path)?;
         let cfg = ModelConfig::from_metadata(&file).map_err(|e| anyhow!("config: {e}"))?;
         let prepack_on = std::env::var("LFM_PREPACK").map(|v| v != "0").unwrap_or(true);
