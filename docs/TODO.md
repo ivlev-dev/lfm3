@@ -65,6 +65,7 @@ cargo test --workspace                     # 245 тестов
 | Parity | F16 GGUF: **5/5 промптов × 64 greedy-токена** совпадают с llama.cpp; логиты `cosine 1.000000`, `max|dlogit| 0.0055` |
 | Q4 | расхождение принципиально (llama.cpp квантует активации int8), точный oracle только F16/BF16 |
 | Порты и Generate | `InferenceBackend`/`TokenizerPort` в `lfm-app`, use-case `Generate` (greedy, гарантированный `free_sequence`), адаптеры для `GpuModel` и `LfmTokenizer`, CLI `gpu-port`; 5 тестов с фейками |
+| Движок на портах | `Engine::spawn` принимает `BackendLoader`/`TokenizerLoader`; в `engine.rs` нет импортов `lfm-gpu`/`lfm-tokenizer`, метрики KV/кэша — через `InferenceBackend`; смоук сервера (tools, completions, loadtest) пройден |
 | Тесты | 245 зелёных (+5 Generate) |
 
 ## Проверки, которые уже прогонялись (и чем повторять)
@@ -153,9 +154,9 @@ P1 — только после перемера на простое.
 
 ### 6. P6 — M1 и M6/M7
 
-- **M1 — готов**: token-parity по F16 (5×64, cos 1.000000) и порты
-  `InferenceBackend`/`TokenizerPort` + `Generate` с адаптерами и фейками.
-- Осталось: перевод серверного движка на порты (ему нужны ещё метрики KV/планировщика).
+- **M1 — готов**: token-parity по F16 (5×64, cos 1.000000), порты
+  `InferenceBackend`/`TokenizerPort`, `Generate` с адаптерами/фейками и серверный
+  движок на портах (composition root — `main.rs`).
 - M6: 3-tier + TP/PP; M7: NPU Hexagon, fuzz парсеров, спека протокола.
 
 ## Подводные камни
@@ -215,13 +216,15 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 
 - `crates/application/src/ports.rs` (новый), `src/generate.rs` (новый),
   `tests/generate.rs` (новый, 5 тестов), экспорты в `lib.rs`.
-- `crates/backend-opencl/src/ports.rs` — `InferenceBackend` для `GpuModel`;
+- `crates/backend-opencl/src/ports.rs` — `InferenceBackend` для `GpuModel`
+  (включая `prefill_begin/finish`, `max_ctx`, `free_pages`, `cache_stats`);
   `crates/infra-tokenizer/src/ports.rs` + зависимость `lfm-app` — `TokenizerPort`.
+- `apps/server/src/engine.rs`, `main.rs` — движок на портах, загрузчики в composition root.
 - `apps/bench/src/main.rs` — команда `gpu-port`.
 - `tools/oracle/greedy.cpp` (новый) — greedy-ids через llama API для сверки.
 - `tools/oracle/parity.py` (новый) — parity-скрипт на 5 промптах.
 - `tools/oracle/README.md` — сборка `greedy.cpp`, запуск parity, результаты F16.
-- `README.md`, `docs/plan.md`, этот файл — статус M1.
+- `README.md`, `docs/plan.md`, `docs/architecture.md`, этот файл — статус M1.
 
 ## Файлы, изменённые в сессии 4
 

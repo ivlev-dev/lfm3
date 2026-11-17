@@ -53,7 +53,8 @@
   `tools/oracle/` (`parity.py`, `compare_prompt.py`, `greedy.cpp`). На Q4 расхождение
   остаётся из-за квантования активаций — точный oracle только F16. Порты
   `InferenceBackend`/`TokenizerPort` и use-case `Generate` готовы (адаптеры для
-  `GpuModel`/`LfmTokenizer`, фейки в тестах, CLI `gpu-port`).
+  `GpuModel`/`LfmTokenizer`, фейки в тестах, CLI `gpu-port`); серверный движок
+  работает только через порты.
 - **M5 (сервер, планировщик и TUI) — готов.** `lfm-server` отдаёт
   `/v1/models`, `/v1/chat/completions` (обычный ответ и SSE, stop, usage, thinking,
   `tools`/`tool_calls` с `finish_reason: tool_calls`), `/v1/completions` (строка или

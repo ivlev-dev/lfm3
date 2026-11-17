@@ -245,8 +245,8 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
 1. ~~Token-parity~~ — сделано: 5 промптов × 64 greedy-id против F16 GGUF, cos 1.000000,
    `max|dlogit| 0.0055` (`tools/oracle/parity.py`).
 2. ~~Порты~~ — сделано: `InferenceBackend`/`TokenizerPort`, `Generate` с фейками,
-   адаптеры `GpuModel`/`LfmTokenizer`, CLI `gpu-port`. Перевод сервера целиком на
-   порты — отдельная задача (движку нужны также метрики KV/планировщика).
+   адаптеры `GpuModel`/`LfmTokenizer`, CLI `gpu-port`; серверный движок переведён
+   на порты (`Engine::spawn` получает загрузчики, `main` — composition root).
 
 ## Инженерные правила
 
@@ -407,8 +407,10 @@ QK-norm, partial RoPE, shortconv, GQA-внимание (online softmax), FFN, ti
    Use-case `Generate` — greedy prompt→ids/text с обязательным `free_sequence`.
    Адаптеры: `impl InferenceBackend for GpuModel`, `impl TokenizerPort for LfmTokenizer`.
    5 тестов с фейками (happy path, EOS, max_tokens=0, ошибка backend, пустой промпт)
-   и CLI `gpu-port` против реальной модели. Серверный движок пока работает с
-   `GpuModel` напрямую — перевод на трейты отдельная задача.
+   и CLI `gpu-port` против реальной модели. Серверный движок переведён на порты:
+   `Engine::spawn` принимает `BackendLoader`/`TokenizerLoader`, конкретные
+   `GpuModel`/`LfmTokenizer` подставляет `main` (composition root), `engine.rs`
+   больше не импортирует инфру.
 
 Найденные по пути особенности LFM3/GGUF:
 - conv-ядро в GGUF циклически сдвинуто на 1 относительно PyTorch: текущий токен

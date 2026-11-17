@@ -122,6 +122,10 @@ apps/bench (CLI), apps/server, apps/tui (клиент к серверу)   ко�
 - `lfm-app::Generate` — greedy prompt→ids/text с гарантированным освобождением слота.
   Адаптеры: `GpuModel` (backend-opencl) и `LfmTokenizer` (infra-tokenizer); фейки в
   `crates/application/tests/generate.rs`, смоук через `lfm-bench gpu-port`.
+- Серверный движок (`apps/server/src/engine.rs`) работает только через порты:
+  `Engine::spawn` принимает `BackendLoader`/`TokenizerLoader`, метрики KV/кэша идут
+  через `InferenceBackend::cache_stats/free_pages/max_ctx`. Конкретные реализации
+  подставляет `main.rs` (composition root).
 
 ### Планировщик
 - Реализован (`crates/application/src/scheduler.rs` + `apps/server/src/engine.rs`):
