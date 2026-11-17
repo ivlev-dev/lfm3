@@ -59,7 +59,9 @@
   Планировщик continuous batching (`crates/application/src/scheduler.rs`):
   общий `step_mixed` на все активные декоды, chunked prefill, admission по свободным
   KV-страницам, отмена по разрыву соединения; нагрузка 6×24 — 45 tok/s агрегата,
-  0 ошибок, второй запрос стартует до конца первого.
+  0 ошибок, второй запрос стартует до конца первого. Chunked prefill тоже публикует
+  страницы в радикс-кэш и восстанавливает conv-состояние: промпт 191 токен,
+  посчитанный при активном декоде, даёт повтору reused 160 токенов с тем же ответом.
   Два TUI: `gpu-chat --tui` (in-process: скролл, история ввода, resize, Ctrl+C-стоп)
   и `lfm-tui` (`apps/tui`, клиент к серверу: SSE, `/metrics` в статусе, `/save`/`/load`).
 - **Тесты:** 239 зелёных (`cargo test --workspace`), сборка без предупреждений.
@@ -81,8 +83,8 @@
    (−31/−54%, спиллы). SoA-раскладка Q4_K замерена и откачена (−4–5% prefill,
    −5% decode 2048). Слияния запусков замерены и откачены (~1%: запуск ~4–5 мкс,
    а не 28). Остаток — ALU батчевого GEMV.
-4. **P3. Остаток M5**: e2e openai-python уже покрыт (chat/stream/tools/completions);
-   остались публикация страниц при chunked prefill в радикс-кэш, pipelined HEADERS
+4. **P3. Остаток M5**: e2e openai-python уже покрыт (chat/stream/tools/completions),
+   chunked prefill публикует страницы в радикс-кэш; остались pipelined HEADERS
    в h2 `wait_for_window` и TLS по требованию.
 5. **P4–P6. M6/M7 и остаток M1**: 3-tier + TP/PP, NPU Hexagon, token-parity по F16 GGUF,
    порты `InferenceBackend`/`TokenizerPort`.

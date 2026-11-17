@@ -52,6 +52,8 @@ cargo test --workspace                     # 239 тестов
 | tools в chat | `tools`/`tool_choice` в запросе, `tool_calls`/`tool_call_id` в истории, рендер шаблона с tools, `finish_reason: tool_calls`, стриминговые дельты `tool_calls` по индексам; `/ws` тоже отдаёт `tool_call` |
 | `/v1/completions` | raw-режим движка (без шаблона и разбора тегов), строка или массив промптов, stream (один промпт), `usage`, HTTP/1.1 и h2c |
 | E2E | `openai-python` 3.52.0: chat, stream, tools (обычный/стрим), completions (обычный/стрим), многоходовой tool-ответ; curl по h2c |
+| Chunked prefill + кэш | `prefill_begin`/`prefill_finish`, `PendingPrefill` в `Sequence`, авто-снапшоты conv на границах страниц; admission сдвигает `prefilled`, завершение публикует хэши. Проверка: промпт 191 токен при активном декоде → 5 страниц, повтор reused 160, ответ совпадает; `gpu-cache` 480/512 |
+| Хвост сессии | `ChatSession::finish()` вызывается на EOS/лимите (thinking/маркер больше не теряются), не-stream отдаёт `reasoning_content` |
 | Тесты | 239 зелёных (+6 protocol: tools, tool-история, форма ответа/дельт, completions) |
 
 ## Проверки, которые уже прогонялись (и чем повторять)
@@ -126,10 +128,10 @@ P1 — только после перемера на простое.
 
 ### 4. P3 — остаток M5
 
-- **Сделано (сессия 4)**: `tools`/`tool_calls`, `/v1/completions`, e2e openai-python.
-- Осталось: chunked prefill при активных декодах **не публикует** страницы в радикс-кэш
-  (нужен `GpuModel::prefill_chunk(slot, tokens, pos0, need_logits)` с публикацией);
-  h2 `wait_for_window` игнорирует pipelined HEADERS; TLS не поддерживается (h2c).
+- **Сделано (сессия 4)**: `tools`/`tool_calls`, `/v1/completions`, e2e openai-python,
+  радикс-кэш в chunked prefill, flush сессии и `reasoning_content`.
+- Осталось: h2 `wait_for_window` игнорирует pipelined HEADERS; TLS не поддерживается
+  (h2c по prior knowledge). Для OpenAI-клиентов не критично.
 
 ### 5. Выбор устройства / CPU
 
@@ -201,10 +203,13 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 - `apps/server/src/protocol.rs` — tools/tool_calls, tool_choice, finish_reason
   `tool_calls`, `CompletionRequest`, формы ответов/дельт и 6 новых тестов.
 - `apps/server/src/engine.rs` — tools в шаблоне, `Event::ToolCall`, `Final` с
-  `tool_calls`/`finish_reason`, raw-режим, `ChatJob::chat/completion`.
+  `tool_calls`/`finish_reason`/`thinking`, raw-режим, `ChatJob::chat/completion`,
+  admission с `prefill_begin` и публикация на завершении, flush сессии.
 - `apps/server/src/main.rs`, `h2.rs` — маршрут `/v1/completions`, tools и tool-дельты
   в HTTP/1.1, h2c и WebSocket.
-- `README.md`, `docs/plan.md`, этот файл.
+- `crates/backend-opencl/src/lib.rs` — `prefill_begin`/`prefill_finish`,
+  `PendingPrefill`, авто-снапшоты conv в `forward_impl`.
+- `README.md`, `docs/plan.md`, `docs/architecture.md`, этот файл.
 
 ## Файлы, изменённые в сессии 3
 

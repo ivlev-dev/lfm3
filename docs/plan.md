@@ -197,6 +197,15 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    стрим (один промпт), `usage`, те же сэмплинг-параметры; HTTP/1.1 и h2c.
    E2E `openai-python` 3.52: chat, stream, tools (не-stream и stream), completions
    (не-stream и stream), многоходовой tool-ответ. Тестов стало 239.
+7. **Сделано: радикс-кэш в chunked prefill (сессия 4).** `GpuModel::prefill_begin`
+   забирает кэшированный префикс и хранит `PendingPrefill` в `Sequence`;
+   `forward_impl` сам пишет снапшоты conv на границах страниц; `prefill_finish`
+   публикует хэши (атомарный `prefill` использует те же три шага). Движок на admission
+   вызывает `prefill_begin` и сдвигает `sched.prefilled`, на завершении — `prefill_finish`.
+   Проверка: при активном декоде промпт 191 токен публикует 5 страниц, повтор
+   переиспользует 160 токенов, ответ совпадает; `gpu-cache` по-прежнему 480/512.
+   Попутно: `ChatSession::finish()` теперь вызывается на EOS/лимите (не теряется хвост
+   thinking/маркера), а не-stream ответ отдаёт `reasoning_content`.
 6. **Сделано: `GET /metrics`** (HTTP/1.1 и h2): атомарный снимок из воркера
    (`active/waiting`, `steps`, `avg_step_ms`, KV-страницы, `cache_hits`,
    `reused_tokens`, `uptime_s`), строгая JSON-схема, тесты на сериализацию и роуты.
