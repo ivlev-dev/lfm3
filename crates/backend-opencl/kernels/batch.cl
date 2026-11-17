@@ -480,7 +480,11 @@ __kernel void gemv_q6_k_i8_b(__global const uchar *w, __global const char *xq, _
             acc[t][r] = 0.0f;
         }
     }
-    for (uint b0 = 0u; b0 < blocks; b0 += 4u) {
+    uint bps = get_sub_group_size() >> 4;
+    if (bps == 0u) {
+        bps = 1u;
+    }
+    for (uint b0 = 0u; b0 < blocks; b0 += bps) {
         uint b = b0 + (lane >> 4);
         if (b < blocks) {
             uint w0 = b * 256u + n * 128u + l;
