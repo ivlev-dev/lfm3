@@ -227,12 +227,18 @@ struct Frame {
     flags: u8,
     stream_id: u32,
     payload: Vec<u8>,
+    flow_applied: bool,
 }
+
+const MAX_DEFERRED_FRAMES: usize = 64;
+const MAX_DEFERRED_BYTES: usize = 1 << 20;
 
 struct Conn {
     stream: TcpStream,
     flow: FlowControl,
     peer_gone: bool,
+    deferred: std::collections::VecDeque<Frame>,
+    deferred_bytes: usize,
 }
 
 impl Conn {
@@ -241,6 +247,8 @@ impl Conn {
             stream,
             flow: FlowControl::new(),
             peer_gone: false,
+            deferred: std::collections::VecDeque::new(),
+            deferred_bytes: 0,
         }
     }
 
@@ -268,7 +276,26 @@ impl Conn {
             flags: head[4],
             stream_id,
             payload,
+            flow_applied: false,
         })
+    }
+
+    fn defer(&mut self, frame: Frame) -> Result<()> {
+        self.deferred_bytes += frame.payload.len();
+        if self.deferred.len() >= MAX_DEFERRED_FRAMES || self.deferred_bytes > MAX_DEFERRED_BYTES {
+            return Err(anyhow!("too many pipelined http/2 frames"));
+        }
+        self.deferred.push_back(frame);
+        Ok(())
+    }
+
+    fn next_frame(&mut self) -> Result<Frame> {
+        if let Some(frame) = self.deferred.pop_front() {
+            self.deferred_bytes = self.deferred_bytes.saturating_sub(frame.payload.len());
+            Ok(frame)
+        } else {
+            self.read_frame()
+        }
     }
 
     fn write_frame(&mut self, typ: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Result<()> {
@@ -429,7 +456,7 @@ impl Conn {
             if !self.flow.has_stream(stream_id) {
                 return Ok(SendState::Reset);
             }
-            let frame = self.read_frame()?;
+            let mut frame = self.read_frame()?;
             match frame.typ {
                 FRAME_SETTINGS => {
                     if frame.flags & FLAG_ACK == 0 {
@@ -452,6 +479,10 @@ impl Conn {
                     self.peer_gone = true;
                     return Ok(SendState::GoneAway);
                 }
+                FRAME_HEADERS | FRAME_CONTINUATION => {
+                    self.flow.open_stream(frame.stream_id);
+                    self.defer(frame)?;
+                }
                 FRAME_DATA => {
                     let len = frame.payload.len() as u32;
                     if len > 0 {
@@ -460,6 +491,8 @@ impl Conn {
                             self.window_update(frame.stream_id, len)?;
                         }
                     }
+                    frame.flow_applied = true;
+                    self.defer(frame)?;
                 }
                 _ => {}
             }
@@ -489,7 +522,7 @@ pub fn serve(stream: TcpStream, engine: &Engine, model: &str) -> Result<()> {
         if conn.peer_gone {
             break;
         }
-        let frame = conn.read_frame()?;
+        let frame = conn.next_frame()?;
         match frame.typ {
             FRAME_SETTINGS => {
                 if frame.flags & FLAG_ACK == 0 {
@@ -568,7 +601,7 @@ pub fn serve(stream: TcpStream, engine: &Engine, model: &str) -> Result<()> {
                     if req.body.len() > 8 << 20 {
                         return Err(anyhow!("request body too large"));
                     }
-                    if !frame.payload.is_empty() {
+                    if !frame.flow_applied && !frame.payload.is_empty() {
                         let inc = frame.payload.len() as u32;
                         conn.window_update(0, inc)?;
                         conn.window_update(frame.stream_id, inc)?;
@@ -1202,6 +1235,33 @@ mod tests {
         let writer = std::thread::spawn(move || conn.send_data(1, b"hello", false).unwrap());
         send_frame(&mut client, FRAME_RST, 0, 1, &ERR_PROTOCOL.to_be_bytes());
         assert_eq!(writer.join().unwrap(), SendState::Reset);
+    }
+
+    #[test]
+    fn window_wait_defers_pipelined_headers_and_body() {
+        let (mut conn, mut client) = pair();
+        conn.flow.apply_initial_window(0).unwrap();
+        conn.flow.open_stream(1);
+        let writer =
+            std::thread::spawn(move || {
+                let state = conn.send_data(1, &[7u8; 40], true).unwrap();
+                (conn, state)
+            });
+        send_frame(&mut client, FRAME_HEADERS, FLAG_END_HEADERS, 3, b"\x82");
+        send_frame(&mut client, FRAME_DATA, 0, 3, b"body");
+        send_frame(&mut client, FRAME_WINDOW_UPDATE, 0, 0, &40u32.to_be_bytes());
+        send_frame(&mut client, FRAME_WINDOW_UPDATE, 0, 1, &40u32.to_be_bytes());
+        let (mut conn, state) = writer.join().unwrap();
+        assert_eq!(state, SendState::Open);
+        let headers = conn.next_frame().unwrap();
+        assert_eq!(headers.typ, FRAME_HEADERS);
+        assert_eq!(headers.stream_id, 3);
+        assert!(conn.flow.has_stream(3));
+        let data = conn.next_frame().unwrap();
+        assert_eq!(data.typ, FRAME_DATA);
+        assert_eq!(data.stream_id, 3);
+        assert_eq!(data.payload, b"body");
+        assert!(data.flow_applied);
     }
 
     #[test]
