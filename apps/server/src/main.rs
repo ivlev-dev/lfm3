@@ -36,13 +36,23 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let engine = Engine::spawn(ServeConfig {
-        model: cli.model.clone(),
-        tokenizer: cli.tokenizer.clone(),
-        template: cli.template.clone(),
-        ctx: cli.ctx,
-        system: cli.system.clone(),
-    })?;
+    let backend: lfm_app::BackendLoader = Box::new(|path, ctx| {
+        Ok(Box::new(lfm_gpu::GpuModel::load(path, ctx)?))
+    });
+    let tokenizer: lfm_app::TokenizerLoader = Box::new(|path| {
+        Ok(Box::new(lfm_tokenizer::LfmTokenizer::from_file(path)?))
+    });
+    let engine = Engine::spawn(
+        ServeConfig {
+            model: cli.model.clone(),
+            tokenizer: cli.tokenizer.clone(),
+            template: cli.template.clone(),
+            ctx: cli.ctx,
+            system: cli.system.clone(),
+        },
+        backend,
+        tokenizer,
+    )?;
     let listener = TcpListener::bind(&cli.addr)?;
     println!("lfm-server: http://{} (модель {})", cli.addr, cli.name);
     for conn in listener.incoming() {

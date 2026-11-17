@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use lfm_app::{InferenceBackend, SequenceStep};
+use lfm_app::{CacheStats, InferenceBackend, SequenceStep};
 
 use crate::{GpuModel, StepReq};
 
@@ -15,6 +15,14 @@ impl InferenceBackend for GpuModel {
 
     fn prefill(&mut self, slot: usize, tokens: &[u32], need_logits: bool) -> Result<usize> {
         GpuModel::prefill(self, slot, tokens, need_logits)
+    }
+
+    fn prefill_begin(&mut self, slot: usize, tokens: &[u32]) -> Result<usize> {
+        GpuModel::prefill_begin(self, slot, tokens)
+    }
+
+    fn prefill_finish(&mut self, slot: usize) -> Result<()> {
+        GpuModel::prefill_finish(self, slot)
     }
 
     fn step(&mut self, steps: &[SequenceStep], need_logits: bool) -> Result<()> {
@@ -35,5 +43,22 @@ impl InferenceBackend for GpuModel {
 
     fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
         GpuModel::logits_row(self, row)
+    }
+
+    fn max_ctx(&self) -> usize {
+        GpuModel::max_ctx(self)
+    }
+
+    fn free_pages(&self) -> usize {
+        GpuModel::free_pages(self)
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        let (cached_pages, used_pages, hits) = GpuModel::cache_stats(self);
+        CacheStats {
+            cached_pages,
+            used_pages,
+            hits,
+        }
     }
 }

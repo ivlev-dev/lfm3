@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use anyhow::{anyhow, Result};
-use lfm_app::{FinishReason, Generate, InferenceBackend, SequenceStep, TokenizerPort};
+use lfm_app::{
+    CacheStats, FinishReason, Generate, InferenceBackend, SequenceStep, TokenizerPort,
+};
 
 struct FakeTokenizer {
     eos: u32,
@@ -63,6 +65,14 @@ impl InferenceBackend for FakeBackend {
         Ok(0)
     }
 
+    fn prefill_begin(&mut self, _slot: usize, _tokens: &[u32]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn prefill_finish(&mut self, _slot: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn step(&mut self, steps: &[SequenceStep], _need_logits: bool) -> Result<()> {
         if self.fail_step {
             return Err(anyhow!("step failed"));
@@ -78,6 +88,18 @@ impl InferenceBackend for FakeBackend {
     fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
         assert_eq!(row, 0);
         Ok(self.logits.borrow_mut().pop_front().unwrap_or_default())
+    }
+
+    fn max_ctx(&self) -> usize {
+        2048
+    }
+
+    fn free_pages(&self) -> usize {
+        64
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        CacheStats::default()
     }
 }
 

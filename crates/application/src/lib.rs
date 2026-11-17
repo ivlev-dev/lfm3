@@ -4,7 +4,9 @@ pub mod sampling;
 pub mod scheduler;
 
 pub use generate::{FinishReason, Generate, GenerateOutcome};
-pub use ports::{InferenceBackend, SequenceStep, TokenizerPort};
+pub use ports::{
+    BackendLoader, CacheStats, InferenceBackend, SequenceStep, TokenizerLoader, TokenizerPort,
+};
 pub use sampling::{argmax, Sampler};
 pub use scheduler::{
     pages_for, ActiveSeq, AdmitError, AdmitOutcome, Enqueued, JobId, Phase, Scheduler,

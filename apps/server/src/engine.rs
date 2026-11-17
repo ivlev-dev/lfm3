@@ -1,12 +1,11 @@
 use anyhow::{anyhow, Result};
 use lfm_app::{
-    ChatSession, Sampler, Scheduler, SchedulerConfig, SessionEvent, StepPlan, StepRow, StepToken,
-    ActiveSeq, JobId,
+    ActiveSeq, BackendLoader, CacheStats, ChatSession, InferenceBackend, JobId, Sampler, Scheduler,
+    SchedulerConfig, SequenceStep, SessionEvent, StepPlan, StepRow, StepToken, TokenizerLoader,
+    TokenizerPort,
 };
 use lfm_chat::ChatTemplate;
 use lfm_domain::{Message, SamplingParams, ToolCall, ToolDef};
-use lfm_gpu::{GpuModel, StepReq};
-use lfm_tokenizer::LfmTokenizer;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -183,7 +182,11 @@ impl EngineMetrics {
 const IDLE_POLL: Duration = Duration::from_millis(20);
 
 impl Engine {
-    pub fn spawn(cfg: ServeConfig) -> Result<Self> {
+    pub fn spawn(
+        cfg: ServeConfig,
+        backend: BackendLoader,
+        tokenizer: TokenizerLoader,
+    ) -> Result<Self> {
         let (job_tx, job_rx) = channel::<Job>();
         let (ready_tx, ready_rx) = channel::<Result<()>>();
         let metrics = Arc::new(EngineMetrics::new(cfg.ctx));
@@ -191,7 +194,7 @@ impl Engine {
         std::thread::Builder::new()
             .name("engine".to_string())
             .spawn(move || {
-                let mut worker = match Worker::load(cfg, worker_metrics) {
+                let mut worker = match Worker::load(cfg, worker_metrics, backend, tokenizer) {
                     Ok(worker) => {
                         let _ = ready_tx.send(Ok(()));
                         worker
@@ -286,7 +289,7 @@ impl RequestState {
         TokenFlow::Continue
     }
 
-    fn process_token(&mut self, tok: &LfmTokenizer, token: u32) -> TokenFlow {
+    fn process_token(&mut self, tok: &dyn TokenizerPort, token: u32) -> TokenFlow {
         self.tokens.push(token);
         let Ok(text) = tok.decode(&self.tokens, true) else {
             return TokenFlow::Continue;
@@ -403,17 +406,21 @@ impl Metrics {
         }
     }
 
-    fn update(&self, sched: &Scheduler, gpu: &GpuModel) -> MetricsUpdate {
-        let (cached, used, hits) = gpu.cache_stats();
+    fn update(&self, sched: &Scheduler, gpu: &dyn InferenceBackend) -> MetricsUpdate {
+        let CacheStats {
+            cached_pages,
+            used_pages,
+            hits,
+        } = gpu.cache_stats();
         MetricsUpdate {
             ctx: gpu.max_ctx(),
             active: saturating_u32(sched.active_len()),
             waiting: saturating_u32(sched.waiting_len()),
             steps: self.steps,
             avg_step_us: self.avg_step_us(),
-            kv_used_pages: saturating_u64(used),
+            kv_used_pages: saturating_u64(used_pages),
             kv_free_pages: saturating_u64(gpu.free_pages()),
-            kv_cached_pages: saturating_u64(cached),
+            kv_cached_pages: saturating_u64(cached_pages),
             cache_hits: hits,
             reused_tokens: saturating_u64(self.reused_tokens),
         }
@@ -447,8 +454,8 @@ fn saturating_u64(value: usize) -> u64 {
 }
 
 struct Worker {
-    gpu: GpuModel,
-    tok: LfmTokenizer,
+    gpu: Box<dyn InferenceBackend>,
+    tok: Box<dyn TokenizerPort>,
     chat: ChatTemplate,
     system: String,
     sched: Scheduler,
@@ -458,8 +465,13 @@ struct Worker {
 }
 
 impl Worker {
-    fn load(cfg: ServeConfig, shared: Arc<EngineMetrics>) -> Result<Self> {
-        let gpu = GpuModel::load(&cfg.model, cfg.ctx)?;
+    fn load(
+        cfg: ServeConfig,
+        shared: Arc<EngineMetrics>,
+        backend: BackendLoader,
+        tokenizer: TokenizerLoader,
+    ) -> Result<Self> {
+        let gpu = backend(&cfg.model, cfg.ctx)?;
         let max_batch = env_range("LFM_PB", 6, 1, 12);
         let max_active = env_range("LFM_SEQS", 8, 1, 16);
         let prefill_budget = env_usize("LFM_PREFILL_BUDGET", 12).clamp(1, 64);
@@ -469,7 +481,7 @@ impl Worker {
             max_batch,
             prefill_budget,
         ));
-        let tok = LfmTokenizer::from_file(&cfg.tokenizer)?;
+        let tok = tokenizer(&cfg.tokenizer)?;
         let chat = ChatTemplate::from_file(&cfg.template)?;
         let worker = Self {
             gpu,
@@ -487,7 +499,7 @@ impl Worker {
 
     fn publish(&self) {
         self.shared
-            .apply(self.metrics.update(&self.sched, &self.gpu));
+            .apply(self.metrics.update(&self.sched, self.gpu.as_ref()));
     }
 
     fn run(&mut self, job_rx: Receiver<Job>) {
@@ -695,7 +707,7 @@ impl Worker {
                 .map(|state| index + 1 >= state.prompt.len())
                 .unwrap_or(false),
         });
-        let mut reqs = Vec::with_capacity(rows.len());
+        let mut reqs: Vec<SequenceStep> = Vec::with_capacity(rows.len());
         let mut failure: Option<(JobId, String)> = None;
         for row in rows {
             let Some(state) = self.reqs.get(&row.id) else {
@@ -718,7 +730,7 @@ impl Worker {
                     }
                 },
             };
-            reqs.push(StepReq {
+            reqs.push(SequenceStep {
                 slot: state.slot,
                 token,
                 pos: row.pos,
@@ -728,7 +740,7 @@ impl Worker {
             self.fail_request(id, reason);
             return false;
         }
-        if let Err(e) = self.gpu.step_mixed(&reqs, need_logits) {
+        if let Err(e) = self.gpu.step(&reqs, need_logits) {
             let mut ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
             ids.sort();
             ids.dedup();
@@ -792,7 +804,7 @@ impl Worker {
         };
         let token = state.sampler.sample(&mut logits);
         state.sampler.push(token);
-        let flow = state.process_token(tok, token);
+        let flow = state.process_token(tok.as_ref(), token);
         let commit = state.commit_token(token, flow);
         self.sched.record_token(id);
         match commit {
