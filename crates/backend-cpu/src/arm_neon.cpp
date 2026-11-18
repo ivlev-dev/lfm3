@@ -2,7 +2,6 @@
 #include <string.h>
 #include <arm_neon.h>
 
-extern "C" {
 
 #define Q4_BLOCK 192
 #define Q6_BLOCK 320
@@ -51,7 +50,7 @@ static inline uint8x16_t nib(uint8x16_t v, int hi) {
     return vandq_u8(v, vdupq_n_u8(0x0F));
 }
 
-void lfm_q4_rows(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
+extern "C" void lfm_q4_rows(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
                  const int32_t *const *sums, int blocks, int ntok, float *out) {
     float acc[MAX_TOK];
     for (int t = 0; t < ntok; ++t) {
@@ -83,7 +82,7 @@ void lfm_q4_rows(const uint8_t *w, const int8_t *const *xq, const float *const *
     }
 }
 
-void lfm_q6_rows(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
+extern "C" void lfm_q6_rows(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
                  const int32_t *const *sums16, int blocks, int ntok, float *out) {
     float acc[MAX_TOK];
     for (int t = 0; t < ntok; ++t) {
@@ -137,6 +136,24 @@ static inline float half_to_float(uint16_t h) {
     return f;
 }
 
+static inline float xs_all(const float *const *xs, int t, int b) {
+    return xs[t][b * 8];
+}
+
+static inline void q4_raw_scales_i(const uint8_t *blk, int *sc, int *mn) {
+    const uint8_t *q = blk + 4;
+    for (int j = 0; j < 8; ++j) {
+        int jm = j & 3;
+        int h = j >> 2;
+        uint8_t a = q[jm], b = q[jm + 4], c = q[jm + 8];
+        uint8_t lo_d = a & 63, lo_m = b & 63;
+        uint8_t hi_d = (uint8_t)((c & 15) | ((a >> 6) << 4));
+        uint8_t hi_m = (uint8_t)((c >> 4) | ((b >> 6) << 4));
+        sc[j] = (int)(h == 0 ? lo_d : hi_d);
+        mn[j] = (int)(h == 0 ? lo_m : hi_m);
+    }
+}
+
 static inline void q4_raw_scales(const uint8_t *blk, float d, float dmin, float *sc, float *mn) {
     const uint8_t *q = blk + 4;
     for (int j = 0; j < 8; ++j) {
@@ -151,9 +168,11 @@ static inline void q4_raw_scales(const uint8_t *blk, float d, float dmin, float 
     }
 }
 
-void lfm_q4_rows_raw(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
-                     const int32_t *const *sums, int blocks, int ntok, float *out) {
-    float acc[MAX_TOK];
+template <int NT>
+static void q4_rows_raw_t(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
+                          const int32_t *const *sums, int blocks, float *out) {
+    constexpr int ntok = NT;
+    float acc[NT];
     for (int t = 0; t < ntok; ++t) {
         acc[t] = 0.0f;
     }
@@ -162,20 +181,33 @@ void lfm_q4_rows_raw(const uint8_t *w, const int8_t *const *xq, const float *con
         __builtin_prefetch(blk + 6 * 144);
         __builtin_prefetch(blk + 6 * 144 + 64);
         __builtin_prefetch(blk + 6 * 144 + 128);
-        float d = half_to_float((uint16_t)(blk[0] | (blk[1] << 8)));
-        float dmin = half_to_float((uint16_t)(blk[2] | (blk[3] << 8)));
-        float sc[8], mn[8];
-        q4_raw_scales(blk, d, dmin, sc, mn);
+        float dw = half_to_float((uint16_t)(blk[0] | (blk[1] << 8)));
+        float dminw = half_to_float((uint16_t)(blk[2] | (blk[3] << 8)));
+        int sc6[8], m6[8];
+        q4_raw_scales_i(blk, sc6, m6);
         const uint8_t *qs = blk + 16;
+        int sumi[NT];
+        int sumn[NT];
+        for (int t = 0; t < ntok; ++t) {
+            sumi[t] = 0;
+            sumn[t] = 0;
+        }
         const int8x16_t bias = vdupq_n_s8(8);
         for (int g = 0; g < 8; ++g) {
             int8x16_t wa = vsubq_s8(vreinterpretq_s8_u8(nib(vld1q_u8(qs + (g / 2) * 32), g & 1)), bias);
             int8x16_t wb = vsubq_s8(vreinterpretq_s8_u8(nib(vld1q_u8(qs + (g / 2) * 32 + 16), g & 1)), bias);
+            const int sc = sc6[g];
+            const int mn = m6[g];
             for (int t = 0; t < ntok; ++t) {
-                const int8_t *xv = xq[t] + b * 256 + g * 32;
-                int32_t dot = dot_i8_32(wa, wb, xv) + 8 * sums[t][b * 8 + g];
-                acc[t] += xs[t][b * 8 + g] * (sc[g] * (float)dot - mn[g] * (float)sums[t][b * 8 + g]);
+                const int32_t *st = sums[t] + b * 8 + g;
+                int dot = dot_i8_32(wa, wb, xq[t] + b * 256 + g * 32) + 8 * (*st);
+                sumi[t] += dot * sc;
+                sumn[t] += (*st) * mn;
             }
+        }
+        for (int t = 0; t < ntok; ++t) {
+            float xsc = xs_all(xs, t, b);
+            acc[t] += xsc * (dw * (float)sumi[t] - dminw * (float)sumn[t]);
         }
     }
     for (int t = 0; t < ntok; ++t) {
@@ -183,9 +215,11 @@ void lfm_q4_rows_raw(const uint8_t *w, const int8_t *const *xq, const float *con
     }
 }
 
-void lfm_q6_rows_raw(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
-                     const int32_t *const *sums16, int blocks, int ntok, float *out) {
-    float acc[MAX_TOK];
+template <int NT>
+static void q6_rows_raw_t(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
+                          const int32_t *const *sums16, int blocks, float *out) {
+    constexpr int ntok = NT;
+    float acc[NT];
     for (int t = 0; t < ntok; ++t) {
         acc[t] = 0.0f;
     }
@@ -227,4 +261,25 @@ void lfm_q6_rows_raw(const uint8_t *w, const int8_t *const *xq, const float *con
     }
 }
 
-} // extern "C"
+extern "C" void lfm_q4_rows_raw(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
+                     const int32_t *const *sums, int blocks, int ntok, float *out) {
+    if (ntok == 8) {
+        q4_rows_raw_t<8>(w, xq, xs, sums, blocks, out);
+    } else if (ntok == 1) {
+        q4_rows_raw_t<1>(w, xq, xs, sums, blocks, out);
+    } else {
+        q4_rows_raw_t<2>(w, xq, xs, sums, blocks, out);
+    }
+}
+
+extern "C" void lfm_q6_rows_raw(const uint8_t *w, const int8_t *const *xq, const float *const *xs,
+                     const int32_t *const *sums16, int blocks, int ntok, float *out) {
+    if (ntok == 8) {
+        q6_rows_raw_t<8>(w, xq, xs, sums16, blocks, out);
+    } else if (ntok == 1) {
+        q6_rows_raw_t<1>(w, xq, xs, sums16, blocks, out);
+    } else {
+        q6_rows_raw_t<2>(w, xq, xs, sums16, blocks, out);
+    }
+}
+

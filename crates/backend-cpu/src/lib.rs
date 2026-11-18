@@ -96,6 +96,7 @@ struct LayerState {
 
 impl CpuBackend {
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
+        init_threads();
         let mmap_on = std::env::var("LFM_MMAP")
             .map(|v| v != "0")
             .unwrap_or(cfg!(any(target_arch = "arm", target_arch = "aarch64")));
@@ -879,6 +880,10 @@ fn quantize(x: &[f32]) -> Act {
     let groups = x.len().div_ceil(GROUP);
     let mut q = vec![0i8; x.len()];
     let mut s = vec![0.0f32; groups];
+    let q256 = std::env::var("LFM_Q256").map(|v| v != "0").unwrap_or(false);
+    if q256 || cfg!(any(target_arch = "arm", target_arch = "aarch64")) {
+        return quantize_block(x, q, s);
+    }
     let mut sum32 = vec![0i32; groups];
     let mut sum16 = vec![0i32; groups * 2];
     for g in 0..groups {
@@ -897,6 +902,30 @@ fn quantize(x: &[f32]) -> Act {
         for i in 0..(end - start) {
             sum32[g] += i32::from(q[start + i]);
             sum16[g * 2 + i / 16] += i32::from(q[start + i]);
+        }
+    }
+    Act { q, s, sum32, sum16 }
+}
+
+fn quantize_block(x: &[f32], mut q: Vec<i8>, mut s: Vec<f32>) -> Act {
+    let groups = s.len();
+    let blocks = x.len() / 256;
+    let mut sum32 = vec![0i32; groups];
+    let mut sum16 = vec![0i32; groups * 2];
+    for b in 0..blocks {
+        let start = b * 256;
+        let end = (start + 256).min(x.len());
+        let amax = x[start..end].iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let sc = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        for g in b * 8..(b * 8 + 8).min(groups) {
+            s[g] = sc;
+        }
+        for i in start..end {
+            let v = (x[i] * inv).round().clamp(-127.0, 127.0) as i8;
+            q[i] = v;
+            sum32[i / 32] += i32::from(v);
+            sum16[i / 16] += i32::from(v);
         }
     }
     Act { q, s, sum32, sum16 }
@@ -940,6 +969,62 @@ unsafe extern "C" {
         ntok: i32,
         out: *mut f32,
     );
+}
+
+fn online_cpus() -> usize {
+    let mut best = 0usize;
+    for path in ["/sys/devices/system/cpu/present", "/sys/devices/system/cpu/online"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let mut count = 0usize;
+            for part in text.trim().split(',') {
+                match part.split_once('-') {
+                    Some((a, b)) => {
+                        if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                            count += b.saturating_sub(a) + 1;
+                        }
+                    }
+                    None => count += 1,
+                }
+            }
+            best = best.max(count);
+        }
+    }
+    if best > 0 {
+        return best;
+    }
+    if let Ok(text) = std::fs::read_to_string("/sys/devices/system/cpu/online") {
+        let mut count = 0usize;
+        for part in text.trim().split(',') {
+            match part.split_once('-') {
+                Some((a, b)) => {
+                    if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                        count += b.saturating_sub(a) + 1;
+                    }
+                }
+                None => count += 1,
+            }
+        }
+        if count > 0 {
+            return count;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+}
+
+fn init_threads() {
+    let n = std::env::var("LFM_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(online_cpus)
+        .min(64);
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+    });
 }
 
 fn q4_raw_scales(blk: &[u8]) -> ([f32; 8], [f32; 8]) {
@@ -993,9 +1078,14 @@ fn raw_rows(w: &Quant, acts: &[&Act], out: &mut [f32]) {
         let u16p: Vec<usize> = acts.iter().map(|a| a.sum16.as_ptr() as usize).collect();
         let dst = out.as_mut_ptr() as usize;
         let base = raw.as_ptr() as usize;
-        (0..rows).into_par_iter().for_each(|row| unsafe {
+        let bsz = if kind == RawKind::Q4 { 144 } else { 210 };
+        let chunk = 16usize;
+        let tasks: Vec<usize> = (0..rows).step_by(chunk).collect();
+        tasks.into_par_iter().for_each(|r0| unsafe {
+            let r1 = (r0 + chunk).min(rows);
+            for row in r0..r1 {
             let mut tmp = [0.0f32; TILE];
-            let wptr = (base as *const u8).add(row * blocks * if kind == RawKind::Q4 { 144 } else { 210 });
+            let wptr = (base as *const u8).add(row * blocks * bsz);
             match kind {
                 RawKind::Q4 => lfm_q4_rows_raw(
                     wptr,
@@ -1019,6 +1109,7 @@ fn raw_rows(w: &Quant, acts: &[&Act], out: &mut [f32]) {
             let p = dst as *mut f32;
             for t in 0..n {
                 *p.add(t * rows + row) = tmp[t];
+            }
             }
         });
         return;
