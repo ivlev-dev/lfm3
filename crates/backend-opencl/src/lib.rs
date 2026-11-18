@@ -478,6 +478,7 @@ pub struct GpuModel {
     subgroup: usize,
     kv_blocks: usize,
     kv_q4: bool,
+    splits_cap: usize,
     cache: RadixCache,
     cache_on: bool,
     attn4: bool,
@@ -820,6 +821,11 @@ impl GpuModel {
         if !gpu.caps.fp16 {
             return Err(anyhow!("device without fp16 is not supported"));
         }
+        let splits_cap: usize = std::env::var("LFM_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| (1..=MAX_SPLITS).contains(v))
+            .unwrap_or(MAX_SPLITS);
         let kv_kind = std::env::var("LFM_KV").unwrap_or_else(|_| "f16".to_string());
         let kv_q4 = kv_kind == "q4" || kv_kind == "k4v4";
         let kv_kvarn = kv_kind == "kvarn" || kv_kind == "kvarn_k4v2";
@@ -943,6 +949,7 @@ impl GpuModel {
             subgroup,
             kv_blocks,
             kv_q4,
+            splits_cap,
             cache: RadixCache::new(kv_blocks),
             cache_on,
             attn4,
@@ -1689,7 +1696,7 @@ impl GpuModel {
                     } else {
                         0
                     };
-                    let splits = attention_splits(pos + 1 - start);
+                    let splits = attention_splits(pos + 1 - start).min(self.splits_cap);
                     let full_end = ((pos + 1) / KV_PAGE * KV_PAGE) as u32;
                     if splits <= 1 {
                         match sel {
@@ -2153,7 +2160,7 @@ impl GpuModel {
         } else {
             0
         };
-        let splits = attention_splits(pos + 1 - start);
+        let splits = attention_splits(pos + 1 - start).min(self.splits_cap);
         if splits <= 1 {
             unsafe {
                 self.gpu.launch(
@@ -2962,7 +2969,7 @@ impl GpuModel {
                     }
                     let last = reqs.iter().map(|r| r.pos).max().unwrap_or(0) + 1;
                     let span_max = if window > 0 { window.min(last) } else { last };
-                    let splits = (span_max / 512).clamp(1, MAX_SPLITS);
+                    let splits = (span_max / 512).clamp(1, self.splits_cap);
                     if splits <= 1 {
                         match kv_q4 {
                             Some((kc, kn, vc, vs)) => unsafe {
@@ -3342,8 +3349,35 @@ impl GpuModel {
         } else {
             self.logits_off = None;
         }
+        self.publish_completed(reqs);
         self.gpu.queue.finish()?;
         Ok(())
+    }
+
+    fn publish_completed(&mut self, reqs: &[StepReq]) {
+        if !self.cache_on {
+            return;
+        }
+        for r in reqs {
+            if (r.pos + 1) % KV_PAGE != 0 {
+                continue;
+            }
+            let page_idx = r.pos / KV_PAGE;
+            let Some(seq) = self.seqs.get(r.slot).and_then(|s| s.as_ref()) else {
+                continue;
+            };
+            let Some(pending) = seq.pending.as_ref() else {
+                continue;
+            };
+            if page_idx < pending.reused_pages {
+                continue;
+            }
+            let hash = pending.hashes.get(page_idx).copied();
+            let page = seq.block_table.get(page_idx).copied();
+            if let (Some(hash), Some(page)) = (hash, page) {
+                self.cache.publish(page as usize, hash);
+            }
+        }
     }
 
     pub fn debug_embed(&mut self, token: u32) -> Result<Vec<f32>> {
