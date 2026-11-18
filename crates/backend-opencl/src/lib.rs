@@ -57,20 +57,6 @@ enum Weight {
     F32(Buffer<f32>),
 }
 
-enum KvBuf {
-    F32(Buffer<f32>),
-    F16(Buffer<u16>),
-}
-
-impl KvBuf {
-    fn mem(&self) -> ClMemRaw {
-        match self {
-            KvBuf::F32(b) => b.get(),
-            KvBuf::F16(b) => b.get(),
-        }
-    }
-}
-
 struct Kernels {
     embed: Kernel,
     rms: Kernel,
@@ -80,14 +66,10 @@ struct Kernels {
     q6: Kernel,
     silu: Kernel,
     conv: Kernel,
-    attn: Kernel,
-    attn_split: Kernel,
     attn_combine: Kernel,
     attn_h: Kernel,
     attn_split_h: Kernel,
-    kv_store: Kernel,
     kv_store_h: Kernel,
-    fill: Kernel,
     fill_h: Kernel,
     rms_quant: Kernel,
     norm_add_quant: Kernel,
@@ -101,18 +83,13 @@ struct Kernels {
     q4_b: Kernel,
     q4p_b: Kernel,
     q4x4p_b: Kernel,
-    gemm_q4_lds10: Kernel,
-    gemm_q4_lds11: Kernel,
     gemm_q4_lds17: Kernel,
     gemm_q6: Kernel,
     gemm_q6_pp: Kernel,
     q6_b: Kernel,
     conv_b: Kernel,
     rms_rope_heads_b: Kernel,
-    kv_store_b: Kernel,
     kv_store_b_h: Kernel,
-    attn_b: Kernel,
-    attn_split_b: Kernel,
     attn_combine_b: Kernel,
     attn_b_h: Kernel,
     attn_b_h2: Kernel,
@@ -400,8 +377,8 @@ struct PendingPrefill {
 struct LayerBufs {
     conv: Option<Buffer<f32>>,
     snap: Option<Buffer<f32>>,
-    k: Option<KvBuf>,
-    v: Option<KvBuf>,
+    k: Option<Buffer<u16>>,
+    v: Option<Buffer<u16>>,
 }
 
 pub struct GpuModel {
@@ -427,7 +404,6 @@ pub struct GpuModel {
     batch_cap: usize,
     gemm_force: Option<String>,
     prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)>,
-    gemm_q4: String,
     rgemv: usize,
     rgemv_b: usize,
     wg: usize,
@@ -436,7 +412,6 @@ pub struct GpuModel {
     kv_blocks: usize,
     cache: RadixCache,
     cache_on: bool,
-    kv_f16: bool,
     attn4: bool,
     attn2: bool,
     max_seqs: usize,
@@ -684,13 +659,6 @@ impl GpuModel {
             .unwrap_or(128);
         let batch_cap = pb.max(prefill_batch);
         let gemm_force: Option<String> = std::env::var("LFM_GEMM_FORCE").ok().filter(|v| !v.is_empty());
-        let gemm_q4: String = std::env::var("LFM_GEMM_Q4").unwrap_or_else(|_| {
-            if gpu.caps.max_work_group_size < 512 {
-                "lds11".to_string()
-            } else {
-                "lds17".to_string()
-            }
-        });
         let rgemv: usize = std::env::var("LFM_RGEMV")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -725,14 +693,10 @@ impl GpuModel {
             q6: Kernel::create(&program, "gemv_q6_k_i8")?,
             silu: Kernel::create(&program, "silu_mul")?,
             conv: Kernel::create(&program, "conv_step")?,
-            attn: Kernel::create(&program, "attention")?,
-            attn_split: Kernel::create(&program, "attention_split")?,
             attn_combine: Kernel::create(&program, "attention_combine")?,
             attn_h: Kernel::create(&program, "attention_h")?,
             attn_split_h: Kernel::create(&program, "attention_split_h")?,
-            kv_store: Kernel::create(&program, "kv_store2")?,
             kv_store_h: Kernel::create(&program, "kv_store_h")?,
-            fill: Kernel::create(&program, "fill_zero")?,
             fill_h: Kernel::create(&program, "fill_zero_h")?,
             rms_quant: Kernel::create(&program, "rms_quant")?,
             norm_add_quant: Kernel::create(&program, "norm_add_quant")?,
@@ -746,18 +710,13 @@ impl GpuModel {
             q4_b: Kernel::create(&program, "gemv_q4_k_i8_b")?,
             q4p_b: Kernel::create(&program, "gemv_q4_k_i8_p_b")?,
             q4x4p_b: Kernel::create(&program, "gemv_q4_k_i8_4p_b")?,
-            gemm_q4_lds10: Kernel::create(&program, "gemm_q4_k_i8_lds10")?,
-            gemm_q4_lds11: Kernel::create(&program, "gemm_q4_k_i8_lds11")?,
             gemm_q4_lds17: Kernel::create(&program, "gemm_q4_k_i8_lds17")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
             conv_b: Kernel::create(&program, "conv_step_b")?,
             rms_rope_heads_b: Kernel::create(&program, "rms_rope_heads_b")?,
-            kv_store_b: Kernel::create(&program, "kv_store_b")?,
             kv_store_b_h: Kernel::create(&program, "kv_store_b_h")?,
-            attn_b: Kernel::create(&program, "attention_b")?,
-            attn_split_b: Kernel::create(&program, "attention_split_b")?,
             attn_combine_b: Kernel::create(&program, "attention_combine_b")?,
             attn_b_h: Kernel::create(&program, "attention_b_h")?,
             attn_b_h2: Kernel::create(&program, "attention_b_h2")?,
@@ -777,10 +736,9 @@ impl GpuModel {
             .filter(|v: &usize| (1..=16).contains(v))
             .unwrap_or(8);
         let cache_on = std::env::var("LFM_CACHE").map(|v| v != "0").unwrap_or(true);
-        let kv_f16 = gpu.caps.fp16
-            && std::env::var("LFM_KV")
-                .map(|v| v != "f32")
-                .unwrap_or(true);
+        if !gpu.caps.fp16 {
+            return Err(anyhow!("device without fp16 is not supported"));
+        }
         let attn4 = std::env::var("LFM_ATTN4").map(|v| v != "0").unwrap_or(true);
         let attn2 = std::env::var("LFM_ATTN2").map(|v| v != "0").unwrap_or(true);
         let bufs = Bufs {
@@ -856,16 +814,8 @@ impl GpuModel {
                 _ => LayerBufs {
                     conv: None,
                     snap: None,
-                    k: Some(if kv_f16 {
-                        KvBuf::F16(gpu.alloc::<u16>(kv_slots * kvd)?)
-                    } else {
-                        KvBuf::F32(gpu.alloc::<f32>(kv_slots * kvd)?)
-                    }),
-                    v: Some(if kv_f16 {
-                        KvBuf::F16(gpu.alloc::<u16>(kv_slots * kvd)?)
-                    } else {
-                        KvBuf::F32(gpu.alloc::<f32>(kv_slots * kvd)?)
-                    }),
+                    k: Some(gpu.alloc::<u16>(kv_slots * kvd)?),
+                    v: Some(gpu.alloc::<u16>(kv_slots * kvd)?),
                 },
             };
             layers.push(layer);
@@ -895,7 +845,6 @@ impl GpuModel {
             batch_cap,
             gemm_force,
             prepacked_i8,
-            gemm_q4,
             rgemv,
             rgemv_b,
             wg,
@@ -904,7 +853,6 @@ impl GpuModel {
             kv_blocks,
             cache: RadixCache::new(kv_blocks),
             cache_on,
-            kv_f16,
             attn4,
             attn2,
             max_seqs,
@@ -986,23 +934,12 @@ impl GpuModel {
         if ntok > self.pb || force {
             if let (Weight::Q4(_), Some(p)) = (weight, packed) {
                 let tps = ntok.div_ceil(32);
-                let (rt, wg) = match self.gemm_q4.as_str() {
-                    "lds17" => (64, 512),
-                    _ => (32, 256),
-                };
-                let grid = rows.div_ceil(rt) * tps * wg;
+                let grid = rows.div_ceil(64) * tps * 512;
                 unsafe {
-                    let kq = if self.gemm_q4 == "lds10" {
-                        &self.kernels.gemm_q4_lds10
-                    } else if self.gemm_q4 == "lds17" {
-                        &self.kernels.gemm_q4_lds17
-                    } else {
-                        &self.kernels.gemm_q4_lds11
-                    };
                     self.gpu.launch(
-                        kq,
+                        &self.kernels.gemm_q4_lds17,
                         grid,
-                        wg,
+                        512,
                         &[
                             Arg::Mem(p.get()),
                             Arg::Mem(xq.get()),
@@ -1263,7 +1200,7 @@ impl GpuModel {
             if let Some(conv) = &layer.conv {
                 unsafe {
                     self.gpu.launch(
-                        &self.kernels.fill,
+                        &self.kernels.fill_h,
                         conv_len,
                         256,
                         &[Arg::Mem(conv.get()), Arg::U32(off), Arg::U32(conv_len as u32)],
@@ -1551,8 +1488,8 @@ impl GpuModel {
                             &[
                                 Arg::Mem(self.bufs.kk.get()),
                                 Arg::Mem(self.bufs.vv.get()),
-                                Arg::Mem(k_buf.mem()),
-                                Arg::Mem(v_buf.mem()),
+                                Arg::Mem(k_buf.get()),
+                                Arg::Mem(v_buf.get()),
                                 Arg::Mem(tbl_mem),
                                 Arg::U32(pos as u32),
                                 Arg::U32(kvd as u32),
@@ -1573,8 +1510,8 @@ impl GpuModel {
                                 64,
                                 &[
                                     Arg::Mem(self.bufs.q.get()),
-                                    Arg::Mem(k_buf.mem()),
-                                    Arg::Mem(v_buf.mem()),
+                                    Arg::Mem(k_buf.get()),
+                                    Arg::Mem(v_buf.get()),
                                     Arg::Mem(tbl_mem),
                                     Arg::Mem(self.bufs.g16.get()),
                                     Arg::Mem(self.bufs.attn.get()),
@@ -1594,8 +1531,8 @@ impl GpuModel {
                                 64,
                                 &[
                                     Arg::Mem(self.bufs.q.get()),
-                                    Arg::Mem(k_buf.mem()),
-                                    Arg::Mem(v_buf.mem()),
+                                    Arg::Mem(k_buf.get()),
+                                    Arg::Mem(v_buf.get()),
                                     Arg::Mem(tbl_mem),
                                     Arg::Mem(self.bufs.pacc.get()),
                                     Arg::Mem(self.bufs.pml.get()),
@@ -1910,8 +1847,8 @@ impl GpuModel {
                 &[
                     Arg::Mem(self.bufs.kk.get()),
                     Arg::Mem(self.bufs.vv.get()),
-                    Arg::Mem(k_buf.mem()),
-                    Arg::Mem(v_buf.mem()),
+                    Arg::Mem(k_buf.get()),
+                    Arg::Mem(v_buf.get()),
                     Arg::Mem(tbl_mem),
                     Arg::U32(pos as u32),
                     Arg::U32(kvd as u32),
@@ -1932,8 +1869,8 @@ impl GpuModel {
                     64,
                     &[
                         Arg::Mem(self.bufs.q.get()),
-                        Arg::Mem(k_buf.mem()),
-                        Arg::Mem(v_buf.mem()),
+                        Arg::Mem(k_buf.get()),
+                        Arg::Mem(v_buf.get()),
                         Arg::Mem(tbl_mem),
                         Arg::Mem(self.bufs.g16.get()),
                         Arg::Mem(self.bufs.attn.get()),
@@ -1953,8 +1890,8 @@ impl GpuModel {
                     64,
                     &[
                         Arg::Mem(self.bufs.q.get()),
-                        Arg::Mem(k_buf.mem()),
-                        Arg::Mem(v_buf.mem()),
+                        Arg::Mem(k_buf.get()),
+                        Arg::Mem(v_buf.get()),
                         Arg::Mem(tbl_mem),
                         Arg::Mem(self.bufs.pacc.get()),
                         Arg::Mem(self.bufs.pml.get()),
@@ -2102,36 +2039,26 @@ impl GpuModel {
     }
 
     fn kv_store_kernel(&self) -> &Kernel {
-        if self.kv_f16 {
-            &self.kernels.kv_store_h
-        } else {
-            &self.kernels.kv_store
-        }
+        &self.kernels.kv_store_h
     }
 
     fn kv_store_b_kernel(&self) -> &Kernel {
-        if self.kv_f16 {
-            &self.kernels.kv_store_b_h
-        } else {
-            &self.kernels.kv_store_b
-        }
+        &self.kernels.kv_store_b_h
     }
 
     fn attn_kernel(&self, split: bool) -> &Kernel {
-        match (self.kv_f16, split) {
-            (true, false) => &self.kernels.attn_h,
-            (true, true) => &self.kernels.attn_split_h,
-            (false, false) => &self.kernels.attn,
-            (false, true) => &self.kernels.attn_split,
+        if split {
+            &self.kernels.attn_split_h
+        } else {
+            &self.kernels.attn_h
         }
     }
 
     fn attn_b_kernel(&self, split: bool) -> &Kernel {
-        match (self.kv_f16, split) {
-            (true, false) => &self.kernels.attn_b_h,
-            (true, true) => &self.kernels.attn_split_b_h,
-            (false, false) => &self.kernels.attn_b,
-            (false, true) => &self.kernels.attn_split_b,
+        if split {
+            &self.kernels.attn_split_b_h
+        } else {
+            &self.kernels.attn_b_h
         }
     }
 
@@ -2146,22 +2073,17 @@ impl GpuModel {
 
     pub fn kernel_stats(&self) -> Vec<(String, u64)> {
         let dev = self.gpu.device.id();
-        let list: [(&str, &Kernel); 23] = [
+        let list: [(&str, &Kernel); 18] = [
             ("q4", &self.kernels.q4),
             ("q4p_b", &self.kernels.q4p_b),
             ("q4x4p_b", &self.kernels.q4x4p_b),
-            ("gemm_q4_lds10", &self.kernels.gemm_q4_lds10),
             ("gemm_q6", &self.kernels.gemm_q6),
             ("gemm_q6_pp", &self.kernels.gemm_q6_pp),
             ("q6", &self.kernels.q6),
             ("q4_b", &self.kernels.q4_b),
             ("q6_b", &self.kernels.q6_b),
-            ("attn", &self.kernels.attn),
-            ("attn_split", &self.kernels.attn_split),
             ("attn_h", &self.kernels.attn_h),
             ("attn_split_h", &self.kernels.attn_split_h),
-            ("attn_b", &self.kernels.attn_b),
-            ("attn_split_b", &self.kernels.attn_split_b),
             ("attn_b_h", &self.kernels.attn_b_h),
             ("attn_b_h2", &self.kernels.attn_b_h2),
             ("attn_split_b_h", &self.kernels.attn_split_b_h),
@@ -2639,8 +2561,8 @@ impl GpuModel {
                             &[
                                 Arg::Mem(self.bufs.kkb.get()),
                                 Arg::Mem(self.bufs.vvb.get()),
-                                Arg::Mem(k_buf.mem()),
-                                Arg::Mem(v_buf.mem()),
+                                Arg::Mem(k_buf.get()),
+                                Arg::Mem(v_buf.get()),
                                 Arg::Mem(self.bufs.tbl_all.get()),
                                 Arg::Mem(self.bufs.tbl_off_b.get()),
                                 Arg::Mem(self.bufs.pos_b.get()),
@@ -2653,7 +2575,6 @@ impl GpuModel {
                         let splits = (span_max / 512).clamp(1, MAX_SPLITS);
                         if splits <= 1 {
                             let use2 = self.attn2
-                                && self.kv_f16
                                 && head_dim == 128
                                 && heads % 4 == 0;
                             let kernel = if use2 {
@@ -2667,8 +2588,8 @@ impl GpuModel {
                                 256,
                                 &[
                                     Arg::Mem(self.bufs.qb.get()),
-                                    Arg::Mem(k_buf.mem()),
-                                    Arg::Mem(v_buf.mem()),
+                                    Arg::Mem(k_buf.get()),
+                                    Arg::Mem(v_buf.get()),
                                     Arg::Mem(self.bufs.tbl_all.get()),
                                     Arg::Mem(self.bufs.tbl_off_b.get()),
                                     Arg::Mem(self.bufs.pos_b.get()),
@@ -2683,7 +2604,6 @@ impl GpuModel {
                             )?;
                         } else {
                             let use4 = self.attn4
-                                && self.kv_f16
                                 && heads == kv_heads * 4
                                 && head_dim == 128;
                             let (kernel, grid) = if use4 {
@@ -2700,8 +2620,8 @@ impl GpuModel {
                                 64,
                                 &[
                                     Arg::Mem(self.bufs.qb.get()),
-                                    Arg::Mem(k_buf.mem()),
-                                    Arg::Mem(v_buf.mem()),
+                                    Arg::Mem(k_buf.get()),
+                                    Arg::Mem(v_buf.get()),
                                     Arg::Mem(self.bufs.tbl_all.get()),
                                     Arg::Mem(self.bufs.tbl_off_b.get()),
                                     Arg::Mem(self.bufs.pos_b.get()),
@@ -3097,8 +3017,7 @@ impl GpuModel {
             .map(|b| (*b as usize) * KV_PAGE + pos % KV_PAGE)
             .unwrap_or(0);
         let k = match &self.layers[layer].k {
-            Some(KvBuf::F32(b)) => self.gpu.download_at(b, slot * kvd * 4, kvd)?,
-            Some(KvBuf::F16(b)) => self
+            Some(b) => self
                 .gpu
                 .download_at(b, slot * kvd * 2, kvd)?
                 .iter()
@@ -3107,8 +3026,7 @@ impl GpuModel {
             None => Vec::new(),
         };
         let v = match &self.layers[layer].v {
-            Some(KvBuf::F32(b)) => self.gpu.download_at(b, slot * kvd * 4, kvd)?,
-            Some(KvBuf::F16(b)) => self
+            Some(b) => self
                 .gpu
                 .download_at(b, slot * kvd * 2, kvd)?
                 .iter()
@@ -3194,7 +3112,7 @@ impl GpuModel {
             if let Some(conv) = &layer.conv {
                 unsafe {
                     self.gpu.launch(
-                        &self.kernels.fill,
+                        &self.kernels.fill_h,
                         conv_len,
                         256,
                         &[Arg::Mem(conv.get()), Arg::U32(0), Arg::U32(conv_len as u32)],
@@ -3203,23 +3121,18 @@ impl GpuModel {
             }
             if let Some(k) = &layer.k {
                 let v = layer.v.as_ref().ok_or_else(|| anyhow!("missing v"))?;
-                let fill = if self.kv_f16 {
-                    &self.kernels.fill_h
-                } else {
-                    &self.kernels.fill
-                };
                 unsafe {
                     self.gpu.launch(
-                        fill,
+                        &self.kernels.fill_h,
                         kv_len,
                         256,
-                        &[Arg::Mem(k.mem()), Arg::U32(0), Arg::U32(kv_len as u32)],
+                        &[Arg::Mem(k.get()), Arg::U32(0), Arg::U32(kv_len as u32)],
                     )?;
                     self.gpu.launch(
-                        fill,
+                        &self.kernels.fill_h,
                         kv_len,
                         256,
-                        &[Arg::Mem(v.mem()), Arg::U32(0), Arg::U32(kv_len as u32)],
+                        &[Arg::Mem(v.get()), Arg::U32(0), Arg::U32(kv_len as u32)],
                     )?;
                 }
             }

@@ -213,7 +213,7 @@ enum Cmd {
         tensor: String,
         #[arg(long, default_value_t = 8)]
         ntok: usize,
-        #[arg(long, default_value = "lds11")]
+        #[arg(long, default_value = "lds17")]
         mode: String,
         #[arg(long, default_value_t = 4)]
         check_rows: usize,
@@ -3331,25 +3331,10 @@ fn gemm_launch(
 ) -> Result<(Vec<f32>, Stats)> {
     let nsg = (64 / gpu.caps.sub_group_size.max(1)).max(1);
     let (kernel, global, local) = match mode {
-        "lc" => (
-            Kernel::create(program, "gemm_q4_k_i8_lc")?,
-            rows.div_ceil(64) * ntok.div_ceil(64) * 128,
-            128usize,
-        ),
         "lds17" => (
             Kernel::create(program, "gemm_q4_k_i8_lds17")?,
             rows.div_ceil(64) * ntok.div_ceil(32) * 512,
             512usize,
-        ),
-        "lds11" => (
-            Kernel::create(program, "gemm_q4_k_i8_lds11")?,
-            rows.div_ceil(32) * ntok.div_ceil(32) * 256,
-            256usize,
-        ),
-        "lds10" => (
-            Kernel::create(program, "gemm_q4_k_i8_lds10")?,
-            rows.div_ceil(32) * ntok.div_ceil(32) * 256,
-            256usize,
         ),
         _ => (
             Kernel::create(program, "gemm_q6_k_i8")?,
@@ -3493,7 +3478,7 @@ fn gemm_cmp(
             continue;
         }
         let m = match t.ggml_type {
-            lfm_gguf::GgmlType::Q4_K => "lds11",
+            lfm_gguf::GgmlType::Q4_K => "lds17",
             lfm_gguf::GgmlType::Q6_K => "q6",
             _ => continue,
         };
