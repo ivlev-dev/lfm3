@@ -235,6 +235,8 @@ enum Cmd {
         seqs: usize,
         #[arg(long, default_value_t = 32)]
         tokens: usize,
+        #[arg(long, default_value_t = 6)]
+        prompt: usize,
     },
     GpuMix {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
@@ -433,7 +435,8 @@ fn main() -> Result<()> {
             model,
             seqs,
             tokens,
-        } => gpu_multi(&model, seqs, tokens),
+            prompt,
+        } => gpu_multi(&model, seqs, tokens, prompt),
         Cmd::GpuMix { model, tokens } => gpu_mix(&model, tokens),
         Cmd::GpuCache {
             model,
@@ -2360,109 +2363,111 @@ fn gpu_cache(model: &PathBuf, tokens: usize, reps: usize, reset: bool) -> Result
     Ok(())
 }
 
-fn gpu_multi(model: &PathBuf, nseq: usize, tokens: usize) -> Result<()> {
+fn gpu_multi(model: &PathBuf, nseq: usize, tokens: usize, prompt_len: usize) -> Result<()> {
+    if nseq > 8 {
+        return Err(anyhow!("at most 8 sequences"));
+    }
     let prompts: Vec<Vec<u32>> = (0..nseq)
         .map(|i| {
-            (0..6)
+            (0..prompt_len.max(1))
                 .map(|j| ((i * 977 + j * 131 + 597) % 60000) as u32 + 100)
                 .collect()
         })
         .collect();
-    if nseq > 8 {
-        return Err(anyhow!("at most 8 sequences"));
-    }
     let mut gpu = lfm_gpu::GpuModel::load(model, 2048)?;
     gpu.free_sequence(0)?;
     let mut slots = Vec::new();
     for _ in 0..nseq {
         slots.push(gpu.create_sequence()?);
     }
-    let mut outs: Vec<Vec<u32>> = vec![Vec::new(); nseq];
-    let mut pos: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+    let mut pos: Vec<usize> = vec![0; nseq];
+    let cap = gpu.prefill_batch_size().max(1);
+    let total_prompt: usize = prompts.iter().map(|p| p.len()).sum();
     gpu.reset_profile();
-    let started = Instant::now();
-    for (i, prompt) in prompts.iter().enumerate() {
-        gpu.forward_batch_seq(slots[i], prompt, 0, true)?;
-        let mut logits = gpu.logits()?;
-        let next = lfm_gpu::argmax(&logits);
-        logits.clear();
-        outs[i].push(next);
+    let prefill_started = Instant::now();
+    let mut done = vec![0usize; nseq];
+    loop {
+        let mut reqs: Vec<lfm_gpu::StepReq> = Vec::new();
+        let mut round = 0usize;
+        while reqs.len() < cap {
+            let mut pushed = false;
+            for i in 0..nseq {
+                let idx = done[i] + round;
+                if idx < prompts[i].len() && reqs.len() < cap {
+                    reqs.push(lfm_gpu::StepReq {
+                        slot: slots[i],
+                        token: prompts[i][idx],
+                        pos: idx,
+                    });
+                    pushed = true;
+                }
+            }
+            if !pushed {
+                break;
+            }
+            round += 1;
+        }
+        if reqs.is_empty() {
+            break;
+        }
+        for i in 0..nseq {
+            let take = reqs.iter().filter(|r| r.slot == slots[i]).count();
+            done[i] = (done[i] + take).min(prompts[i].len());
+            pos[i] = done[i];
+        }
+        gpu.step_mixed(&reqs, false)?;
+        if done.iter().zip(&prompts).all(|(d, p)| *d >= p.len()) {
+            break;
+        }
     }
-    while outs[0].len() < tokens {
-        let mut pending = Vec::new();
+    gpu.finish()?;
+    let prefill_s = prefill_started.elapsed().as_secs_f64();
+    if std::env::var("LFM_PROFILE").map(|v| v == "1").unwrap_or(false) {
+        println!("  -- prefill kernels --");
+        for (name, calls, avg_us, total_ms) in gpu.profile_report().iter().take(8) {
+            println!("  {name:24} {calls} calls {avg_us:.1} us {total_ms:.1} ms");
+        }
+    }
+    gpu.reset_profile();
+    let mut outs: Vec<Vec<u32>> = vec![Vec::new(); nseq];
+    let started = Instant::now();
+    while outs.iter().any(|o| o.len() < tokens) {
+        let mut reqs: Vec<lfm_gpu::StepReq> = Vec::new();
+        let mut ids: Vec<usize> = Vec::new();
         for i in 0..nseq {
             if outs[i].len() >= tokens {
                 continue;
             }
-            let last = *outs[i].last().unwrap();
-            pending.push((
-                i,
-                lfm_gpu::StepReq {
-                    slot: slots[i],
-                    token: last,
-                    pos: pos[i],
-                },
-            ));
+            let token = match outs[i].last() {
+                Some(t) => *t,
+                None => *prompts[i].last().unwrap(),
+            };
+            ids.push(i);
+            reqs.push(lfm_gpu::StepReq {
+                slot: slots[i],
+                token,
+                pos: pos[i],
+            });
         }
-        if pending.is_empty() {
+        if reqs.is_empty() {
             break;
         }
-        let pb = gpu.batch_size();
-        for chunk in pending.chunks(pb) {
-            let reqs: Vec<lfm_gpu::StepReq> = chunk.iter().map(|(_, r)| *r).collect();
-            gpu.step_mixed(&reqs, true)?;
-            for (row, (i, _)) in chunk.iter().enumerate() {
-                let logits = gpu.logits_row(row)?;
-                outs[*i].push(lfm_gpu::argmax(&logits));
-                pos[*i] += 1;
-            }
+        gpu.step_mixed(&reqs, true)?;
+        for (row, i) in ids.iter().enumerate() {
+            let logits = gpu.logits_row(row)?;
+            outs[*i].push(lfm_gpu::argmax(&logits));
+            pos[*i] += 1;
         }
     }
     let elapsed = started.elapsed().as_secs_f64();
     gpu.finish()?;
+    let decoded = (outs.iter().map(|o| o.len()).sum::<usize>()) as f64;
     println!(
-        "{} seqs x {} tok in {:.2} s ({:.1} tok/s aggregate)",
-        nseq,
-        tokens,
-        elapsed,
-        (nseq * tokens) as f64 / elapsed.max(1e-9)
+        "seqs={nseq} prompt={prompt_len}: prefill {total_prompt} tok in {prefill_s:.2} s = {:.1} tok/s; decode {decoded:.0} tok in {elapsed:.2} s = {:.1} tok/s; total {:.1} tok/s",
+        total_prompt as f64 / prefill_s.max(1e-9),
+        decoded / elapsed.max(1e-9),
+        (total_prompt as f64 + decoded) / (prefill_s + elapsed).max(1e-9),
     );
-    let report = gpu.profile_report();
-    if !report.is_empty() {
-        for (name, calls, avg_us, total_ms) in report {
-            println!("  {name:<22} {calls:>6} calls  {avg_us:>8.1} us  {total_ms:>7.2} ms total");
-        }
-    }
-    let kv_pages = gpu.sequence(slots[0])?.len.div_ceil(32);
-    println!("seq0: {} tokens, {} KV pages", gpu.sequence(slots[0])?.len, kv_pages);
-
-    let mut mismatch = 0;
-    for i in 0..nseq {
-        gpu.reset()?;
-        let solo = gpu.create_sequence()?;
-        let prompt = &prompts[i];
-        gpu.forward_batch_seq(solo, prompt, 0, true)?;
-        let mut solo_out = vec![lfm_gpu::argmax(&gpu.logits()?)];
-        let mut p = prompt.len();
-        while solo_out.len() < tokens {
-            let last = *solo_out.last().unwrap();
-            gpu.step_mixed(
-                &[lfm_gpu::StepReq {
-                    slot: solo,
-                    token: last,
-                    pos: p,
-                }],
-                true,
-            )?;
-            p += 1;
-            solo_out.push(lfm_gpu::argmax(&gpu.logits_row(0)?));
-        }
-        if solo_out != outs[i] {
-            mismatch += 1;
-            println!("  seq {i}: MISMATCH vs solo run");
-        }
-    }
-    println!("mismatches: {mismatch}/{nseq}");
     Ok(())
 }
 
