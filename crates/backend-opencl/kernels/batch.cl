@@ -2040,3 +2040,4 @@ __kernel void gemm_q4_k_i8_lds17(__global const uchar *w, __global const char *x
         }
     }
 }
+
