@@ -139,6 +139,7 @@ struct Kernels {
     q4x4p_b: Kernel,
     gemm_q4_lds17: Kernel,
     gemm_q4_b8: Kernel,
+    gemm_q4_i8_gz: Kernel,
     gemm_q6_b8: Kernel,
     gemm_q6: Kernel,
     gemm_q6_pp: Kernel,
@@ -473,6 +474,7 @@ pub struct GpuModel {
     batch_cap: usize,
     gemm_force: Option<String>,
     prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)>,
+    prepacked_q4_i8: HashMap<String, (Buffer<i8>, Buffer<f32>)>,
     rgemv: usize,
     rgemv_b: usize,
     wg: usize,
@@ -553,11 +555,19 @@ impl GpuModel {
         let has_head = layer_end == cfg.num_layers;
         let prepack_on = std::env::var("LFM_PREPACK").map(|v| v != "0").unwrap_or(true);
         let fuse_on = std::env::var("LFM_FUSE").map(|v| v != "0").unwrap_or(true);
+        let q4_i8_on = std::env::var("LFM_Q4I8").map(|v| v != "0").unwrap_or(true);
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
+        let mut prepacked_q4_i8: HashMap<String, (Buffer<i8>, Buffer<f32>)> = HashMap::new();
         for info in file.tensors() {
             if !tensor_needed(&info.name, layer_start, layer_end, has_embed, has_head) {
+                continue;
+            }
+            if prepack_on
+                && (info.name.ends_with(".ffn_gate.weight")
+                    || info.name.ends_with(".ffn_up.weight"))
+            {
                 continue;
             }
             let bytes = file.tensor_bytes(&info.name)?;
@@ -654,6 +664,14 @@ impl GpuModel {
                     if prepack_on && up_info.ggml_type == GgmlType::Q4_K {
                         let mut fused = prepack::prepack_q4_k(&gate_s);
                         fused.extend_from_slice(&prepack::prepack_q4_k(&up_s));
+                        let cols = up_info.dims[0] as usize;
+                        if cols % 256 == 0 && q4_i8_on {
+                            let (q8, sc) = prepack::prepack_q4_i8(&fused, cols);
+                            prepacked_q4_i8.insert(
+                                format!("blk.{layer}.ffn_ug.weight"),
+                                (gpu.upload(&q8)?, gpu.upload(&sc)?),
+                            );
+                        }
                         prepacked.insert(
                             format!("blk.{layer}.ffn_ug.weight"),
                             gpu.upload_bytes(&fused)?,
@@ -783,6 +801,7 @@ impl GpuModel {
             q4x4p_b: Kernel::create(&program, "gemv_q4_k_i8_4p_b")?,
             gemm_q4_lds17: Kernel::create(&program, "gemm_q4_k_i8_lds17")?,
             gemm_q4_b8: Kernel::create(&program, "gemm_q4_k_i8_b8")?,
+            gemm_q4_i8_gz: Kernel::create(&program, "gemm_q4_i8_gz")?,
             gemm_q6_b8: Kernel::create(&program, "gemm_q6_i8_b8")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
@@ -946,6 +965,7 @@ impl GpuModel {
             batch_cap,
             gemm_force,
             prepacked_i8,
+            prepacked_q4_i8,
             rgemv,
             rgemv_b,
             wg,
@@ -1057,6 +1077,28 @@ impl GpuModel {
             }
         }
         if ntok > self.pb || force {
+            if let Some((w8, wsc)) = self.prepacked_q4_i8.get(name) {
+                let tps = ntok.div_ceil(32);
+                let grid = rows.div_ceil(64) * tps * 512;
+                unsafe {
+                    self.gpu.launch(
+                        &self.kernels.gemm_q4_i8_gz,
+                        grid,
+                        512,
+                        &[
+                            Arg::Mem(w8.get()),
+                            Arg::Mem(wsc.get()),
+                            Arg::Mem(xq.get()),
+                            Arg::Mem(xs.get()),
+                            Arg::Mem(y.get()),
+                            Arg::U32(rows as u32),
+                            Arg::U32(cols as u32),
+                            Arg::U32(ntok as u32),
+                        ],
+                    )?;
+                }
+                return Ok(());
+            }
             if let (Weight::Q4(_), Some(p)) = (weight, packed) {
                 let tps = ntok.div_ceil(32);
                 let grid = rows.div_ceil(64) * tps * 512;

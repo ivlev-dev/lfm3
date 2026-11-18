@@ -236,3 +236,45 @@ mod tests {
         assert!(std::panic::catch_unwind(|| prepack_q6_i8(&[0u8; 210], 128)).is_err());
     }
 }
+
+pub fn prepack_q4_i8(src: &[u8], cols: usize) -> (Vec<i8>, Vec<f32>) {
+    assert!(cols % 256 == 0, "q4 cols {cols} not a multiple of 256");
+    let per_row = cols / 256 * Q4K_PACKED;
+    assert!(
+        src.len() % per_row == 0,
+        "q4 packed bytes {} not a multiple of {per_row}",
+        src.len()
+    );
+    let rows = src.len() / per_row;
+    let groups = cols / 32;
+    let mut q = vec![0i8; groups * rows * 32];
+    let mut scales = vec![0f32; groups * rows];
+    let mut vals = [0f32; 32];
+    for r in 0..rows {
+        for b in 0..cols / 256 {
+            let blk = &src[r * per_row + b * Q4K_PACKED..r * per_row + (b + 1) * Q4K_PACKED];
+            let d = lfm_quant::half_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+            let dmin = lfm_quant::half_bits_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+            for jj in 0..8usize {
+                let sc = blk[Q4K_SCALES + 2 * jj] as f32;
+                let mn = blk[Q4K_SCALES + 2 * jj + 1] as f32;
+                let qq = jj / 2;
+                let hi = jj % 2 == 1;
+                for i in 0..32usize {
+                    let byte = blk[Q4K_QUANTS + qq * 32 + i];
+                    let nib = if hi { byte >> 4 } else { byte & 0x0F } as f32;
+                    vals[i] = d * sc * nib - dmin * mn;
+                }
+                let amax = vals.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                let g = b * 8 + jj;
+                scales[g * rows + r] = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+                let base = (g * rows + r) * 32;
+                for i in 0..32 {
+                    q[base + i] = (vals[i] * inv).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        }
+    }
+    (q, scales)
+}
