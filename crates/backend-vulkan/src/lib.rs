@@ -245,6 +245,7 @@ impl GemvQ4 {
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(4)];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .pool_sizes(&sizes)
             .max_sets(1);
         let pool = unsafe { vk.device.create_descriptor_pool(&pool_info, None)? };
@@ -431,5 +432,175 @@ mod tests {
         let xs = vec![1.0f32 / 127.0; 8];
         let out = gemv.run(&vk, &block, &xq, &xs, 1, 256, 0).expect("run");
         assert!((out[0] - 3840.0).abs() < 1.0, "got {}", out[0]);
+    }
+}
+
+const GEMM_Q4_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_q4.spv"));
+
+pub struct GemmQ4 {
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+}
+
+impl GemmQ4 {
+    pub fn new(vk: &Vk) -> Result<Self> {
+        let bindings = (0..4)
+            .map(|i| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect::<Vec<_>>();
+        let set_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let set_layout = unsafe { vk.device.create_descriptor_set_layout(&set_info, None)? };
+        let range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(12);
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&set_layout))
+            .push_constant_ranges(std::slice::from_ref(&range));
+        let pipeline_layout = unsafe { vk.device.create_pipeline_layout(&layout_info, None)? };
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(GEMM_Q4_SPV))?;
+        let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
+        let module = unsafe { vk.device.create_shader_module(&module_info, None)? };
+        let entry = std::ffi::CString::new("main").unwrap();
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(&entry);
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(pipeline_layout);
+        let pipeline = unsafe {
+            vk.device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .map_err(|(_, e)| anyhow!("pipeline: {e}"))?[0]
+        };
+        unsafe { vk.device.destroy_shader_module(module, None) };
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(4)];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+            .pool_sizes(&sizes)
+            .max_sets(1);
+        let pool = unsafe { vk.device.create_descriptor_pool(&pool_info, None)? };
+        Ok(Self {
+            set_layout,
+            pipeline_layout,
+            pipeline,
+            pool,
+        })
+    }
+
+    pub fn run(
+        &self,
+        vk: &Vk,
+        weights: &[u8],
+        xq: &[i8],
+        xs: &[f32],
+        rows: usize,
+        cols: usize,
+        ntok: usize,
+        reps: u32,
+    ) -> Result<Vec<f32>> {
+        let w = vk.upload(weights)?;
+        let xb: &[u8] = bytemuck::cast_slice(xq);
+        let q = vk.upload(xb)?;
+        let s = vk.upload(bytemuck::cast_slice(xs))?;
+        let (y_buf, y_mem) = vk.create_buffer(
+            (rows * ntok * 4) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let y = (y_buf, y_mem);
+        let set_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.pool)
+            .set_layouts(std::slice::from_ref(&self.set_layout));
+        let set = unsafe { vk.device.allocate_descriptor_sets(&set_info)?[0] };
+        let infos = [
+            vk::DescriptorBufferInfo::default().buffer(w.0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(q.0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(s.0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(y.0).range(vk::WHOLE_SIZE),
+        ];
+        let writes = (0..4)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&infos[i]))
+            })
+            .collect::<Vec<_>>();
+        unsafe { vk.device.update_descriptor_sets(&writes, &[]) };
+        let cmd_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(vk.cmd_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe { vk.device.allocate_command_buffers(&cmd_info)?[0] };
+        let begin = vk::CommandBufferBeginInfo::default();
+        let groups = rows.div_ceil(64) * ntok.div_ceil(64);
+        let push = [rows as u32, cols as u32, ntok as u32];
+        unsafe {
+            vk.device.begin_command_buffer(cmd, &begin)?;
+            vk.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            vk.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            vk.device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::cast_slice(&push),
+            );
+            for _ in 0..reps.max(1) {
+                vk.device
+                    .cmd_dispatch(cmd, groups as u32, 1, 1);
+                vk.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[],
+                );
+            }
+            vk.device.end_command_buffer(cmd)?;
+        }
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = unsafe { vk.device.create_fence(&fence_info, None)? };
+        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        unsafe {
+            vk.device.queue_submit(vk.queue, &[submit], fence)?;
+            vk.device.wait_for_fences(&[fence], true, u64::MAX)?;
+        }
+        unsafe {
+            vk.device.destroy_fence(fence, None);
+            vk.device.free_command_buffers(vk.cmd_pool, &[cmd]);
+            vk.device.free_descriptor_sets(self.pool, &[set])?;
+        }
+        let bytes = vk.read_buffer(&y, rows * ntok * 4)?;
+        let out = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        vk.destroy_buf(&w);
+        vk.destroy_buf(&q);
+        vk.destroy_buf(&s);
+        vk.destroy_buf(&y);
+        Ok(out)
     }
 }

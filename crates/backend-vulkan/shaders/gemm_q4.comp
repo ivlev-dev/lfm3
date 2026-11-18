@@ -1,0 +1,174 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer XQ { uint xq[]; };
+layout(std430, binding = 2) readonly buffer XS { float xs[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Args {
+    uint rows;
+    uint cols;
+    uint ntok;
+} args;
+
+shared uint wq[8 * 64 * 4];
+shared uint ws[64 * 4];
+shared uint wh[64];
+shared uint xt[64 * 64];
+shared int xsum[64 * 8];
+
+int dp4(uint a, uint b, int c) {
+    return dotPacked4x8EXT(int(a), int(b)) + c;
+}
+
+int sum4(uint a) {
+    return dotPacked4x8EXT(int(a), int(0x01010101u));
+}
+
+uint wbyte(uint word, uint idx) {
+    return (word >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_WorkGroupID.x;
+    uint tps = (args.ntok + 63u) / 64u;
+    uint row0 = (gid / tps) * 64u;
+    uint t0 = (gid % tps) * 64u;
+    if (row0 >= args.rows) {
+        return;
+    }
+    uint valid_rows = min(64u, args.rows - row0);
+    uint blocks = args.cols >> 8;
+    uint ngs = args.cols >> 5;
+    uint row_stride = blocks * 148u;
+    uint lane = lid & 63u;
+    uint wave = lid >> 6;
+    uint tok_base = wave * 16u;
+    float acc[16];
+    for (uint j = 0u; j < 16u; ++j) {
+        acc[j] = 0.0f;
+    }
+    for (uint b = 0u; b < blocks; ++b) {
+        for (uint i = 0u; i < 2u; ++i) {
+            uint idx = lid + i * 256u;
+            uint c = idx >> 6;
+            uint rr = idx & 63u;
+            uint qoff = (c >> 1) * 32u + (c & 1u) * 16u;
+            uint src = (row0 + rr) * row_stride + b * 148u + 20u + qoff;
+            uvec4 v = uvec4(0u);
+            if (rr < valid_rows) {
+                v = uvec4(w[src >> 2], w[(src >> 2) + 1u], w[(src >> 2) + 2u], w[(src >> 2) + 3u]);
+            }
+            uint dst = (c * 64u + rr) * 4u;
+            wq[dst] = v.x;
+            wq[dst + 1u] = v.y;
+            wq[dst + 2u] = v.z;
+            wq[dst + 3u] = v.w;
+        }
+        {
+            uint r = lid >> 2;
+            uint wi = lid & 3u;
+            uint v = 0u;
+            if (r < valid_rows) {
+                v = w[(((row0 + r) * row_stride + b * 148u + 4u) >> 2) + wi];
+            }
+            ws[r * 4u + wi] = v;
+        }
+        if (lid < 64u) {
+            uint v = 0u;
+            if (lid < valid_rows) {
+                v = w[((row0 + lid) * row_stride + b * 148u) >> 2];
+            }
+            wh[lid] = v;
+        }
+        {
+            uint tt = lid >> 2;
+            uint part = lid & 3u;
+            uint token = t0 + tt;
+            uint src = token * args.cols + b * 256u + part * 64u;
+            uint v[16];
+            for (uint i = 0u; i < 16u; ++i) {
+                v[i] = 0u;
+            }
+            if (token < args.ntok) {
+                for (uint i = 0u; i < 16u; ++i) {
+                    v[i] = xq[(src >> 2) + i];
+                }
+            }
+            for (uint i = 0u; i < 16u; ++i) {
+                xt[tt * 64u + part * 16u + i] = v[i];
+            }
+            int s0 = 0;
+            int s1 = 0;
+            for (uint i = 0u; i < 8u; ++i) {
+                s0 += sum4(v[i]);
+            }
+            for (uint i = 8u; i < 16u; ++i) {
+                s1 += sum4(v[i]);
+            }
+            xsum[tt * 8u + 2u * part] = s0;
+            xsum[tt * 8u + 2u * part + 1u] = s1;
+        }
+        barrier();
+
+        if (lane < valid_rows) {
+            vec2 dm = unpackHalf2x16(wh[lane]);
+            float d = dm.x;
+            float dmin = dm.y;
+            for (uint q = 0u; q < 4u; ++q) {
+                uint sw = ws[lane * 4u + q];
+                float scl = d * float(wbyte(sw, 0u));
+                float mnl = dmin * float(wbyte(sw, 1u));
+                float sch = d * float(wbyte(sw, 2u));
+                float mnh = dmin * float(wbyte(sw, 3u));
+                uint base = (2u * q * 64u + lane) * 4u;
+                uint bbase = ((2u * q + 1u) * 64u + lane) * 4u;
+                uvec4 pa = uvec4(wq[base], wq[base + 1u], wq[base + 2u], wq[base + 3u]);
+                uvec4 pb = uvec4(wq[bbase], wq[bbase + 1u], wq[bbase + 2u], wq[bbase + 3u]);
+                const uint M = 0x0F0F0F0Fu;
+                uint lo0 = pa.x & M, lo1 = pa.y & M, lo2 = pa.z & M, lo3 = pa.w & M;
+                uint lo4 = pb.x & M, lo5 = pb.y & M, lo6 = pb.z & M, lo7 = pb.w & M;
+                uint hi0 = (pa.x >> 4u) & M, hi1 = (pa.y >> 4u) & M;
+                uint hi2 = (pa.z >> 4u) & M, hi3 = (pa.w >> 4u) & M;
+                uint hi4 = (pb.x >> 4u) & M, hi5 = (pb.y >> 4u) & M;
+                uint hi6 = (pb.z >> 4u) & M, hi7 = (pb.w >> 4u) & M;
+                for (uint j = 0u; j < 16u; ++j) {
+                    uint t = tok_base + j;
+                    uint token = t0 + t;
+                    if (token < args.ntok) {
+                        uint xb = t * 64u + q * 16u;
+                        uint x0 = xt[xb + 0u], x1 = xt[xb + 1u], x2 = xt[xb + 2u], x3 = xt[xb + 3u];
+                        uint x4 = xt[xb + 4u], x5 = xt[xb + 5u], x6 = xt[xb + 6u], x7 = xt[xb + 7u];
+                        uint y0 = xt[xb + 8u], y1 = xt[xb + 9u], y2 = xt[xb + 10u], y3 = xt[xb + 11u];
+                        uint y4 = xt[xb + 12u], y5 = xt[xb + 13u], y6 = xt[xb + 14u], y7 = xt[xb + 15u];
+                        int dl = 0;
+                        int dh = 0;
+                        dl = dp4(lo0, x0, dl); dl = dp4(lo1, x1, dl); dl = dp4(lo2, x2, dl); dl = dp4(lo3, x3, dl);
+                        dl = dp4(lo4, x4, dl); dl = dp4(lo5, x5, dl); dl = dp4(lo6, x6, dl); dl = dp4(lo7, x7, dl);
+                        dh = dp4(hi0, y0, dh); dh = dp4(hi1, y1, dh); dh = dp4(hi2, y2, dh); dh = dp4(hi3, y3, dh);
+                        dh = dp4(hi4, y4, dh); dh = dp4(hi5, y5, dh); dh = dp4(hi6, y6, dh); dh = dp4(hi7, y7, dh);
+                        int suml = xsum[t * 8u + 2u * q];
+                        int sumh = xsum[t * 8u + 2u * q + 1u];
+                        uint g = token * ngs + b * 8u + 2u * q;
+                        acc[j] += xs[g] * (float(dl) * scl - float(suml) * mnl);
+                        acc[j] += xs[g + 1u] * (float(dh) * sch - float(sumh) * mnh);
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+    if (lane < valid_rows) {
+        for (uint j = 0u; j < 16u; ++j) {
+            uint token = t0 + tok_base + j;
+            if (token < args.ntok) {
+                y[token * args.rows + row0 + lane] = acc[j];
+            }
+        }
+    }
+}

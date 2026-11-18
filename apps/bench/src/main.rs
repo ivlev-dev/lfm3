@@ -221,6 +221,18 @@ enum Cmd {
         spv: Option<PathBuf>,
     },
     VulkanInfo,
+    VulkanGemm {
+        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
+        model: PathBuf,
+        #[arg(long, default_value = "blk.2.ffn_up.weight")]
+        tensor: String,
+        #[arg(long, default_value_t = 64)]
+        ntok: usize,
+        #[arg(long, default_value_t = 4)]
+        check_rows: usize,
+        #[arg(long, default_value_t = 10)]
+        reps: u32,
+    },
     VulkanGemv {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -436,6 +448,13 @@ fn main() -> Result<()> {
             spv,
         } => gemm_cmp(&model, &tensor, ntok, &mode, check_rows, spv.as_ref()),
         Cmd::VulkanInfo => vulkan_info(),
+        Cmd::VulkanGemm {
+            model,
+            tensor,
+            ntok,
+            check_rows,
+            reps,
+        } => vulkan_gemm(&model, &tensor, ntok, check_rows, reps),
         Cmd::VulkanGemv {
             model,
             tensor,
@@ -3740,3 +3759,64 @@ fn vulkan_gemv(model: &PathBuf, tensor: &str, rows: usize, ones: bool) -> Result
     Ok(())
 }
 
+fn vulkan_gemm(
+    model: &PathBuf,
+    tensor: &str,
+    ntok: usize,
+    check_rows: usize,
+    reps: u32,
+) -> Result<()> {
+    let gguf = lfm_gguf::GgufFile::open(model)?;
+    let info = gguf
+        .tensor(tensor)
+        .ok_or_else(|| anyhow!("tensor {tensor} not found"))?
+        .clone();
+    if info.ggml_type != lfm_gguf::GgmlType::Q4_K {
+        return Err(anyhow!("only Q4_K supported"));
+    }
+    let rows = info.dims[1] as usize;
+    let cols = info.dims[0] as usize;
+    let bytes = gguf.tensor_bytes(tensor)?;
+    let wb = prepack_q4_key(&bytes);
+    let mut x = Vec::with_capacity(ntok * cols);
+    for t in 0..ntok {
+        for (i, v) in make_x(cols).into_iter().enumerate() {
+            x.push(v * (1.0 + t as f32 * 0.03) * if (i + t) % 3 == 0 { -1.0 } else { 1.0 });
+        }
+    }
+    let mut xq = Vec::with_capacity(ntok * cols);
+    let mut xs = Vec::with_capacity(ntok * cols / GROUP);
+    for t in 0..ntok {
+        let (q, sc) = quantize_ref(&x[t * cols..(t + 1) * cols], GROUP);
+        xq.extend_from_slice(&q);
+        xs.extend_from_slice(&sc);
+    }
+    let vk = lfm_backend_vulkan::Vk::open(None)?;
+    let gemm = lfm_backend_vulkan::GemmQ4::new(&vk)?;
+    let t0 = Instant::now();
+    let out = gemm.run(&vk, &wb, &xq, &xs, rows, cols, ntok, reps)?;
+    let dt = t0.elapsed().as_secs_f64() / f64::from(reps.max(1));
+    let row_bytes = bytes.len() / rows;
+    let mut max_rel = 0.0f32;
+    for r in 0..check_rows.min(rows) {
+        let slice = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        for t in 0..ntok {
+            let g = out[t * rows + r];
+            let refv = dot_i8(
+                info.ggml_type,
+                slice,
+                &xq[t * cols..(t + 1) * cols],
+                &xs[t * cols / GROUP..(t + 1) * cols / GROUP],
+            )?;
+            let rel = (g - refv).abs() / refv.abs().max(1e-3);
+            max_rel = max_rel.max(rel);
+        }
+    }
+    let macs = rows as f64 * cols as f64 * ntok as f64;
+    println!(
+        "vulkan gemm {rows}x{cols} ntok={ntok}: {:.3} ms -> {:.2} T MAC/s, max_rel {max_rel:.2e}",
+        dt * 1e3,
+        macs / dt / 1e12
+    );
+    Ok(())
+}
