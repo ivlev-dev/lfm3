@@ -101,6 +101,7 @@ struct Kernels {
     q4x4p_b: Kernel,
     gemm_q4_lds10: Kernel,
     gemm_q4_lds11: Kernel,
+    gemm_q4_lds17: Kernel,
     gemm_q6: Kernel,
     gemm_q6_pp: Kernel,
     q6_b: Kernel,
@@ -681,7 +682,7 @@ impl GpuModel {
             .unwrap_or(128);
         let batch_cap = pb.max(prefill_batch);
         let gemm_force: Option<String> = std::env::var("LFM_GEMM_FORCE").ok().filter(|v| !v.is_empty());
-        let gemm_q4: String = std::env::var("LFM_GEMM_Q4").unwrap_or_else(|_| "lds11".to_string());
+        let gemm_q4: String = std::env::var("LFM_GEMM_Q4").unwrap_or_else(|_| "lds17".to_string());
         let rgemv: usize = std::env::var("LFM_RGEMV")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -739,6 +740,7 @@ impl GpuModel {
             q4x4p_b: Kernel::create(&program, "gemv_q4_k_i8_4p_b")?,
             gemm_q4_lds10: Kernel::create(&program, "gemm_q4_k_i8_lds10")?,
             gemm_q4_lds11: Kernel::create(&program, "gemm_q4_k_i8_lds11")?,
+            gemm_q4_lds17: Kernel::create(&program, "gemm_q4_k_i8_lds17")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
@@ -976,17 +978,20 @@ impl GpuModel {
         if ntok > self.pb || force {
             if let (Weight::Q4(_), Some(p)) = (weight, packed) {
                 let tps = ntok.div_ceil(32);
-                let grid = rows.div_ceil(32) * tps * 256;
+                let (rt, wg) = if self.gemm_q4 == "lds17" { (64usize, 512usize) } else { (32, 256) };
+                let grid = rows.div_ceil(rt) * tps * wg;
                 unsafe {
                     let kq = if self.gemm_q4 == "lds10" {
                         &self.kernels.gemm_q4_lds10
+                    } else if self.gemm_q4 == "lds17" {
+                        &self.kernels.gemm_q4_lds17
                     } else {
                         &self.kernels.gemm_q4_lds11
                     };
                     self.gpu.launch(
                         kq,
                         grid,
-                        256,
+                        wg,
                         &[
                             Arg::Mem(p.get()),
                             Arg::Mem(xq.get()),
