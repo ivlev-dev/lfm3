@@ -14,12 +14,18 @@ const LFM_KERNELS: &str = concat!(
     "\n",
     include_str!("../../../crates/backend-opencl/kernels/decode.cl"),
     "\n",
-    include_str!("../../../crates/backend-opencl/kernels/batch.cl")
+    include_str!("../../../crates/backend-opencl/kernels/batch.cl"),
+    "\n",
+    include_str!("../../../crates/backend-opencl/kernels/kvq4.cl")
 );
 const GROUP: usize = 32;
 
 #[derive(Parser)]
 struct Cli {
+    #[arg(long, global = true, default_value = "f16")]
+    kv_cache: String,
+    #[arg(long, global = true, default_value_t = true)]
+    kv_nc: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -334,6 +340,16 @@ fn describe(st: &Stats) -> String {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let kv = match cli.kv_cache.as_str() {
+        "f16" => "f16",
+        "k4v4" | "q4" => "q4",
+        "k4v3" => return Err(anyhow!("--kv-cache k4v3 is not implemented yet")),
+        other => return Err(anyhow!("unknown --kv-cache {other}, expected f16|k4v4|k4v3")),
+    };
+    unsafe {
+        std::env::set_var("LFM_KV", kv);
+        std::env::set_var("LFM_KV_NC", if cli.kv_nc { "1" } else { "0" });
+    }
     match cli.cmd {
         Cmd::Info => info(),
         Cmd::Bw { mb, reps } => bw(mb, reps),

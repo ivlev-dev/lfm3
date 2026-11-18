@@ -218,7 +218,12 @@ impl Gpu {
                 }
             }
         }
-        let event = unsafe { exec.enqueue_nd_range(&self.queue) }.context("clEnqueueNDRangeKernel")?;
+        let event = unsafe { exec.enqueue_nd_range(&self.queue) }.map_err(|e| {
+            anyhow!(
+                "clEnqueueNDRangeKernel({}, global={global}, local={local}): {e}",
+                kernel.function_name().unwrap_or_default()
+            )
+        })?;
         if self.profile {
             let name = kernel.function_name().unwrap_or_default();
             event.wait()?;

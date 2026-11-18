@@ -45,11 +45,27 @@ const KERNELS: &str = concat!(
     "\n",
     include_str!("../kernels/decode.cl"),
     "\n",
-    include_str!("../kernels/batch.cl")
+    include_str!("../kernels/batch.cl"),
+    "\n",
+    include_str!("../kernels/kvq4.cl")
 );
 const GROUP: usize = 32;
 const MAX_SPLITS: usize = 16;
 const KV_PAGE: usize = PAGE;
+
+enum KvBuf {
+    F16(Buffer<u16>),
+    Q4 { code: Buffer<u8>, scale: Buffer<u16> },
+}
+
+impl KvBuf {
+    fn mem(&self) -> ClMemRaw {
+        match self {
+            KvBuf::F16(b) => b.get(),
+            KvBuf::Q4 { code, .. } => code.get(),
+        }
+    }
+}
 
 enum Weight {
     Q4(Buffer<u8>),
@@ -90,6 +106,12 @@ struct Kernels {
     conv_b: Kernel,
     rms_rope_heads_b: Kernel,
     kv_store_b_h: Kernel,
+    kv_store_q: Kernel,
+    kv_store_b_q: Kernel,
+    attn_h_q: Kernel,
+    attn_split_h_q: Kernel,
+    attn_b_h_q: Kernel,
+    attn_split_b_h_q: Kernel,
     attn_combine_b: Kernel,
     attn_b_h: Kernel,
     attn_b_h2: Kernel,
@@ -377,8 +399,8 @@ struct PendingPrefill {
 struct LayerBufs {
     conv: Option<Buffer<f32>>,
     snap: Option<Buffer<f32>>,
-    k: Option<Buffer<u16>>,
-    v: Option<Buffer<u16>>,
+    k: Option<KvBuf>,
+    v: Option<KvBuf>,
 }
 
 pub struct GpuModel {
@@ -410,6 +432,7 @@ pub struct GpuModel {
     wg_b: usize,
     subgroup: usize,
     kv_blocks: usize,
+    kv_q4: bool,
     cache: RadixCache,
     cache_on: bool,
     attn4: bool,
@@ -717,6 +740,12 @@ impl GpuModel {
             conv_b: Kernel::create(&program, "conv_step_b")?,
             rms_rope_heads_b: Kernel::create(&program, "rms_rope_heads_b")?,
             kv_store_b_h: Kernel::create(&program, "kv_store_b_h")?,
+            kv_store_q: Kernel::create(&program, "kv_store_q")?,
+            kv_store_b_q: Kernel::create(&program, "kv_store_b_q")?,
+            attn_h_q: Kernel::create(&program, "attention_h_q")?,
+            attn_split_h_q: Kernel::create(&program, "attention_split_h_q")?,
+            attn_b_h_q: Kernel::create(&program, "attention_b_h_q")?,
+            attn_split_b_h_q: Kernel::create(&program, "attention_split_b_h_q")?,
             attn_combine_b: Kernel::create(&program, "attention_combine_b")?,
             attn_b_h: Kernel::create(&program, "attention_b_h")?,
             attn_b_h2: Kernel::create(&program, "attention_b_h2")?,
@@ -738,6 +767,15 @@ impl GpuModel {
         let cache_on = std::env::var("LFM_CACHE").map(|v| v != "0").unwrap_or(true);
         if !gpu.caps.fp16 {
             return Err(anyhow!("device without fp16 is not supported"));
+        }
+        let kv_q4 = std::env::var("LFM_KV")
+            .map(|v| v == "q4" || v == "k4v4")
+            .unwrap_or(false);
+        if std::env::var("LFM_KV_NC").as_deref() == Ok("0") {
+            return Err(anyhow!("QJL correction (--kv-nc=false) is not implemented"));
+        }
+        if kv_q4 && shard.is_some() {
+            return Err(anyhow!("q4 KV is not supported with tensor parallelism"));
         }
         let attn4 = std::env::var("LFM_ATTN4").map(|v| v != "0").unwrap_or(true);
         let attn2 = std::env::var("LFM_ATTN2").map(|v| v != "0").unwrap_or(true);
@@ -814,8 +852,22 @@ impl GpuModel {
                 _ => LayerBufs {
                     conv: None,
                     snap: None,
-                    k: Some(gpu.alloc::<u16>(kv_slots * kvd)?),
-                    v: Some(gpu.alloc::<u16>(kv_slots * kvd)?),
+                    k: Some(if kv_q4 {
+                        KvBuf::Q4 {
+                            code: gpu.alloc::<u8>(kv_slots * (kvd / cfg.head_dim) * 64)?,
+                            scale: gpu.alloc::<u16>(kv_slots * (kvd / cfg.head_dim))?,
+                        }
+                    } else {
+                        KvBuf::F16(gpu.alloc::<u16>(kv_slots * kvd)?)
+                    }),
+                    v: Some(if kv_q4 {
+                        KvBuf::Q4 {
+                            code: gpu.alloc::<u8>(kv_slots * (kvd / cfg.head_dim) * 64)?,
+                            scale: gpu.alloc::<u16>(kv_slots * (kvd / cfg.head_dim))?,
+                        }
+                    } else {
+                        KvBuf::F16(gpu.alloc::<u16>(kv_slots * kvd)?)
+                    }),
                 },
             };
             layers.push(layer);
@@ -851,6 +903,7 @@ impl GpuModel {
             wg_b,
             subgroup,
             kv_blocks,
+            kv_q4,
             cache: RadixCache::new(kv_blocks),
             cache_on,
             attn4,
@@ -1480,22 +1533,49 @@ impl GpuModel {
                             lb.v.as_ref().ok_or_else(|| anyhow!("missing kv"))?,
                         )
                     };
-                    unsafe {
-                        self.gpu.launch(
-                            self.kv_store_kernel(),
-                            kvd,
-                            256,
-                            &[
-                                Arg::Mem(self.bufs.kk.get()),
-                                Arg::Mem(self.bufs.vv.get()),
-                                Arg::Mem(k_buf.get()),
-                                Arg::Mem(v_buf.get()),
-                                Arg::Mem(tbl_mem),
-                                Arg::U32(pos as u32),
-                                Arg::U32(kvd as u32),
-                            ],
-                        )?;
-                    }
+                    let kv_q4 = match (k_buf, v_buf) {
+                        (KvBuf::Q4 { code: kc, scale: kn }, KvBuf::Q4 { code: vc, scale: vs }) => {
+                            unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.kv_store_q,
+                                    kv_heads * 64,
+                                    64,
+                                    &[
+                                        Arg::Mem(self.bufs.kk.get()),
+                                        Arg::Mem(self.bufs.vv.get()),
+                                        Arg::Mem(kc.get()),
+                                        Arg::Mem(kn.get()),
+                                        Arg::Mem(vc.get()),
+                                        Arg::Mem(vs.get()),
+                                        Arg::Mem(tbl_mem),
+                                        Arg::U32(pos as u32),
+                                        Arg::U32(kv_heads as u32),
+                                        Arg::U32(head_dim as u32),
+                                    ],
+                                )?;
+                            }
+                            Some((kc.get(), kn.get(), vc.get(), vs.get()))
+                        }
+                        _ => {
+                            unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.kv_store_h,
+                                    kvd,
+                                    256,
+                                    &[
+                                        Arg::Mem(self.bufs.kk.get()),
+                                        Arg::Mem(self.bufs.vv.get()),
+                                        Arg::Mem(k_buf.mem()),
+                                        Arg::Mem(v_buf.mem()),
+                                        Arg::Mem(tbl_mem),
+                                        Arg::U32(pos as u32),
+                                        Arg::U32(kvd as u32),
+                                    ],
+                                )?;
+                            }
+                            None
+                        }
+                    };
                     let start = if self.cfg.kind(layer) == LayerKind::SlidingAttention {
                         (pos + 1).saturating_sub(self.cfg.sliding_window)
                     } else {
@@ -1503,47 +1583,96 @@ impl GpuModel {
                     };
                     let splits = attention_splits(pos + 1 - start);
                     if splits <= 1 {
-                        unsafe {
-                            self.gpu.launch(
-                                self.attn_kernel(false),
-                                heads * 64,
-                                64,
-                                &[
-                                    Arg::Mem(self.bufs.q.get()),
-                                    Arg::Mem(k_buf.get()),
-                                    Arg::Mem(v_buf.get()),
-                                    Arg::Mem(tbl_mem),
-                                    Arg::Mem(self.bufs.g16.get()),
-                                    Arg::Mem(self.bufs.attn.get()),
-                                    Arg::U32((pos + 1) as u32),
-                                    Arg::U32(start as u32),
-                                    Arg::U32(kv_heads as u32),
-                                    Arg::U32(head_dim as u32),
-                                    Arg::U32(heads as u32),
-                                ],
-                            )?;
+                        match kv_q4 {
+                            Some((kc, kn, vc, vs)) => unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.attn_h_q,
+                                    heads * 64,
+                                    64,
+                                    &[
+                                        Arg::Mem(self.bufs.q.get()),
+                                        Arg::Mem(kc),
+                                        Arg::Mem(kn),
+                                        Arg::Mem(vc),
+                                        Arg::Mem(vs),
+                                        Arg::Mem(tbl_mem),
+                                        Arg::Mem(self.bufs.g16.get()),
+                                        Arg::Mem(self.bufs.attn.get()),
+                                        Arg::U32((pos + 1) as u32),
+                                        Arg::U32(start as u32),
+                                        Arg::U32(kv_heads as u32),
+                                        Arg::U32(heads as u32),
+                                    ],
+                                )?;
+                            },
+                            None => unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.attn_h,
+                                    heads * 64,
+                                    64,
+                                    &[
+                                        Arg::Mem(self.bufs.q.get()),
+                                        Arg::Mem(k_buf.mem()),
+                                        Arg::Mem(v_buf.mem()),
+                                        Arg::Mem(tbl_mem),
+                                        Arg::Mem(self.bufs.g16.get()),
+                                        Arg::Mem(self.bufs.attn.get()),
+                                        Arg::U32((pos + 1) as u32),
+                                        Arg::U32(start as u32),
+                                        Arg::U32(kv_heads as u32),
+                                        Arg::U32(head_dim as u32),
+                                        Arg::U32(heads as u32),
+                                    ],
+                                )?;
+                            },
                         }
                     } else {
+                        match kv_q4 {
+                            Some((kc, kn, vc, vs)) => unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.attn_split_h_q,
+                                    heads * splits * 64,
+                                    64,
+                                    &[
+                                        Arg::Mem(self.bufs.q.get()),
+                                        Arg::Mem(kc),
+                                        Arg::Mem(kn),
+                                        Arg::Mem(vc),
+                                        Arg::Mem(vs),
+                                        Arg::Mem(tbl_mem),
+                                        Arg::Mem(self.bufs.pacc.get()),
+                                        Arg::Mem(self.bufs.pml.get()),
+                                        Arg::U32((pos + 1) as u32),
+                                        Arg::U32(start as u32),
+                                        Arg::U32(kv_heads as u32),
+                                        Arg::U32(heads as u32),
+                                        Arg::U32(splits as u32),
+                                    ],
+                                )?;
+                            },
+                            None => unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.attn_split_h,
+                                    heads * splits * 64,
+                                    64,
+                                    &[
+                                        Arg::Mem(self.bufs.q.get()),
+                                        Arg::Mem(k_buf.mem()),
+                                        Arg::Mem(v_buf.mem()),
+                                        Arg::Mem(tbl_mem),
+                                        Arg::Mem(self.bufs.pacc.get()),
+                                        Arg::Mem(self.bufs.pml.get()),
+                                        Arg::U32((pos + 1) as u32),
+                                        Arg::U32(start as u32),
+                                        Arg::U32(kv_heads as u32),
+                                        Arg::U32(head_dim as u32),
+                                        Arg::U32(heads as u32),
+                                        Arg::U32(splits as u32),
+                                    ],
+                                )?;
+                            },
+                        }
                         unsafe {
-                            self.gpu.launch(
-                                self.attn_kernel(true),
-                                heads * splits * 64,
-                                64,
-                                &[
-                                    Arg::Mem(self.bufs.q.get()),
-                                    Arg::Mem(k_buf.get()),
-                                    Arg::Mem(v_buf.get()),
-                                    Arg::Mem(tbl_mem),
-                                    Arg::Mem(self.bufs.pacc.get()),
-                                    Arg::Mem(self.bufs.pml.get()),
-                                    Arg::U32((pos + 1) as u32),
-                                    Arg::U32(start as u32),
-                                    Arg::U32(kv_heads as u32),
-                                    Arg::U32(head_dim as u32),
-                                    Arg::U32(heads as u32),
-                                    Arg::U32(splits as u32),
-                                ],
-                            )?;
                             self.gpu.launch(
                                 &self.kernels.attn_combine,
                                 heads * 64,
@@ -1847,8 +1976,8 @@ impl GpuModel {
                 &[
                     Arg::Mem(self.bufs.kk.get()),
                     Arg::Mem(self.bufs.vv.get()),
-                    Arg::Mem(k_buf.get()),
-                    Arg::Mem(v_buf.get()),
+                    Arg::Mem(k_buf.mem()),
+                    Arg::Mem(v_buf.mem()),
                     Arg::Mem(tbl_mem),
                     Arg::U32(pos as u32),
                     Arg::U32(kvd as u32),
@@ -1869,8 +1998,8 @@ impl GpuModel {
                     64,
                     &[
                         Arg::Mem(self.bufs.q.get()),
-                        Arg::Mem(k_buf.get()),
-                        Arg::Mem(v_buf.get()),
+                        Arg::Mem(k_buf.mem()),
+                        Arg::Mem(v_buf.mem()),
                         Arg::Mem(tbl_mem),
                         Arg::Mem(self.bufs.g16.get()),
                         Arg::Mem(self.bufs.attn.get()),
@@ -1890,8 +2019,8 @@ impl GpuModel {
                     64,
                     &[
                         Arg::Mem(self.bufs.q.get()),
-                        Arg::Mem(k_buf.get()),
-                        Arg::Mem(v_buf.get()),
+                        Arg::Mem(k_buf.mem()),
+                        Arg::Mem(v_buf.mem()),
                         Arg::Mem(tbl_mem),
                         Arg::Mem(self.bufs.pacc.get()),
                         Arg::Mem(self.bufs.pml.get()),
@@ -2039,26 +2168,36 @@ impl GpuModel {
     }
 
     fn kv_store_kernel(&self) -> &Kernel {
-        &self.kernels.kv_store_h
+        if self.kv_q4 {
+            &self.kernels.kv_store_q
+        } else {
+            &self.kernels.kv_store_h
+        }
     }
 
     fn kv_store_b_kernel(&self) -> &Kernel {
-        &self.kernels.kv_store_b_h
+        if self.kv_q4 {
+            &self.kernels.kv_store_b_q
+        } else {
+            &self.kernels.kv_store_b_h
+        }
     }
 
     fn attn_kernel(&self, split: bool) -> &Kernel {
-        if split {
-            &self.kernels.attn_split_h
-        } else {
-            &self.kernels.attn_h
+        match (self.kv_q4, split) {
+            (true, true) => &self.kernels.attn_split_h_q,
+            (true, false) => &self.kernels.attn_h_q,
+            (false, true) => &self.kernels.attn_split_h,
+            (false, false) => &self.kernels.attn_h,
         }
     }
 
     fn attn_b_kernel(&self, split: bool) -> &Kernel {
-        if split {
-            &self.kernels.attn_split_b_h
-        } else {
-            &self.kernels.attn_b_h
+        match (self.kv_q4, split) {
+            (true, true) => &self.kernels.attn_split_b_h_q,
+            (true, false) => &self.kernels.attn_b_h_q,
+            (false, true) => &self.kernels.attn_split_b_h,
+            (false, false) => &self.kernels.attn_b_h,
         }
     }
 
@@ -2554,87 +2693,180 @@ impl GpuModel {
                         0
                     };
                     unsafe {
-                        self.gpu.launch(
-                            self.kv_store_b_kernel(),
-                            ntok * kvd,
-                            256,
-                            &[
-                                Arg::Mem(self.bufs.kkb.get()),
-                                Arg::Mem(self.bufs.vvb.get()),
-                                Arg::Mem(k_buf.get()),
-                                Arg::Mem(v_buf.get()),
-                                Arg::Mem(self.bufs.tbl_all.get()),
-                                Arg::Mem(self.bufs.tbl_off_b.get()),
-                                Arg::Mem(self.bufs.pos_b.get()),
-                                Arg::U32(kvd as u32),
-                                Arg::U32(n32),
-                            ],
-                        )?;
-                        let last = reqs.iter().map(|r| r.pos).max().unwrap_or(0) + 1;
-                        let span_max = if window > 0 { window.min(last) } else { last };
-                        let splits = (span_max / 512).clamp(1, MAX_SPLITS);
-                        if splits <= 1 {
-                            let use2 = self.attn2
-                                && head_dim == 128
-                                && heads % 4 == 0;
-                            let kernel = if use2 {
-                                &self.kernels.attn_b_h2
-                            } else {
-                                self.attn_b_kernel(false)
-                            };
-                            self.gpu.launch(
-                                kernel,
-                                ntok * (heads / 4) * 256,
-                                256,
-                                &[
-                                    Arg::Mem(self.bufs.qb.get()),
-                                    Arg::Mem(k_buf.get()),
-                                    Arg::Mem(v_buf.get()),
-                                    Arg::Mem(self.bufs.tbl_all.get()),
-                                    Arg::Mem(self.bufs.tbl_off_b.get()),
-                                    Arg::Mem(self.bufs.pos_b.get()),
-                                    Arg::Mem(self.bufs.gb.get()),
-                                    Arg::Mem(self.bufs.attnb.get()),
-                                    Arg::U32(n32),
-                                    Arg::U32(kv_heads as u32),
-                                    Arg::U32(head_dim as u32),
-                                    Arg::U32(heads as u32),
-                                    Arg::U32(window as u32),
-                                ],
-                            )?;
-                        } else {
-                            let use4 = self.attn4
-                                && heads == kv_heads * 4
-                                && head_dim == 128;
-                            let (kernel, grid) = if use4 {
-                                (
-                                    &self.kernels.attn_split_b_h4_p4,
-                                    ntok * kv_heads * splits * 64,
-                                )
-                            } else {
-                                (self.attn_b_kernel(true), ntok * heads * splits * 64)
-                            };
-                            self.gpu.launch(
-                                kernel,
-                                grid,
-                                64,
-                                &[
-                                    Arg::Mem(self.bufs.qb.get()),
-                                    Arg::Mem(k_buf.get()),
-                                    Arg::Mem(v_buf.get()),
-                                    Arg::Mem(self.bufs.tbl_all.get()),
-                                    Arg::Mem(self.bufs.tbl_off_b.get()),
-                                    Arg::Mem(self.bufs.pos_b.get()),
-                                    Arg::Mem(self.bufs.pacc_b.get()),
-                                    Arg::Mem(self.bufs.pml_b.get()),
-                                    Arg::U32(n32),
-                                    Arg::U32(kv_heads as u32),
-                                    Arg::U32(head_dim as u32),
-                                    Arg::U32(heads as u32),
-                                    Arg::U32(window as u32),
-                                    Arg::U32(splits as u32),
-                                ],
-                            )?;
+                    let kv_q4 = match (k_buf, v_buf) {
+                        (KvBuf::Q4 { code: kc, scale: kn }, KvBuf::Q4 { code: vc, scale: vs }) => {
+                            unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.kv_store_b_q,
+                                    ntok * kv_heads * 64,
+                                    64,
+                                    &[
+                                        Arg::Mem(self.bufs.kkb.get()),
+                                        Arg::Mem(self.bufs.vvb.get()),
+                                        Arg::Mem(kc.get()),
+                                        Arg::Mem(kn.get()),
+                                        Arg::Mem(vc.get()),
+                                        Arg::Mem(vs.get()),
+                                        Arg::Mem(self.bufs.tbl_all.get()),
+                                        Arg::Mem(self.bufs.tbl_off_b.get()),
+                                        Arg::Mem(self.bufs.pos_b.get()),
+                                        Arg::U32(kv_heads as u32),
+                                        Arg::U32(head_dim as u32),
+                                        Arg::U32(ntok as u32),
+                                    ],
+                                )?;
+                            }
+                            Some((kc.get(), kn.get(), vc.get(), vs.get()))
+                        }
+                        _ => {
+                            unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.kv_store_b_h,
+                                    ntok * kvd,
+                                    256,
+                                    &[
+                                        Arg::Mem(self.bufs.kkb.get()),
+                                        Arg::Mem(self.bufs.vvb.get()),
+                                        Arg::Mem(k_buf.mem()),
+                                        Arg::Mem(v_buf.mem()),
+                                        Arg::Mem(self.bufs.tbl_all.get()),
+                                        Arg::Mem(self.bufs.tbl_off_b.get()),
+                                        Arg::Mem(self.bufs.pos_b.get()),
+                                        Arg::U32(kvd as u32),
+                                        Arg::U32(n32),
+                                    ],
+                                )?;
+                            }
+                            None
+                        }
+                    };
+                    let last = reqs.iter().map(|r| r.pos).max().unwrap_or(0) + 1;
+                    let span_max = if window > 0 { window.min(last) } else { last };
+                    let splits = (span_max / 512).clamp(1, MAX_SPLITS);
+                    if splits <= 1 {
+                        match kv_q4 {
+                            Some((kc, kn, vc, vs)) => unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.attn_b_h_q,
+                                    ntok * (heads / 4) * 256,
+                                    256,
+                                    &[
+                                        Arg::Mem(self.bufs.qb.get()),
+                                        Arg::Mem(kc),
+                                        Arg::Mem(kn),
+                                        Arg::Mem(vc),
+                                        Arg::Mem(vs),
+                                        Arg::Mem(self.bufs.tbl_all.get()),
+                                        Arg::Mem(self.bufs.tbl_off_b.get()),
+                                        Arg::Mem(self.bufs.pos_b.get()),
+                                        Arg::Mem(self.bufs.gb.get()),
+                                        Arg::Mem(self.bufs.attnb.get()),
+                                        Arg::U32(ntok as u32),
+                                        Arg::U32(kv_heads as u32),
+                                        Arg::U32(heads as u32),
+                                        Arg::U32(window as u32),
+                                    ],
+                                )?;
+                            },
+                            None => {
+                                let use2 = self.attn2
+                                    && !self.kv_q4
+                                    && head_dim == 128
+                                    && heads % 4 == 0;
+                                let kernel = if use2 {
+                                    &self.kernels.attn_b_h2
+                                } else {
+                                    &self.kernels.attn_b_h
+                                };
+                                unsafe {
+                                    self.gpu.launch(
+                                        kernel,
+                                        ntok * (heads / 4) * 256,
+                                        256,
+                                        &[
+                                            Arg::Mem(self.bufs.qb.get()),
+                                            Arg::Mem(k_buf.mem()),
+                                            Arg::Mem(v_buf.mem()),
+                                            Arg::Mem(self.bufs.tbl_all.get()),
+                                            Arg::Mem(self.bufs.tbl_off_b.get()),
+                                            Arg::Mem(self.bufs.pos_b.get()),
+                                            Arg::Mem(self.bufs.gb.get()),
+                                            Arg::Mem(self.bufs.attnb.get()),
+                                            Arg::U32(n32),
+                                            Arg::U32(kv_heads as u32),
+                                            Arg::U32(head_dim as u32),
+                                            Arg::U32(heads as u32),
+                                            Arg::U32(window as u32),
+                                        ],
+                                    )?;
+                                }
+                            }
+                        }
+                    } else {
+                        match kv_q4 {
+                            Some((kc, kn, vc, vs)) => unsafe {
+                                self.gpu.launch(
+                                    &self.kernels.attn_split_b_h_q,
+                                    ntok * heads * splits * 64,
+                                    64,
+                                    &[
+                                        Arg::Mem(self.bufs.qb.get()),
+                                        Arg::Mem(kc),
+                                        Arg::Mem(kn),
+                                        Arg::Mem(vc),
+                                        Arg::Mem(vs),
+                                        Arg::Mem(self.bufs.tbl_all.get()),
+                                        Arg::Mem(self.bufs.tbl_off_b.get()),
+                                        Arg::Mem(self.bufs.pos_b.get()),
+                                        Arg::Mem(self.bufs.pacc_b.get()),
+                                        Arg::Mem(self.bufs.pml_b.get()),
+                                        Arg::U32(ntok as u32),
+                                        Arg::U32(kv_heads as u32),
+                                        Arg::U32(heads as u32),
+                                        Arg::U32(window as u32),
+                                        Arg::U32(splits as u32),
+                                    ],
+                                )?;
+                            },
+                            None => {
+                                let use4 = self.attn4
+                                    && !self.kv_q4
+                                    && heads == kv_heads * 4
+                                    && head_dim == 128;
+                                let (kernel, grid) = if use4 {
+                                    (
+                                        &self.kernels.attn_split_b_h4_p4,
+                                        ntok * kv_heads * splits * 64,
+                                    )
+                                } else {
+                                    (&self.kernels.attn_split_b_h, ntok * heads * splits * 64)
+                                };
+                                unsafe {
+                                    self.gpu.launch(
+                                        kernel,
+                                        grid,
+                                        64,
+                                        &[
+                                            Arg::Mem(self.bufs.qb.get()),
+                                            Arg::Mem(k_buf.mem()),
+                                            Arg::Mem(v_buf.mem()),
+                                            Arg::Mem(self.bufs.tbl_all.get()),
+                                            Arg::Mem(self.bufs.tbl_off_b.get()),
+                                            Arg::Mem(self.bufs.pos_b.get()),
+                                            Arg::Mem(self.bufs.pacc_b.get()),
+                                            Arg::Mem(self.bufs.pml_b.get()),
+                                            Arg::U32(n32),
+                                            Arg::U32(kv_heads as u32),
+                                            Arg::U32(head_dim as u32),
+                                            Arg::U32(heads as u32),
+                                            Arg::U32(window as u32),
+                                            Arg::U32(splits as u32),
+                                        ],
+                                    )?;
+                                }
+                            }
+                        }
+                        unsafe {
                             self.gpu.launch(
                                 &self.kernels.attn_combine_b,
                                 ntok * heads * 64,
@@ -2651,6 +2883,7 @@ impl GpuModel {
                                 ],
                             )?;
                         }
+                    }
                         self.gpu.launch(
                             &self.kernels.quant_b,
                             ntok * (qd / GROUP),
@@ -3017,22 +3250,22 @@ impl GpuModel {
             .map(|b| (*b as usize) * KV_PAGE + pos % KV_PAGE)
             .unwrap_or(0);
         let k = match &self.layers[layer].k {
-            Some(b) => self
+            Some(KvBuf::F16(b)) => self
                 .gpu
                 .download_at(b, slot * kvd * 2, kvd)?
                 .iter()
                 .map(|bits| half_to_f32(*bits))
                 .collect(),
-            None => Vec::new(),
+            _ => Vec::new(),
         };
         let v = match &self.layers[layer].v {
-            Some(b) => self
+            Some(KvBuf::F16(b)) => self
                 .gpu
                 .download_at(b, slot * kvd * 2, kvd)?
                 .iter()
                 .map(|bits| half_to_f32(*bits))
                 .collect(),
-            None => Vec::new(),
+            _ => Vec::new(),
         };
         Ok((conv, k, v))
     }
@@ -3119,9 +3352,8 @@ impl GpuModel {
                     )?;
                 }
             }
-            if let Some(k) = &layer.k {
-                let v = layer.v.as_ref().ok_or_else(|| anyhow!("missing v"))?;
-                unsafe {
+            match (&layer.k, &layer.v) {
+                (Some(KvBuf::F16(k)), Some(KvBuf::F16(v))) => unsafe {
                     self.gpu.launch(
                         &self.kernels.fill_h,
                         kv_len,
@@ -3134,7 +3366,35 @@ impl GpuModel {
                         256,
                         &[Arg::Mem(v.get()), Arg::U32(0), Arg::U32(kv_len as u32)],
                     )?;
+                },
+                (
+                    Some(KvBuf::Q4 { code: kc, scale: kn }),
+                    Some(KvBuf::Q4 { code: vc, scale: vs }),
+                ) => {
+                    let heads = self.cfg.kv_dim() / self.cfg.head_dim;
+                    let codes = (kv_len / self.cfg.head_dim) * 32;
+                    let scales = kv_len / self.cfg.head_dim;
+                    unsafe {
+                        for buf in [kc.get(), vc.get()] {
+                            self.gpu.launch(
+                                &self.kernels.fill_h,
+                                codes,
+                                0,
+                                &[Arg::Mem(buf), Arg::U32(0), Arg::U32(codes as u32)],
+                            )?;
+                        }
+                        for buf in [kn.get(), vs.get()] {
+                            self.gpu.launch(
+                                &self.kernels.fill_h,
+                                scales,
+                                0,
+                                &[Arg::Mem(buf), Arg::U32(0), Arg::U32(scales as u32)],
+                            )?;
+                        }
+                    }
+                    let _ = heads;
                 }
+                _ => {}
             }
         }
         Ok(())
