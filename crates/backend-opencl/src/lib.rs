@@ -99,6 +99,8 @@ struct Kernels {
     q4_b: Kernel,
     q4p_b: Kernel,
     q4x4p_b: Kernel,
+    gemm_q4: Kernel,
+    gemm_q6: Kernel,
     q6_b: Kernel,
     conv_b: Kernel,
     rms_rope_heads_b: Kernel,
@@ -416,6 +418,8 @@ pub struct GpuModel {
     layers: Vec<LayerBufs>,
     ffn: usize,
     pb: usize,
+    prefill_batch: usize,
+    batch_cap: usize,
     rgemv: usize,
     rgemv_b: usize,
     wg: usize,
@@ -651,6 +655,12 @@ impl GpuModel {
             .and_then(|v| v.parse().ok())
             .filter(|v: &usize| (1..=12).contains(v))
             .unwrap_or(6);
+        let prefill_batch: usize = std::env::var("LFM_PREFILL_NTOK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| (1..=128).contains(v))
+            .unwrap_or(pb);
+        let batch_cap = pb.max(prefill_batch);
         let rgemv: usize = std::env::var("LFM_RGEMV")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -672,7 +682,7 @@ impl GpuModel {
             .and_then(|v| v.parse().ok())
             .filter(|v: &usize| (64..=512).contains(v))
             .map(|v| v / 64 * 64)
-            .unwrap_or(64);
+            .unwrap_or(pb);
         let subgroup = gpu.caps.sub_group_size.max(1);
         let options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
         let program: Program = gpu.build(KERNELS, &options)?;
@@ -706,6 +716,8 @@ impl GpuModel {
             q4_b: Kernel::create(&program, "gemv_q4_k_i8_b")?,
             q4p_b: Kernel::create(&program, "gemv_q4_k_i8_p_b")?,
             q4x4p_b: Kernel::create(&program, "gemv_q4_k_i8_4p_b")?,
+            gemm_q4: Kernel::create(&program, "gemm_q4_k_i8_p")?,
+            gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
             conv_b: Kernel::create(&program, "conv_step_b")?,
             rms_rope_heads_b: Kernel::create(&program, "rms_rope_heads_b")?,
@@ -756,35 +768,35 @@ impl GpuModel {
             g16: gpu.alloc::<f32>(cfg.num_heads)?,
             attn: gpu.alloc::<f32>(qd)?,
             logits: gpu.alloc::<f32>(vocab)?,
-            tokens: gpu.alloc::<u32>(pb)?,
-            xb: gpu.alloc::<f32>(pb * h)?,
-            opb: gpu.alloc::<f32>(pb * h)?,
-            tmpb: gpu.alloc::<f32>(pb * h)?,
-            hqx: gpu.alloc::<i8>(pb * h)?,
-            hsx: gpu.alloc::<f32>(pb * (h / GROUP))?,
-            ugb: gpu.alloc::<f32>(pb * 2 * ffn)?,
-            actqb: gpu.alloc::<i8>(pb * ffn)?,
-            actsb: gpu.alloc::<f32>(pb * (ffn / GROUP))?,
-            bcxb: gpu.alloc::<f32>(pb * 3 * h)?,
-            qb: gpu.alloc::<f32>(pb * qd)?,
-            kkb: gpu.alloc::<f32>(pb * kvd)?,
-            vvb: gpu.alloc::<f32>(pb * kvd)?,
-            gb: gpu.alloc::<f32>(pb * cfg.num_heads)?,
-            attnb: gpu.alloc::<f32>(pb * qd)?,
-            logitsb: gpu.alloc::<f32>(pb * vocab)?,
-            xqg: gpu.alloc::<i8>(pb * h)?,
-            xsg: gpu.alloc::<f32>(pb * (h / GROUP))?,
-            logitsg: gpu.alloc::<f32>(pb * vocab)?,
-            pos_b: gpu.alloc::<u32>(pb)?,
-            tbl_off_b: gpu.alloc::<u32>(pb)?,
-            conv_off_b: gpu.alloc::<u32>(pb)?,
+            tokens: gpu.alloc::<u32>(batch_cap)?,
+            xb: gpu.alloc::<f32>(batch_cap * h)?,
+            opb: gpu.alloc::<f32>(batch_cap * h)?,
+            tmpb: gpu.alloc::<f32>(batch_cap * h)?,
+            hqx: gpu.alloc::<i8>(batch_cap * h)?,
+            hsx: gpu.alloc::<f32>(batch_cap * (h / GROUP))?,
+            ugb: gpu.alloc::<f32>(batch_cap * 2 * ffn)?,
+            actqb: gpu.alloc::<i8>(batch_cap * ffn)?,
+            actsb: gpu.alloc::<f32>(batch_cap * (ffn / GROUP))?,
+            bcxb: gpu.alloc::<f32>(batch_cap * 3 * h)?,
+            qb: gpu.alloc::<f32>(batch_cap * qd)?,
+            kkb: gpu.alloc::<f32>(batch_cap * kvd)?,
+            vvb: gpu.alloc::<f32>(batch_cap * kvd)?,
+            gb: gpu.alloc::<f32>(batch_cap * cfg.num_heads)?,
+            attnb: gpu.alloc::<f32>(batch_cap * qd)?,
+            logitsb: gpu.alloc::<f32>(batch_cap * vocab)?,
+            xqg: gpu.alloc::<i8>(batch_cap * h)?,
+            xsg: gpu.alloc::<f32>(batch_cap * (h / GROUP))?,
+            logitsg: gpu.alloc::<f32>(batch_cap * vocab)?,
+            pos_b: gpu.alloc::<u32>(batch_cap)?,
+            tbl_off_b: gpu.alloc::<u32>(batch_cap)?,
+            conv_off_b: gpu.alloc::<u32>(batch_cap)?,
             tbl_all: gpu.alloc::<u32>(max_seqs * kv_blocks.max(1))?,
-            snap_page: gpu.alloc::<u32>(pb)?,
+            snap_page: gpu.alloc::<u32>(batch_cap)?,
             snap_dummy: gpu.alloc::<f32>(1)?,
             pacc: gpu.alloc::<f32>(MAX_SPLITS * cfg.num_heads * cfg.head_dim)?,
             pml: gpu.alloc::<f32>(MAX_SPLITS * cfg.num_heads * 2)?,
-            pacc_b: gpu.alloc::<f32>(pb * MAX_SPLITS * cfg.num_heads * cfg.head_dim)?,
-            pml_b: gpu.alloc::<f32>(pb * MAX_SPLITS * cfg.num_heads * 2)?,
+            pacc_b: gpu.alloc::<f32>(batch_cap * MAX_SPLITS * cfg.num_heads * cfg.head_dim)?,
+            pml_b: gpu.alloc::<f32>(batch_cap * MAX_SPLITS * cfg.num_heads * 2)?,
         };
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -846,6 +858,8 @@ impl GpuModel {
             layers,
             ffn,
             pb,
+            prefill_batch,
+            batch_cap,
             rgemv,
             rgemv_b,
             wg,
@@ -929,6 +943,49 @@ impl GpuModel {
         } else {
             None
         };
+        if ntok > self.pb {
+            if let (Weight::Q4(_), Some(p)) = (weight, packed) {
+                let grid = rows.div_ceil(2) * 64;
+                unsafe {
+                    self.gpu.launch(
+                        &self.kernels.gemm_q4,
+                        grid,
+                        64,
+                        &[
+                            Arg::Mem(p.get()),
+                            Arg::Mem(xq.get()),
+                            Arg::Mem(xs.get()),
+                            Arg::Mem(y.get()),
+                            Arg::U32(rows as u32),
+                            Arg::U32(cols as u32),
+                            Arg::U32(ntok as u32),
+                        ],
+                    )?;
+                }
+                return Ok(());
+            }
+            if let Weight::Q6(b) = weight {
+                let grid = rows.div_ceil(2) * 64;
+                unsafe {
+                    self.gpu.launch(
+                        &self.kernels.gemm_q6,
+                        grid,
+                        64,
+                        &[
+                            Arg::Mem(b.get()),
+                            Arg::Mem(xq.get()),
+                            Arg::Mem(xs.get()),
+                            Arg::Mem(y.get()),
+                            Arg::U32(rows as u32),
+                            Arg::U32(cols as u32),
+                            Arg::U32(ntok as u32),
+                        ],
+                    )?;
+                }
+                return Ok(());
+            }
+            return Err(anyhow!("large prefill batch: unsupported weight {name} ntok {ntok}"));
+        }
         let (kernel, buffer) = match (weight, packed) {
             (Weight::Q4(_), Some(p)) => (&self.kernels.q4p_b, p),
             (Weight::Q4(b), None) => (&self.kernels.q4_b, b),
@@ -1964,6 +2021,10 @@ impl GpuModel {
         self.pb
     }
 
+    pub fn prefill_batch_size(&self) -> usize {
+        self.prefill_batch
+    }
+
     fn kv_store_kernel(&self) -> &Kernel {
         if self.kv_f16 {
             &self.kernels.kv_store_h
@@ -2009,10 +2070,12 @@ impl GpuModel {
 
     pub fn kernel_stats(&self) -> Vec<(String, u64)> {
         let dev = self.gpu.device.id();
-        let list: [(&str, &Kernel); 20] = [
+        let list: [(&str, &Kernel); 22] = [
             ("q4", &self.kernels.q4),
             ("q4p_b", &self.kernels.q4p_b),
             ("q4x4p_b", &self.kernels.q4x4p_b),
+            ("gemm_q4", &self.kernels.gemm_q4),
+            ("gemm_q6", &self.kernels.gemm_q6),
             ("q6", &self.kernels.q6),
             ("q4_b", &self.kernels.q4_b),
             ("q6_b", &self.kernels.q6_b),
@@ -2140,8 +2203,8 @@ impl GpuModel {
         if ntok == 0 {
             return Err(anyhow!("empty batch"));
         }
-        if ntok > self.pb {
-            return Err(anyhow!("batch of {ntok} exceeds prefetch batch {}", self.pb));
+        if ntok > self.batch_cap {
+            return Err(anyhow!("batch of {ntok} exceeds prefetch batch {}", self.batch_cap));
         }
         for req in reqs {
             if req.pos >= self.max_ctx {
@@ -2342,7 +2405,7 @@ impl GpuModel {
                 _ => {
                     let kv_heads = self.cfg.kv_heads_of(layer);
                     let kvg = kv_heads * head_dim;
-                    let fused = if self
+                    let fused = if ntok <= self.pb && self
                         .prepacked
                         .contains_key(&format!("{prefix}.attn_qkvg.weight"))
                     {
@@ -3099,7 +3162,7 @@ impl GpuModel {
         let reused = self.prefill_begin(slot, prompt)?;
         let mut pos = reused;
         while pos < prompt.len() {
-            let end = (pos + self.pb).min(prompt.len());
+            let end = (pos + self.prefill_batch).min(prompt.len());
             let reqs: Vec<StepReq> = (pos..end)
                 .map(|p| StepReq {
                     slot,

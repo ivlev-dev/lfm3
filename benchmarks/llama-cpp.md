@@ -29,9 +29,16 @@ cmake --build build-vulkan -j12 --target llama-bench
 
 | бэкенд | prefill | decode |
 |---|---|---|
-| OpenCL (Q4_K_M, GPU) | 512: ~205 tok/s, 8192: ~159 tok/s | 8192: ~64 tok/s |
+| OpenCL (Q4_K_M, GPU) | 512: ~205–213 tok/s, 8192: ~159–179 tok/s | 8192: ~64 tok/s |
 | CPU (W4A8/AVX2) | 512: 10.0 tok/s | 6.9 tok/s |
 | ROCm | нет (ROCm не установлен) | — |
+
+## Попытка GEMM (сессия 8)
+
+`gemm_q4_k_i8_p`/`gemm_q6_k_i8` (2 строки × 16 токенов): 512 — 150 tok/s,
+8192 — 133 tok/s против 213/179 у старого RGEMV=5/PB=6. Причина — малый тайл по
+строкам и трафик `x`; нужен LDS-тайлинг (RT 16, TT 32–64) с кооперативной загрузкой.
+По умолчанию `LFM_PREFILL_NTOK=6`.
 
 ## Разрывы и цели
 

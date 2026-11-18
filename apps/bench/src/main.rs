@@ -2274,7 +2274,7 @@ fn gpu_cache(model: &PathBuf, tokens: usize, reps: usize, reset: bool) -> Result
         gpu.finish()?;
         let started = Instant::now();
         let reused = if std::env::var("LFM_OLD").is_ok() {
-            let pb = gpu.batch_size();
+            let pb = gpu.prefill_batch_size();
             let mut at = 0;
             while at < ids.len() {
                 let end = (at + pb).min(ids.len());
@@ -2621,13 +2621,17 @@ fn gpu_prefill(model: &PathBuf, tokens: usize, decode: usize) -> Result<()> {
     let ids: Vec<u32> = (0..tokens)
         .map(|i| ((i * 2654435761usize) % 60000) as u32 + 100)
         .collect();
-    gpu.forward_batch(&ids[..gpu.batch_size().min(ids.len())], 0, true)?;
+    gpu.forward_batch(
+        &ids[..gpu.prefill_batch_size().min(ids.len())],
+        0,
+        true,
+    )?;
     gpu.reset()?;
     let started = Instant::now();
     let mut pos = 0;
     let mut chunks = Vec::new();
     while pos < ids.len() {
-        let end = (pos + gpu.batch_size()).min(ids.len());
+        let end = (pos + gpu.prefill_batch_size()).min(ids.len());
         chunks.push((pos, end));
         pos = end;
     }

@@ -1389,3 +1389,209 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
     }
 }
 
+
+__kernel void gemm_q4_k_i8_p(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+    uint lane = get_sub_group_local_id();
+    uint sgs = get_sub_group_size();
+    uint sgid = get_sub_group_id();
+    uint nsg = get_num_sub_groups();
+    uint row0 = (get_group_id(0) * nsg + sgid) * 2u;
+    if (rows < 2u) {
+        return;
+    }
+    if (row0 + 2u > rows) {
+        row0 = rows - 2u;
+    }
+    uint u = lane & 7u;
+    uint bpi = sgs >> 3;
+    uint blocks = cols >> 8;
+    uint ngs = cols >> 5;
+    ulong row_stride = (ulong)blocks * 148ul;
+    __global const uchar *base_w = w + (ulong)row0 * row_stride;
+    uint sb_lo = (u >> 1) << 1;
+    uint wbase = (u >> 1) * 64u + (u & 1u) * 16u;
+    const char4 ones = (char4)(1);
+    for (uint t0 = 0u; t0 < ntok; t0 += 16u) {
+        float acc[2][16];
+        #pragma unroll
+        for (uint r = 0u; r < 2u; ++r) {
+            #pragma unroll
+            for (uint tt = 0u; tt < 16u; ++tt) {
+                acc[r][tt] = 0.0f;
+            }
+        }
+        for (uint b0 = 0u; b0 < blocks; b0 += bpi) {
+            uint b = b0 + (lane >> 3);
+            if (b < blocks) {
+                uint4 pk[2];
+                uchar4 sm[2];
+                float d[2];
+                float dmin[2];
+                #pragma unroll
+                for (uint r = 0u; r < 2u; ++r) {
+                    __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 148ul;
+                    d[r] = (float)vload_half(0, (__global const half *)blk);
+                    dmin[r] = (float)vload_half(0, (__global const half *)(blk + 2));
+                    sm[r] = vload4(0, blk + 4u + 4u * (u >> 1));
+                    pk[r] = vload4(0, (__global const uint *)(blk + 20u + u * 16u));
+                }
+                uint w_lo = b * 256u + wbase;
+                uint ski = w_lo >> 5;
+                uint ski2 = (w_lo + 32u) >> 5;
+                #pragma unroll
+                for (uint tt = 0u; tt < 16u; ++tt) {
+                    uint t = t0 + tt;
+                    if (t < ntok) {
+                        char16 xl = vload16(0, xq + (ulong)t * cols + w_lo);
+                        char16 xh = vload16(0, xq + (ulong)t * cols + w_lo + 32u);
+                        float xsl = xs[t * ngs + ski];
+                        float xsh = xs[t * ngs + ski2];
+                        int suml = (int)dot(xl.s0123, ones) + (int)dot(xl.s4567, ones)
+                                 + (int)dot(xl.s89ab, ones) + (int)dot(xl.scdef, ones);
+                        int sumh = (int)dot(xh.s0123, ones) + (int)dot(xh.s4567, ones)
+                                 + (int)dot(xh.s89ab, ones) + (int)dot(xh.scdef, ones);
+                        #pragma unroll
+                        for (uint r = 0u; r < 2u; ++r) {
+                            char4 l0 = as_char4(pk[r].x & 0x0F0F0F0Fu);
+                            char4 l1 = as_char4(pk[r].y & 0x0F0F0F0Fu);
+                            char4 l2 = as_char4(pk[r].z & 0x0F0F0F0Fu);
+                            char4 l3 = as_char4(pk[r].w & 0x0F0F0F0Fu);
+                            char4 h0 = as_char4((pk[r].x >> 4) & 0x0F0F0F0Fu);
+                            char4 h1 = as_char4((pk[r].y >> 4) & 0x0F0F0F0Fu);
+                            char4 h2 = as_char4((pk[r].z >> 4) & 0x0F0F0F0Fu);
+                            char4 h3 = as_char4((pk[r].w >> 4) & 0x0F0F0F0Fu);
+                            float dl_coef = d[r] * (float)sm[r].x;
+                            float dh_coef = d[r] * (float)sm[r].z;
+                            float ml_coef = dmin[r] * (float)sm[r].y;
+                            float mh_coef = dmin[r] * (float)sm[r].w;
+                            float dl = (float)(dot(l0, xl.s0123) + dot(l1, xl.s4567)
+                                             + dot(l2, xl.s89ab) + dot(l3, xl.scdef));
+                            float dh = (float)(dot(h0, xh.s0123) + dot(h1, xh.s4567)
+                                             + dot(h2, xh.s89ab) + dot(h3, xh.scdef));
+                            acc[r][tt] += xsl * (dl * dl_coef - (float)suml * ml_coef);
+                            acc[r][tt] += xsh * (dh * dh_coef - (float)sumh * mh_coef);
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint r = 0u; r < 2u; ++r) {
+            #pragma unroll
+            for (uint tt = 0u; tt < 16u; ++tt) {
+                uint t = t0 + tt;
+                if (t < ntok) {
+                    float total = sub_group_reduce_add(acc[r][tt]);
+                    if (lane == 0u) {
+                        y[(ulong)t * rows + row0 + r] = total;
+                    }
+                }
+            }
+        }
+    }
+}
+
+__kernel void gemm_q6_k_i8(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+    uint lane = get_sub_group_local_id();
+    uint sgs = get_sub_group_size();
+    uint sgid = get_sub_group_id();
+    uint nsg = get_num_sub_groups();
+    uint row0 = (get_group_id(0) * nsg + sgid) * 2u;
+    if (rows < 2u) {
+        return;
+    }
+    if (row0 + 2u > rows) {
+        row0 = rows - 2u;
+    }
+    uint sub = lane & 15u;
+    uint n = sub >> 3;
+    uint l = (sub & 7u) * 4u;
+    uint lq = l >> 4;
+    uint bps = sgs >> 4;
+    if (bps == 0u) {
+        bps = 1u;
+    }
+    uint blocks = cols >> 8;
+    uint ngs = cols >> 5;
+    ulong row_stride = (ulong)blocks * 210ul;
+    __global const uchar *base_w = w + (ulong)row0 * row_stride;
+    for (uint t0 = 0u; t0 < ntok; t0 += 16u) {
+        float acc[2][16];
+        #pragma unroll
+        for (uint r = 0u; r < 2u; ++r) {
+            #pragma unroll
+            for (uint tt = 0u; tt < 16u; ++tt) {
+                acc[r][tt] = 0.0f;
+            }
+        }
+        for (uint b0 = 0u; b0 < blocks; b0 += bps) {
+            uint b = b0 + (lane >> 4);
+            if (b < blocks) {
+                char4 q0[2];
+                char4 q1[2];
+                char4 q2[2];
+                char4 q3[2];
+                float s0[2];
+                float s1[2];
+                float s2[2];
+                float s3[2];
+                #pragma unroll
+                for (uint r = 0u; r < 2u; ++r) {
+                    __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 210ul;
+                    __global const char *sc = (__global const char *)(blk + 192u);
+                    float d = (float)vload_half(0, (__global const half *)(blk + 208u));
+                    uint so = n * 8u + lq;
+                    s0[r] = d * (float)sc[so + 0u];
+                    s1[r] = d * (float)sc[so + 2u];
+                    s2[r] = d * (float)sc[so + 4u];
+                    s3[r] = d * (float)sc[so + 6u];
+                    __global const uchar *ql = blk + n * 64u + l;
+                    __global const uchar *qh = blk + 128u + n * 32u + l;
+                    uint lo = as_uint(vload4(0, ql));
+                    uint hi = as_uint(vload4(0, ql + 32u));
+                    uint hb = as_uint(vload4(0, qh));
+                    q0[r] = as_char4((lo & 0x0F0F0F0Fu) | ((hb & 0x03030303u) << 4)) - (char4)(32);
+                    q1[r] = as_char4((hi & 0x0F0F0F0Fu) | (((hb >> 2) & 0x03030303u) << 4)) - (char4)(32);
+                    q2[r] = as_char4(((lo >> 4) & 0x0F0F0F0Fu) | (((hb >> 4) & 0x03030303u) << 4)) - (char4)(32);
+                    q3[r] = as_char4(((hi >> 4) & 0x0F0F0F0Fu) | (((hb >> 6) & 0x03030303u) << 4)) - (char4)(32);
+                }
+                uint w0 = b * 256u + n * 128u + l;
+                uint xg = w0 >> 5;
+                #pragma unroll
+                for (uint tt = 0u; tt < 16u; ++tt) {
+                    uint t = t0 + tt;
+                    if (t < ntok) {
+                        char4 x0 = vload4(0, xq + (ulong)t * cols + w0);
+                        char4 x1 = vload4(0, xq + (ulong)t * cols + w0 + 32u);
+                        char4 x2 = vload4(0, xq + (ulong)t * cols + w0 + 64u);
+                        char4 x3 = vload4(0, xq + (ulong)t * cols + w0 + 96u);
+                        float xs0 = xs[t * ngs + xg + 0u];
+                        float xs1 = xs[t * ngs + xg + 1u];
+                        float xs2 = xs[t * ngs + xg + 2u];
+                        float xs3 = xs[t * ngs + xg + 3u];
+                        #pragma unroll
+                        for (uint r = 0u; r < 2u; ++r) {
+                            acc[r][tt] += xs0 * s0[r] * (float)dot(q0[r], x0);
+                            acc[r][tt] += xs1 * s1[r] * (float)dot(q1[r], x1);
+                            acc[r][tt] += xs2 * s2[r] * (float)dot(q2[r], x2);
+                            acc[r][tt] += xs3 * s3[r] * (float)dot(q3[r], x3);
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint r = 0u; r < 2u; ++r) {
+            #pragma unroll
+            for (uint tt = 0u; tt < 16u; ++tt) {
+                uint t = t0 + tt;
+                if (t < ntok) {
+                    float total = sub_group_reduce_add(acc[r][tt]);
+                    if (lane == 0u) {
+                        y[(ulong)t * rows + row0 + r] = total;
+                    }
+                }
+            }
+        }
+    }
+}
