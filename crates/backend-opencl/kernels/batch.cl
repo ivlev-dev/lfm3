@@ -1908,9 +1908,6 @@ __kernel void attention_split_b_h4_p4(__global const float *q, __global const ha
         }
     }
 }
-
-
-
 __kernel void gemm_q4_k_i8_lds17(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
     uint lid = get_local_id(0);
     uint tps = (ntok + 31u) / 32u;
