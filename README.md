@@ -55,11 +55,12 @@
   top-5 совпадает; сервер с `LFM_TIERS` отдаёт ответы и переиспользует радикс-кэш
   на обеих ступенях (повтор — reused 192 токена).
 - **Модульные бэкенды: CPU-бэкенд готов.** Новый крейт `backend-cpu` (pure Rust):
-  веса Q4_K/Q6_K предпакованы в u8+скейлы (1.6 ГБ вместо 6.8 ГБ f32), активации
-  W4A8 по группам 32, AVX2 (`maddubs`/`fmadd`, runtime-детект, scalar fallback),
-  Rayon по строкам. `cpu-port` даёт те же greedy-ids, что GPU Q4 (8 токенов),
-  ~6.9 tok/s на i5-10400; сервер запускается с `LFM_BACKEND=cpu`. Архитектура и
-  архитектура бэкендов — `docs/backends.md`.
+  веса Q4_K/Q6_K предпакованы (Q4 — нибблы + скейлы/мины, 1.2 ГБ вместо 6.8 ГБ f32),
+  активации W4A8 по группам 32, AVX2 (`maddubs`/`fmadd`, кешируемый runtime-детект,
+  scalar fallback), батчевый prefill по 8 токенов и векторизованный `matvec`.
+  `cpu-port` даёт те же greedy-ids, что GPU Q4 (8 токенов); prefill ≈ 54.5 tok/s,
+  decode ≈ 15.7 tok/s на i5-10400; сервер запускается с `LFM_BACKEND=cpu`.
+  Архитектура — `docs/backends.md`.
 - **M6 (tensor parallel) — готов.** Full TP на двух устройствах: q/k/v/g и gate —
   по головам, `attn_output` — по столбцам, FFN — `up/gate` по строкам и `down`
   по столбцам, lm_head — по словарю с host-gather. `LFM_TP=0/1`/`gpu-tp`: ids
@@ -111,11 +112,13 @@
    остался только TLS по требованию.
 5. **Цель — обогнать llama.cpp** (`benchmarks/llama-cpp.md`) на CPU и OpenCL:
    prefill и decode. Бейзлайн: CPU 142 pp512 / 23 tg128, Vulkan 1393 / 91.
-   Главный разрыв — prefill (GEMM): CPU ×50, OpenCL ×2.3 (512) / ×3.1 (8192);
-   decode OpenCL ×1.4. Готовы LDS-GEMM для Q4 (`gemm_q4_k_i8_lds11`), int8-предпак
-   для Q6 (`gemm_q6_i8_pp`) и attention по 4 позиции за итерацию:
-   prefill 512 — 597 tok/s, 2048 — 525, 8192 — 402. Дальше — attention (40% времени
-   на 8192) и эффективность Q4-GEMM.
+   Главный разрыв — prefill (GEMM): CPU ×2.6, OpenCL ×2.3 (512) / ×3.1 (8192);
+   decode CPU ×1.5, OpenCL ×1.4.
+   Готовы: CPU — батчевый prefill + AVX2-векторизация (prefill 54.5, decode 15.7 tok/s,
+   было 10 / 8.2); OpenCL — LDS-GEMM для Q4 (`gemm_q4_k_i8_lds11`), int8-предпак для Q6
+   (`gemm_q6_i8_pp`) и attention по 4 позиции за итерацию (prefill 512 — 597, 2048 — 525,
+   8192 — 402). Дальше — attention на длинном контексте (40% времени при 8192),
+   эффективность Q4-GEMM и CPU-prefetch.
    Vulkan/ROCm исключены из плана.
 
 ## Железо и целевые показатели

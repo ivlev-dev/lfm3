@@ -170,7 +170,7 @@ P1 — только после перемера на простое.
 
 - **Бейзлайн** (`benchmarks/llama-cpp.md`): llama.cpp Vulkan pp512 1393 / tg128 91,
   pp8192 1236 / tg64 94; CPU pp512 142 / tg128 23.
-- **Наши**: OpenCL ~597 pp512 / 525 pp2048 / 402 pp8192 / 64 tg; CPU 10 pp512 / 6.9 tg.
+- **Наши**: OpenCL ~597 pp512 / 525 pp2048 / 402 pp8192 / 64 tg; CPU ~54.5 pp512 / 15.7 tg.
 - Цель: на каждом бэкенде prefill и decode ≥ llama.cpp. Главный разрыв — prefill
   (GEMM/батчевый Q4) и Q6-GEMM; на CPU — батчевый AVX2-GEMM и 4-битная упаковка.
 - **GEMM готов (LDS-тайлинг, сессия 8).** Итоговое ядро `gemm_q4_k_i8_lds11`:
@@ -193,8 +193,12 @@ P1 — только после перемера на простое.
   --mode lds11` сверяет GEMM с CPU-эталоном (max_rel ~1e-5) и печатает время.
 
 
-- **CPU готов**: W4A8 AVX2, `LFM_BACKEND=cpu`; дальше оптимизации (Q6 AVX2, prefetch,
-  f16-KV, аллокации) и NEON-ветка.
+- **CPU готов**: W4A8 AVX2, `LFM_BACKEND=cpu`.
+- **CPU-оптимизация (сессия 9)**: батчевый prefill (тайл 8 токенов) + векторные
+  аккумуляторы AVX2 + ниббл-упаковка Q4 + векторизованный `matvec`:
+  prefill 10.0 → 54.5 tok/s, decode 8.2 → 15.7 (llama.cpp CPU: 141.5 / 23.3).
+  Prefill остаётся ALU-bound (~8 ГБ/s трафика), decode — у полосы памяти.
+  Дальше: prefetch/стриминг весов, f16-KV, NEON-ветка.
 - **Vulkan/ROCm исключены** — только CPU и OpenCL.
 - Архитектура и DoD — `docs/backends.md`.
 

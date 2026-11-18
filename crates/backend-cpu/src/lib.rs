@@ -8,12 +8,31 @@ use lfm_gguf::{GgmlType, GgufFile};
 use rayon::prelude::*;
 
 const GROUP: usize = 32;
+const TILE: usize = 8;
 
 #[derive(Clone)]
 struct Q4Block {
     scales: [f32; 8],
     mins: [f32; 8],
-    q: [u8; 256],
+    q: [u8; 128],
+}
+
+impl Q4Block {
+    #[inline]
+    fn qgroup(&self, g: usize) -> [u8; 32] {
+        let base = (g & 3) * 32;
+        let mut out = [0u8; 32];
+        if g < 4 {
+            for i in 0..32 {
+                out[i] = self.q[base + i] & 0x0F;
+            }
+        } else {
+            for i in 0..32 {
+                out[i] = self.q[base + i] >> 4;
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone)]
@@ -235,6 +254,255 @@ impl CpuBackend {
         Ok(matvec(self.t("token_embd.weight")?, &quantize(&x)))
     }
 
+    fn conv_block_batch(
+        &self,
+        layer: usize,
+        acts: &[Act],
+        st: &mut LayerState,
+        h: usize,
+        n: usize,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let prefix = format!("blk.{layer}");
+        let in_proj = self.t(&format!("{prefix}.shortconv.in_proj.weight"))?;
+        let mut bcx = vec![0.0f32; TILE * 3 * h];
+        matmul_batch(in_proj, acts, &mut bcx);
+        let kernel = cfg.conv_cache;
+        let (wcols, wrows) = self.row_f32(&format!("{prefix}.shortconv.conv.weight"))?;
+        let w = self.f(&format!("{prefix}.shortconv.conv.weight"))?;
+        if wcols != kernel || wrows < h {
+            return Err(anyhow!("bad conv weight shape"));
+        }
+        let mut ys: Vec<Act> = Vec::with_capacity(TILE);
+        for t in 0..n {
+            let src = &bcx[t * 3 * h..(t + 1) * 3 * h];
+            let b = &src[0..h];
+            let c = &src[h..2 * h];
+            let xv = &src[2 * h..3 * h];
+            let bx: Vec<f32> = b.iter().zip(xv).map(|(a, b)| a * b).collect();
+            let mut out = vec![0.0f32; h];
+            out.par_iter_mut().enumerate().for_each(|(ch, o)| {
+                let wrow = &w[ch * kernel..(ch + 1) * kernel];
+                let mut acc = wrow[kernel - 1] * bx[ch];
+                for j in 0..kernel - 1 {
+                    acc += wrow[j] * st.conv[j * h + ch];
+                }
+                *o = acc;
+            });
+            st.conv.extend_from_slice(&bx);
+            if st.conv.len() > (kernel - 1) * h {
+                let excess = st.conv.len() - (kernel - 1) * h;
+                st.conv.drain(0..excess);
+            }
+            let y: Vec<f32> = c.iter().zip(&out).map(|(a, b)| a * b).collect();
+            ys.push(quantize(&y));
+        }
+        pad_acts(&mut ys, h);
+        let out_proj = self.t(&format!("{prefix}.shortconv.out_proj.weight"))?;
+        let mut op = vec![0.0f32; TILE * h];
+        matmul_batch(out_proj, &ys, &mut op);
+        Ok(op)
+    }
+
+    fn attn_block_batch(
+        &self,
+        layer: usize,
+        acts: &[Act],
+        st: &mut LayerState,
+        pos0: usize,
+        n: usize,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let prefix = format!("blk.{layer}");
+        let n_heads = cfg.num_heads;
+        let head_dim = cfg.head_dim;
+        let kv_heads = cfg.kv_heads_of(layer);
+        let group = n_heads / kv_heads.max(1);
+        let inv_freq = match cfg.kind(layer) {
+            LayerKind::SlidingAttention => &self.rope_sliding,
+            _ => &self.rope_full,
+        };
+        let qd = n_heads * head_dim;
+        let kvd = kv_heads * head_dim;
+        let mut qv = vec![0.0f32; TILE * qd];
+        let mut kvb = vec![0.0f32; TILE * kvd];
+        let mut vvb = vec![0.0f32; TILE * kvd];
+        let mut gb = vec![0.0f32; TILE * n_heads];
+        matmul_batch(self.t(&format!("{prefix}.attn_q.weight"))?, acts, &mut qv);
+        matmul_batch(self.t(&format!("{prefix}.attn_k.weight"))?, acts, &mut kvb);
+        matmul_batch(self.t(&format!("{prefix}.attn_v.weight"))?, acts, &mut vvb);
+        matmul_batch(
+            self.t(&format!("{prefix}.attn_gate.weight"))?,
+            acts,
+            &mut gb,
+        );
+        let q_norm = self.f(&format!("{prefix}.attn_q_norm.weight"))?;
+        let k_norm = self.f(&format!("{prefix}.attn_k_norm.weight"))?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut attns: Vec<Act> = Vec::with_capacity(TILE);
+        for t in 0..n {
+            let pos = pos0 + t;
+            {
+                let q = &mut qv[t * qd..(t + 1) * qd];
+                for head in 0..n_heads {
+                    let base = head * head_dim;
+                    let normed = rms_norm(&q[base..base + head_dim], q_norm, cfg.norm_eps);
+                    q[base..base + head_dim].copy_from_slice(&normed);
+                    rope_inplace(&mut q[base..base + head_dim], pos, inv_freq);
+                }
+            }
+            {
+                let kv = &mut kvb[t * kvd..(t + 1) * kvd];
+                for head in 0..kv_heads {
+                    let base = head * head_dim;
+                    let normed = rms_norm(&kv[base..base + head_dim], k_norm, cfg.norm_eps);
+                    kv[base..base + head_dim].copy_from_slice(&normed);
+                    rope_inplace(&mut kv[base..base + head_dim], pos, inv_freq);
+                }
+            }
+            st.k.extend_from_slice(&kvb[t * kvd..(t + 1) * kvd]);
+            st.v.extend_from_slice(&vvb[t * kvd..(t + 1) * kvd]);
+            let total = st.k.len() / (kv_heads * head_dim);
+            let window = if cfg.kind(layer) == LayerKind::SlidingAttention {
+                cfg.sliding_window.min(total)
+            } else {
+                total
+            };
+            let start = total - window;
+            let mut attn = vec![0.0f32; qd];
+            let q = &qv[t * qd..(t + 1) * qd];
+            for head in 0..n_heads {
+                let kvh = head / group;
+                let qh = &q[head * head_dim..(head + 1) * head_dim];
+                let mut scores = vec![0.0f32; window];
+                for (j, slot) in (start..total).enumerate() {
+                    let base = slot * kv_heads * head_dim + kvh * head_dim;
+                    scores[j] = dot_f32(&st.k[base..base + head_dim], qh) * scale;
+                }
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                let inv = 1.0 / sum;
+                let out = &mut attn[head * head_dim..(head + 1) * head_dim];
+                for (j, slot) in (start..total).enumerate() {
+                    let base = slot * kv_heads * head_dim + kvh * head_dim;
+                    let vh = &st.v[base..base + head_dim];
+                    let w = scores[j] * inv;
+                    for d in 0..head_dim {
+                        out[d] += w * vh[d];
+                    }
+                }
+            }
+            for head in 0..n_heads {
+                let g = sigmoid(gb[t * n_heads + head]);
+                for d in 0..head_dim {
+                    attn[head * head_dim + d] *= g;
+                }
+            }
+            attns.push(quantize(&attn));
+        }
+        pad_acts(&mut attns, qd);
+        let mut op = vec![0.0f32; TILE * h];
+        matmul_batch(
+            self.t(&format!("{prefix}.attn_output.weight"))?,
+            &attns,
+            &mut op,
+        );
+        Ok(op)
+    }
+
+    fn forward_batch(
+        &self,
+        seq: &mut SeqState,
+        tokens: &[u32],
+        pos0: usize,
+        need_logits: bool,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let ffn = cfg.ffn_size;
+        let n = tokens.len();
+        if n == 0 || n > TILE {
+            return Err(anyhow!("bad cpu batch size {n}"));
+        }
+        if pos0 + n > self.max_ctx {
+            return Err(anyhow!("context overflow {} >= {}", pos0 + n, self.max_ctx));
+        }
+        let emb = self.t("token_embd.weight")?;
+        let mut x = Vec::with_capacity(TILE * h);
+        for &token in tokens {
+            x.extend_from_slice(&embed_row(emb, token as usize)?);
+        }
+        x.resize(TILE * h, 0.0);
+        for layer in 0..cfg.num_layers {
+            let prefix = format!("blk.{layer}");
+            let attn_norm = self.f(&format!("{prefix}.attn_norm.weight"))?;
+            let mut acts: Vec<Act> = (0..n)
+                .map(|t| quantize(&rms_norm(&x[t * h..(t + 1) * h], attn_norm, cfg.norm_eps)))
+                .collect();
+            pad_acts(&mut acts, h);
+            let residual = x.clone();
+            let op = match cfg.kind(layer) {
+                LayerKind::Conv => {
+                    self.conv_block_batch(layer, &acts, &mut seq.layers[layer], h, n)?
+                }
+                _ => self.attn_block_batch(layer, &acts, &mut seq.layers[layer], pos0, n)?,
+            };
+            let post = self.f(&format!("{prefix}.post_attention_norm.weight"))?;
+            let ffn_norm = self.f(&format!("{prefix}.ffn_norm.weight"))?;
+            let mut merged = vec![0.0f32; TILE * h];
+            let mut acts2: Vec<Act> = Vec::with_capacity(TILE);
+            for t in 0..n {
+                let nr = rms_norm(&op[t * h..(t + 1) * h], post, cfg.norm_eps);
+                for i in 0..h {
+                    merged[t * h + i] = nr[i] + residual[t * h + i];
+                }
+                acts2.push(quantize(&rms_norm(
+                    &merged[t * h..(t + 1) * h],
+                    ffn_norm,
+                    cfg.norm_eps,
+                )));
+            }
+            pad_acts(&mut acts2, h);
+            let up = self.t(&format!("{prefix}.ffn_up.weight"))?;
+            let gate = self.t(&format!("{prefix}.ffn_gate.weight"))?;
+            let down = self.t(&format!("{prefix}.ffn_down.weight"))?;
+            let mut u = vec![0.0f32; TILE * ffn];
+            let mut g = vec![0.0f32; TILE * ffn];
+            matmul_batch(up, &acts2, &mut u);
+            matmul_batch(gate, &acts2, &mut g);
+            let mut acts3: Vec<Act> = Vec::with_capacity(TILE);
+            for t in 0..n {
+                let a: Vec<f32> = (0..ffn)
+                    .map(|i| silu(g[t * ffn + i]) * u[t * ffn + i])
+                    .collect();
+                acts3.push(quantize(&a));
+            }
+            pad_acts(&mut acts3, ffn);
+            let mut d = vec![0.0f32; TILE * h];
+            matmul_batch(down, &acts3, &mut d);
+            let post_ffn = self.f(&format!("{prefix}.post_ffw_norm.weight"))?;
+            for t in 0..n {
+                let nr = rms_norm(&d[t * h..(t + 1) * h], post_ffn, cfg.norm_eps);
+                for i in 0..h {
+                    x[t * h + i] = merged[t * h + i] + nr[i];
+                }
+            }
+        }
+        seq.len += n;
+        if !need_logits {
+            return Ok(Vec::new());
+        }
+        let norm = self.f("output_norm.weight")?;
+        let last = &x[(n - 1) * h..n * h];
+        let xn = rms_norm(last, norm, cfg.norm_eps);
+        Ok(matvec(emb, &quantize(&xn)))
+    }
+
     fn conv_block(
         &self,
         layer: usize,
@@ -394,8 +662,16 @@ impl InferenceBackend for CpuBackend {
             .ok_or_else(|| anyhow!("empty cpu sequence {slot}"))?;
         let mut logits = Vec::new();
         let result = (|| -> Result<()> {
-            for (pos, &token) in tokens.iter().enumerate().skip(reused) {
-                logits = self.forward(&mut state, token, pos)?;
+            let mut pos = reused;
+            while pos < tokens.len() {
+                let end = (pos + TILE).min(tokens.len());
+                logits = self.forward_batch(
+                    &mut state,
+                    &tokens[pos..end],
+                    pos,
+                    need_logits && end == tokens.len(),
+                )?;
+                pos = end;
             }
             Ok(())
         })();
@@ -467,7 +743,7 @@ fn prep_q4(block: &[u8]) -> Q4Block {
     let dmin = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
     let mut scales = [0.0f32; 8];
     let mut mins = [0.0f32; 8];
-    let mut q = [0u8; 256];
+    let mut q = [0u8; 128];
     let mut q_off = 0usize;
     let mut is = 0usize;
     let mut g = 0usize;
@@ -477,13 +753,17 @@ fn prep_q4(block: &[u8]) -> Q4Block {
         scales[g] = d * f32::from(sc1);
         mins[g] = dmin * f32::from(m1);
         for l in 0..32 {
-            q[j + l] = block[16 + q_off + l] & 0x0F;
+            let v = j + l;
+            let lo = (block[16 + q_off + l] & 0x0F) as u16;
+            q[v & 127] |= (lo << (4 * (v >> 7))) as u8;
         }
         g += 1;
         scales[g] = d * f32::from(sc2);
         mins[g] = dmin * f32::from(m2);
         for l in 0..32 {
-            q[j + 32 + l] = block[16 + q_off + l] >> 4;
+            let v = j + 32 + l;
+            let hi = (block[16 + q_off + l] >> 4) as u16;
+            q[v & 127] |= (hi << (4 * (v >> 7))) as u8;
         }
         g += 1;
         q_off += 32;
@@ -579,6 +859,14 @@ fn quantize(x: &[f32]) -> Act {
 }
 
 fn matvec(w: &Quant, x: &Act) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() && has_fma() && std::env::var("LFM_CPU_SCALAR").is_err() {
+            unsafe {
+                return matvec_avx2(w, x);
+            }
+        }
+    }
     let blocks = w.cols / 256;
     (0..w.rows)
         .into_par_iter()
@@ -591,7 +879,8 @@ fn matvec(w: &Quant, x: &Act) -> Vec<f32> {
                     let xb = b * 256;
                     for g in 0..8 {
                         let off = xb + g * 32;
-                        let dot = dot_u8_i8_32(&blk.q[g * 32..g * 32 + 32], &x.q[off..off + 32]);
+                        let qg = blk.qgroup(g);
+                        let dot = dot_u8_i8_32(&qg, &x.q[off..off + 32]);
                         acc += x.s[g + b * 8]
                             * (blk.scales[g] * dot as f32 - blk.mins[g] * x.sum32[g + b * 8] as f32);
                     }
@@ -617,6 +906,271 @@ fn matvec(w: &Quant, x: &Act) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn matmul_batch_avx2(w: &Quant, acts: &[Act], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let rows = w.rows;
+    let blocks = w.cols / 256;
+    let ptr = out.as_mut_ptr() as usize;
+    let ones = _mm256_set1_epi16(1);
+    let mut wsum = vec![0.0f32; TILE * blocks * 16];
+    for t in 0..TILE {
+        let a = &acts[t];
+        for b in 0..blocks {
+            let base = (t * blocks + b) * 16;
+            match &w.data {
+                Matrix::Q4(_) => {
+                    for g in 0..8 {
+                        wsum[base + g] = a.s[b * 8 + g] * a.sum32[b * 8 + g] as f32;
+                    }
+                }
+                Matrix::Q6(_) => {
+                    for k in 0..16 {
+                        wsum[base + k] = 32.0 * a.sum16[b * 16 + k] as f32 * a.s[b * 8 + k / 2];
+                    }
+                }
+            }
+        }
+    }
+    let wsum = &wsum;
+    match &w.data {
+        Matrix::Q4(data) => {
+            (0..rows).into_par_iter().for_each(|row| unsafe {
+                let mut acc = [_mm256_setzero_ps(); TILE];
+                let mut msub = [_mm256_setzero_ps(); TILE];
+                let base = row * blocks;
+                for b in 0..blocks {
+                    let blk = &data[base + b];
+                    let mnv = _mm256_loadu_ps(blk.mins.as_ptr());
+                    for t in 0..TILE {
+                        let wv = _mm256_loadu_ps(wsum.as_ptr().add((t * blocks + b) * 16));
+                        msub[t] = _mm256_fmadd_ps(mnv, wv, msub[t]);
+                    }
+                    for g in 0..8 {
+                        let p = _mm256_loadu_si256(blk.q[(g & 3) * 32..(g & 3) * 32 + 32].as_ptr() as *const __m256i);
+                        let q = if g < 4 {
+                            _mm256_and_si256(p, _mm256_set1_epi8(0x0F))
+                        } else {
+                            _mm256_and_si256(_mm256_srli_epi16(p, 4), _mm256_set1_epi8(0x0F))
+                        };
+                        let scv = _mm256_set1_ps(blk.scales[g]);
+                        let off = b * 256 + g * 32;
+                        for t in 0..TILE {
+                            let a = &acts[t];
+                            let xv = _mm256_loadu_si256(a.q[off..off + 32].as_ptr() as *const __m256i);
+                            let pairs = _mm256_maddubs_epi16(q, xv);
+                            let sums = _mm256_madd_epi16(pairs, ones);
+                            let f = _mm256_cvtepi32_ps(sums);
+                            acc[t] = _mm256_fmadd_ps(f, _mm256_mul_ps(scv, _mm256_set1_ps(a.s[b * 8 + g])), acc[t]);
+                        }
+                    }
+                }
+                for t in 0..TILE {
+                    let v = _mm256_sub_ps(acc[t], msub[t]);
+                    let lo = _mm256_castps256_ps128(v);
+                    let hi = _mm256_extractf128_ps(v, 1);
+                    let s4 = _mm_add_ps(lo, hi);
+                    let s2 = _mm_hadd_ps(s4, s4);
+                    let s1 = _mm_hadd_ps(s2, s2);
+                    *(ptr as *mut f32).add(t * rows + row) = _mm_cvtss_f32(s1);
+                }
+            });
+        }
+        Matrix::Q6(data) => {
+            (0..rows).into_par_iter().for_each(|row| unsafe {
+                let mut acc = [_mm256_setzero_ps(); TILE];
+                let mut msub = [_mm256_setzero_ps(); TILE];
+                let base = row * blocks;
+                for b in 0..blocks {
+                    let blk = &data[base + b];
+                    for t in 0..TILE {
+                        let wv0 = _mm256_loadu_ps(wsum.as_ptr().add((t * blocks + b) * 16));
+                        let wv1 = _mm256_loadu_ps(wsum.as_ptr().add((t * blocks + b) * 16 + 8));
+                        let sc0 = _mm256_loadu_ps(blk.scales.as_ptr());
+                        let sc1 = _mm256_loadu_ps(blk.scales.as_ptr().add(8));
+                        msub[t] = _mm256_fmadd_ps(sc0, wv0, msub[t]);
+                        msub[t] = _mm256_fmadd_ps(sc1, wv1, msub[t]);
+                    }
+                    for kk in 0..8 {
+                        let k0 = kk * 2;
+                        let q = _mm256_loadu_si256(blk.q[k0 * 16..k0 * 16 + 32].as_ptr() as *const __m256i);
+                        let sa = blk.scales[k0];
+                        let sb = blk.scales[k0 + 1];
+                        let scv = _mm256_setr_ps(sa, sa, sa, sa, sb, sb, sb, sb);
+                        let off = b * 256 + k0 * 16;
+                        for t in 0..TILE {
+                            let a = &acts[t];
+                            let xv = _mm256_loadu_si256(a.q[off..off + 32].as_ptr() as *const __m256i);
+                            let pairs = _mm256_maddubs_epi16(q, xv);
+                            let sums = _mm256_madd_epi16(pairs, ones);
+                            let f = _mm256_cvtepi32_ps(sums);
+                            acc[t] = _mm256_fmadd_ps(f, _mm256_mul_ps(scv, _mm256_set1_ps(a.s[b * 8 + k0 / 2])), acc[t]);
+                        }
+                    }
+                }
+                for t in 0..TILE {
+                    let v = _mm256_sub_ps(acc[t], msub[t]);
+                    let lo = _mm256_castps256_ps128(v);
+                    let hi = _mm256_extractf128_ps(v, 1);
+                    let s4 = _mm_add_ps(lo, hi);
+                    let s2 = _mm_hadd_ps(s4, s4);
+                    let s1 = _mm_hadd_ps(s2, s2);
+                    *(ptr as *mut f32).add(t * rows + row) = _mm_cvtss_f32(s1);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn matvec_avx2(w: &Quant, x: &Act) -> Vec<f32> {
+    use std::arch::x86_64::*;
+    let blocks = w.cols / 256;
+    let ones = _mm256_set1_epi16(1);
+    let hsum = |v: __m256| -> f32 {
+        let m = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+        let s2 = _mm_hadd_ps(m, m);
+        _mm_cvtss_f32(_mm_hadd_ps(s2, s2))
+    };
+    match &w.data {
+        Matrix::Q4(data) => (0..w.rows)
+            .into_par_iter()
+            .map(|row| unsafe {
+                let base = row * blocks;
+                let mut vacc = _mm256_setzero_ps();
+                let mut msum = 0.0f32;
+                for b in 0..blocks {
+                    let blk = &data[base + b];
+                    for g in 0..8 {
+                        let p = _mm256_loadu_si256(blk.q[(g & 3) * 32..(g & 3) * 32 + 32].as_ptr() as *const __m256i);
+                        let q = if g < 4 {
+                            _mm256_and_si256(p, _mm256_set1_epi8(0x0F))
+                        } else {
+                            _mm256_and_si256(_mm256_srli_epi16(p, 4), _mm256_set1_epi8(0x0F))
+                        };
+                        let off = b * 256 + g * 32;
+                        let xv = _mm256_loadu_si256(x.q[off..off + 32].as_ptr() as *const __m256i);
+                        let pairs = _mm256_maddubs_epi16(q, xv);
+                        let sums = _mm256_madd_epi16(pairs, ones);
+                        let f = _mm256_cvtepi32_ps(sums);
+                        let xs = x.s[b * 8 + g];
+                        vacc = _mm256_fmadd_ps(f, _mm256_set1_ps(blk.scales[g] * xs), vacc);
+                        msum += blk.mins[g] * xs * x.sum32[b * 8 + g] as f32;
+                    }
+                }
+                hsum(vacc) - msum
+            })
+            .collect(),
+        Matrix::Q6(data) => (0..w.rows)
+            .into_par_iter()
+            .map(|row| unsafe {
+                let base = row * blocks;
+                let mut vacc = _mm256_setzero_ps();
+                let mut msum = 0.0f32;
+                for b in 0..blocks {
+                    let blk = &data[base + b];
+                    for kk in 0..8 {
+                        let k0 = kk * 2;
+                        let q = _mm256_loadu_si256(blk.q[k0 * 16..k0 * 16 + 32].as_ptr() as *const __m256i);
+                        let sa = blk.scales[k0];
+                        let sb = blk.scales[k0 + 1];
+                        let scv = _mm256_setr_ps(sa, sa, sa, sa, sb, sb, sb, sb);
+                        let off = b * 256 + k0 * 16;
+                        let xv = _mm256_loadu_si256(x.q[off..off + 32].as_ptr() as *const __m256i);
+                        let pairs = _mm256_maddubs_epi16(q, xv);
+                        let sums = _mm256_madd_epi16(pairs, ones);
+                        let f = _mm256_cvtepi32_ps(sums);
+                        let xs = x.s[b * 8 + k0 / 2];
+                        vacc = _mm256_fmadd_ps(f, _mm256_mul_ps(scv, _mm256_set1_ps(xs)), vacc);
+                        msum += 32.0
+                            * (x.sum16[b * 16 + k0] as f32 * sa + x.sum16[b * 16 + k0 + 1] as f32 * sb)
+                            * xs;
+                    }
+                }
+                hsum(vacc) - msum
+            })
+            .collect(),
+    }
+}
+
+fn pad_acts(acts: &mut Vec<Act>, cols: usize) {
+    while acts.len() < TILE {
+        acts.push(Act {
+            q: vec![0i8; cols],
+            s: vec![0.0f32; cols / 32],
+            sum32: vec![0i32; cols / 32],
+            sum16: vec![0i32; cols / 16],
+        });
+    }
+}
+
+fn matmul_batch(w: &Quant, acts: &[Act], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() && has_fma() && std::env::var("LFM_CPU_SCALAR").is_err() {
+            unsafe {
+                matmul_batch_avx2(w, acts, out);
+            }
+            return;
+        }
+    }
+    matmul_batch_generic(w, acts, out);
+}
+
+fn matmul_batch_generic(w: &Quant, acts: &[Act], out: &mut [f32]) {
+    let n = acts.len();
+    let rows = w.rows;
+    debug_assert!(n == TILE && out.len() >= n * rows);
+    let blocks = w.cols / 256;
+    let ptr = out.as_mut_ptr() as usize;
+    (0..rows).into_par_iter().for_each(|row| {
+        let mut acc = [0.0f32; TILE];
+        match &w.data {
+            Matrix::Q4(data) => {
+                let base = row * blocks;
+                for b in 0..blocks {
+                    let blk = &data[base + b];
+                    for g in 0..8 {
+                        let qg = blk.qgroup(g);
+                        let q = &qg[..];
+                        let sc = blk.scales[g];
+                        let mn = blk.mins[g];
+                        let off = b * 256 + g * 32;
+                        for t in 0..n {
+                            let dot = dot_u8_i8_32(q, &acts[t].q[off..off + 32]);
+                            acc[t] += acts[t].s[b * 8 + g]
+                                * (sc * dot as f32 - mn * acts[t].sum32[b * 8 + g] as f32);
+                        }
+                    }
+                }
+            }
+            Matrix::Q6(data) => {
+                let base = row * blocks;
+                for b in 0..blocks {
+                    let blk = &data[base + b];
+                    for k in 0..16 {
+                        let q = &blk.q[k * 16..k * 16 + 16];
+                        let sc = blk.scales[k];
+                        let off = b * 256 + k * 16;
+                        for t in 0..n {
+                            let dot = dot_u8_i8_16(q, &acts[t].q[off..off + 16]);
+                            let sum = acts[t].sum16[b * 16 + k];
+                            acc[t] += acts[t].s[b * 8 + k / 2] * sc * (dot - 32 * sum) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        for t in 0..n {
+            unsafe {
+                *(ptr as *mut f32).add(t * rows + row) = acc[t];
+            }
+        }
+    });
+}
+
 fn embed_row(w: &Quant, row: usize) -> Result<Vec<f32>> {
     let blocks = w.cols / 256;
     match &w.data {
@@ -638,10 +1192,24 @@ fn embed_row(w: &Quant, row: usize) -> Result<Vec<f32>> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn has_avx2() -> bool {
+    use std::sync::OnceLock;
+    static AVX2: OnceLock<bool> = OnceLock::new();
+    *AVX2.get_or_init(|| std::is_x86_feature_detected!("avx2"))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_fma() -> bool {
+    use std::sync::OnceLock;
+    static FMA: OnceLock<bool> = OnceLock::new();
+    *FMA.get_or_init(|| std::is_x86_feature_detected!("fma"))
+}
+
 fn dot_u8_i8_32(q: &[u8], x: &[i8]) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") {
+        if has_avx2() {
             unsafe {
                 return dot_u8_i8_32_avx2(q.as_ptr(), x.as_ptr());
             }
@@ -665,7 +1233,7 @@ fn dot_u8_i8_16(q: &[u8], x: &[i8]) -> i32 {
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        if has_avx2() && has_fma() {
             unsafe {
                 return dot_f32_avx2(a.as_ptr(), b.as_ptr(), a.len());
             }
@@ -762,7 +1330,8 @@ mod tests {
         for g in 0..8 {
             for i in 0..32 {
                 let idx = g * 32 + i;
-                let got = prep.scales[g] * f32::from(prep.q[idx]) - prep.mins[g];
+                let qv = prep.qgroup(g)[i];
+                let got = prep.scales[g] * f32::from(qv) - prep.mins[g];
                 assert!((got - expect[idx]).abs() < 1e-4, "idx {idx}");
             }
         }

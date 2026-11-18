@@ -258,7 +258,11 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    Rayon по строкам; `InferenceBackend`, `cpu-port`, `LFM_BACKEND=cpu`. Parity:
    greedy-ids = GPU Q4 (8 токенов), ~6.9 tok/s; KV непрерывный, радикс-кэша нет.
    Архитектура — `docs/backends.md`.
-2. **Vulkan/ROCm исключены** решением от 18.11. Остаются CPU и OpenCL.
+2. **Сделано: CPU prefill батчевый + AVX2-векторизация.** `forward_batch`/`matmul_batch`
+   (тайл 8 токенов), редукция один раз на строку, ниббл-упаковка Q4 (1.6 → 1.2 ГБ),
+   векторизованный `matvec`: prefill 10.0 → 54.5 tok/s, decode 8.2 → 15.7
+   (llama.cpp CPU 141.5 / 23.3).
+3. **Vulkan/ROCm исключены** решением от 18.11. Остаются CPU и OpenCL.
 3. **Цель: обогнать llama.cpp** по prefill и decode на CPU и OpenCL
    (бейзлайн — `benchmarks/llama-cpp.md`).
 4. **Сделано: LDS-GEMM для prefill (OpenCL).** `gemm_q4_k_i8_lds11` (варп = 4 токена,
