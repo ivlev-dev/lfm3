@@ -137,6 +137,7 @@ pub struct Scheduler {
     next_id: u64,
     waiting: VecDeque<WaitingJob>,
     active: Vec<ActiveSeq>,
+    cursor: usize,
 }
 
 impl Scheduler {
@@ -145,6 +146,7 @@ impl Scheduler {
             cfg,
             next_id: 0,
             waiting: VecDeque::new(),
+            cursor: 0,
             active: Vec::new(),
         }
     }
@@ -215,7 +217,7 @@ impl Scheduler {
         free_pages.saturating_sub(pending)
     }
 
-    pub fn plan_step(&self) -> StepPlan {
+    pub fn plan_step(&mut self) -> StepPlan {
         let has_decode = self
             .active
             .iter()
@@ -234,9 +236,20 @@ impl Scheduler {
             }
         }
 
+        let n = self.active.len();
+        let order: Vec<usize> = if n == 0 {
+            Vec::new()
+        } else {
+            (0..n).map(|i| (self.cursor + i) % n).collect()
+        };
+        self.cursor = if n == 0 { 0 } else { (self.cursor + 1) % n };
         let mut rows: Vec<StepRow> = Vec::with_capacity(self.cfg.max_batch);
         let mut need_logits = false;
-        for seq in self.active.iter().filter(|seq| seq.phase == Phase::Decode) {
+        for &i in &order {
+            let seq = &self.active[i];
+            if seq.phase != Phase::Decode {
+                continue;
+            }
             if rows.len() >= self.cfg.max_batch {
                 break;
             }
@@ -249,9 +262,9 @@ impl Scheduler {
         }
 
         let mut budget = self.cfg.prefill_budget;
-        let prefs: Vec<&ActiveSeq> = self
-            .active
+        let prefs: Vec<&ActiveSeq> = order
             .iter()
+            .map(|&i| &self.active[i])
             .filter(|seq| seq.phase == Phase::Prefill && seq.prompt_remaining() > 0)
             .collect();
         let mut taken = vec![0usize; prefs.len()];
@@ -664,6 +677,20 @@ mod tests {
         assert_eq!(seq.used_pages(), 1);
         assert_eq!(seq.future_pages(), 2);
         assert_eq!(s.available_for_new(3), 1);
+    }
+
+    #[test]
+    fn prefill_order_rotates_between_plans() {
+        let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 8, 2));
+        let a = s.enqueue(40, 4).unwrap();
+        let b = s.enqueue(40, 4).unwrap();
+        admit_all(&mut s, 128);
+        let first = |plan: StepPlan| plan.rows().first().map(|r| r.id);
+        let p1 = first(s.plan_step());
+        let p2 = first(s.plan_step());
+        assert_ne!(p1, p2);
+        assert!(p1 == Some(a.id) || p1 == Some(b.id));
+        assert!(p2 == Some(a.id) || p2 == Some(b.id));
     }
 
     #[test]
