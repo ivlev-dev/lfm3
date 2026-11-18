@@ -1596,7 +1596,7 @@ __kernel void gemm_q6_i8_b8(__global const char *w, __global const float *wsc, _
     }
 }
 
-__kernel void gemm_q4_i8_gz(__global const char *wq8, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+__kernel void gemm_i8_gz(__global const char *wq8, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
     uint lid = get_local_id(0);
     uint tps = (ntok + 31u) / 32u;
     uint gid = get_group_id(0);
