@@ -1,0 +1,13 @@
+[package]
+name = "lfm-backend-vulkan"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+ash = "0.38"
+bytemuck.workspace = true
+half.workspace = true
+lfm-gguf.workspace = true
+lfm-quant.workspace = true

@@ -16,3 +16,4 @@ lfm-chat.workspace = true
 lfm-app.workspace = true
 lfm-domain.workspace = true
 lfm-gpu.workspace = true
+lfm-backend-vulkan.workspace = true
