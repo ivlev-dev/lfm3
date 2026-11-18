@@ -180,6 +180,7 @@ impl EngineMetrics {
 }
 
 const IDLE_POLL: Duration = Duration::from_millis(20);
+const BATCH_WINDOW: Duration = Duration::from_micros(2000);
 
 impl Engine {
     pub fn spawn(
@@ -522,7 +523,10 @@ impl Worker {
                     break;
                 }
                 match job_rx.recv_timeout(IDLE_POLL) {
-                    Ok(job) => self.register(job),
+                    Ok(job) => {
+                        self.register(job);
+                        std::thread::sleep(BATCH_WINDOW);
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => closed = true,
                 }
