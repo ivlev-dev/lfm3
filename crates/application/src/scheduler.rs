@@ -243,24 +243,37 @@ impl Scheduler {
         }
 
         let mut budget = self.cfg.prefill_budget;
-        for seq in self.active.iter().filter(|seq| seq.phase == Phase::Prefill) {
-            if budget == 0 {
-                break;
-            }
-            let remaining = seq.prompt_remaining();
-            let take = remaining.min(budget);
-            for i in 0..take {
-                let index = seq.prefilled + i;
+        let prefs: Vec<&ActiveSeq> = self
+            .active
+            .iter()
+            .filter(|seq| seq.phase == Phase::Prefill && seq.prompt_remaining() > 0)
+            .collect();
+        let mut taken = vec![0usize; prefs.len()];
+        let mut progress = prefs.iter().any(|seq| seq.prompt_remaining() > 0);
+        while budget > 0 && progress {
+            progress = false;
+            for (i, seq) in prefs.iter().enumerate() {
+                if budget == 0 {
+                    break;
+                }
+                if taken[i] >= seq.prompt_remaining() {
+                    continue;
+                }
+                let index = seq.prefilled + taken[i];
                 rows.push(StepRow {
                     id: seq.id,
                     pos: index,
                     token: StepToken::Prompt(index),
                 });
+                taken[i] += 1;
+                budget -= 1;
+                progress = true;
             }
-            if take == remaining && remaining > 0 {
+        }
+        for (i, seq) in prefs.iter().enumerate() {
+            if taken[i] > 0 && taken[i] == seq.prompt_remaining() {
                 need_logits = true;
             }
-            budget -= take;
         }
 
         if rows.is_empty() {
@@ -643,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_budget_is_shared_in_admission_order() {
+    fn prefill_budget_is_shared_round_robin() {
         let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 6, 2));
         let a = s.enqueue(10, 5).unwrap();
         let b = s.enqueue(50, 5).unwrap();
@@ -655,7 +668,8 @@ mod tests {
         let rows = plan.rows();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].id, b.id);
-        assert_eq!(rows[2].id, b.id);
-        assert!(rows.iter().all(|row| row.id != c.id));
+        assert_eq!(rows[2].id, c.id);
+        assert_eq!(rows[1].pos, 0);
+        assert_eq!(rows[2].pos, 0);
     }
 }
