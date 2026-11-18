@@ -31,7 +31,6 @@ cmake --build build-vulkan -j12 --target llama-bench
 |---|---|---|
 | OpenCL (Q4_K_M, GPU) | 512: ~205 tok/s, 8192: ~159 tok/s | 8192: ~64 tok/s |
 | CPU (W4A8/AVX2) | 512: 10.0 tok/s | 6.9 tok/s |
-| Vulkan | только Q4-GEMV-ядро (бит-в-бит), forward нет | — |
 | ROCm | нет (ROCm не установлен) | — |
 
 ## Разрывы и цели
@@ -40,7 +39,6 @@ cmake --build build-vulkan -j12 --target llama-bench
 |---|---|---|---|
 | CPU | 14× медленнее | 3.4× медленнее | ≥ 142 pp512, ≥ 24 tg |
 | OpenCL | 6.8× медленнее (512), 7.8× (8192) | 1.4× медленнее | ≥ 1400 pp, ≥ 95 tg |
-| Vulkan | нужно реализовать forward | — | ≥ 1400 pp, ≥ 95 tg |
 | ROCm | нужно поднять ROCm + forward | — | ≥ 1400 pp, ≥ 95 tg |
 
 Вывод: decode у OpenCL уже близко к llama.cpp Vulkan; главный разрыв — **prefill**

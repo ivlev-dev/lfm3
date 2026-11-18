@@ -16,7 +16,7 @@
 | M5 | OpenAI-сервер (SSE/WS/tools/thinking) + TUI | e2e openai-python, load-тест, TUI | сервер + планировщик continuous batching + `/metrics` + flow control h2; два TUI (in-process и клиент `lfm-tui`); load-тест 6 соединений без ошибок; осталось: tools/`tool_calls`, `/v1/completions`, e2e openai-python |
 | M6 | 3-tier слоёв и KV, TP+PP, PoCL CPU | конфиг 20/80/0, 2-device тесты | PP (20/80/0) и full TP (головы/FFN/lm_head) готовы: ids совпадают, logits cos 0.9997 |
 | M7 | NPU-порт Hexagon v68, hardening, docs | feature-сборка, спека протокола | |
-| M8 | модульные бэкенды: CPU (AVX2/NEON), Vulkan, ROCm | parity ids/logits, A/B tok/s | CPU W4A8 готов; Vulkan-каркас + Q4-GEMV бит-в-бит, остальные ядра/ROCm — дальше |
+| M8 | CPU (AVX2/NEON) и OpenCL; цель — llama.cpp | prefill/decode ≥ llama.cpp | CPU/OpenCL готовы; Vulkan/ROCm исключены; идёт оптимизация GEMM |
 
 ## Текущее состояние (сводка)
 
@@ -251,18 +251,16 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
 3. DoD: конфиг 20/80/0 проходит `gpu-cmp`, 2-device тесты дают те же логиты —
    выполнено для PP и full TP (ids/logits выше).
 
-### P4b. Бэкенды (CPU готов, Vulkan/ROCm дальше)
+### P4b. Бэкенды: CPU и OpenCL, цель — llama.cpp
 
 1. **Сделано: backend-cpu (W4A8, AVX2).** Q4_K/Q6_K предпак в u8+скейлы (1.6 ГБ),
    активации i8 по 32, `_mm256_maddubs_epi16`/`_mm256_fmadd_ps` с runtime-детектом,
    Rayon по строкам; `InferenceBackend`, `cpu-port`, `LFM_BACKEND=cpu`. Parity:
    greedy-ids = GPU Q4 (8 токенов), ~6.9 tok/s; KV непрерывный, радикс-кэша нет.
    Архитектура — `docs/backends.md`.
-2. **Сделано: каркас Vulkan.** `ash`, устройство/память/пайплайн, GLSL→SPIR-V
-   (`glslc`), ядро Q4_K-GEMV (W4A8) с бит-в-бит совпадением с CPU
-   (`vulkan-gemv`, max_rel 1.6e-6, synthetic/real тесты). Дальше: Q6/нормы/attention/
-   lm_head → полный forward, затем device-local память, subgroup-редукции, тюнинг.
-3. **Дальше: ROCm** (HIP, порт ядер), общий parity-набор и A/B по tok/s.
+2. **Vulkan/ROCm исключены** решением от 18.11. Остаются CPU и OpenCL.
+3. **Цель: обогнать llama.cpp** по prefill и decode на CPU и OpenCL
+   (бейзлайн — `benchmarks/llama-cpp.md`). Главный разрыв — prefill/GEMM.
 
 ### P5. M7 — NPU и hardening
 

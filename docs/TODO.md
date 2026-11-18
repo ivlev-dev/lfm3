@@ -5,7 +5,7 @@
 ```bash
 cd /home/ivlev98/Проекты/PC/lfm3
 cargo build --release --workspace          # без предупреждений
-cargo test --workspace                     # 251 тест
+cargo test --workspace                     # 248 тестов
 ```
 
 `main` = `origin/main`, рабочее дерево чистое, незакоммиченных экспериментов нет.
@@ -79,7 +79,6 @@ cargo test --workspace                     # 251 тест
 | M6/PoCL | CPU-тир PoCL заработал: причины были в хосте (`per_wg` считался как `wg/64`, а PoCL даёт подгруппу = всему workgroup) и в гонках `norm_add_quant` (чтение `red[0]` без барьера перед перезаписью). Теперь `gpu-check` cos 0.9993, `gpu-gen` ids совпадают с AMD, `gpu-cmp` batch cos 0.9994. Intel runtime удалён (iGPU в системе нет) |
 | M6/PP | `GpuModel::load_stage` (диапазон слоёв, embed/head), `PipelineModel` (host-handoff, синхронные prefill/кэш), `LFM_DEVICE`/`LFM_TIERS`, CLI `gpu-pp`. 20/80/0 и 50/50 дают ids как single GPU (16 токенов), logits cos 0.999824, top-5; сервер с `LFM_TIERS` переиспользует кэш на обеих ступенях (reused 192) |
 | Бэкенды | новый `backend-cpu` (W4A8, AVX2): Q4/Q6 предпак в u8+скейлы, активации i8 по 32, runtime AVX2/FMA + scalar fallback, Rayon; `parse/forward/attention/conv` pure Rust; `InferenceBackend` + `LFM_BACKEND=cpu` + `cpu-port`. ids = GPU Q4 (8 токенов), ~6.9 tok/s; архитектура — `docs/backends.md` |
-| Vulkan | новый `backend-vulkan`: `ash` (инстанс/устройство/очередь), host-visible SSBO, descriptor sets, push-constants, GLSL→SPIR-V (`glslc`), ядро Q4_K-GEMV (W4A8) бит-в-бит с CPU (max_rel 1.6e-6), CLI `vulkan-info`/`vulkan-gemv`, 3 теста |
 | M6/TP | full TP: головы q/k/v/g/gate и `attn_output` по столбцам, FFN `up/gate` по строкам + `down` по столбцам, lm_head по словарю с host-gather; `TpShard` режет Q4/Q6 по строкам/блокам, `x/hq/hs` синхронизируются после фаз. `LFM_TP=0/1`/`gpu-tp`: ids как single (8/8), logits cos 0.999745; сервер отвечает |
 
 ## Проверки, которые уже прогонялись (и чем повторять)
@@ -172,17 +171,14 @@ P1 — только после перемера на простое.
 - **Бейзлайн** (`benchmarks/llama-cpp.md`): llama.cpp Vulkan pp512 1393 / tg128 91,
   pp8192 1236 / tg64 94; CPU pp512 142 / tg128 23.
 - **Наши**: OpenCL ~205 pp512 / 159 pp8192 / 64 tg; CPU 10 pp512 / 6.9 tg;
-  Vulkan — только Q4-GEMV.
+
 - Цель: на каждом бэкенде prefill и decode ≥ llama.cpp. Главный разрыв — prefill
   (GEMM/батчевый Q4): нужен GEMM-тайлинг/subgroup (GPU) и батчевый AVX2-GEMM (CPU).
 
 
 - **CPU готов**: W4A8 AVX2, `LFM_BACKEND=cpu`; дальше оптимизации (Q6 AVX2, prefetch,
   f16-KV, аллокации) и NEON-ветка.
-- **Vulkan**: каркас готов (Q4-GEMV бит-в-бит). Дальше: Q6/нормы/silu/quant,
-  attention/KV, lm_head → полный forward; device-local память, subgroup-редукции,
-  несколько строк на workgroup, pipeline cache.
-- **ROCm**: HIP, порт ядер, сравнение с OpenCL/Vulkan.
+- **Vulkan/ROCm исключены** — только CPU и OpenCL.
 - Архитектура и DoD — `docs/backends.md`.
 
 ### 7. P6 — M1 и M6/M7
@@ -214,8 +210,6 @@ P1 — только после перемера на простое.
 - **`LFM_TIERS`** (PP): проценты слоёв по устройствам, например `20/80/0`
   (GPU 4 слоя + PoCL CPU 20). Работает в сервере и `gpu-pp`; CPU-ступень медленная,
   поэтому для серверных тестов брать короткие ответы.
-- **Vulkan**: сборка требует `glslc` (shaderc); устройство по `LFM_DEVICE`
-  (индекс Vulkan-устройства), проверка — `vulkan-info`, `vulkan-gemv`.
 - **`LFM_BACKEND=cpu`**: pure-Rust CPU-бэкенд; веса предпакованы, загрузка ~0.7 с,
   память ~1.6 ГБ, AVX2 определяется в рантайме. Для бенча — `cpu-port`.
 - **`LFM_TP`** (TP): список устройств через `/`, например `0/1`; full TP
@@ -271,8 +265,6 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 - `crates/backend-cpu/**` (новый крейт): W4A8-веса, AVX2-ядра, forward, `CpuBackend`.
 - `Cargo.toml`/`Cargo.lock` — член workspace, зависимости (`rayon`, `lfm-backend-cpu`).
 - `apps/server/src/main.rs` — `LFM_BACKEND=cpu`; `apps/bench/src/main.rs` — `cpu-port`.
-- `crates/backend-vulkan/**` (новый крейт): `ash`-каркас, `glslc`-сборка,
-  `shaders/gemv_q4.comp`, `GemvQ4`, тесты (synthetic/real block/row).
 - `docs/backends.md` (новый), `README.md`, `docs/plan.md`, этот файл.
 
 ## Файлы, изменённые в сессии 6
@@ -288,7 +280,7 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 - `crates/backend-opencl/src/tp.rs` (новый) — full TP: `TpShard` (головы/FFN/словарь),
   `TpModel` (all-reduce/gather через host, синхронизация `x/hq/hs`).
 - `apps/server/src/main.rs` — загрузчик по `LFM_TIERS`/`LFM_TP` (composition root).
-- `apps/bench/src/main.rs` — `gpu-tp`, `cpu-port`, `vulkan-info`/`vulkan-gemv`.
+- `apps/bench/src/main.rs` — `gpu-tp`, `cpu-port`, `cpu-prefill`.
 - KV int8 (+Hadamard), unroll/fast-math, Q6-RGEMV и PB-варианты реализованы,
   замерены и полностью откачены.
 - `docs/plan.md`, этот файл — результаты экспериментов и PoCL-совместимости.

@@ -1,7 +1,7 @@
 # Модульные бэкенды
 
-Цель — один движок и несколько взаимозаменяемых исполнителей (CPU, OpenCL, Vulkan,
-ROCm), с одинаковым поведением и общими проверками.
+Цель — один движок и несколько взаимозаменяемых исполнителей (CPU, OpenCL),
+с одинаковым поведением и общими проверками. Vulkan/ROCm исключены.
 
 ## Слои и зависимости
 
@@ -12,8 +12,6 @@ apps/*  (composition root: выбор бэкенда по CLI/env)
 бэкенды реализуют lfm_app::InferenceBackend / TokenizerPort
   backend-cpu    pure Rust, AVX2 → NEON
   backend-opencl rusticl/PoCL (текущий)
-  backend-vulkan compute shaders (SPIR-V)
-  backend-rocm   HIP/ROCm
 общие крейты: domain, application, infra-gguf, infra-quant, infra-tokenizer
 ```
 
@@ -38,10 +36,10 @@ apps/*  (composition root: выбор бэкенда по CLI/env)
 
 Env/CLI (composition root):
 - `LFM_BACKEND=cpu|opencl|vulkan|rocm` (default opencl);
-- `LFM_DEVICE` — индекс устройства у OpenCL/Vulkan/ROCm;
+- `LFM_DEVICE` — индекс устройства у OpenCL;
 - `LFM_TIERS` — PP по слоям (OpenCL), `LFM_TP` — full TP (OpenCL);
-- фичи Cargo: `backend-cpu` (default), `backend-opencl` (default), `backend-vulkan`,
-  `backend-rocm` — чтобы сборка под ARM/NPU не тянула лишние зависимости.
+- фичи Cargo: `backend-cpu` (default), `backend-opencl` (default); Vulkan/ROCm
+  исключены.
 
 ## backend-cpu (готов, W4A8 + AVX2)
 
@@ -59,23 +57,10 @@ Env/CLI (composition root):
 - Дальше по CPU: AVX2 для Q6, блочный prefetch, f16-KV, отказ от аллокаций в forward,
   NEON-ветка (aarch64).
 
-## backend-vulkan (каркас готов)
+## Vulkan/ROCm
 
-- `ash`, инстанс/физическое устройство (RADV), compute-очередь, host-visible
-  SSBO-буферы, descriptor sets, push-constants.
-- Шейдеры — GLSL, сборка в SPIR-V через `glslc` (build.rs); первое ядро
-  `gemv_q4.comp` (Q4_K, W4A8) уже даёт **бит-в-бит** результат с CPU на реальном
-  тензоре (`vulkan-gemv`, max_rel ≤ 1.6e-6), synthetic/real тесты в крейте.
-- CLI: `vulkan-info`, `vulkan-gemv --rows N`.
-- Дальше: Q6_K-GEMV, нормы/silu/quant, attention/KV, lm_head, сборка полного
-  forward; затем переход с host-visible на device-local + staging, subgroup-редукции,
-  несколько строк на workgroup и pipeline cache. Проверки — тот же parity-набор.
-
-## backend-rocm
-
-- HIP через `hip-sys`/`rocm-sys`; ядра — порт OpenCL-ядер (HIP C++) или SPIR-V.
-- Память: hipMalloc/hipMemcpy, стримы; без P2P, обмен через host как в TP.
-- Цель — сравнить с OpenCL/Vulkan на одной машине, выбрать быстрейший путь.
+Исключены решением от 18.11.2026: остаются CPU и OpenCL, цель — обогнать
+llama.cpp по prefill и decode.
 
 ## Проверки и производительность
 

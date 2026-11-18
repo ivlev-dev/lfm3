@@ -59,11 +59,7 @@
   W4A8 по группам 32, AVX2 (`maddubs`/`fmadd`, runtime-детект, scalar fallback),
   Rayon по строкам. `cpu-port` даёт те же greedy-ids, что GPU Q4 (8 токенов),
   ~6.9 tok/s на i5-10400; сервер запускается с `LFM_BACKEND=cpu`. Архитектура и
-  план Vulkan/ROCm — `docs/backends.md`.
-- **Vulkan-каркас готов.** `backend-vulkan` (`ash` + GLSL→SPIR-V через `glslc`):
-  устройство/память/пайплайн, первое ядро Q4_K-GEMV (W4A8) — бит-в-бит с CPU
-  (`vulkan-gemv`, max_rel ≤ 1.6e-6), `vulkan-info`. Дальше — остальные ядра и
-  полный forward бэкенда.
+  архитектура бэкендов — `docs/backends.md`.
 - **M6 (tensor parallel) — готов.** Full TP на двух устройствах: q/k/v/g и gate —
   по головам, `attn_output` — по столбцам, FFN — `up/gate` по строкам и `down`
   по столбцам, lm_head — по словарю с host-gather. `LFM_TP=0/1`/`gpu-tp`: ids
@@ -91,7 +87,7 @@
   посчитанный при активном декоде, даёт повтору reused 160 токенов с тем же ответом.
   Два TUI: `gpu-chat --tui` (in-process: скролл, история ввода, resize, Ctrl+C-стоп)
   и `lfm-tui` (`apps/tui`, клиент к серверу: SSE, `/metrics` в статусе, `/save`/`/load`).
-- **Тесты:** 251 зелёный (`cargo test --workspace`), сборка без предупреждений.
+- **Тесты:** 248 зелёных (`cargo test --workspace`), сборка без предупреждений.
 
 ## Что дальше
 
@@ -113,10 +109,10 @@
 4. **P3. Остаток M5**: e2e openai-python уже покрыт (chat/stream/tools/completions),
    chunked prefill публикует страницы в радикс-кэш, pipelined HEADERS в h2 буферизуются;
    остался только TLS по требованию.
-5. **P4–P6. M6/M7**: PP (`LFM_TIERS`) и full TP (`LFM_TP`) готовы; CPU-бэкенд
-   (W4A8/AVX2) готов, Vulkan-каркас с Q4-GEMV. Цель — обогнать llama.cpp
-   (`benchmarks/llama-cpp.md`): Vulkan 1393 pp512 / 91 tg128, CPU 142 / 23;
-   главный разрыв — prefill (GEMM). Дальше — остальные ядра Vulkan, ROCm, M7.
+5. **Цель — обогнать llama.cpp** (`benchmarks/llama-cpp.md`) на CPU и OpenCL:
+   prefill и decode. Бейзлайн: CPU 142 pp512 / 23 tg128, Vulkan 1393 / 91.
+   Главный разрыв — prefill (батчевый GEMM): CPU ×14, OpenCL ×7; decode OpenCL ×1.4.
+   Vulkan/ROCm исключены из плана.
 
 ## Железо и целевые показатели
 
@@ -144,7 +140,6 @@ crates/
                     `InferenceBackend`/`TokenizerPort`, `Generate`
   backend-cpu/      pure Rust CPU: W4A8, AVX2 (NEON — позже), Rayon
   backend-opencl/   GPU через OpenCL (rusticl/PoCL)
-  backend-vulkan/   GPU через Vulkan compute (каркас + Q4-GEMV)
   infra-gguf/       парсер GGUF + адаптер метаданных
   infra-quant/      эталонная деквантизация Q4_K/Q6_K/Q8_0
   infra-cpu/        CPU-эталон forward (f32)
@@ -185,8 +180,7 @@ cargo run --release -p lfm-bench -- gpu-port --tokens 24     # через пор
 cargo run --release -p lfm-bench -- gpu-pp --tokens 8 --tiers 20/80/0  # PP: GPU+PoCL
 cargo run --release -p lfm-bench -- gpu-tp --tokens 8 --devices 0/1      # full TP
 cargo run --release -p lfm-bench -- cpu-port --tokens 8                   # CPU W4A8/AVX2
-cargo run --release -p lfm-bench -- vulkan-info                           # Vulkan устройства
-cargo run --release -p lfm-bench -- vulkan-gemv --rows 8                  # Q4-GEMV vs CPUcargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
+cargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
 cargo run --release -p lfm-bench -- gpu-chat --user "What is the capital of Japan?"
 cargo run --release -p lfm-bench -- gpu-multi --seqs 6 --tokens 48   # 6 стримов
 cargo run --release -p lfm-bench -- gpu-cmp --ids 597,5205,302 --batch 5  # batch == seq
