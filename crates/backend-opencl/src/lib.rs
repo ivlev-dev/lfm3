@@ -138,6 +138,7 @@ struct Kernels {
     q4p_b: Kernel,
     q4x4p_b: Kernel,
     gemm_q4_lds17: Kernel,
+    gemm_q4_b8: Kernel,
     gemm_q6: Kernel,
     gemm_q6_pp: Kernel,
     q6_b: Kernel,
@@ -780,6 +781,7 @@ impl GpuModel {
             q4p_b: Kernel::create(&program, "gemv_q4_k_i8_p_b")?,
             q4x4p_b: Kernel::create(&program, "gemv_q4_k_i8_4p_b")?,
             gemm_q4_lds17: Kernel::create(&program, "gemm_q4_k_i8_lds17")?,
+            gemm_q4_b8: Kernel::create(&program, "gemm_q4_k_i8_b8")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
@@ -1030,6 +1032,28 @@ impl GpuModel {
             .gemm_force
             .as_deref()
             .is_some_and(|list| list.split(',').any(|pat| !pat.is_empty() && name.contains(pat)));
+        if (2..=8).contains(&ntok) && !force {
+            if let (Weight::Q4(_), Some(p)) = (weight, packed) {
+                let grid = rows.div_ceil(64) * 64;
+                unsafe {
+                    self.gpu.launch(
+                        &self.kernels.gemm_q4_b8,
+                        grid,
+                        64,
+                        &[
+                            Arg::Mem(p.get()),
+                            Arg::Mem(xq.get()),
+                            Arg::Mem(xs.get()),
+                            Arg::Mem(y.get()),
+                            Arg::U32(rows as u32),
+                            Arg::U32(cols as u32),
+                            Arg::U32(ntok as u32),
+                        ],
+                    )?;
+                }
+                return Ok(());
+            }
+        }
         if ntok > self.pb || force {
             if let (Weight::Q4(_), Some(p)) = (weight, packed) {
                 let tps = ntok.div_ceil(32);
