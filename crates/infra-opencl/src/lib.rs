@@ -130,16 +130,6 @@ impl Gpu {
             .map_err(|e| anyhow!("build failed: {e}"))
     }
 
-    pub fn build_il(&self, il: &[u8]) -> Result<Program> {
-        let mut program = Program::create_from_il(&self.context, il)
-            .map_err(|e| anyhow!("clCreateProgramWithIL: {e}"))?;
-        let device = self.device.id();
-        program
-            .build(&[device], "")
-            .map_err(|e| anyhow!("build IL failed: {e}"))?;
-        Ok(program)
-    }
-
     pub fn alloc<T>(&self, len: usize) -> Result<Buffer<T>> {
         unsafe { Buffer::create(&self.context, CL_MEM_READ_WRITE, len, std::ptr::null_mut()) }
             .context("clCreateBuffer")
@@ -292,11 +282,8 @@ impl Gpu {
 const PROBE_SRC: &str = "__kernel void probe_sgs(__global uint *out) { out[0] = get_sub_group_size(); }";
 
 fn probe_sub_group_size(context: &Context, queue: &CommandQueue) -> Result<usize> {
-    let program = match Program::create_and_build_from_source(context, PROBE_SRC, "-cl-std=CL3.0") {
-        Ok(p) => p,
-        Err(_) => Program::create_and_build_from_source(context, PROBE_SRC, "-cl-std=CL2.0")
-            .map_err(|e| anyhow!("probe build failed: {e}"))?,
-    };
+    let program = Program::create_and_build_from_source(context, PROBE_SRC, "-cl-std=CL3.0")
+        .map_err(|e| anyhow!("probe build failed: {e}"))?;
     let kernel = Kernel::create(&program, "probe_sgs")?;
     let mut buffer: Buffer<u32> =
         unsafe { Buffer::create(context, CL_MEM_READ_WRITE, 256, std::ptr::null_mut())? };

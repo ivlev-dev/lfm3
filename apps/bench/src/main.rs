@@ -217,31 +217,6 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value_t = 4)]
         check_rows: usize,
-        #[arg(long)]
-        spv: Option<PathBuf>,
-    },
-    VulkanInfo,
-    VulkanGemm {
-        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
-        model: PathBuf,
-        #[arg(long, default_value = "blk.2.ffn_up.weight")]
-        tensor: String,
-        #[arg(long, default_value_t = 64)]
-        ntok: usize,
-        #[arg(long, default_value_t = 4)]
-        check_rows: usize,
-        #[arg(long, default_value_t = 10)]
-        reps: u32,
-    },
-    VulkanGemv {
-        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
-        model: PathBuf,
-        #[arg(long, default_value = "blk.2.attn_q.weight")]
-        tensor: String,
-        #[arg(long, default_value_t = 4)]
-        rows: usize,
-        #[arg(long)]
-        ones: bool,
     },
     Gemb {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
@@ -445,22 +420,7 @@ fn main() -> Result<()> {
             ntok,
             mode,
             check_rows,
-            spv,
-        } => gemm_cmp(&model, &tensor, ntok, &mode, check_rows, spv.as_ref()),
-        Cmd::VulkanInfo => vulkan_info(),
-        Cmd::VulkanGemm {
-            model,
-            tensor,
-            ntok,
-            check_rows,
-            reps,
-        } => vulkan_gemm(&model, &tensor, ntok, check_rows, reps),
-        Cmd::VulkanGemv {
-            model,
-            tensor,
-            rows,
-            ones,
-        } => vulkan_gemv(&model, &tensor, rows, ones),
+        } => gemm_cmp(&model, &tensor, ntok, &mode, check_rows),
         Cmd::Gemb {
             model,
             tensor,
@@ -3376,16 +3336,6 @@ fn gemm_launch(
             rows.div_ceil(64) * ntok.div_ceil(32) * 512,
             512usize,
         ),
-        "lds22" => (
-            Kernel::create(program, "gemm_q4_k_i8_lds22")?,
-            rows.div_ceil(64) * ntok.div_ceil(64) * 256,
-            256usize,
-        ),
-        "lds21" => (
-            Kernel::create(program, "gemm_q4_k_i8_lds21")?,
-            rows.div_ceil(64) * ntok.div_ceil(32) * 512,
-            512usize,
-        ),
         "lds11" => (
             Kernel::create(program, "gemm_q4_k_i8_lds11")?,
             rows.div_ceil(32) * ntok.div_ceil(32) * 256,
@@ -3501,18 +3451,10 @@ fn gemm_cmp(
     ntok: usize,
     mode: &str,
     check_rows: usize,
-    spv: Option<&PathBuf>,
 ) -> Result<()> {
     let gguf = lfm_gguf::GgufFile::open(model)?;
     let gpu = Gpu::open(0)?;
-    let program = match spv {
-        Some(path) => gpu.build_il(&std::fs::read(path)?)?,
-        None => {
-            let opts = std::env::var("LFM_BUILD_OPTS")
-                .unwrap_or_else(|_| "-cl-std=CL3.0 -DRGEMV=4 -DRGEMV_B=64 -DPB=6".into());
-            gpu.build(LFM_KERNELS, &opts)?
-        }
-    };
+    let program = gpu.build(LFM_KERNELS, "-cl-std=CL3.0 -DRGEMV=4 -DRGEMV_B=64 -DPB=6")?;
     if tensor != "*" {
         let info = gguf
             .tensor(tensor)
@@ -3676,147 +3618,5 @@ fn kernel_bin(name: &str, out: &std::path::Path) -> Result<()> {
     if wrote == 0 {
         return Err(anyhow!("driver returned no program binaries"));
     }
-    Ok(())
-}
-
-fn vulkan_info() -> Result<()> {
-    for d in lfm_backend_vulkan::Vk::devices()? {
-        println!(
-            "vulkan device {}: {} ({}, {} MiB)",
-            d.index, d.name, d.kind, d.memory_mb
-        );
-    }
-    Ok(())
-}
-
-fn quantize_x(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
-    let groups = x.len().div_ceil(32);
-    let mut q = vec![0i8; x.len()];
-    let mut s = vec![0.0f32; groups];
-    for g in 0..groups {
-        let start = g * 32;
-        let end = (start + 32).min(x.len());
-        let amax = x[start..end].iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        let sc = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-        s[g] = sc;
-        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-        for (i, &v) in x[start..end].iter().enumerate() {
-            q[start + i] = (v * inv).round().clamp(-127.0, 127.0) as i8;
-        }
-    }
-    (q, s)
-}
-
-fn vulkan_gemv(model: &PathBuf, tensor: &str, rows: usize, ones: bool) -> Result<()> {
-    let gguf = lfm_gguf::GgufFile::open(model)?;
-    let info = gguf
-        .tensor(tensor)
-        .ok_or_else(|| anyhow!("tensor {tensor} not found"))?
-        .clone();
-    if info.ggml_type != lfm_gguf::GgmlType::Q4_K {
-        return Err(anyhow!("only Q4_K supported"));
-    }
-    let cols = info.dims[0] as usize;
-    let bytes = gguf.tensor_bytes(tensor)?;
-    let x = make_x(cols);
-    let (xq, xs) = if ones {
-        (vec![127i8; cols], vec![1.0f32 / 127.0; cols / 32])
-    } else {
-        quantize_x(&x)
-    };
-    let vk = lfm_backend_vulkan::Vk::open(None)?;
-    println!("device: {}", vk.name());
-    let gemv = lfm_backend_vulkan::GemvQ4::new(&vk)?;
-    let got = gemv.run(&vk, &bytes, &xq, &xs, rows, cols, 0)?;
-    let row_bytes = cols / 256 * 144;
-    let mut max_rel = 0.0f32;
-    for (r, &g) in got.iter().enumerate() {
-        let deq = lfm_quant::dequant_row_q4_k(&bytes[r * row_bytes..(r + 1) * row_bytes], cols)?;
-        let expect: f32 = deq
-            .iter()
-            .enumerate()
-            .map(|(d, v)| v * f32::from(xq[d]) * xs[d / 32])
-            .sum();
-        let rel = (g - expect).abs() / expect.abs().max(1e-6);
-        max_rel = max_rel.max(rel);
-        if r < 2 {
-            println!("row {r}: vulkan {g:.6} cpu {expect:.6} rel {rel:.2e}");
-        }
-    }
-    println!("rows {rows}: max_rel {max_rel:.2e}");
-    let reps = 20;
-    let t0 = Instant::now();
-    for _ in 0..reps {
-        let _ = gemv.run(&vk, &bytes, &xq, &xs, rows, cols, 0)?;
-    }
-    let dt = t0.elapsed().as_secs_f64() / reps as f64;
-    println!(
-        "vulkan gemv: {:.3} ms -> {:.1} GB/s, {:.1} GFLOP/s",
-        dt * 1e3,
-        bytes.len() as f64 / dt / 1e9,
-        2.0 * rows as f64 * cols as f64 / dt / 1e9
-    );
-    Ok(())
-}
-
-fn vulkan_gemm(
-    model: &PathBuf,
-    tensor: &str,
-    ntok: usize,
-    check_rows: usize,
-    reps: u32,
-) -> Result<()> {
-    let gguf = lfm_gguf::GgufFile::open(model)?;
-    let info = gguf
-        .tensor(tensor)
-        .ok_or_else(|| anyhow!("tensor {tensor} not found"))?
-        .clone();
-    if info.ggml_type != lfm_gguf::GgmlType::Q4_K {
-        return Err(anyhow!("only Q4_K supported"));
-    }
-    let rows = info.dims[1] as usize;
-    let cols = info.dims[0] as usize;
-    let bytes = gguf.tensor_bytes(tensor)?;
-    let wb = prepack_q4_key(&bytes);
-    let mut x = Vec::with_capacity(ntok * cols);
-    for t in 0..ntok {
-        for (i, v) in make_x(cols).into_iter().enumerate() {
-            x.push(v * (1.0 + t as f32 * 0.03) * if (i + t) % 3 == 0 { -1.0 } else { 1.0 });
-        }
-    }
-    let mut xq = Vec::with_capacity(ntok * cols);
-    let mut xs = Vec::with_capacity(ntok * cols / GROUP);
-    for t in 0..ntok {
-        let (q, sc) = quantize_ref(&x[t * cols..(t + 1) * cols], GROUP);
-        xq.extend_from_slice(&q);
-        xs.extend_from_slice(&sc);
-    }
-    let vk = lfm_backend_vulkan::Vk::open(None)?;
-    let gemm = lfm_backend_vulkan::GemmQ4::new(&vk)?;
-    let t0 = Instant::now();
-    let out = gemm.run(&vk, &wb, &xq, &xs, rows, cols, ntok, reps)?;
-    let dt = t0.elapsed().as_secs_f64() / f64::from(reps.max(1));
-    let row_bytes = bytes.len() / rows;
-    let mut max_rel = 0.0f32;
-    for r in 0..check_rows.min(rows) {
-        let slice = &bytes[r * row_bytes..(r + 1) * row_bytes];
-        for t in 0..ntok {
-            let g = out[t * rows + r];
-            let refv = dot_i8(
-                info.ggml_type,
-                slice,
-                &xq[t * cols..(t + 1) * cols],
-                &xs[t * cols / GROUP..(t + 1) * cols / GROUP],
-            )?;
-            let rel = (g - refv).abs() / refv.abs().max(1e-3);
-            max_rel = max_rel.max(rel);
-        }
-    }
-    let macs = rows as f64 * cols as f64 * ntok as f64;
-    println!(
-        "vulkan gemm {rows}x{cols} ntok={ntok}: {:.3} ms -> {:.2} T MAC/s, max_rel {max_rel:.2e}",
-        dt * 1e3,
-        macs / dt / 1e12
-    );
     Ok(())
 }

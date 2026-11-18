@@ -3,7 +3,7 @@
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 #endif
 
-#if defined(__AMDGCN__) || defined(LFM_AMD)
+#if defined(__AMDGCN__)
 static inline int lfm_dot4(uint a, uint b, int c) {
     return (int)__builtin_amdgcn_sdot4((int)a, (int)b, c, 0);
 }

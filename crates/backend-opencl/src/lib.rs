@@ -684,7 +684,13 @@ impl GpuModel {
             .unwrap_or(128);
         let batch_cap = pb.max(prefill_batch);
         let gemm_force: Option<String> = std::env::var("LFM_GEMM_FORCE").ok().filter(|v| !v.is_empty());
-        let gemm_q4: String = std::env::var("LFM_GEMM_Q4").unwrap_or_else(|_| "lds17".to_string());
+        let gemm_q4: String = std::env::var("LFM_GEMM_Q4").unwrap_or_else(|_| {
+            if gpu.caps.max_work_group_size < 512 {
+                "lds11".to_string()
+            } else {
+                "lds17".to_string()
+            }
+        });
         let rgemv: usize = std::env::var("LFM_RGEMV")
             .ok()
             .and_then(|v| v.parse().ok())

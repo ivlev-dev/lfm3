@@ -5,7 +5,6 @@ members = [
     "crates/infra-quant",
     "crates/infra-opencl",
     "crates/backend-opencl",
-    "crates/backend-vulkan",
     "crates/domain",
     "crates/application",
     "crates/infra-hf",
@@ -36,7 +35,6 @@ lfm-gguf = { path = "crates/infra-gguf" }
 lfm-quant = { path = "crates/infra-quant" }
 lfm-opencl = { path = "crates/infra-opencl" }
 lfm-gpu = { path = "crates/backend-opencl" }
-lfm-backend-vulkan = { path = "crates/backend-vulkan" }
 lfm-domain = { path = "crates/domain" }
 lfm-app = { path = "crates/application" }
 lfm-hf = { path = "crates/infra-hf" }
