@@ -3501,81 +3501,74 @@ fn gemm_cmp(
 fn dot_rate(iters: u32) -> Result<()> {
     let gpu = Gpu::open(0)?;
     let src = r#"
-__kernel void dot_rate(__global int *out, uint iters) {
-    char4 a0 = (char4)(1, 2, 3, 4);
-    char4 a1 = (char4)(4, 3, 2, 1);
-    char4 a2 = (char4)(2, 5, 1, 7);
-    char4 a3 = (char4)(9, 1, 4, 2);
-    char4 b0 = (char4)(5, 6, 7, 8);
-    char4 b1 = (char4)(1, 2, 5, 4);
-    char4 b2 = (char4)(3, 7, 2, 6);
-    char4 b3 = (char4)(2, 8, 3, 5);
-    int c0 = 0;
-    int c1 = 0;
-    int c2 = 0;
-    int c3 = 0;
+__kernel void dot_rate(__global const char *src, __global int *out, uint iters) {
+    uint gid = get_global_id(0);
+    char4 a0 = vload4(0, src + gid * 16);
+    char4 a1 = vload4(0, src + gid * 16 + 4);
+    char4 b0 = vload4(0, src + gid * 16 + 8);
+    char4 b1 = vload4(0, src + gid * 16 + 12);
+    int c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0, c6 = 0, c7 = 0;
     for (uint i = 0; i < iters; ++i) {
         c0 += dot(a0, b0);
         c1 += dot(a1, b1);
-        c2 += dot(a2, b2);
-        c3 += dot(a3, b3);
-        a0 = (char4)(c0 & 3, a0.s1, c1 & 3, a0.s3);
-        b0 = (char4)(c2 & 3, b0.s1, c3 & 3, b0.s3);
+        c2 += dot(a0, b1);
+        c3 += dot(a1, b0);
+        c4 += dot(a0, b0);
+        c5 += dot(a1, b1);
+        c6 += dot(a0, b1);
+        c7 += dot(a1, b0);
+        a0 = (char4)((c0 & 3), a0.y, a0.z, a0.w);
+        b0 = (char4)(b0.x, (c1 & 3), b0.z, b0.w);
     }
-    out[get_global_id(0)] = c0 + c1 + c2 + c3;
+    out[gid] = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7;
 }
-__kernel void fma_rate(__global float *out, uint iters) {
-    float4 a0 = (float4)(1.0f, 2.0f, 3.0f, 4.0f);
-    float4 b0 = (float4)(0.5f, 0.25f, 0.125f, 1.5f);
-    float4 c0 = (float4)(0.0f);
-    float4 c1 = (float4)(0.0f);
-    float4 c2 = (float4)(0.0f);
-    float4 c3 = (float4)(0.0f);
+__kernel void f16_rate(__global const char *src, __global float *out, uint iters) {
+    uint gid = get_global_id(0);
+    half4 a0 = vload4(0, (__global const half *)(src + gid * 16));
+    half4 b0 = vload4(0, (__global const half *)(src + gid * 16 + 8));
+    half4 a1 = vload4(4, (__global const half *)(src + gid * 16));
+    half4 b1 = vload4(4, (__global const half *)(src + gid * 16 + 8));
+    half4 c0 = (half4)(0), c1 = (half4)(0), c2 = (half4)(0), c3 = (half4)(0);
+    half4 c4 = (half4)(0), c5 = (half4)(0), c6 = (half4)(0), c7 = (half4)(0);
     for (uint i = 0; i < iters; ++i) {
         c0 = fma(a0, b0, c0);
-        c1 = fma(a0, b0, c1);
-        c2 = fma(a0, b0, c2);
-        c3 = fma(a0, b0, c3);
-        b0 = (float4)(c0.x * 1e-9f + 0.5f, b0.y, b0.z, b0.w);
+        c1 = fma(a1, b1, c1);
+        c2 = fma(a0, b1, c2);
+        c3 = fma(a1, b0, c3);
+        c4 = fma(a0, b0, c4);
+        c5 = fma(a1, b1, c5);
+        c6 = fma(a0, b1, c6);
+        c7 = fma(a1, b0, c7);
     }
-    out[get_global_id(0)] = c0.x + c1.y + c2.z + c3.w;
+    float4 r = convert_float4(c0 + c1 + c2 + c3) + convert_float4(c4 + c5 + c6 + c7);
+    out[gid] = r.x + r.y + r.z + r.w;
 }
 "#;
     let program = gpu.build(src, "-cl-std=CL3.0")?;
-    let grid = 12 * 64 * 64;
-    for name in ["dot_rate", "fma_rate"] {
+    let grid = 12 * 4 * 64 * 4;
+    let bytes = vec![7u8; grid * 16];
+    let sbuf = gpu.upload_bytes(&bytes)?;
+    for name in ["dot_rate", "f16_rate"] {
         let k = Kernel::create(&program, name)?;
-        if name == "dot_rate" {
-            let out = gpu.alloc::<i32>(grid)?;
-            let st = gpu.bench(2, 5, || -> Result<()> {
-                unsafe {
-                    gpu.launch(&k, grid, 64, &[Arg::Mem(out.get()), Arg::U32(iters)])?;
+        let out_i = gpu.alloc::<i32>(grid)?;
+        let out_f = gpu.alloc::<f32>(grid)?;
+        let st = gpu.bench(2, 5, || -> Result<()> {
+            unsafe {
+                if name == "dot_rate" {
+                    gpu.launch(&k, grid, 64, &[Arg::Mem(sbuf.get()), Arg::Mem(out_i.get()), Arg::U32(iters)])?;
+                } else {
+                    gpu.launch(&k, grid, 64, &[Arg::Mem(sbuf.get()), Arg::Mem(out_f.get()), Arg::U32(iters)])?;
                 }
-                Ok(())
-            })?;
-            let ops = grid as f64 * iters as f64 * 4.0;
-            println!(
-                "{name}: {} -> {:.2} T dot4/s ({:.2} T MAC/s)",
-                describe(&st),
-                ops / (st.median_ms / 1e3) / 1e12,
-                ops * 4.0 / (st.median_ms / 1e3) / 1e12
-            );
-        } else {
-            let out = gpu.alloc::<f32>(grid)?;
-            let st = gpu.bench(2, 5, || -> Result<()> {
-                unsafe {
-                    gpu.launch(&k, grid, 64, &[Arg::Mem(out.get()), Arg::U32(iters)])?;
-                }
-                Ok(())
-            })?;
-            let ops = grid as f64 * iters as f64 * 4.0;
-            println!(
-                "{name}: {} -> {:.2} T fma4/s ({:.2} T MAC/s)",
-                describe(&st),
-                ops / (st.median_ms / 1e3) / 1e12,
-                ops * 4.0 / (st.median_ms / 1e3) / 1e12
-            );
-        }
+            }
+            Ok(())
+        })?;
+        let macs = grid as f64 * iters as f64 * 8.0 * 4.0;
+        println!(
+            "{name}: {} -> {:.2} G MAC/s ({:.2} TFLOP/s)",
+            describe(&st),
+            macs / (st.median_ms / 1e3) / 1e9,
+            macs * 2.0 / (st.median_ms / 1e3) / 1e12
+        );
     }
     Ok(())
 }
