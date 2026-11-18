@@ -13,6 +13,7 @@ members = [
     "crates/infra-chat",
     "crates/infra-cpu",
     "apps/bench",
+    "apps/bench-cpu",
     "apps/server",
     "apps/tui",
 ]

@@ -193,7 +193,11 @@ P1 — только после перемера на простое.
   --mode lds11` сверяет GEMM с CPU-эталоном (max_rel ~1e-5) и печатает время.
 
 
-- **CPU готов**: W4A8 AVX2, `LFM_BACKEND=cpu`.
+- **CPU готов**: W4A8 AVX2, `LFM_BACKEND=cpu`; ARMv7 — NEON-ядра (`arm_neon.c`).
+- **Android (Xperia Z3, MSM8974)**: llama.cpp CPU pp32 3.78 / tg16 2.28 tok/s; наш
+  движок — 1.1–1.3 prefill / 0.50 decode (было 0.5 / — на скалярах). OpenCL на Adreno 330
+  нецелесообразен (драйвер 1.2 без `cl_khr_integer_dot_product` и подгрупп CL3.0).
+  Детали и план — `benchmarks/android.md`.
 - **CPU-оптимизация (сессия 9)**: батчевый prefill (тайл 8 токенов) + векторные
   аккумуляторы AVX2 + ниббл-упаковка Q4 + векторизованный `matvec`:
   prefill 10.0 → 54.5 tok/s, decode 8.2 → 15.7 (llama.cpp CPU: 141.5 / 23.3).

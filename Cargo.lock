@@ -987,6 +987,7 @@ name = "lfm-backend-cpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "half",
  "lfm-app",
  "lfm-domain",
@@ -1011,6 +1012,17 @@ dependencies = [
  "lfm-gpu",
  "lfm-opencl",
  "lfm-quant",
+ "lfm-tokenizer",
+]
+
+[[package]]
+name = "lfm-bench-cpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "lfm-app",
+ "lfm-backend-cpu",
  "lfm-tokenizer",
 ]
 

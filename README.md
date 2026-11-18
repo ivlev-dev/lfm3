@@ -187,6 +187,7 @@ cargo run --release -p lfm-bench -- gpu-port --tokens 24     # через пор
 cargo run --release -p lfm-bench -- gpu-pp --tokens 8 --tiers 20/80/0  # PP: GPU+PoCL
 cargo run --release -p lfm-bench -- gpu-tp --tokens 8 --devices 0/1      # full TP
 cargo run --release -p lfm-bench -- cpu-port --tokens 8                   # CPU W4A8/AVX2
+cargo run --release -p lfm-bench-cpu -- prefill --tokens 512              # CPU-стенд (в т.ч. armv7)
 cargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
 cargo run --release -p lfm-bench -- gpu-chat --user "What is the capital of Japan?"
 cargo run --release -p lfm-bench -- gpu-multi --seqs 6 --tokens 48   # 6 стримов

@@ -11,3 +11,6 @@ lfm-domain.workspace = true
 lfm-app.workspace = true
 lfm-gguf.workspace = true
 lfm-quant.workspace = true
+
+[build-dependencies]
+cc = "1"

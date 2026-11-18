@@ -10,6 +10,7 @@ use rayon::prelude::*;
 const GROUP: usize = 32;
 const TILE: usize = 8;
 
+#[repr(C)]
 #[derive(Clone)]
 struct Q4Block {
     scales: [f32; 8],
@@ -21,20 +22,16 @@ impl Q4Block {
     #[inline]
     fn qgroup(&self, g: usize) -> [u8; 32] {
         let base = (g & 3) * 32;
+        let shift: u32 = if g >= 4 { 4 } else { 0 };
         let mut out = [0u8; 32];
-        if g < 4 {
-            for i in 0..32 {
-                out[i] = self.q[base + i] & 0x0F;
-            }
-        } else {
-            for i in 0..32 {
-                out[i] = self.q[base + i] >> 4;
-            }
+        for i in 0..32 {
+            out[i] = (self.q[base + i] >> shift) & 0x0F;
         }
         out
     }
 }
 
+#[repr(C)]
 #[derive(Clone)]
 struct Q6Block {
     scales: [f32; 16],
@@ -858,7 +855,70 @@ fn quantize(x: &[f32]) -> Act {
     Act { q, s, sum32, sum16 }
 }
 
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn lfm_q4_rows(
+        w: *const u8,
+        xq: *const *const i8,
+        xs: *const *const f32,
+        sums: *const *const i32,
+        blocks: i32,
+        ntok: i32,
+        out: *mut f32,
+    );
+    fn lfm_q6_rows(
+        w: *const u8,
+        xq: *const *const i8,
+        xs: *const *const f32,
+        sums16: *const *const i32,
+        blocks: i32,
+        ntok: i32,
+        out: *mut f32,
+    );
+}
+
+#[allow(unreachable_code)]
 fn matvec(w: &Quant, x: &Act) -> Vec<f32> {
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    {
+        let blocks = w.cols / 256;
+        let mut out = vec![0.0f32; w.rows];
+        let xq = [x.q.as_ptr() as usize];
+        let xs = [x.s.as_ptr() as usize];
+        let sums = [x.sum32.as_ptr() as usize];
+        let sums16 = [x.sum16.as_ptr() as usize];
+        match &w.data {
+            Matrix::Q4(data) => {
+                out.par_iter_mut().enumerate().for_each(|(row, o)| unsafe {
+                    let wptr = data.as_ptr().add(row * blocks) as *const u8;
+                    lfm_q4_rows(
+                        wptr,
+                        xq.as_ptr() as *const *const i8,
+                        xs.as_ptr() as *const *const f32,
+                        sums.as_ptr() as *const *const i32,
+                        blocks as i32,
+                        1,
+                        o as *mut f32,
+                    );
+                });
+            }
+            Matrix::Q6(data) => {
+                out.par_iter_mut().enumerate().for_each(|(row, o)| unsafe {
+                    let wptr = data.as_ptr().add(row * blocks) as *const u8;
+                    lfm_q6_rows(
+                        wptr,
+                        xq.as_ptr() as *const *const i8,
+                        xs.as_ptr() as *const *const f32,
+                        sums16.as_ptr() as *const *const i32,
+                        blocks as i32,
+                        1,
+                        o as *mut f32,
+                    );
+                });
+            }
+        }
+        return out;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() && has_fma() && std::env::var("LFM_CPU_SCALAR").is_err() {
@@ -914,6 +974,14 @@ unsafe fn matmul_batch_avx2(w: &Quant, acts: &[Act], out: &mut [f32]) {
     let blocks = w.cols / 256;
     let ptr = out.as_mut_ptr() as usize;
     let ones = _mm256_set1_epi16(1);
+    let mut qp = [0usize; TILE];
+    let mut sp = [0usize; TILE];
+    let mut up = [0usize; TILE];
+    for t in 0..TILE {
+        qp[t] = acts[t].q.as_ptr() as usize;
+        sp[t] = acts[t].s.as_ptr() as usize;
+        up[t] = acts[t].sum32.as_ptr() as usize;
+    }
     let mut wsum = vec![0.0f32; TILE * blocks * 16];
     for t in 0..TILE {
         let a = &acts[t];
@@ -1106,7 +1174,60 @@ fn pad_acts(acts: &mut Vec<Act>, cols: usize) {
     }
 }
 
+#[allow(unreachable_code)]
 fn matmul_batch(w: &Quant, acts: &[Act], out: &mut [f32]) {
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    {
+        let n = acts.len();
+        let blocks = w.cols / 256;
+        let rows = w.rows;
+        let qp: Vec<usize> = acts.iter().map(|a| a.q.as_ptr() as usize).collect();
+        let sp: Vec<usize> = acts.iter().map(|a| a.s.as_ptr() as usize).collect();
+        let up: Vec<usize> = acts.iter().map(|a| a.sum32.as_ptr() as usize).collect();
+        let u16p: Vec<usize> = acts.iter().map(|a| a.sum16.as_ptr() as usize).collect();
+        let dst = out.as_mut_ptr() as usize;
+        match &w.data {
+            Matrix::Q4(data) => {
+                (0..rows).into_par_iter().for_each(|row| unsafe {
+                    let mut tmp = [0.0f32; TILE];
+                    let wptr = data.as_ptr().add(row * blocks) as *const u8;
+                    lfm_q4_rows(
+                        wptr,
+                        qp.as_ptr() as *const *const i8,
+                        sp.as_ptr() as *const *const f32,
+                        up.as_ptr() as *const *const i32,
+                        blocks as i32,
+                        n as i32,
+                        tmp.as_mut_ptr(),
+                    );
+                    let p = dst as *mut f32;
+                    for t in 0..n {
+                        *p.add(t * rows + row) = tmp[t];
+                    }
+                });
+            }
+            Matrix::Q6(data) => {
+                (0..rows).into_par_iter().for_each(|row| unsafe {
+                    let mut tmp = [0.0f32; TILE];
+                    let wptr = data.as_ptr().add(row * blocks) as *const u8;
+                    lfm_q6_rows(
+                        wptr,
+                        qp.as_ptr() as *const *const i8,
+                        sp.as_ptr() as *const *const f32,
+                        u16p.as_ptr() as *const *const i32,
+                        blocks as i32,
+                        n as i32,
+                        tmp.as_mut_ptr(),
+                    );
+                    let p = dst as *mut f32;
+                    for t in 0..n {
+                        *p.add(t * rows + row) = tmp[t];
+                    }
+                });
+            }
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() && has_fma() && std::env::var("LFM_CPU_SCALAR").is_err() {

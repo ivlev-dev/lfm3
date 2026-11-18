@@ -1,0 +1,11 @@
+[package]
+name = "lfm-bench-cpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+lfm-app.workspace = true
+lfm-backend-cpu.workspace = true
+lfm-tokenizer.workspace = true
