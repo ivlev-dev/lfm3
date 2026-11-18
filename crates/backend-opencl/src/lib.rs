@@ -1294,15 +1294,16 @@ impl GpuModel {
 
     fn clear_conv_slot(&mut self, slot: usize) -> Result<()> {
         let conv_len = (self.cfg.conv_cache - 1) * self.cfg.hidden_size;
-        let off = (slot * conv_len) as u32;
+        let off = (slot * conv_len * 2) as u32;
+        let n = conv_len * 2;
         for layer in self.layers.iter() {
             if let Some(conv) = &layer.conv {
                 unsafe {
                     self.gpu.launch(
                         &self.kernels.fill_h,
-                        conv_len,
+                        n,
                         256,
-                        &[Arg::Mem(conv.get()), Arg::U32(off), Arg::U32(conv_len as u32)],
+                        &[Arg::Mem(conv.get()), Arg::U32(off), Arg::U32(n as u32)],
                     )?;
                 }
             }
@@ -3652,7 +3653,7 @@ impl GpuModel {
         self.create_sequence()?;
         let h = self.cfg.hidden_size;
         let kvd = self.cfg.kv_dim();
-        let conv_len = self.max_seqs * (self.cfg.conv_cache - 1) * h;
+        let conv_len = self.max_seqs * (self.cfg.conv_cache - 1) * h * 2;
         let kv_len = self.kv_blocks * KV_PAGE * kvd;
         for layer in &self.layers {
             if let Some(conv) = &layer.conv {
