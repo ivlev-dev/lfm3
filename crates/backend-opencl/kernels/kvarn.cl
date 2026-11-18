@@ -91,7 +91,7 @@ static float lfm_kvarn_ch_var(__local const float *t, __local const float *ic, _
 
 __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
                            __global uchar *kcode, __global half *ka, __global half *kc,
-                           __global uchar *vcode, __global half *vb, __global half *vc,
+                           __global uchar *vcode, __global half *vb, __global half *vbz, __global half *vc,
                            __global const uint *tbl, uint tbl_off, uint page, uint kv_heads, uint head_dim) {
     uint lane = get_local_id(0);
     uint h = get_group_id(0);
@@ -105,6 +105,7 @@ __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
     __local float ic[32];
     __local float a[128];
     __local float b[32];
+    __local float bz[32];
     ulong phys = (ulong)tbl[tbl_off + page];
     uint kstride = kv_heads * head_dim;
     for (uint tok = 0u; tok < 32u; ++tok) {
@@ -192,13 +193,22 @@ __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
     lfm_kvarn_scale(lr, lc, ir, ic, lane, 128u, 32u);
     {
         for (uint t2 = lane; t2 < 32u; t2 += 64u) {
-            float mx = 1e-8f;
+            float mn = 1e9f;
+            float mx = -1e9f;
             float c = ic[t2];
             for (uint ch = 0u; ch < 128u; ++ch) {
-                mx = fmax(mx, fabs(t[t2 * 128u + ch] * c * ir[ch]));
+                float v = t[t2 * 128u + ch] * c * ir[ch];
+                mn = fmin(mn, v);
+                mx = fmax(mx, v);
             }
-            b[t2] = mx / 1.5f;
-            vb[((uint)phys * kv_heads + h) * 32u + t2] = (half)(b[t2] * exp(lc[t2]));
+            float step = (mx - mn) / 3.0f;
+            if (step < 1e-8f) {
+                step = 1e-8f;
+            }
+            b[t2] = step;
+            bz[t2] = mn;
+            vb[((uint)phys * kv_heads + h) * 32u + t2] = (half)(step * exp(lc[t2]));
+            vbz[((uint)phys * kv_heads + h) * 32u + t2] = (half)(mn * exp(lc[t2]));
         }
         for (uint c = lane; c < 128u; c += 64u) {
             vc[((uint)phys * kv_heads + h) * 128u + c] = (half)exp(lr[c]);
@@ -211,7 +221,7 @@ __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
                 float ct = ic[tok];
                 for (uint k = 0u; k < 4u; ++k) {
                     uint ch = lane * 4u + k;
-                    int q = (int)round((t[tok * 128u + ch] * ct * ir[ch]) / b[tok] + 1.5f);
+                    int q = (int)round((t[tok * 128u + ch] * ct * ir[ch] - bz[tok]) / b[tok]);
                     q = q < 0 ? 0 : (q > 3 ? 3 : q);
                     byte |= (uchar)(q << (2u * k));
                 }
@@ -232,23 +242,24 @@ static float2 lfm_kvarn_k(__global const uchar *kcode, __global const half *ka, 
     return k;
 }
 
-static float2 lfm_kvarn_v(__global const uchar *vcode, __global const half *vb, __global const half *vc,
-                          uint phys, uint tok, uint kvh, uint kv_heads, uint lane) {
+static float2 lfm_kvarn_v(__global const uchar *vcode, __global const half *vb, __global const half *vbz,
+                          __global const half *vc, uint phys, uint tok, uint kvh, uint kv_heads, uint lane) {
     uint base = phys * kv_heads + kvh;
     uchar b = vcode[((phys << 5 | tok) * kv_heads + kvh) * 32u + (lane >> 1)];
     uint sh = 4u * (lane & 1u);
     float bt = (float)vb[base * 32u + tok];
+    float zero = (float)vbz[base * 32u + tok];
     float2 v;
-    v.x = (float)((b >> sh) & 3u) - 1.5f;
-    v.y = (float)((b >> (sh + 2u)) & 3u) - 1.5f;
-    v.x *= bt * (float)vc[base * 128u + 2u * lane];
-    v.y *= bt * (float)vc[base * 128u + 2u * lane + 1u];
+    v.x = (float)((b >> sh) & 3u) * bt + zero;
+    v.y = (float)((b >> (sh + 2u)) & 3u) * bt + zero;
+    v.x *= (float)vc[base * 128u + 2u * lane];
+    v.y *= (float)vc[base * 128u + 2u * lane + 1u];
     return v;
 }
 
 __kernel void attention_h_qk(__global const float *q, __global const half *kst, __global const half *vst,
                              __global const uchar *kcode, __global const half *ka, __global const half *kc,
-                             __global const uchar *vcode, __global const half *vb, __global const half *vc,
+                             __global const uchar *vcode, __global const half *vb, __global const half *vbz, __global const half *vc,
                              __global const uint *tbl, __global const float *gate, __global float *out,
                              uint len, uint start, uint full_end, uint kv_heads, uint n_heads) {
     uint lane = get_local_id(0);
@@ -304,8 +315,8 @@ __kernel void attention_h_qk(__global const float *q, __global const half *kst, 
         float2 v0;
         float2 v1;
         if (pos + 1u < full_end) {
-            v0 = lfm_kvarn_v(vcode, vb, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
-            v1 = lfm_kvarn_v(vcode, vb, vc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
+            v0 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
+            v1 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
             v0 = vload_half2(lane, vst + s0 * kstride + kvh * 128u);
             v1 = vload_half2(lane, vst + s1 * kstride + kvh * 128u);
@@ -341,7 +352,7 @@ __kernel void attention_h_qk(__global const float *q, __global const half *kst, 
         l = l * corr + w;
         float2 v;
         if (pos < full_end) {
-            v = lfm_kvarn_v(vcode, vb, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
+            v = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
             v = vload_half2(lane, vst + sp * kstride + kvh * 128u);
         }
@@ -361,7 +372,7 @@ __kernel void attention_h_qk(__global const float *q, __global const half *kst, 
 
 __kernel void attention_split_h_qk(__global const float *q, __global const half *kst, __global const half *vst,
                                    __global const uchar *kcode, __global const half *ka, __global const half *kc,
-                                   __global const uchar *vcode, __global const half *vb, __global const half *vc,
+                                   __global const uchar *vcode, __global const half *vb, __global const half *vbz, __global const half *vc,
                                    __global const uint *tbl, __global float *pacc, __global float *pml,
                                    uint len, uint start, uint full_end, uint kv_heads, uint n_heads, uint splits) {
     uint gid = get_group_id(0);
@@ -426,8 +437,8 @@ __kernel void attention_split_h_qk(__global const float *q, __global const half 
         float2 v0;
         float2 v1;
         if (pos + 1u < full_end) {
-            v0 = lfm_kvarn_v(vcode, vb, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
-            v1 = lfm_kvarn_v(vcode, vb, vc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
+            v0 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
+            v1 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
             v0 = vload_half2(lane, vst + s0 * kstride + kvh * 128u);
             v1 = vload_half2(lane, vst + s1 * kstride + kvh * 128u);
@@ -463,7 +474,7 @@ __kernel void attention_split_h_qk(__global const float *q, __global const half 
         l = l * corr + w;
         float2 v;
         if (pos < full_end) {
-            v = lfm_kvarn_v(vcode, vb, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
+            v = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
             v = vload_half2(lane, vst + sp2 * kstride + kvh * 128u);
         }

@@ -72,6 +72,7 @@ enum DecKv {
         kc: ClMemRaw,
         vcode: ClMemRaw,
         vb: ClMemRaw,
+        vbz: ClMemRaw,
         vc: ClMemRaw,
     },
 }
@@ -89,6 +90,7 @@ enum KvBuf {
         kc: Buffer<u16>,
         vcode: Buffer<u8>,
         vb: Buffer<u16>,
+        vbz: Buffer<u16>,
         vc: Buffer<u16>,
     },
 }
@@ -1634,29 +1636,29 @@ impl GpuModel {
                         }
                     };
                     let kv_kvarn = match k_buf {
-                        KvBuf::Kvarn { staging: ks, kcode, ka, kc, vcode, vb, vc } => {
+                        KvBuf::Kvarn { staging: ks, kcode, ka, kc, vcode, vb, vbz, vc } => {
                             let vs = match v_buf {
                                 KvBuf::Kvarn { staging, .. } => staging,
                                 _ => return Err(anyhow!("mixed kv variants")),
                             };
                             Some((
                                 ks.get(), vs.get(), kcode.get(), ka.get(), kc.get(),
-                                vcode.get(), vb.get(), vc.get(),
+                                vcode.get(), vb.get(), vbz.get(), vc.get(),
                             ))
                         }
                         _ => None,
                     };
                     let sel = match (kv_kvarn, kv_q4) {
-                        (Some((kst, vst, kcode, ka, kc, vcode, vb, vc)), _) => DecKv::Kvarn {
-                            kst, vst, kcode, ka, kc, vcode, vb, vc,
+                        (Some((kst, vst, kcode, ka, kc, vcode, vb, vbz, vc)), _) => DecKv::Kvarn {
+                            kst, vst, kcode, ka, kc, vcode, vb, vbz, vc,
                         },
                         (None, Some((kc, kn, vc, vs))) => DecKv::Q4 { kc, kn, vc, vs },
                         (None, None) => DecKv::F16,
                     };
-                    if let Some((_, _, _, _, _, _, _, _)) = kv_kvarn {
+                    if kv_kvarn.is_some() {
                         if (pos + 1) % KV_PAGE == 0 {
                             let page = ((pos + 1) / KV_PAGE - 1) as u32;
-                            let (kst, vst, kcode, ka, kc, vcode, vb, vc) = kv_kvarn.unwrap();
+                            let (kst, vst, kcode, ka, kc, vcode, vb, vbz, vc) = kv_kvarn.unwrap();
                             unsafe {
                                 self.gpu.launch(
                                     &self.kernels.kvarn_commit,
@@ -1670,6 +1672,7 @@ impl GpuModel {
                                         Arg::Mem(kc),
                                         Arg::Mem(vcode),
                                         Arg::Mem(vb),
+                                        Arg::Mem(vbz),
                                         Arg::Mem(vc),
                                         Arg::Mem(tbl_mem),
                                         Arg::U32(0),
@@ -1690,7 +1693,7 @@ impl GpuModel {
                     let full_end = ((pos + 1) / KV_PAGE * KV_PAGE) as u32;
                     if splits <= 1 {
                         match sel {
-                            DecKv::Kvarn { kst, vst, kcode, ka, kc, vcode, vb, vc } => unsafe {
+                            DecKv::Kvarn { kst, vst, kcode, ka, kc, vcode, vb, vbz, vc } => unsafe {
                                 self.gpu.launch(
                                     &self.kernels.attn_h_qk,
                                     heads * 64,
@@ -1704,6 +1707,7 @@ impl GpuModel {
                                         Arg::Mem(kc),
                                         Arg::Mem(vcode),
                                         Arg::Mem(vb),
+                                        Arg::Mem(vbz),
                                         Arg::Mem(vc),
                                         Arg::Mem(tbl_mem),
                                         Arg::Mem(self.bufs.g16.get()),
@@ -1760,7 +1764,7 @@ impl GpuModel {
                         }
                     } else {
                         match sel {
-                            DecKv::Kvarn { kst, vst, kcode, ka, kc, vcode, vb, vc } => unsafe {
+                            DecKv::Kvarn { kst, vst, kcode, ka, kc, vcode, vb, vbz, vc } => unsafe {
                                 self.gpu.launch(
                                     &self.kernels.attn_split_h_qk,
                                     heads * splits * 64,
@@ -1774,6 +1778,7 @@ impl GpuModel {
                                         Arg::Mem(kc),
                                         Arg::Mem(vcode),
                                         Arg::Mem(vb),
+                                        Arg::Mem(vbz),
                                         Arg::Mem(vc),
                                         Arg::Mem(tbl_mem),
                                         Arg::Mem(self.bufs.pacc.get()),
@@ -2921,7 +2926,7 @@ impl GpuModel {
                             None
                         }
                     };
-                    if let KvBuf::Kvarn { staging: ks, kcode, ka, kc, vcode, vb, vc } = k_buf {
+                    if let KvBuf::Kvarn { staging: ks, kcode, ka, kc, vcode, vb, vbz, vc } = k_buf {
                         let vs = match v_buf {
                             KvBuf::Kvarn { staging, .. } => staging,
                             _ => return Err(anyhow!("mixed kv variants")),
@@ -2942,6 +2947,7 @@ impl GpuModel {
                                             Arg::Mem(kc.get()),
                                             Arg::Mem(vcode.get()),
                                             Arg::Mem(vb.get()),
+                                            Arg::Mem(vbz.get()),
                                             Arg::Mem(vc.get()),
                                             Arg::Mem(self.bufs.tbl_all.get()),
                                             Arg::U32(tbl_off_host[t]),
@@ -3668,7 +3674,7 @@ impl GpuModel {
                     let _ = heads;
                 }
                 (
-                    Some(KvBuf::Kvarn { staging: ks, kcode, ka, kc, vcode, vb, vc }),
+                    Some(KvBuf::Kvarn { staging: ks, kcode, ka, kc, vcode, vb, vbz, vc }),
                     Some(KvBuf::Kvarn { staging: vst, .. }),
                 ) => {
                     let heads = self.cfg.kv_dim() / self.cfg.head_dim;
@@ -3681,6 +3687,7 @@ impl GpuModel {
                         (ka.get(), blocks * heads * 128),
                         (kc.get(), blocks * heads * 32),
                         (vb.get(), blocks * heads * 32),
+                        (vbz.get(), blocks * heads * 32),
                         (vc.get(), blocks * heads * 128),
                     ];
                     unsafe {
@@ -4075,6 +4082,7 @@ fn make_kv(
             kc: gpu.alloc::<u16>(blocks * heads * 32)?,
             vcode: gpu.alloc::<u8>(slots * heads * 32)?,
             vb: gpu.alloc::<u16>(blocks * heads * 32)?,
+            vbz: gpu.alloc::<u16>(blocks * heads * 32)?,
             vc: gpu.alloc::<u16>(blocks * heads * 128)?,
         }
     } else if q4 {
