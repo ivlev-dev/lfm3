@@ -145,10 +145,10 @@ __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
                 mx = fmax(mx, fabs(t[tok * 128u + c] * ic[tok] * r));
             }
             a[c] = mx / 7.0f;
-            ka[(page * kv_heads + h) * 128u + c] = (half)(a[c] * exp(lr[c]));
+            ka[((uint)phys * kv_heads + h) * 128u + c] = (half)(a[c] * exp(lr[c]));
         }
         if (lane < 32u) {
-            kc[(page * kv_heads + h) * 32u + lane] = (half)exp(lc[lane]);
+            kc[((uint)phys * kv_heads + h) * 32u + lane] = (half)exp(lc[lane]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint tok = 0u; tok < 32u; ++tok) {
@@ -198,10 +198,10 @@ __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
                 mx = fmax(mx, fabs(t[t2 * 128u + ch] * c * ir[ch]));
             }
             b[t2] = mx / 1.5f;
-            vb[(page * kv_heads + h) * 32u + t2] = (half)(b[t2] * exp(lc[t2]));
+            vb[((uint)phys * kv_heads + h) * 32u + t2] = (half)(b[t2] * exp(lc[t2]));
         }
         for (uint c = lane; c < 128u; c += 64u) {
-            vc[(page * kv_heads + h) * 128u + c] = (half)exp(lr[c]);
+            vc[((uint)phys * kv_heads + h) * 128u + c] = (half)exp(lr[c]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 32u) {
