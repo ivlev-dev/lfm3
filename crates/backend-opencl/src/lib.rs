@@ -102,6 +102,7 @@ struct Kernels {
     gemm_q4_lds10: Kernel,
     gemm_q4_lds11: Kernel,
     gemm_q6: Kernel,
+    gemm_q6_pp: Kernel,
     q6_b: Kernel,
     conv_b: Kernel,
     rms_rope_heads_b: Kernel,
@@ -422,6 +423,7 @@ pub struct GpuModel {
     prefill_batch: usize,
     batch_cap: usize,
     gemm_force: Option<String>,
+    prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)>,
     gemm_q4: String,
     rgemv: usize,
     rgemv_b: usize,
@@ -504,6 +506,7 @@ impl GpuModel {
         let fuse_on = std::env::var("LFM_FUSE").map(|v| v != "0").unwrap_or(true);
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
+        let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
         for info in file.tensors() {
             if !tensor_needed(&info.name, layer_start, layer_end, has_embed, has_head) {
                 continue;
@@ -529,7 +532,20 @@ impl GpuModel {
                     }
                     Weight::Q4(gpu.upload_bytes(data.as_ref())?)
                 }
-                GgmlType::Q6_K => Weight::Q6(gpu.upload_bytes(data.as_ref())?),
+                GgmlType::Q6_K => {
+                    if prepack_on && shard.is_none() && info.dims.len() == 2 {
+                        let cols = info.dims[0] as usize;
+                        let rows = info.dims[1] as usize;
+                        if cols % 256 == 0 && rows > 0 {
+                            let (q, sc) = prepack::prepack_q6_i8(data.as_ref(), cols);
+                            prepacked_i8.insert(
+                                info.name.clone(),
+                                (gpu.upload(&q)?, gpu.upload(&sc)?, rows),
+                            );
+                        }
+                    }
+                    Weight::Q6(gpu.upload_bytes(data.as_ref())?)
+                }
                 GgmlType::F32 => {
                     let data: Vec<f32> = data
                         .chunks_exact(4)
@@ -724,6 +740,7 @@ impl GpuModel {
             gemm_q4_lds10: Kernel::create(&program, "gemm_q4_k_i8_lds10")?,
             gemm_q4_lds11: Kernel::create(&program, "gemm_q4_k_i8_lds11")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
+            gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
             conv_b: Kernel::create(&program, "conv_step_b")?,
             rms_rope_heads_b: Kernel::create(&program, "rms_rope_heads_b")?,
@@ -867,6 +884,7 @@ impl GpuModel {
             prefill_batch,
             batch_cap,
             gemm_force,
+            prepacked_i8,
             gemm_q4,
             rgemv,
             rgemv_b,
@@ -981,6 +999,29 @@ impl GpuModel {
                     )?;
                 }
                 return Ok(());
+            }
+            if let Some((w8, wsc, _)) = self.prepacked_i8.get(name) {
+                if matches!(weight, Weight::Q6(_)) {
+                    let grid = rows.div_ceil(32) * ntok.div_ceil(32) * 256;
+                    unsafe {
+                        self.gpu.launch(
+                            &self.kernels.gemm_q6_pp,
+                            grid,
+                            256,
+                            &[
+                                Arg::Mem(w8.get()),
+                                Arg::Mem(wsc.get()),
+                                Arg::Mem(xq.get()),
+                                Arg::Mem(xs.get()),
+                                Arg::Mem(y.get()),
+                                Arg::U32(rows as u32),
+                                Arg::U32(cols as u32),
+                                Arg::U32(ntok as u32),
+                            ],
+                        )?;
+                    }
+                    return Ok(());
+                }
             }
             if let Weight::Q6(b) = weight {
                 let nsg = (64 / self.gpu.caps.sub_group_size.max(1)).max(1);
@@ -2089,12 +2130,13 @@ impl GpuModel {
 
     pub fn kernel_stats(&self) -> Vec<(String, u64)> {
         let dev = self.gpu.device.id();
-        let list: [(&str, &Kernel); 22] = [
+        let list: [(&str, &Kernel); 23] = [
             ("q4", &self.kernels.q4),
             ("q4p_b", &self.kernels.q4p_b),
             ("q4x4p_b", &self.kernels.q4x4p_b),
             ("gemm_q4_lds10", &self.kernels.gemm_q4_lds10),
             ("gemm_q6", &self.kernels.gemm_q6),
+            ("gemm_q6_pp", &self.kernels.gemm_q6_pp),
             ("q6", &self.kernels.q6),
             ("q4_b", &self.kernels.q4_b),
             ("q6_b", &self.kernels.q6_b),

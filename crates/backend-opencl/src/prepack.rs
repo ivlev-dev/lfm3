@@ -25,6 +25,38 @@ pub fn prepack_q4_k(src: &[u8]) -> Vec<u8> {
     out
 }
 
+pub const Q6K_BLOCK: usize = 210;
+
+pub fn prepack_q6_i8(src: &[u8], cols: usize) -> (Vec<i8>, Vec<f32>) {
+    assert!(cols % 256 == 0, "q6 cols {cols} not a multiple of 256");
+    let block_bytes = cols / 256 * Q6K_BLOCK;
+    assert!(
+        src.len() % block_bytes == 0,
+        "q6 bytes {} not a multiple of {block_bytes}",
+        src.len()
+    );
+    let rows = src.len() / block_bytes;
+    let groups = cols / 32;
+    let mut q = vec![0i8; groups * rows * 32];
+    let mut scales = vec![0f32; groups * rows];
+    for r in 0..rows {
+        let row = &src[r * block_bytes..(r + 1) * block_bytes];
+        let vals = lfm_quant::dequant_row_q6_k(row, cols).expect("q6 row dequant");
+        for g in 0..groups {
+            let chunk = &vals[g * 32..(g + 1) * 32];
+            let amax = chunk.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let sc = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            scales[g * rows + r] = sc;
+            let base = (g * rows + r) * 32;
+            for i in 0..32 {
+                q[base + i] = (chunk[i] * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+    }
+    (q, scales)
+}
+
 pub fn scale_min(blk: &[u8], j: usize) -> (u8, u8) {
     let q = &blk[4..16];
     let jm = j & 3;
@@ -154,5 +186,53 @@ mod tests {
     #[test]
     fn rejects_unaligned_input() {
         assert!(std::panic::catch_unwind(|| prepack_q4_k(&[0u8; 143])).is_err());
+    }
+
+    fn q6_block(seed: u8) -> Vec<u8> {
+        let mut b = vec![0u8; Q6K_BLOCK];
+        b[208..210].copy_from_slice(&0x3800u16.to_le_bytes());
+        for i in 0..16 {
+            b[192 + i] = (i as i8 - 8) as u8;
+        }
+        for i in 0..128 {
+            b[i] = (i as u8).wrapping_mul(37).wrapping_add(seed);
+        }
+        for i in 0..64 {
+            b[128 + i] = (i as u8).wrapping_mul(53).wrapping_add(seed);
+        }
+        b
+    }
+
+    #[test]
+    fn q6_i8_layout_and_precision() {
+        let cols = 512;
+        let mut src = Vec::new();
+        for seed in 0..2u8 {
+            src.extend_from_slice(&q6_block(seed * 11));
+            src.extend_from_slice(&q6_block(seed * 7 + 3));
+        }
+        let (q, sc) = prepack_q6_i8(&src, cols);
+        assert_eq!(q.len(), cols * 2);
+        assert_eq!(sc.len(), (cols / 32) * 2);
+        for r in 0..2 {
+            let row = &src[r * (cols / 256) * Q6K_BLOCK..(r + 1) * (cols / 256) * Q6K_BLOCK];
+            let vals = lfm_quant::dequant_row_q6_k(row, cols).unwrap();
+            for g in 0..cols / 32 {
+                let scale = sc[g * 2 + r];
+                for i in 0..32 {
+                    let deq = q[(g * 2 + r) * 32 + i] as f32 * scale;
+                    let want = vals[g * 32 + i];
+                    assert!(
+                        (deq - want).abs() <= scale * 0.5001 + 1e-4,
+                        "r {r} g {g} i {i}: {deq} vs {want} scale {scale}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q6_i8_rejects_unaligned_cols() {
+        assert!(std::panic::catch_unwind(|| prepack_q6_i8(&[0u8; 210], 128)).is_err());
     }
 }

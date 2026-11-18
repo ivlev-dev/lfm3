@@ -1067,6 +1067,7 @@ dependencies = [
  "lfm-domain",
  "lfm-gguf",
  "lfm-opencl",
+ "lfm-quant",
 ]
 
 [[package]]

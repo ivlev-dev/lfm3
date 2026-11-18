@@ -1796,3 +1796,99 @@ __kernel void gemm_q4_k_i8_lds11(__global const uchar *w, __global const char *x
         }
     }
 }
+
+__kernel void gemm_q6_i8_pp(__global const char *w, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+    uint lid = get_local_id(0);
+    uint tps = (ntok + 31u) / 32u;
+    uint gid = get_group_id(0);
+    uint row0 = (gid / tps) * 32u;
+    uint t0 = (gid % tps) * 32u;
+    if (row0 >= rows) {
+        return;
+    }
+    uint valid_rows = min(32u, rows - row0);
+    uint blocks = cols >> 8;
+    uint ngs = cols >> 5;
+    __local char wq[8 * 32 * 32];
+    __local float wqsc[8 * 32];
+    __local char xt[32 * 256];
+    uint lane = lid & 31u;
+    uint warp = lid >> 5;
+    uint tok_base = warp * 4u;
+    uint lrow = lid & 31u;
+    uint lg = lid >> 5;
+    uint xt_t = lid >> 3;
+    uint xt_off = (lid & 7u) * 32u;
+    float acc[4];
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        acc[j] = 0.0f;
+    }
+    for (uint b = 0u; b < blocks; ++b) {
+        {
+            uchar16 a = (uchar16)(0);
+            uchar16 c = (uchar16)(0);
+            if (lrow < valid_rows) {
+                __global const char *src = w + ((ulong)(b * 8u + lg) * rows + row0 + lrow) * 32u;
+                a = as_uchar16(vload16(0, src));
+                c = as_uchar16(vload16(0, src + 16u));
+            }
+            vstore16(a, 0, (__local uchar *)(wq + (lg * 32u + lrow) * 32u));
+            vstore16(c, 0, (__local uchar *)(wq + (lg * 32u + lrow) * 32u + 16u));
+        }
+        if (lid < 256u) {
+            float v = 0.0f;
+            if (lrow < valid_rows) {
+                v = wsc[(ulong)(b * 8u + lg) * rows + row0 + lrow];
+            }
+            wqsc[lg * 32u + lrow] = v;
+        }
+        {
+            uint token = t0 + xt_t;
+            char16 a = (char16)(0);
+            char16 c = (char16)(0);
+            if (token < ntok) {
+                __global const char *src = xq + (ulong)token * cols + (ulong)b * 256u + xt_off;
+                a = vload16(0, src);
+                c = vload16(0, src + 16u);
+            }
+            vstore16(a, 0, xt + xt_t * 256u + xt_off);
+            vstore16(c, 0, xt + xt_t * 256u + xt_off + 16u);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lane < valid_rows && t0 + tok_base < ntok) {
+            #pragma unroll
+            for (uint g = 0u; g < 8u; ++g) {
+                __local const char *wp = wq + (g * 32u + lane) * 32u;
+                char16 wa = vload16(0, wp);
+                char16 wb = vload16(0, wp + 16u);
+                float ws = wqsc[g * 32u + lane];
+                #pragma unroll
+                for (uint j = 0u; j < 4u; ++j) {
+                    uint t = tok_base + j;
+                    uint token = t0 + t;
+                    if (token < ntok) {
+                        __local const char *xp = xt + t * 256u + g * 32u;
+                        char16 xa = vload16(0, xp);
+                        char16 xb = vload16(0, xp + 16u);
+                        float d = (float)(dot(wa.s0123, xa.s0123) + dot(wa.s4567, xa.s4567)
+                                        + dot(wa.s89ab, xa.s89ab) + dot(wa.scdef, xa.scdef)
+                                        + dot(wb.s0123, xb.s0123) + dot(wb.s4567, xb.s4567)
+                                        + dot(wb.s89ab, xb.s89ab) + dot(wb.scdef, xb.scdef));
+                        acc[j] += xs[(ulong)token * ngs + (ulong)b * 8u + g] * ws * d;
+                    }
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lane < valid_rows) {
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            uint t = tok_base + j;
+            if (t0 + t < ntok) {
+                y[(ulong)(t0 + t) * rows + row0 + lane] = acc[j];
+            }
+        }
+    }
+}

@@ -111,9 +111,11 @@
    остался только TLS по требованию.
 5. **Цель — обогнать llama.cpp** (`benchmarks/llama-cpp.md`) на CPU и OpenCL:
    prefill и decode. Бейзлайн: CPU 142 pp512 / 23 tg128, Vulkan 1393 / 91.
-   Главный разрыв — prefill (GEMM): CPU ×50, OpenCL ×2.8 (512) / ×3.6 (8192);
-   decode OpenCL ×1.4. LDS-GEMM для Q4 готов (`gemm_q4_k_i8_lds11`, чанк 128):
-   prefill 512 — 502 tok/s, 8192 — 345. Vulkan/ROCm исключены из плана.
+   Главный разрыв — prefill (GEMM): CPU ×50, OpenCL ×2.4 (512) / ×3.2 (8192);
+   decode OpenCL ×1.4. Готовы LDS-GEMM для Q4 (`gemm_q4_k_i8_lds11`) и int8-предпак
+   для Q6 (`gemm_q6_i8_pp`): prefill 512 — 585 tok/s, 2048 — 527, 8192 — 380.
+   Дальше — flash-attention-тайлинг (на 8192 attention 45% времени).
+   Vulkan/ROCm исключены из плана.
 
 ## Железо и целевые показатели
 
