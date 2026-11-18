@@ -1,6 +1,6 @@
 # Android / ARMv7 (Sony Xperia Z3)
 
-> Код ARMv7 (CPU NEON + OpenCL 1.1) вынесен в отдельный репозиторий `lfm-legacy-armv7-opencl11`.
+> Код ARMv7 (CPU NEON + OpenCL 1.1) вынесен в отдельный репозиторий `lfm3-old-opencl`.
 > Здесь сохранены замеры платформы и выводы.
 
 Устройство: **Sony Xperia Z3** (LineageOS 11, Android 11, userdebug + root).
