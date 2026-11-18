@@ -978,7 +978,10 @@ impl GpuModel {
         if ntok > self.pb || force {
             if let (Weight::Q4(_), Some(p)) = (weight, packed) {
                 let tps = ntok.div_ceil(32);
-                let (rt, wg) = if self.gemm_q4 == "lds17" { (64usize, 512usize) } else { (32, 256) };
+                let (rt, wg) = match self.gemm_q4.as_str() {
+                    "lds17" => (64, 512),
+                    _ => (32, 256),
+                };
                 let grid = rows.div_ceil(rt) * tps * wg;
                 unsafe {
                     let kq = if self.gemm_q4 == "lds10" {
