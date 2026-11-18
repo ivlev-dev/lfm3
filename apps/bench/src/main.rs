@@ -3331,6 +3331,11 @@ fn gemm_launch(
 ) -> Result<(Vec<f32>, Stats)> {
     let nsg = (64 / gpu.caps.sub_group_size.max(1)).max(1);
     let (kernel, global, local) = match mode {
+        "lc" => (
+            Kernel::create(program, "gemm_q4_k_i8_lc")?,
+            rows.div_ceil(64) * ntok.div_ceil(64) * 128,
+            128usize,
+        ),
         "lds17" => (
             Kernel::create(program, "gemm_q4_k_i8_lds17")?,
             rows.div_ceil(64) * ntok.div_ceil(32) * 512,
