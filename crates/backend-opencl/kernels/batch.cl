@@ -1526,6 +1526,76 @@ __kernel void gemm_q4_k_i8_b8(__global const uchar *w, __global const char *xq, 
     }
 }
 
+__kernel void gemm_q6_i8_b8(__global const char *w, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+    uint lane = get_local_id(0);
+    uint gid = get_group_id(0);
+    uint row = gid * 64u + lane;
+    uint blocks = cols >> 8;
+    uint ngs = cols >> 5;
+    __local char xt[8 * 256];
+    uint st = lane >> 3;
+    uint sc = lane & 7u;
+    float acc[8];
+    #pragma unroll
+    for (uint t = 0u; t < 8u; ++t) {
+        acc[t] = 0.0f;
+    }
+    for (uint b = 0u; b < blocks; ++b) {
+        {
+            uint token = st;
+            char16 a = (char16)(0);
+            char16 c = (char16)(0);
+            if (token < ntok) {
+                __global const char *src = xq + (ulong)token * cols + (ulong)b * 256u + sc * 32u;
+                a = vload16(0, src);
+                c = vload16(0, src + 16u);
+            }
+            vstore16(a, 0, xt + token * 256u + sc * 32u);
+            vstore16(c, 0, xt + token * 256u + sc * 32u + 16u);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (row < rows) {
+            ulong gbase = (ulong)b * 8u;
+            #pragma unroll
+            for (uint g = 0u; g < 8u; ++g) {
+                __global const char *wp = w + ((gbase + g) * rows + row) * 32u;
+                uint4 wa = vload4(0, (__global const uint *)wp);
+                uint4 wb = vload4(0, (__global const uint *)(wp + 16u));
+                float ws = wsc[(gbase + g) * rows + row];
+                __local const uint *xp = (__local const uint *)(xt + g * 32u);
+                #pragma unroll
+                for (uint t = 0u; t < 8u; ++t) {
+                    if (t < ntok) {
+                        __local const uint *xq2 = (__local const uint *)(xt + t * 256u + g * 32u);
+                        uint4 xa = vload4(0, xq2);
+                        uint4 xb = vload4(0, xq2 + 4u);
+                        int dl = 0;
+                        dl = lfm_dot4(wa.x, xa.x, dl);
+                        dl = lfm_dot4(wa.y, xa.y, dl);
+                        dl = lfm_dot4(wa.z, xa.z, dl);
+                        dl = lfm_dot4(wa.w, xa.w, dl);
+                        dl = lfm_dot4(wb.x, xb.x, dl);
+                        dl = lfm_dot4(wb.y, xb.y, dl);
+                        dl = lfm_dot4(wb.z, xb.z, dl);
+                        dl = lfm_dot4(wb.w, xb.w, dl);
+                        acc[t] += ws * xs[(ulong)t * ngs + gbase + g] * (float)dl;
+                    }
+                }
+                (void)xp;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (row < rows) {
+        #pragma unroll
+        for (uint t = 0u; t < 8u; ++t) {
+            if (t < ntok) {
+                y[(ulong)t * rows + row] = acc[t];
+            }
+        }
+    }
+}
+
 __kernel void gemm_q4_k_i8_lds17(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
     uint lid = get_local_id(0);
     uint tps = (ntok + 31u) / 32u;

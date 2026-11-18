@@ -3357,6 +3357,38 @@ fn gemm_launch(
             rows.div_ceil(64) * 64,
             64usize,
         ),
+        "q6b8" => {
+            let (w8, wsc) = lfm_gpu::prepack::prepack_q6_i8(wbytes, cols);
+            let w8b = gpu.upload(&w8)?;
+            let wscb = gpu.upload(&wsc)?;
+            let kernel = Kernel::create(program, "gemm_q6_i8_b8")?;
+            let xqb = gpu.upload(xq)?;
+            let xsb = gpu.upload(xs)?;
+            let yb = gpu.alloc::<f32>(rows * ntok)?;
+            let launch = || -> Result<()> {
+                unsafe {
+                    gpu.launch(
+                        &kernel,
+                        rows.div_ceil(64) * 64,
+                        64,
+                        &[
+                            Arg::Mem(w8b.get()),
+                            Arg::Mem(wscb.get()),
+                            Arg::Mem(xqb.get()),
+                            Arg::Mem(xsb.get()),
+                            Arg::Mem(yb.get()),
+                            Arg::U32(rows as u32),
+                            Arg::U32(cols as u32),
+                            Arg::U32(ntok as u32),
+                        ],
+                    )?;
+                }
+                Ok(())
+            };
+            launch()?;
+            let st = gpu.bench(2, 10, launch)?;
+            return Ok((gpu.download(&yb, rows * ntok)?, st));
+        }
         "lds17" => (
             Kernel::create(program, "gemm_q4_k_i8_lds17")?,
             rows.div_ceil(64) * ntok.div_ceil(32) * 512,
@@ -3476,10 +3508,10 @@ fn gemm_cmp(
             .tensor(tensor)
             .ok_or_else(|| anyhow!("tensor {tensor} not found"))?
             .clone();
-        if mode != "q6" && info.ggml_type != lfm_gguf::GgmlType::Q4_K {
+        if mode != "q6" && mode != "q6b8" && info.ggml_type != lfm_gguf::GgmlType::Q4_K {
             return Err(anyhow!("mode {mode} needs Q4_K weights"));
         }
-        if mode == "q6" && info.ggml_type != lfm_gguf::GgmlType::Q6_K {
+        if (mode == "q6" || mode == "q6b8") && info.ggml_type != lfm_gguf::GgmlType::Q6_K {
             return Err(anyhow!("mode q6 needs Q6_K weights"));
         }
         let bytes = gguf.tensor_bytes(tensor)?;

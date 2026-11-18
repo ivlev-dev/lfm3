@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod pipeline;
-mod prepack;
+pub mod prepack;
 mod tp;
 mod ports;
 mod radix;
@@ -139,6 +139,7 @@ struct Kernels {
     q4x4p_b: Kernel,
     gemm_q4_lds17: Kernel,
     gemm_q4_b8: Kernel,
+    gemm_q6_b8: Kernel,
     gemm_q6: Kernel,
     gemm_q6_pp: Kernel,
     q6_b: Kernel,
@@ -782,6 +783,7 @@ impl GpuModel {
             q4x4p_b: Kernel::create(&program, "gemv_q4_k_i8_4p_b")?,
             gemm_q4_lds17: Kernel::create(&program, "gemm_q4_k_i8_lds17")?,
             gemm_q4_b8: Kernel::create(&program, "gemm_q4_k_i8_b8")?,
+            gemm_q6_b8: Kernel::create(&program, "gemm_q6_i8_b8")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
@@ -1078,6 +1080,26 @@ impl GpuModel {
             }
             if let Some((w8, wsc, _)) = self.prepacked_i8.get(name) {
                 if matches!(weight, Weight::Q6(_)) {
+                    if (5..=8).contains(&ntok) {
+                        unsafe {
+                            self.gpu.launch(
+                                &self.kernels.gemm_q6_b8,
+                                rows.div_ceil(64) * 64,
+                                64,
+                                &[
+                                    Arg::Mem(w8.get()),
+                                    Arg::Mem(wsc.get()),
+                                    Arg::Mem(xq.get()),
+                                    Arg::Mem(xs.get()),
+                                    Arg::Mem(y.get()),
+                                    Arg::U32(rows as u32),
+                                    Arg::U32(cols as u32),
+                                    Arg::U32(ntok as u32),
+                                ],
+                            )?;
+                        }
+                        return Ok(());
+                    }
                     let grid = rows.div_ceil(32) * ntok.div_ceil(32) * 256;
                     unsafe {
                         self.gpu.launch(
