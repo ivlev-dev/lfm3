@@ -1,5 +1,3 @@
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 
 #ifndef RGEMV
 #define RGEMV 5
@@ -167,10 +165,10 @@ __kernel void gemv_q4_k_i8(__global const uchar *w, __global const char *xq, __g
             char16 xh = vload16(0, xq + w_lo + 32u);
             float xs_lo = xs[w_lo >> 5];
             float xs_hi = xs[(w_lo + 32u) >> 5];
-            int sum_lo = (int)dot(xl.s0123, ones) + (int)dot(xl.s4567, ones)
-                       + (int)dot(xl.s89ab, ones) + (int)dot(xl.scdef, ones);
-            int sum_hi = (int)dot(xh.s0123, ones) + (int)dot(xh.s4567, ones)
-                       + (int)dot(xh.s89ab, ones) + (int)dot(xh.scdef, ones);
+            int sum_lo = (int)LFM_DOT(xl.s0123, ones) + (int)LFM_DOT(xl.s4567, ones)
+                       + (int)LFM_DOT(xl.s89ab, ones) + (int)LFM_DOT(xl.scdef, ones);
+            int sum_hi = (int)LFM_DOT(xh.s0123, ones) + (int)LFM_DOT(xh.s4567, ones)
+                       + (int)LFM_DOT(xh.s89ab, ones) + (int)LFM_DOT(xh.scdef, ones);
             #pragma unroll
             for (uint r = 0u; r < RGEMV; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 144ul;
@@ -186,10 +184,10 @@ __kernel void gemv_q4_k_i8(__global const uchar *w, __global const char *xq, __g
                 uint4 pk = vload4(0, (__global const uint *)(blk + 16u + u * 16u));
                 uint4 lo = pk & (uint4)(0x0F0F0F0Fu);
                 uint4 hi = (pk >> 4) & (uint4)(0x0F0F0F0Fu);
-                float dl = (float)(dot(as_char4(lo.x), xl.s0123) + dot(as_char4(lo.y), xl.s4567)
-                                 + dot(as_char4(lo.z), xl.s89ab) + dot(as_char4(lo.w), xl.scdef));
-                float dh = (float)(dot(as_char4(hi.x), xh.s0123) + dot(as_char4(hi.y), xh.s4567)
-                                 + dot(as_char4(hi.z), xh.s89ab) + dot(as_char4(hi.w), xh.scdef));
+                float dl = (float)(LFM_DOT(as_char4(lo.x), xl.s0123) + LFM_DOT(as_char4(lo.y), xl.s4567)
+                                 + LFM_DOT(as_char4(lo.z), xl.s89ab) + LFM_DOT(as_char4(lo.w), xl.scdef));
+                float dh = (float)(LFM_DOT(as_char4(hi.x), xh.s0123) + LFM_DOT(as_char4(hi.y), xh.s4567)
+                                 + LFM_DOT(as_char4(hi.z), xh.s89ab) + LFM_DOT(as_char4(hi.w), xh.scdef));
                 acc[r] += xs_lo * (dl * (d * (float)sl) - (float)sum_lo * (dmin * (float)ml));
                 acc[r] += xs_hi * (dh * (d * (float)sh) - (float)sum_hi * (dmin * (float)mh));
             }
@@ -261,10 +259,10 @@ __kernel void gemv_q6_k_i8(__global const uchar *w, __global const char *xq, __g
                 char4 q1 = as_char4((hi & 0x0F0F0F0Fu) | (((hb >> 2) & 0x03030303u) << 4)) - (char4)(32);
                 char4 q2 = as_char4(((lo >> 4) & 0x0F0F0F0Fu) | (((hb >> 4) & 0x03030303u) << 4)) - (char4)(32);
                 char4 q3 = as_char4(((hi >> 4) & 0x0F0F0F0Fu) | (((hb >> 6) & 0x03030303u) << 4)) - (char4)(32);
-                acc[r] += xs0 * s0 * (float)dot(q0, x0);
-                acc[r] += xs1 * s1 * (float)dot(q1, x1);
-                acc[r] += xs2 * s2 * (float)dot(q2, x2);
-                acc[r] += xs3 * s3 * (float)dot(q3, x3);
+                acc[r] += xs0 * s0 * (float)LFM_DOT(q0, x0);
+                acc[r] += xs1 * s1 * (float)LFM_DOT(q1, x1);
+                acc[r] += xs2 * s2 * (float)LFM_DOT(q2, x2);
+                acc[r] += xs3 * s3 * (float)LFM_DOT(q3, x3);
             }
         }
     }

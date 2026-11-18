@@ -10,6 +10,8 @@ use std::time::Instant;
 const BENCH_CL: &str = include_str!("../kernels/bench.cl");
 const GEMV_CL: &str = include_str!("../kernels/gemv.cl");
 const LFM_KERNELS: &str = concat!(
+    include_str!("../../../crates/backend-opencl/kernels/common.cl"),
+    "\n",
     include_str!("../../../crates/backend-opencl/kernels/decode.cl"),
     "\n",
     include_str!("../../../crates/backend-opencl/kernels/batch.cl")
@@ -215,6 +217,8 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value_t = 4)]
         check_rows: usize,
+        #[arg(long)]
+        spv: Option<PathBuf>,
     },
     VulkanInfo,
     VulkanGemv {
@@ -429,7 +433,8 @@ fn main() -> Result<()> {
             ntok,
             mode,
             check_rows,
-        } => gemm_cmp(&model, &tensor, ntok, &mode, check_rows),
+            spv,
+        } => gemm_cmp(&model, &tensor, ntok, &mode, check_rows, spv.as_ref()),
         Cmd::VulkanInfo => vulkan_info(),
         Cmd::VulkanGemv {
             model,
@@ -3352,6 +3357,16 @@ fn gemm_launch(
             rows.div_ceil(64) * ntok.div_ceil(32) * 512,
             512usize,
         ),
+        "lds22" => (
+            Kernel::create(program, "gemm_q4_k_i8_lds22")?,
+            rows.div_ceil(64) * ntok.div_ceil(64) * 256,
+            256usize,
+        ),
+        "lds21" => (
+            Kernel::create(program, "gemm_q4_k_i8_lds21")?,
+            rows.div_ceil(64) * ntok.div_ceil(32) * 512,
+            512usize,
+        ),
         "lds11" => (
             Kernel::create(program, "gemm_q4_k_i8_lds11")?,
             rows.div_ceil(32) * ntok.div_ceil(32) * 256,
@@ -3467,10 +3482,18 @@ fn gemm_cmp(
     ntok: usize,
     mode: &str,
     check_rows: usize,
+    spv: Option<&PathBuf>,
 ) -> Result<()> {
     let gguf = lfm_gguf::GgufFile::open(model)?;
     let gpu = Gpu::open(0)?;
-    let program = gpu.build(LFM_KERNELS, "-cl-std=CL3.0 -DRGEMV=4 -DRGEMV_B=64 -DPB=6")?;
+    let program = match spv {
+        Some(path) => gpu.build_il(&std::fs::read(path)?)?,
+        None => {
+            let opts = std::env::var("LFM_BUILD_OPTS")
+                .unwrap_or_else(|_| "-cl-std=CL3.0 -DRGEMV=4 -DRGEMV_B=64 -DPB=6".into());
+            gpu.build(LFM_KERNELS, &opts)?
+        }
+    };
     if tensor != "*" {
         let info = gguf
             .tensor(tensor)

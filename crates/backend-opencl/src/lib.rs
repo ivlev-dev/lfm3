@@ -41,6 +41,8 @@ pub fn reuse_cap(prompt_len: usize) -> usize {
 }
 
 const KERNELS: &str = concat!(
+    include_str!("../kernels/common.cl"),
+    "\n",
     include_str!("../kernels/decode.cl"),
     "\n",
     include_str!("../kernels/batch.cl")

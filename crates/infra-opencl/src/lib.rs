@@ -63,7 +63,20 @@ impl Gpu {
     }
 
     pub fn open_with(index: usize, profiling: bool) -> Result<Self> {
-        let ids = get_all_devices(CL_DEVICE_TYPE_ALL).context("clGetDeviceIDs")?;
+        let ids = match std::env::var("LFM_PLATFORM") {
+            Ok(pat) if !pat.is_empty() => {
+                let mut out = Vec::new();
+                for plat in opencl3::platform::get_platforms().context("clGetPlatformIDs")? {
+                    let name = plat.name().unwrap_or_default();
+                    let ver = plat.version().unwrap_or_default();
+                    if name.contains(&pat) || ver.contains(&pat) {
+                        out.extend(plat.get_devices(CL_DEVICE_TYPE_ALL).unwrap_or_default());
+                    }
+                }
+                out
+            }
+            _ => get_all_devices(CL_DEVICE_TYPE_ALL).context("clGetDeviceIDs")?,
+        };
         let id = *ids
             .get(index)
             .ok_or_else(|| anyhow!("no OpenCL device at index {index}, found {}", ids.len()))?;
@@ -115,6 +128,16 @@ impl Gpu {
     pub fn build(&self, source: &str, options: &str) -> Result<Program> {
         Program::create_and_build_from_source(&self.context, source, options)
             .map_err(|e| anyhow!("build failed: {e}"))
+    }
+
+    pub fn build_il(&self, il: &[u8]) -> Result<Program> {
+        let mut program = Program::create_from_il(&self.context, il)
+            .map_err(|e| anyhow!("clCreateProgramWithIL: {e}"))?;
+        let device = self.device.id();
+        program
+            .build(&[device], "")
+            .map_err(|e| anyhow!("build IL failed: {e}"))?;
+        Ok(program)
     }
 
     pub fn alloc<T>(&self, len: usize) -> Result<Buffer<T>> {
@@ -269,8 +292,11 @@ impl Gpu {
 const PROBE_SRC: &str = "__kernel void probe_sgs(__global uint *out) { out[0] = get_sub_group_size(); }";
 
 fn probe_sub_group_size(context: &Context, queue: &CommandQueue) -> Result<usize> {
-    let program = Program::create_and_build_from_source(context, PROBE_SRC, "-cl-std=CL3.0")
-        .map_err(|e| anyhow!("probe build failed: {e}"))?;
+    let program = match Program::create_and_build_from_source(context, PROBE_SRC, "-cl-std=CL3.0") {
+        Ok(p) => p,
+        Err(_) => Program::create_and_build_from_source(context, PROBE_SRC, "-cl-std=CL2.0")
+            .map_err(|e| anyhow!("probe build failed: {e}"))?,
+    };
     let kernel = Kernel::create(&program, "probe_sgs")?;
     let mut buffer: Buffer<u32> =
         unsafe { Buffer::create(context, CL_MEM_READ_WRITE, 256, std::ptr::null_mut())? };

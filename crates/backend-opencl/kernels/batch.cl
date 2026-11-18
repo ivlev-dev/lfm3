@@ -1,5 +1,3 @@
-#pragma OPENCL EXTENSION cl_khr_fp16 : enable
-#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 
 #ifndef RGEMV_B
 #define RGEMV_B 5
@@ -12,23 +10,6 @@
 #ifndef PB
 #define PB 4
 #endif
-
-#if defined(__AMDGCN__)
-static inline int lfm_dot4(uint a, uint b, int c) {
-    return (int)__builtin_amdgcn_sdot4((int)a, (int)b, c, 0);
-}
-static inline int lfm_sum4(uint a, int c) {
-    return (int)__builtin_amdgcn_sdot4((int)a, 0x01010101, c, 0);
-}
-#else
-static inline int lfm_dot4(uint a, uint b, int c) {
-    return c + (int)dot(as_char4(a), as_char4(b));
-}
-static inline int lfm_sum4(uint a, int c) {
-    return c + (int)dot(as_char4(a), (char4)(1));
-}
-#endif
-
 __kernel void embed_q6k_b(__global const uchar *w, __global float *out, __global const uint *tokens, uint ntok, uint cols) {
     uint i = get_global_id(0);
     uint total = ntok * cols;
@@ -304,10 +285,10 @@ __kernel void gemv_q4_k_i8_b(__global const uchar *w, __global const char *xq, _
                     xh[t] = vload16(0, xq + (ulong)t * cols + w_lo + 32u);
                     xsl[t] = xs[t * ngs + ski];
                     xsh[t] = xs[t * ngs + ski2];
-                    suml[t] = (int)dot(xl[t].s0123, ones) + (int)dot(xl[t].s4567, ones)
-                            + (int)dot(xl[t].s89ab, ones) + (int)dot(xl[t].scdef, ones);
-                    sumh[t] = (int)dot(xh[t].s0123, ones) + (int)dot(xh[t].s4567, ones)
-                            + (int)dot(xh[t].s89ab, ones) + (int)dot(xh[t].scdef, ones);
+                    suml[t] = (int)LFM_DOT(xl[t].s0123, ones) + (int)LFM_DOT(xl[t].s4567, ones)
+                            + (int)LFM_DOT(xl[t].s89ab, ones) + (int)LFM_DOT(xl[t].scdef, ones);
+                    sumh[t] = (int)LFM_DOT(xh[t].s0123, ones) + (int)LFM_DOT(xh[t].s4567, ones)
+                            + (int)LFM_DOT(xh[t].s89ab, ones) + (int)LFM_DOT(xh[t].scdef, ones);
                 }
             }
             #pragma unroll
@@ -338,10 +319,10 @@ __kernel void gemv_q4_k_i8_b(__global const uchar *w, __global const char *xq, _
                 #pragma unroll
                 for (uint t = 0u; t < PB; ++t) {
                     if (t >= tok0 && t < ntok) {
-                        float dl = (float)(dot(l0, xl[t].s0123) + dot(l1, xl[t].s4567)
-                                         + dot(l2, xl[t].s89ab) + dot(l3, xl[t].scdef));
-                        float dh = (float)(dot(h0, xh[t].s0123) + dot(h1, xh[t].s4567)
-                                         + dot(h2, xh[t].s89ab) + dot(h3, xh[t].scdef));
+                        float dl = (float)(LFM_DOT(l0, xl[t].s0123) + LFM_DOT(l1, xl[t].s4567)
+                                         + LFM_DOT(l2, xl[t].s89ab) + LFM_DOT(l3, xl[t].scdef));
+                        float dh = (float)(LFM_DOT(h0, xh[t].s0123) + LFM_DOT(h1, xh[t].s4567)
+                                         + LFM_DOT(h2, xh[t].s89ab) + LFM_DOT(h3, xh[t].scdef));
                         acc[t][r] += xsl[t] * (dl * dl_coef - (float)suml[t] * ml_coef);
                         acc[t][r] += xsh[t] * (dh * dh_coef - (float)sumh[t] * mh_coef);
                     }
@@ -417,10 +398,10 @@ __kernel void gemv_q4_k_i8_p_b(__global const uchar *w, __global const char *xq,
                     xh[t] = vload16(0, xq + (ulong)t * cols + w_lo + 32u);
                     xsl[t] = xs[t * ngs + ski];
                     xsh[t] = xs[t * ngs + ski2];
-                    suml[t] = (int)dot(xl[t].s0123, ones) + (int)dot(xl[t].s4567, ones)
-                            + (int)dot(xl[t].s89ab, ones) + (int)dot(xl[t].scdef, ones);
-                    sumh[t] = (int)dot(xh[t].s0123, ones) + (int)dot(xh[t].s4567, ones)
-                            + (int)dot(xh[t].s89ab, ones) + (int)dot(xh[t].scdef, ones);
+                    suml[t] = (int)LFM_DOT(xl[t].s0123, ones) + (int)LFM_DOT(xl[t].s4567, ones)
+                            + (int)LFM_DOT(xl[t].s89ab, ones) + (int)LFM_DOT(xl[t].scdef, ones);
+                    sumh[t] = (int)LFM_DOT(xh[t].s0123, ones) + (int)LFM_DOT(xh[t].s4567, ones)
+                            + (int)LFM_DOT(xh[t].s89ab, ones) + (int)LFM_DOT(xh[t].scdef, ones);
                 }
             }
             #pragma unroll
@@ -445,10 +426,10 @@ __kernel void gemv_q4_k_i8_p_b(__global const uchar *w, __global const char *xq,
                 #pragma unroll
                 for (uint t = 0u; t < PB; ++t) {
                     if (t >= tok0 && t < ntok) {
-                        float dl = (float)(dot(l0, xl[t].s0123) + dot(l1, xl[t].s4567)
-                                         + dot(l2, xl[t].s89ab) + dot(l3, xl[t].scdef));
-                        float dh = (float)(dot(h0, xh[t].s0123) + dot(h1, xh[t].s4567)
-                                         + dot(h2, xh[t].s89ab) + dot(h3, xh[t].scdef));
+                        float dl = (float)(LFM_DOT(l0, xl[t].s0123) + LFM_DOT(l1, xl[t].s4567)
+                                         + LFM_DOT(l2, xl[t].s89ab) + LFM_DOT(l3, xl[t].scdef));
+                        float dh = (float)(LFM_DOT(h0, xh[t].s0123) + LFM_DOT(h1, xh[t].s4567)
+                                         + LFM_DOT(h2, xh[t].s89ab) + LFM_DOT(h3, xh[t].scdef));
                         acc[t][r] += xsl[t] * (dl * dl_coef - (float)suml[t] * ml_coef);
                         acc[t][r] += xsh[t] * (dh * dh_coef - (float)sumh[t] * mh_coef);
                     }
@@ -560,10 +541,10 @@ __kernel void gemv_q6_k_i8_b(__global const uchar *w, __global const char *xq, _
                 #pragma unroll
                 for (uint t = 0u; t < PB; ++t) {
                     if (t >= tok0 && t < ntok) {
-                        acc[t][r] += xs0[t] * s0 * (float)dot(q0, x0[t]);
-                        acc[t][r] += xs1[t] * s1 * (float)dot(q1, x1[t]);
-                        acc[t][r] += xs2[t] * s2 * (float)dot(q2, x2[t]);
-                        acc[t][r] += xs3[t] * s3 * (float)dot(q3, x3[t]);
+                        acc[t][r] += xs0[t] * s0 * (float)LFM_DOT(q0, x0[t]);
+                        acc[t][r] += xs1[t] * s1 * (float)LFM_DOT(q1, x1[t]);
+                        acc[t][r] += xs2[t] * s2 * (float)LFM_DOT(q2, x2[t]);
+                        acc[t][r] += xs3[t] * s3 * (float)LFM_DOT(q3, x3[t]);
                     }
                 }
             }
@@ -1190,10 +1171,10 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
                     xh[t] = vload16(0, xq + (ulong)t * cols + w_lo + 32u);
                     xsl[t] = xs[t * ngs + ski];
                     xsh[t] = xs[t * ngs + ski2];
-                    suml[t] = (int)dot(xl[t].s0123, ones) + (int)dot(xl[t].s4567, ones)
-                            + (int)dot(xl[t].s89ab, ones) + (int)dot(xl[t].scdef, ones);
-                    sumh[t] = (int)dot(xh[t].s0123, ones) + (int)dot(xh[t].s4567, ones)
-                            + (int)dot(xh[t].s89ab, ones) + (int)dot(xh[t].scdef, ones);
+                    suml[t] = (int)LFM_DOT(xl[t].s0123, ones) + (int)LFM_DOT(xl[t].s4567, ones)
+                            + (int)LFM_DOT(xl[t].s89ab, ones) + (int)LFM_DOT(xl[t].scdef, ones);
+                    sumh[t] = (int)LFM_DOT(xh[t].s0123, ones) + (int)LFM_DOT(xh[t].s4567, ones)
+                            + (int)LFM_DOT(xh[t].s89ab, ones) + (int)LFM_DOT(xh[t].scdef, ones);
                 }
             }
             #pragma unroll
@@ -1218,10 +1199,10 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
                 #pragma unroll
                 for (uint t = 0u; t < PB; ++t) {
                     if (t < ntok) {
-                        float dl = (float)(dot(l0, xl[t].s0123) + dot(l1, xl[t].s4567)
-                                         + dot(l2, xl[t].s89ab) + dot(l3, xl[t].scdef));
-                        float dh = (float)(dot(h0, xh[t].s0123) + dot(h1, xh[t].s4567)
-                                         + dot(h2, xh[t].s89ab) + dot(h3, xh[t].scdef));
+                        float dl = (float)(LFM_DOT(l0, xl[t].s0123) + LFM_DOT(l1, xl[t].s4567)
+                                         + LFM_DOT(l2, xl[t].s89ab) + LFM_DOT(l3, xl[t].scdef));
+                        float dh = (float)(LFM_DOT(h0, xh[t].s0123) + LFM_DOT(h1, xh[t].s4567)
+                                         + LFM_DOT(h2, xh[t].s89ab) + LFM_DOT(h3, xh[t].scdef));
                         acc[t][r] += xsl[t] * (dl * dl_coef - (float)suml[t] * ml_coef);
                         acc[t][r] += xsh[t] * (dh * dh_coef - (float)sumh[t] * mh_coef);
                     }
@@ -1340,10 +1321,10 @@ __kernel void gemm_q6_k_i8(__global const uchar *w, __global const char *xq, __g
                         float xs3 = xs[t * ngs + xg + 3u];
                         #pragma unroll
                         for (uint r = 0u; r < 2u; ++r) {
-                            acc[r][tt] += xs0 * s0[r] * (float)dot(q0[r], x0);
-                            acc[r][tt] += xs1 * s1[r] * (float)dot(q1[r], x1);
-                            acc[r][tt] += xs2 * s2[r] * (float)dot(q2[r], x2);
-                            acc[r][tt] += xs3 * s3[r] * (float)dot(q3[r], x3);
+                            acc[r][tt] += xs0 * s0[r] * (float)LFM_DOT(q0[r], x0);
+                            acc[r][tt] += xs1 * s1[r] * (float)LFM_DOT(q1[r], x1);
+                            acc[r][tt] += xs2 * s2[r] * (float)LFM_DOT(q2[r], x2);
+                            acc[r][tt] += xs3 * s3[r] * (float)LFM_DOT(q3[r], x3);
                         }
                     }
                 }
@@ -1484,22 +1465,22 @@ __kernel void gemm_q4_k_i8_lds10(__global const uchar *w, __global const char *x
                         char16 xl1 = vload16(0, xp + 16u);
                         char16 xh0 = vload16(0, xp + 32u);
                         char16 xh1 = vload16(0, xp + 48u);
-                        float dl = (float)(dot(l0, xl0.s0123) + dot(l1, xl0.s4567)
-                                         + dot(l2, xl0.s89ab) + dot(l3, xl0.scdef)
-                                         + dot(l4, xl1.s0123) + dot(l5, xl1.s4567)
-                                         + dot(l6, xl1.s89ab) + dot(l7, xl1.scdef));
-                        float dh = (float)(dot(h0, xh0.s0123) + dot(h1, xh0.s4567)
-                                         + dot(h2, xh0.s89ab) + dot(h3, xh0.scdef)
-                                         + dot(h4, xh1.s0123) + dot(h5, xh1.s4567)
-                                         + dot(h6, xh1.s89ab) + dot(h7, xh1.scdef));
-                        int suml = (int)dot(xl0.s0123, ones) + (int)dot(xl0.s4567, ones)
-                                 + (int)dot(xl0.s89ab, ones) + (int)dot(xl0.scdef, ones)
-                                 + (int)dot(xl1.s0123, ones) + (int)dot(xl1.s4567, ones)
-                                 + (int)dot(xl1.s89ab, ones) + (int)dot(xl1.scdef, ones);
-                        int sumh = (int)dot(xh0.s0123, ones) + (int)dot(xh0.s4567, ones)
-                                 + (int)dot(xh0.s89ab, ones) + (int)dot(xh0.scdef, ones)
-                                 + (int)dot(xh1.s0123, ones) + (int)dot(xh1.s4567, ones)
-                                 + (int)dot(xh1.s89ab, ones) + (int)dot(xh1.scdef, ones);
+                        float dl = (float)(LFM_DOT(l0, xl0.s0123) + LFM_DOT(l1, xl0.s4567)
+                                         + LFM_DOT(l2, xl0.s89ab) + LFM_DOT(l3, xl0.scdef)
+                                         + LFM_DOT(l4, xl1.s0123) + LFM_DOT(l5, xl1.s4567)
+                                         + LFM_DOT(l6, xl1.s89ab) + LFM_DOT(l7, xl1.scdef));
+                        float dh = (float)(LFM_DOT(h0, xh0.s0123) + LFM_DOT(h1, xh0.s4567)
+                                         + LFM_DOT(h2, xh0.s89ab) + LFM_DOT(h3, xh0.scdef)
+                                         + LFM_DOT(h4, xh1.s0123) + LFM_DOT(h5, xh1.s4567)
+                                         + LFM_DOT(h6, xh1.s89ab) + LFM_DOT(h7, xh1.scdef));
+                        int suml = (int)LFM_DOT(xl0.s0123, ones) + (int)LFM_DOT(xl0.s4567, ones)
+                                 + (int)LFM_DOT(xl0.s89ab, ones) + (int)LFM_DOT(xl0.scdef, ones)
+                                 + (int)LFM_DOT(xl1.s0123, ones) + (int)LFM_DOT(xl1.s4567, ones)
+                                 + (int)LFM_DOT(xl1.s89ab, ones) + (int)LFM_DOT(xl1.scdef, ones);
+                        int sumh = (int)LFM_DOT(xh0.s0123, ones) + (int)LFM_DOT(xh0.s4567, ones)
+                                 + (int)LFM_DOT(xh0.s89ab, ones) + (int)LFM_DOT(xh0.scdef, ones)
+                                 + (int)LFM_DOT(xh1.s0123, ones) + (int)LFM_DOT(xh1.s4567, ones)
+                                 + (int)LFM_DOT(xh1.s89ab, ones) + (int)LFM_DOT(xh1.scdef, ones);
                         ulong g = (ulong)token * ngs + (ulong)b * 8u + 2u * q;
                         acc[j] += xs[g] * (dl * scl - (float)suml * mnl);
                         acc[j] += xs[g + 1u] * (dh * sch - (float)sumh * mnh);
@@ -1591,10 +1572,10 @@ __kernel void gemm_q4_k_i8_lds11(__global const uchar *w, __global const char *x
             }
             vstore16(a, 0, xt + xt_t * 256u + xt_off);
             vstore16(c, 0, xt + xt_t * 256u + xt_off + 16u);
-            int sx = (int)dot(a.s0123, ones) + (int)dot(a.s4567, ones)
-                   + (int)dot(a.s89ab, ones) + (int)dot(a.scdef, ones)
-                   + (int)dot(c.s0123, ones) + (int)dot(c.s4567, ones)
-                   + (int)dot(c.s89ab, ones) + (int)dot(c.scdef, ones);
+            int sx = (int)LFM_DOT(a.s0123, ones) + (int)LFM_DOT(a.s4567, ones)
+                   + (int)LFM_DOT(a.s89ab, ones) + (int)LFM_DOT(a.scdef, ones)
+                   + (int)LFM_DOT(c.s0123, ones) + (int)LFM_DOT(c.s4567, ones)
+                   + (int)LFM_DOT(c.s89ab, ones) + (int)LFM_DOT(c.scdef, ones);
             xsum[xt_t * 8u + (xt_off >> 5)] = sx;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -1637,14 +1618,14 @@ __kernel void gemm_q4_k_i8_lds11(__global const uchar *w, __global const char *x
                         char16 xl1 = vload16(0, xp + 16u);
                         char16 xh0 = vload16(0, xp + 32u);
                         char16 xh1 = vload16(0, xp + 48u);
-                        float dl = (float)(dot(l0, xl0.s0123) + dot(l1, xl0.s4567)
-                                         + dot(l2, xl0.s89ab) + dot(l3, xl0.scdef)
-                                         + dot(l4, xl1.s0123) + dot(l5, xl1.s4567)
-                                         + dot(l6, xl1.s89ab) + dot(l7, xl1.scdef));
-                        float dh = (float)(dot(h0, xh0.s0123) + dot(h1, xh0.s4567)
-                                         + dot(h2, xh0.s89ab) + dot(h3, xh0.scdef)
-                                         + dot(h4, xh1.s0123) + dot(h5, xh1.s4567)
-                                         + dot(h6, xh1.s89ab) + dot(h7, xh1.scdef));
+                        float dl = (float)(LFM_DOT(l0, xl0.s0123) + LFM_DOT(l1, xl0.s4567)
+                                         + LFM_DOT(l2, xl0.s89ab) + LFM_DOT(l3, xl0.scdef)
+                                         + LFM_DOT(l4, xl1.s0123) + LFM_DOT(l5, xl1.s4567)
+                                         + LFM_DOT(l6, xl1.s89ab) + LFM_DOT(l7, xl1.scdef));
+                        float dh = (float)(LFM_DOT(h0, xh0.s0123) + LFM_DOT(h1, xh0.s4567)
+                                         + LFM_DOT(h2, xh0.s89ab) + LFM_DOT(h3, xh0.scdef)
+                                         + LFM_DOT(h4, xh1.s0123) + LFM_DOT(h5, xh1.s4567)
+                                         + LFM_DOT(h6, xh1.s89ab) + LFM_DOT(h7, xh1.scdef));
                         int suml = xsum[t * 8u + 2u * q];
                         int sumh = xsum[t * 8u + 2u * q + 1u];
                         ulong g = (ulong)token * ngs + (ulong)b * 8u + 2u * q;
@@ -1739,10 +1720,10 @@ __kernel void gemm_q4_k_i8_lds11(__global const uchar *w, __global const char *x
                         __local const char *xp = xt + t * 256u + g * 32u;
                         char16 xa = vload16(0, xp);
                         char16 xb = vload16(0, xp + 16u);
-                        float d = (float)(dot(wa.s0123, xa.s0123) + dot(wa.s4567, xa.s4567)
-                                        + dot(wa.s89ab, xa.s89ab) + dot(wa.scdef, xa.scdef)
-                                        + dot(wb.s0123, xb.s0123) + dot(wb.s4567, xb.s4567)
-                                        + dot(wb.s89ab, xb.s89ab) + dot(wb.scdef, xb.scdef));
+                        float d = (float)(LFM_DOT(wa.s0123, xa.s0123) + LFM_DOT(wa.s4567, xa.s4567)
+                                        + LFM_DOT(wa.s89ab, xa.s89ab) + LFM_DOT(wa.scdef, xa.scdef)
+                                        + LFM_DOT(wb.s0123, xb.s0123) + LFM_DOT(wb.s4567, xb.s4567)
+                                        + LFM_DOT(wb.s89ab, xb.s89ab) + LFM_DOT(wb.scdef, xb.scdef));
                         acc[j] += xs[(ulong)token * ngs + (ulong)b * 8u + g] * ws * d;
                     }
                 }
@@ -1978,10 +1959,10 @@ __kernel void gemm_q4_k_i8_lds17(__global const uchar *w, __global const char *x
                 char16 c = vload16(0, xq + (ulong)token * cols + (ulong)b * 256u + off + 16u);
                 vstore16(a, 0, xt + (lid >> 3) * 256u + off);
                 vstore16(c, 0, xt + (lid >> 3) * 256u + off + 16u);
-                int sx = (int)dot(a.s0123, ones) + (int)dot(a.s4567, ones)
-                       + (int)dot(a.s89ab, ones) + (int)dot(a.scdef, ones)
-                       + (int)dot(c.s0123, ones) + (int)dot(c.s4567, ones)
-                       + (int)dot(c.s89ab, ones) + (int)dot(c.scdef, ones);
+                int sx = (int)LFM_DOT(a.s0123, ones) + (int)LFM_DOT(a.s4567, ones)
+                       + (int)LFM_DOT(a.s89ab, ones) + (int)LFM_DOT(a.scdef, ones)
+                       + (int)LFM_DOT(c.s0123, ones) + (int)LFM_DOT(c.s4567, ones)
+                       + (int)LFM_DOT(c.s89ab, ones) + (int)LFM_DOT(c.scdef, ones);
                 xsum[(lid >> 3) * 8u + (off >> 5)] = sx;
             }
             (void)v;
@@ -2014,13 +1995,147 @@ __kernel void gemm_q4_k_i8_lds17(__global const uchar *w, __global const char *x
                         char16 xh1 = vload16(0, xp + 48u);
                         int suml = xsum[t * 8u + 2u * q];
                         int sumh = xsum[t * 8u + 2u * q + 1u];
-                        float dl = (float)(dot(l0, xl0.s0123) + dot(l1, xl0.s4567) + dot(l2, xl0.s89ab) + dot(l3, xl0.scdef)
-                                         + dot(l4, xl1.s0123) + dot(l5, xl1.s4567) + dot(l6, xl1.s89ab) + dot(l7, xl1.scdef));
-                        float dh = (float)(dot(h0, xh0.s0123) + dot(h1, xh0.s4567) + dot(h2, xh0.s89ab) + dot(h3, xh0.scdef)
-                                         + dot(h4, xh1.s0123) + dot(h5, xh1.s4567) + dot(h6, xh1.s89ab) + dot(h7, xh1.scdef));
+                        float dl = (float)(LFM_DOT(l0, xl0.s0123) + LFM_DOT(l1, xl0.s4567) + LFM_DOT(l2, xl0.s89ab) + LFM_DOT(l3, xl0.scdef)
+                                         + LFM_DOT(l4, xl1.s0123) + LFM_DOT(l5, xl1.s4567) + LFM_DOT(l6, xl1.s89ab) + LFM_DOT(l7, xl1.scdef));
+                        float dh = (float)(LFM_DOT(h0, xh0.s0123) + LFM_DOT(h1, xh0.s4567) + LFM_DOT(h2, xh0.s89ab) + LFM_DOT(h3, xh0.scdef)
+                                         + LFM_DOT(h4, xh1.s0123) + LFM_DOT(h5, xh1.s4567) + LFM_DOT(h6, xh1.s89ab) + LFM_DOT(h7, xh1.scdef));
                         ulong g = (ulong)token * ngs + (ulong)b * 8u + 2u * q;
                         acc[j] += xs[g] * (dl * scl - (float)suml * mnl);
                         acc[j] += xs[g + 1u] * (dh * sch - (float)sumh * mnh);
+                    }
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (rloc < valid_rows) {
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            uint t = tok_base + j;
+            if (t0 + t < ntok) {
+                y[(ulong)(t0 + t) * rows + row0 + rloc] = acc[j];
+            }
+        }
+    }
+}
+
+
+__kernel void gemm_q4_k_i8_lds21(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+    uint lid = get_local_id(0);
+    uint tps = (ntok + 31u) / 32u;
+    uint gid = get_group_id(0);
+    uint row0 = (gid / tps) * 64u;
+    uint t0 = (gid % tps) * 32u;
+    if (row0 >= rows) {
+        return;
+    }
+    uint valid_rows = min(64u, rows - row0);
+    uint blocks = cols >> 8;
+    uint ngs = cols >> 5;
+    ulong row_stride = (ulong)blocks * 148ul;
+    __local uint wq[8 * 64 * 4];
+    __local uchar ws[64 * 16];
+    __local uchar wh[64 * 4];
+    __local char xt[32 * 256];
+    __local int xsum[32 * 8];
+    const char4 ones = (char4)(1);
+    const uint M = 0x0F0F0F0Fu;
+    uint lane = lid & 31u;
+    uint warp = lid >> 5;
+    uint whalf = warp >> 3;
+    uint tok_base = (warp & 7u) * 4u;
+    uint rloc = whalf * 32u + lane;
+    float acc[4];
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        acc[j] = 0.0f;
+    }
+    for (uint b = 0u; b < blocks; ++b) {
+        {
+            uint c = lid >> 6;
+            uint rr = lid & 63u;
+            uint qoff = (c >> 1) * 32u + (c & 1u) * 16u;
+            uint4 v = (uint4)(0);
+            if (rr < valid_rows) {
+                __global const uchar *src = w + (ulong)(row0 + rr) * row_stride + (ulong)b * 148ul + 20ul + qoff;
+                v = vload4(0, (__global const uint *)src);
+            }
+            vstore4(v, 0, wq + (c * 64u + rr) * 4u);
+        }
+        {
+            uint si = lid * 2u;
+            uint r = si >> 4;
+            uint off = si & 15u;
+            uchar2 v = (uchar2)(0);
+            if (r < valid_rows) {
+                v = vload2(0, w + (ulong)(row0 + r) * row_stride + (ulong)b * 148ul + 4ul + off);
+            }
+            vstore2(v, 0, ws + r * 16u + off);
+        }
+        if (lid < 256u) {
+            uint r = lid >> 2;
+            uint off = lid & 3u;
+            uchar v = 0u;
+            if (r < valid_rows) {
+                v = w[(ulong)(row0 + r) * row_stride + (ulong)b * 148ul + off];
+            }
+            wh[lid] = v;
+        }
+        {
+            uint4 v = (uint4)(0);
+            if (lid < 256u) {
+                uint token = t0 + (lid >> 3);
+                uint off = (lid & 7u) * 32u;
+                char16 a = vload16(0, xq + (ulong)token * cols + (ulong)b * 256u + off);
+                char16 c = vload16(0, xq + (ulong)token * cols + (ulong)b * 256u + off + 16u);
+                vstore16(a, 0, xt + (lid >> 3) * 256u + off);
+                vstore16(c, 0, xt + (lid >> 3) * 256u + off + 16u);
+                int sx = 0;
+                sx = lfm_sum4(as_uint(a.s0123), sx); sx = lfm_sum4(as_uint(a.s4567), sx);
+                sx = lfm_sum4(as_uint(a.s89ab), sx); sx = lfm_sum4(as_uint(a.scdef), sx);
+                sx = lfm_sum4(as_uint(c.s0123), sx); sx = lfm_sum4(as_uint(c.s4567), sx);
+                sx = lfm_sum4(as_uint(c.s89ab), sx); sx = lfm_sum4(as_uint(c.scdef), sx);
+                xsum[(lid >> 3) * 8u + (off >> 5)] = sx;
+            }
+            (void)v;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (rloc < valid_rows) {
+            __local const uchar *srow = ws + rloc * 16u;
+            float d = (float)vload_half(0, (__local const half *)(wh + rloc * 4u));
+            float dmin = (float)vload_half(0, (__local const half *)(wh + rloc * 4u + 2u));
+            #pragma unroll
+            for (uint q = 0u; q < 4u; ++q) {
+                uint4 pa = vload4(0, wq + ((2u * q) * 64u + rloc) * 4u);
+                uint4 pb = vload4(0, wq + ((2u * q + 1u) * 64u + rloc) * 4u);
+                uint lo0 = pa.x & M, lo1 = pa.y & M, lo2 = pa.z & M, lo3 = pa.w & M;
+                uint lo4 = pb.x & M, lo5 = pb.y & M, lo6 = pb.z & M, lo7 = pb.w & M;
+                uint hi0 = (pa.x >> 4) & M, hi1 = (pa.y >> 4) & M, hi2 = (pa.z >> 4) & M, hi3 = (pa.w >> 4) & M;
+                uint hi4 = (pb.x >> 4) & M, hi5 = (pb.y >> 4) & M, hi6 = (pb.z >> 4) & M, hi7 = (pb.w >> 4) & M;
+                float scl = d * (float)srow[4u * q], mnl = dmin * (float)srow[4u * q + 1u];
+                float sch = d * (float)srow[4u * q + 2u], mnh = dmin * (float)srow[4u * q + 3u];
+                uint xbase = q * 64u;
+                #pragma unroll
+                for (uint j = 0u; j < 4u; ++j) {
+                    uint t = tok_base + j;
+                    uint token = t0 + t;
+                    if (token < ntok) {
+                        __local const uint *xp = (__local const uint *)(xt + t * 256u + xbase);
+                        uint x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
+                        uint x4 = xp[4], x5 = xp[5], x6 = xp[6], x7 = xp[7];
+                        uint y0 = xp[8], y1 = xp[9], y2 = xp[10], y3 = xp[11];
+                        uint y4 = xp[12], y5 = xp[13], y6 = xp[14], y7 = xp[15];
+                        int suml = xsum[t * 8u + 2u * q];
+                        int sumh = xsum[t * 8u + 2u * q + 1u];
+                        int dl = 0, dh = 0;
+                        dl = lfm_dot4(lo0, x0, dl); dl = lfm_dot4(lo1, x1, dl); dl = lfm_dot4(lo2, x2, dl); dl = lfm_dot4(lo3, x3, dl);
+                        dl = lfm_dot4(lo4, x4, dl); dl = lfm_dot4(lo5, x5, dl); dl = lfm_dot4(lo6, x6, dl); dl = lfm_dot4(lo7, x7, dl);
+                        dh = lfm_dot4(hi0, y0, dh); dh = lfm_dot4(hi1, y1, dh); dh = lfm_dot4(hi2, y2, dh); dh = lfm_dot4(hi3, y3, dh);
+                        dh = lfm_dot4(hi4, y4, dh); dh = lfm_dot4(hi5, y5, dh); dh = lfm_dot4(hi6, y6, dh); dh = lfm_dot4(hi7, y7, dh);
+                        float dlf = (float)dl, dhf = (float)dh;
+                        ulong g = (ulong)token * ngs + (ulong)b * 8u + 2u * q;
+                        acc[j] += xs[g] * (dlf * scl - (float)suml * mnl);
+                        acc[j] += xs[g + 1u] * (dhf * sch - (float)sumh * mnh);
                     }
                 }
             }
