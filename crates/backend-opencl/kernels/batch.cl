@@ -1119,152 +1119,6 @@ __kernel void attention_split_b_h(__global const float *q, __global const half *
     }
 }
 
-__kernel void attention_split_b_h4(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
-    uint gid = get_group_id(0);
-    uint lane = get_local_id(0);
-    uint per_tok = kv_heads * splits;
-    uint t = gid / per_tok;
-    uint rem = gid % per_tok;
-    uint kvh = rem / splits;
-    uint sp = rem % splits;
-    if (t >= ntok) {
-        return;
-    }
-    __local float sred[512];
-    uint len = pos_b[t] + 1u;
-    uint start = (window > 0u && len > window) ? len - window : 0u;
-    uint toff = tbl_off[t];
-    uint span = len - start;
-    uint chunk = (span + splits - 1u) / splits;
-    uint p0 = start + sp * chunk;
-    uint p1 = min(p0 + chunk, len);
-    uint head0 = kvh * (n_heads / kv_heads);
-    float q0[4];
-    float q1[4];
-    float m[4];
-    float l[4];
-    float acc0[4];
-    float acc1[4];
-    #pragma unroll
-    for (uint g = 0u; g < 4u; ++g) {
-        __global const float *qh = q + ((ulong)t * n_heads + head0 + g) * head_dim;
-        q0[g] = qh[2u * lane];
-        q1[g] = qh[2u * lane + 1u];
-        m[g] = -INFINITY;
-        l[g] = 0.0f;
-        acc0[g] = 0.0f;
-        acc1[g] = 0.0f;
-    }
-    float scale = 1.0f / sqrt((float)head_dim);
-    uint kv_stride = kv_heads * head_dim;
-    uint pos = p0;
-    for (; pos + 1u < p1; pos += 2u) {
-        ulong slot0 = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        ulong slot1 = (ulong)((tbl[toff + ((pos + 1u) >> 5)] << 5) | ((pos + 1u) & 31u));
-        __global const half *kp0 = kbuf + slot0 * kv_stride + kvh * head_dim;
-        __global const half *kp1 = kbuf + slot1 * kv_stride + kvh * head_dim;
-        float2 k0 = vload_half2(lane, kp0);
-        float2 k1 = vload_half2(lane, kp1);
-        #pragma unroll
-        for (uint g = 0u; g < 4u; ++g) {
-            sred[g * 64u + lane] = q0[g] * k0.x + q1[g] * k0.y;
-            sred[(4u + g) * 64u + lane] = q0[g] * k1.x + q1[g] * k1.y;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (lane < 8u) {
-            #pragma unroll
-            for (uint j = 0u; j < 8u; ++j) {
-                sred[j * 64u + lane] = sred[j * 64u + lane] + sred[j * 64u + lane + 8u]
-                    + sred[j * 64u + lane + 16u] + sred[j * 64u + lane + 24u]
-                    + sred[j * 64u + lane + 32u] + sred[j * 64u + lane + 40u]
-                    + sred[j * 64u + lane + 48u] + sred[j * 64u + lane + 56u];
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (lane == 0u) {
-            #pragma unroll
-            for (uint j = 0u; j < 8u; ++j) {
-                sred[j * 64u] = sred[j * 64u] + sred[j * 64u + 1u] + sred[j * 64u + 2u]
-                    + sred[j * 64u + 3u] + sred[j * 64u + 4u] + sred[j * 64u + 5u]
-                    + sred[j * 64u + 6u] + sred[j * 64u + 7u];
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        __global const half *vp0 = vbuf + slot0 * kv_stride + kvh * head_dim;
-        __global const half *vp1 = vbuf + slot1 * kv_stride + kvh * head_dim;
-        float2 v0 = vload_half2(lane, vp0);
-        float2 v1 = vload_half2(lane, vp1);
-        #pragma unroll
-        for (uint g = 0u; g < 4u; ++g) {
-            float s0 = sred[g * 64u] * scale;
-            float s1 = sred[(4u + g) * 64u] * scale;
-            float m_new = fmax(m[g], fmax(s0, s1));
-            float corr = exp(m[g] - m_new);
-            float w0 = exp(s0 - m_new);
-            float w1 = exp(s1 - m_new);
-            l[g] = l[g] * corr + w0 + w1;
-            acc0[g] = acc0[g] * corr + w0 * v0.x + w1 * v1.x;
-            acc1[g] = acc1[g] * corr + w0 * v0.y + w1 * v1.y;
-            m[g] = m_new;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    if (pos < p1) {
-        ulong slots = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        __global const half *kp = kbuf + slots * kv_stride + kvh * head_dim;
-        float2 k = vload_half2(lane, kp);
-        #pragma unroll
-        for (uint g = 0u; g < 4u; ++g) {
-            sred[g * 64u + lane] = q0[g] * k.x + q1[g] * k.y;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (lane < 8u) {
-            #pragma unroll
-            for (uint j = 0u; j < 4u; ++j) {
-                sred[j * 64u + lane] = sred[j * 64u + lane] + sred[j * 64u + lane + 8u]
-                    + sred[j * 64u + lane + 16u] + sred[j * 64u + lane + 24u]
-                    + sred[j * 64u + lane + 32u] + sred[j * 64u + lane + 40u]
-                    + sred[j * 64u + lane + 48u] + sred[j * 64u + lane + 56u];
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (lane == 0u) {
-            #pragma unroll
-            for (uint j = 0u; j < 4u; ++j) {
-                sred[j * 64u] = sred[j * 64u] + sred[j * 64u + 1u] + sred[j * 64u + 2u]
-                    + sred[j * 64u + 3u] + sred[j * 64u + 4u] + sred[j * 64u + 5u]
-                    + sred[j * 64u + 6u] + sred[j * 64u + 7u];
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        __global const half *vp = vbuf + slots * kv_stride + kvh * head_dim;
-        float2 v = vload_half2(lane, vp);
-        #pragma unroll
-        for (uint g = 0u; g < 4u; ++g) {
-            float sv = sred[g * 64u] * scale;
-            float m_new = fmax(m[g], sv);
-            float corr = exp(m[g] - m_new);
-            float w = exp(sv - m_new);
-            l[g] = l[g] * corr + w;
-            acc0[g] = acc0[g] * corr + w * v.x;
-            acc1[g] = acc1[g] * corr + w * v.y;
-            m[g] = m_new;
-        }
-    }
-    #pragma unroll
-    for (uint g = 0u; g < 4u; ++g) {
-        ulong pbase = ((ulong)t * n_heads + head0 + g) * splits + sp;
-        __global float *pa = pacc + pbase * head_dim;
-        pa[2u * lane] = acc0[g];
-        pa[2u * lane + 1u] = acc1[g];
-        if (lane == 0u) {
-            pml[pbase * 2u] = m[g];
-            pml[pbase * 2u + 1u] = l[g];
-        }
-    }
-}
-
-
 __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y1, __global float *y2, __global float *y3, __global float *y4, uint r1, uint r2, uint r3, uint r4, uint cols, uint ntok) {
     uint lane = get_sub_group_local_id();
     uint sgs = get_sub_group_size();
@@ -1889,6 +1743,154 @@ __kernel void gemm_q6_i8_pp(__global const char *w, __global const float *wsc, _
             if (t0 + t < ntok) {
                 y[(ulong)(t0 + t) * rows + row0 + lane] = acc[j];
             }
+        }
+    }
+}
+
+__kernel void attention_split_b_h4_p4(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
+    uint gid = get_group_id(0);
+    uint lane = get_local_id(0);
+    uint per_tok = kv_heads * splits;
+    uint t = gid / per_tok;
+    uint rem = gid % per_tok;
+    uint kvh = rem / splits;
+    uint sp = rem % splits;
+    if (t >= ntok) {
+        return;
+    }
+    __local float sred[16 * 64];
+    uint len = pos_b[t] + 1u;
+    uint start = (window > 0u && len > window) ? len - window : 0u;
+    uint toff = tbl_off[t];
+    uint span = len - start;
+    uint chunk = (span + splits - 1u) / splits;
+    uint p0 = start + sp * chunk;
+    uint p1 = min(p0 + chunk, len);
+    uint head0 = kvh * (n_heads / kv_heads);
+    float q0[4];
+    float q1[4];
+    float m[4];
+    float l[4];
+    float acc0[4];
+    float acc1[4];
+    #pragma unroll
+    for (uint g = 0u; g < 4u; ++g) {
+        __global const float *qh = q + ((ulong)t * n_heads + head0 + g) * head_dim;
+        q0[g] = qh[2u * lane];
+        q1[g] = qh[2u * lane + 1u];
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+        acc0[g] = 0.0f;
+        acc1[g] = 0.0f;
+    }
+    float scale = 1.0f / sqrt((float)head_dim);
+    uint kv_stride = kv_heads * head_dim;
+    uint pos = p0;
+    for (; pos + 3u < p1; pos += 4u) {
+        float2 k[4];
+        float2 v[4];
+        #pragma unroll
+        for (uint u = 0u; u < 4u; ++u) {
+            ulong slot = (ulong)((tbl[toff + ((pos + u) >> 5)] << 5) | ((pos + u) & 31u));
+            k[u] = vload_half2(lane, kbuf + slot * kv_stride + kvh * head_dim);
+            v[u] = vload_half2(lane, vbuf + slot * kv_stride + kvh * head_dim);
+        }
+        #pragma unroll
+        for (uint g = 0u; g < 4u; ++g) {
+            #pragma unroll
+            for (uint u = 0u; u < 4u; ++u) {
+                sred[(u * 4u + g) * 64u + lane] = q0[g] * k[u].x + q1[g] * k[u].y;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lane < 8u) {
+            #pragma unroll
+            for (uint j = 0u; j < 16u; ++j) {
+                sred[j * 64u + lane] = sred[j * 64u + lane] + sred[j * 64u + lane + 8u]
+                    + sred[j * 64u + lane + 16u] + sred[j * 64u + lane + 24u]
+                    + sred[j * 64u + lane + 32u] + sred[j * 64u + lane + 40u]
+                    + sred[j * 64u + lane + 48u] + sred[j * 64u + lane + 56u];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint j = 0u; j < 16u; ++j) {
+                sred[j * 64u] = sred[j * 64u] + sred[j * 64u + 1u] + sred[j * 64u + 2u]
+                    + sred[j * 64u + 3u] + sred[j * 64u + 4u] + sred[j * 64u + 5u]
+                    + sred[j * 64u + 6u] + sred[j * 64u + 7u];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (uint g = 0u; g < 4u; ++g) {
+            float s0 = sred[(0u * 4u + g) * 64u] * scale;
+            float s1 = sred[(1u * 4u + g) * 64u] * scale;
+            float s2 = sred[(2u * 4u + g) * 64u] * scale;
+            float s3 = sred[(3u * 4u + g) * 64u] * scale;
+            float m_new = fmax(fmax(m[g], s0), fmax(s2, s3));
+            float corr = exp(m[g] - m_new);
+            float w0 = exp(s0 - m_new);
+            float w1 = exp(s1 - m_new);
+            float w2 = exp(s2 - m_new);
+            float w3 = exp(s3 - m_new);
+            l[g] = l[g] * corr + w0 + w1 + w2 + w3;
+            acc0[g] = acc0[g] * corr + w0 * v[0].x + w1 * v[1].x + w2 * v[2].x + w3 * v[3].x;
+            acc1[g] = acc1[g] * corr + w0 * v[0].y + w1 * v[1].y + w2 * v[2].y + w3 * v[3].y;
+            m[g] = m_new;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (; pos < p1; ++pos) {
+        ulong slot = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
+        float2 k = vload_half2(lane, kbuf + slot * kv_stride + kvh * head_dim);
+        #pragma unroll
+        for (uint g = 0u; g < 4u; ++g) {
+            sred[g * 64u + lane] = q0[g] * k.x + q1[g] * k.y;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lane < 8u) {
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                sred[j * 64u + lane] = sred[j * 64u + lane] + sred[j * 64u + lane + 8u]
+                    + sred[j * 64u + lane + 16u] + sred[j * 64u + lane + 24u]
+                    + sred[j * 64u + lane + 32u] + sred[j * 64u + lane + 40u]
+                    + sred[j * 64u + lane + 48u] + sred[j * 64u + lane + 56u];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                sred[j * 64u] = sred[j * 64u] + sred[j * 64u + 1u] + sred[j * 64u + 2u]
+                    + sred[j * 64u + 3u] + sred[j * 64u + 4u] + sred[j * 64u + 5u]
+                    + sred[j * 64u + 6u] + sred[j * 64u + 7u];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float2 v = vload_half2(lane, vbuf + slot * kv_stride + kvh * head_dim);
+        #pragma unroll
+        for (uint g = 0u; g < 4u; ++g) {
+            float sv = sred[g * 64u] * scale;
+            float m_new = fmax(m[g], sv);
+            float corr = exp(m[g] - m_new);
+            float w = exp(sv - m_new);
+            l[g] = l[g] * corr + w;
+            acc0[g] = acc0[g] * corr + w * v.x;
+            acc1[g] = acc1[g] * corr + w * v.y;
+            m[g] = m_new;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    #pragma unroll
+    for (uint g = 0u; g < 4u; ++g) {
+        ulong pbase = ((ulong)t * n_heads + head0 + g) * splits + sp;
+        __global float *pa = pacc + pbase * head_dim;
+        pa[2u * lane] = acc0[g];
+        pa[2u * lane + 1u] = acc1[g];
+        if (lane == 0u) {
+            pml[pbase * 2u] = m[g];
+            pml[pbase * 2u + 1u] = l[g];
         }
     }
 }

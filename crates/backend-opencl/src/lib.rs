@@ -114,7 +114,7 @@ struct Kernels {
     attn_b_h: Kernel,
     attn_b_h2: Kernel,
     attn_split_b_h: Kernel,
-    attn_split_b_h4: Kernel,
+    attn_split_b_h4_p4: Kernel,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -752,7 +752,7 @@ impl GpuModel {
             attn_b_h: Kernel::create(&program, "attention_b_h")?,
             attn_b_h2: Kernel::create(&program, "attention_b_h2")?,
             attn_split_b_h: Kernel::create(&program, "attention_split_b_h")?,
-            attn_split_b_h4: Kernel::create(&program, "attention_split_b_h4")?,
+            attn_split_b_h4_p4: Kernel::create(&program, "attention_split_b_h4_p4")?,
         };
         let h = cfg.hidden_size;
         let qd = cfg.q_dim();
@@ -2672,7 +2672,7 @@ impl GpuModel {
                                 && head_dim == 128;
                             let (kernel, grid) = if use4 {
                                 (
-                                    &self.kernels.attn_split_b_h4,
+                                    &self.kernels.attn_split_b_h4_p4,
                                     ntok * kv_heads * splits * 64,
                                 )
                             } else {
