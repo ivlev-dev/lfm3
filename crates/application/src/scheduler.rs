@@ -20,7 +20,7 @@ impl SchedulerConfig {
         let max_batch = max_batch.max(1);
         Self {
             max_ctx: max_ctx.max(1),
-            max_active: max_active.clamp(1, 16).min(max_batch),
+            max_active: max_active.clamp(1, 16),
             max_batch,
             prefill_budget: prefill_budget.max(1),
         }
@@ -591,7 +591,7 @@ mod tests {
             ids.push(s.enqueue(8, 5).unwrap().id);
         }
         let admitted = admit_all(&mut s, 512);
-        assert_eq!(admitted.len(), 4);
+        assert_eq!(admitted.len(), 8);
         for id in &admitted {
             make_decode(&mut s, *id);
         }
@@ -677,6 +677,28 @@ mod tests {
         assert_eq!(seq.used_pages(), 1);
         assert_eq!(seq.future_pages(), 2);
         assert_eq!(s.available_for_new(3), 1);
+    }
+
+    #[test]
+    fn decode_rotation_covers_all_when_active_exceeds_batch() {
+        let mut s = Scheduler::new(SchedulerConfig::new(4096, 16, 4, 12));
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            ids.push(s.enqueue(8, 5).unwrap().id);
+        }
+        admit_all(&mut s, 512);
+        for id in &ids {
+            make_decode(&mut s, *id);
+        }
+        let mut served = std::collections::HashSet::new();
+        for _ in 0..8 {
+            if let StepPlan::Mixed { rows, .. } = s.plan_step() {
+                for row in rows {
+                    served.insert(row.id);
+                }
+            }
+        }
+        assert_eq!(served.len(), 8);
     }
 
     #[test]

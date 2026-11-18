@@ -1269,7 +1269,16 @@ impl GpuModel {
             .seqs
             .iter()
             .position(|s| s.is_none())
-            .ok_or_else(|| anyhow!("no free sequence slots (max {})", self.max_seqs))?;
+            .ok_or_else(|| {
+                let used: Vec<usize> = self
+                    .seqs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.is_some())
+                    .map(|(i, _)| i)
+                    .collect();
+                anyhow!("no free sequence slots (max {}, used {:?})", self.max_seqs, used)
+            })?;
         let tbl = self.gpu.alloc::<u32>(self.kv_blocks.max(1))?;
         self.clear_conv_slot(slot)?;
         self.seqs[slot] = Some(Sequence {
@@ -2337,6 +2346,10 @@ impl GpuModel {
 
     pub fn prefill_batch_size(&self) -> usize {
         self.prefill_batch
+    }
+
+    pub fn max_sequences(&self) -> usize {
+        self.max_seqs
     }
 
     fn kv_store_kernel(&self) -> &Kernel {

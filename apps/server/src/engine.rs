@@ -472,9 +472,10 @@ impl Worker {
         backend: BackendLoader,
         tokenizer: TokenizerLoader,
     ) -> Result<Self> {
-        let gpu = backend(&cfg.model, cfg.ctx)?;
+        let mut gpu = backend(&cfg.model, cfg.ctx)?;
+        let _ = gpu.free_sequence(0);
         let max_batch = env_range("LFM_PB", 6, 1, 12);
-        let max_active = env_range("LFM_SEQS", 8, 1, 16);
+        let max_active = env_range("LFM_SEQS", 8, 1, 16).min(gpu.max_sequences());
         let prefill_budget = env_usize("LFM_PREFILL_BUDGET", 64).clamp(1, 128);
         let sched = Scheduler::new(SchedulerConfig::new(
             gpu.max_ctx(),

@@ -29,6 +29,10 @@ impl InferenceBackend for GpuModel {
         GpuModel::prefill_batch_size(self)
     }
 
+    fn max_sequences(&self) -> usize {
+        GpuModel::max_sequences(self)
+    }
+
     fn step(&mut self, steps: &[SequenceStep], need_logits: bool) -> Result<()> {
         let reqs: Vec<StepReq> = steps
             .iter()

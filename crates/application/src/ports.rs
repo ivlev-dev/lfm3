@@ -32,6 +32,9 @@ pub trait InferenceBackend: Send {
     fn logits(&self) -> Result<Vec<f32>>;
     fn logits_row(&self, row: usize) -> Result<Vec<f32>>;
     fn max_ctx(&self) -> usize;
+    fn max_sequences(&self) -> usize {
+        16
+    }
     fn prefill_batch_size(&self) -> usize {
         128
     }
