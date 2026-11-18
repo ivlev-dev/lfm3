@@ -682,7 +682,7 @@ impl GpuModel {
             .and_then(|v| v.parse().ok())
             .filter(|v: &usize| (64..=512).contains(v))
             .map(|v| v / 64 * 64)
-            .unwrap_or(pb);
+            .unwrap_or(64);
         let subgroup = gpu.caps.sub_group_size.max(1);
         let options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
         let program: Program = gpu.build(KERNELS, &options)?;
