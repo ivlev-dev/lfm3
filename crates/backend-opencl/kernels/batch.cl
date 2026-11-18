@@ -13,6 +13,22 @@
 #define PB 4
 #endif
 
+#if defined(__AMDGCN__)
+static inline int lfm_dot4(uint a, uint b, int c) {
+    return (int)__builtin_amdgcn_sdot4((int)a, (int)b, c, 0);
+}
+static inline int lfm_sum4(uint a, int c) {
+    return (int)__builtin_amdgcn_sdot4((int)a, 0x01010101, c, 0);
+}
+#else
+static inline int lfm_dot4(uint a, uint b, int c) {
+    return c + (int)dot(as_char4(a), as_char4(b));
+}
+static inline int lfm_sum4(uint a, int c) {
+    return c + (int)dot(as_char4(a), (char4)(1));
+}
+#endif
+
 __kernel void embed_q6k_b(__global const uchar *w, __global float *out, __global const uint *tokens, uint ntok, uint cols) {
     uint i = get_global_id(0);
     uint total = ntok * cols;
@@ -1892,4 +1908,5 @@ __kernel void attention_split_b_h4_p4(__global const float *q, __global const ha
         }
     }
 }
+
 
