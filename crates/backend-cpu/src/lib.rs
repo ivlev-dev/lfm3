@@ -41,12 +41,26 @@ struct Q6Block {
 enum Matrix {
     Q4(Vec<Q4Block>),
     Q6(Vec<Q6Block>),
+    Raw(RawKind),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawKind {
+    Q4,
+    Q6,
 }
 
 struct Quant {
     rows: usize,
     cols: usize,
     data: Matrix,
+    raw: Option<(std::sync::Arc<GgufFile>, usize)>,
+}
+
+impl Quant {
+    fn raw_bytes(&self) -> Option<&[u8]> {
+        self.raw.as_ref().map(|(f, off)| &f.raw()[*off..])
+    }
 }
 
 struct Act {
@@ -82,8 +96,13 @@ struct LayerState {
 
 impl CpuBackend {
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
-        let file = GgufFile::open(path).with_context(|| format!("open {}", path.display()))?;
-        let cfg = ModelConfig::from_metadata(&file).map_err(|e| anyhow!("config: {e}"))?;
+        let mmap_on = std::env::var("LFM_MMAP")
+            .map(|v| v != "0")
+            .unwrap_or(cfg!(any(target_arch = "arm", target_arch = "aarch64")));
+        let file = std::sync::Arc::new(
+            GgufFile::open(path).with_context(|| format!("open {}", path.display()))?,
+        );
+        let cfg = ModelConfig::from_metadata(file.as_ref()).map_err(|e| anyhow!("config: {e}"))?;
         let mut quant = HashMap::new();
         let mut f32s = HashMap::new();
         let mut dims = HashMap::new();
@@ -100,33 +119,61 @@ impl CpuBackend {
                     if blocks != rows * cols / 256 {
                         return Err(anyhow!("q4 shape mismatch {}", info.name));
                     }
-                    let mut out = Vec::with_capacity(blocks);
-                    for b in bytes.chunks_exact(144) {
-                        out.push(prep_q4(b));
+                    if mmap_on {
+                        let (start, _) = file.tensor_span(&info.name)?;
+                        quant.insert(
+                            info.name.clone(),
+                            Quant {
+                                rows,
+                                cols,
+                                data: Matrix::Raw(RawKind::Q4),
+                                raw: Some((file.clone(), start)),
+                            },
+                        );
+                    } else {
+                        let mut out = Vec::with_capacity(blocks);
+                        for b in bytes.chunks_exact(144) {
+                            out.push(prep_q4(b));
+                        }
+                        quant.insert(
+                            info.name.clone(),
+                            Quant {
+                                rows,
+                                cols,
+                                data: Matrix::Q4(out),
+                                raw: None,
+                            },
+                        );
                     }
-                    quant.insert(
-                        info.name.clone(),
-                        Quant {
-                            rows,
-                            cols,
-                            data: Matrix::Q4(out),
-                        },
-                    );
                 }
                 GgmlType::Q6_K => {
                     let blocks = bytes.len() / 210;
-                    let mut out = Vec::with_capacity(blocks);
-                    for b in bytes.chunks_exact(210) {
-                        out.push(prep_q6(b));
+                    if mmap_on {
+                        let (start, _) = file.tensor_span(&info.name)?;
+                        quant.insert(
+                            info.name.clone(),
+                            Quant {
+                                rows,
+                                cols,
+                                data: Matrix::Raw(RawKind::Q6),
+                                raw: Some((file.clone(), start)),
+                            },
+                        );
+                    } else {
+                        let mut out = Vec::with_capacity(blocks);
+                        for b in bytes.chunks_exact(210) {
+                            out.push(prep_q6(b));
+                        }
+                        quant.insert(
+                            info.name.clone(),
+                            Quant {
+                                rows,
+                                cols,
+                                data: Matrix::Q6(out),
+                                raw: None,
+                            },
+                        );
                     }
-                    quant.insert(
-                        info.name.clone(),
-                        Quant {
-                            rows,
-                            cols,
-                            data: Matrix::Q6(out),
-                        },
-                    );
                 }
                 GgmlType::F32 => {
                     let data: Vec<f32> = bytes
@@ -875,10 +922,172 @@ unsafe extern "C" {
         ntok: i32,
         out: *mut f32,
     );
+    fn lfm_q4_rows_raw(
+        w: *const u8,
+        xq: *const *const i8,
+        xs: *const *const f32,
+        sums: *const *const i32,
+        blocks: i32,
+        ntok: i32,
+        out: *mut f32,
+    );
+    fn lfm_q6_rows_raw(
+        w: *const u8,
+        xq: *const *const i8,
+        xs: *const *const f32,
+        sums16: *const *const i32,
+        blocks: i32,
+        ntok: i32,
+        out: *mut f32,
+    );
+}
+
+fn q4_raw_scales(blk: &[u8]) -> ([f32; 8], [f32; 8]) {
+    let d = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
+    let dmin = half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
+    let mut sc = [0.0f32; 8];
+    let mut mn = [0.0f32; 8];
+    for j in 0..8 {
+        let (a, b) = scale_min(blk, j);
+        sc[j] = d * f32::from(a);
+        mn[j] = dmin * f32::from(b);
+    }
+    (sc, mn)
+}
+
+#[inline]
+fn q4_raw_val(qs: &[u8], g: usize, i: usize) -> u8 {
+    let base = (g / 2) * 32;
+    let shift: u32 = 4 * (g as u32 & 1);
+    (qs[base + i] >> shift) & 0x0F
+}
+
+#[inline]
+fn q6_raw_val(blk: &[u8], v: usize) -> u8 {
+    let n = v / 128;
+    let j = v % 128;
+    let s = j / 32;
+    let l = j % 32;
+    let ql = blk[64 * n + (s & 1) * 32 + l];
+    let qh = blk[128 + 32 * n + l];
+    let nib = if s < 2 { ql & 0x0F } else { ql >> 4 };
+    nib | (((qh >> (2 * s)) & 3) << 4)
+}
+
+#[allow(unreachable_code)]
+fn raw_rows(w: &Quant, acts: &[&Act], out: &mut [f32]) {
+    let raw = w.raw_bytes().expect("raw weights");
+    let neon = std::env::var("LFM_NEON").map(|v| v != "0").unwrap_or(true);
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    if neon {
+        let kind = match &w.data {
+            Matrix::Raw(k) => *k,
+            _ => unreachable!(),
+        };
+        let blocks = w.cols / 256;
+        let rows = w.rows;
+        let n = acts.len();
+        let qp: Vec<usize> = acts.iter().map(|a| a.q.as_ptr() as usize).collect();
+        let sp: Vec<usize> = acts.iter().map(|a| a.s.as_ptr() as usize).collect();
+        let up: Vec<usize> = acts.iter().map(|a| a.sum32.as_ptr() as usize).collect();
+        let u16p: Vec<usize> = acts.iter().map(|a| a.sum16.as_ptr() as usize).collect();
+        let dst = out.as_mut_ptr() as usize;
+        let base = raw.as_ptr() as usize;
+        (0..rows).into_par_iter().for_each(|row| unsafe {
+            let mut tmp = [0.0f32; TILE];
+            let wptr = (base as *const u8).add(row * blocks * if kind == RawKind::Q4 { 144 } else { 210 });
+            match kind {
+                RawKind::Q4 => lfm_q4_rows_raw(
+                    wptr,
+                    qp.as_ptr() as *const *const i8,
+                    sp.as_ptr() as *const *const f32,
+                    up.as_ptr() as *const *const i32,
+                    blocks as i32,
+                    n as i32,
+                    tmp.as_mut_ptr(),
+                ),
+                RawKind::Q6 => lfm_q6_rows_raw(
+                    wptr,
+                    qp.as_ptr() as *const *const i8,
+                    sp.as_ptr() as *const *const f32,
+                    u16p.as_ptr() as *const *const i32,
+                    blocks as i32,
+                    n as i32,
+                    tmp.as_mut_ptr(),
+                ),
+            }
+            let p = dst as *mut f32;
+            for t in 0..n {
+                *p.add(t * rows + row) = tmp[t];
+            }
+        });
+        return;
+    }
+    let _ = raw;
+    let kind = match &w.data {
+        Matrix::Raw(k) => *k,
+        _ => unreachable!(),
+    };
+    let blocks = w.cols / 256;
+    let rows = w.rows;
+    let n = acts.len();
+    let ptr = out.as_mut_ptr() as usize;
+    (0..rows).into_par_iter().for_each(|row| {
+        let mut acc = [0.0f32; TILE];
+        match kind {
+            RawKind::Q4 => {
+                for b in 0..blocks {
+                    let blk = &raw[(row * blocks + b) * 144..][..144];
+                    let (sc, mn) = q4_raw_scales(blk);
+                    let qs = &blk[16..144];
+                    for g in 0..8 {
+                        let off = b * 256 + g * 32;
+                        for (t, a) in acts.iter().enumerate().take(n) {
+                            let mut dot = 0i32;
+                            for i in 0..32 {
+                                dot += i32::from(q4_raw_val(qs, g, i)) * i32::from(a.q[off + i]);
+                            }
+                            acc[t] += a.s[b * 8 + g] * (sc[g] * dot as f32
+                                - mn[g] * a.sum32[b * 8 + g] as f32);
+                        }
+                    }
+                }
+            }
+            RawKind::Q6 => {
+                for b in 0..blocks {
+                    let blk = &raw[(row * blocks + b) * 210..][..210];
+                    let d = half::f16::from_bits(u16::from_le_bytes([blk[208], blk[209]])).to_f32();
+                    for k in 0..16 {
+                        let sc = d * f32::from(blk[192 + k] as i8);
+                        let off = b * 256 + k * 16;
+                        for (t, a) in acts.iter().enumerate().take(n) {
+                            let mut dot = 0i32;
+                            for i in 0..16 {
+                                dot += i32::from(q6_raw_val(blk, k * 16 + i)) * i32::from(a.q[off + i]);
+                            }
+                            acc[t] += a.s[b * 8 + k / 2] * sc
+                                * (dot - 32 * a.sum16[b * 16 + k]) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        let p = ptr as *mut f32;
+        for t in 0..n {
+            unsafe {
+                *p.add(t * rows + row) = acc[t];
+            }
+        }
+    });
 }
 
 #[allow(unreachable_code)]
 fn matvec(w: &Quant, x: &Act) -> Vec<f32> {
+    if w.raw.is_some() {
+        let mut out = vec![0.0f32; w.rows];
+        raw_rows(w, &[x], &mut out);
+        return out;
+    }
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         let blocks = w.cols / 256;
@@ -888,6 +1097,7 @@ fn matvec(w: &Quant, x: &Act) -> Vec<f32> {
         let sums = [x.sum32.as_ptr() as usize];
         let sums16 = [x.sum16.as_ptr() as usize];
         match &w.data {
+            Matrix::Raw(_) => unreachable!("raw handled earlier"),
             Matrix::Q4(data) => {
                 out.par_iter_mut().enumerate().for_each(|(row, o)| unsafe {
                     let wptr = data.as_ptr().add(row * blocks) as *const u8;
@@ -931,6 +1141,7 @@ fn matvec(w: &Quant, x: &Act) -> Vec<f32> {
     (0..w.rows)
         .into_par_iter()
         .map(|row| match &w.data {
+            Matrix::Raw(_) => unreachable!("raw handled earlier"),
             Matrix::Q4(data) => {
                 let mut acc = 0.0f32;
                 let base = row * blocks;
@@ -988,6 +1199,7 @@ unsafe fn matmul_batch_avx2(w: &Quant, acts: &[Act], out: &mut [f32]) {
         for b in 0..blocks {
             let base = (t * blocks + b) * 16;
             match &w.data {
+                Matrix::Raw(_) => unreachable!("raw handled earlier"),
                 Matrix::Q4(_) => {
                     for g in 0..8 {
                         wsum[base + g] = a.s[b * 8 + g] * a.sum32[b * 8 + g] as f32;
@@ -1003,6 +1215,7 @@ unsafe fn matmul_batch_avx2(w: &Quant, acts: &[Act], out: &mut [f32]) {
     }
     let wsum = &wsum;
     match &w.data {
+        Matrix::Raw(_) => unreachable!("raw handled earlier"),
         Matrix::Q4(data) => {
             (0..rows).into_par_iter().for_each(|row| unsafe {
                 let mut acc = [_mm256_setzero_ps(); TILE];
@@ -1103,6 +1316,7 @@ unsafe fn matvec_avx2(w: &Quant, x: &Act) -> Vec<f32> {
         _mm_cvtss_f32(_mm_hadd_ps(s2, s2))
     };
     match &w.data {
+        Matrix::Raw(_) => unreachable!("raw handled earlier"),
         Matrix::Q4(data) => (0..w.rows)
             .into_par_iter()
             .map(|row| unsafe {
@@ -1176,6 +1390,11 @@ fn pad_acts(acts: &mut Vec<Act>, cols: usize) {
 
 #[allow(unreachable_code)]
 fn matmul_batch(w: &Quant, acts: &[Act], out: &mut [f32]) {
+    if w.raw.is_some() {
+        let refs: Vec<&Act> = acts.iter().collect();
+        raw_rows(w, &refs, out);
+        return;
+    }
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         let n = acts.len();
@@ -1187,6 +1406,7 @@ fn matmul_batch(w: &Quant, acts: &[Act], out: &mut [f32]) {
         let u16p: Vec<usize> = acts.iter().map(|a| a.sum16.as_ptr() as usize).collect();
         let dst = out.as_mut_ptr() as usize;
         match &w.data {
+            Matrix::Raw(_) => unreachable!("raw handled earlier"),
             Matrix::Q4(data) => {
                 (0..rows).into_par_iter().for_each(|row| unsafe {
                     let mut tmp = [0.0f32; TILE];
@@ -1249,6 +1469,7 @@ fn matmul_batch_generic(w: &Quant, acts: &[Act], out: &mut [f32]) {
     (0..rows).into_par_iter().for_each(|row| {
         let mut acc = [0.0f32; TILE];
         match &w.data {
+            Matrix::Raw(_) => unreachable!("raw handled earlier"),
             Matrix::Q4(data) => {
                 let base = row * blocks;
                 for b in 0..blocks {
@@ -1294,6 +1515,21 @@ fn matmul_batch_generic(w: &Quant, acts: &[Act], out: &mut [f32]) {
 
 fn embed_row(w: &Quant, row: usize) -> Result<Vec<f32>> {
     let blocks = w.cols / 256;
+    if let Matrix::Raw(RawKind::Q6) = w.data {
+        let raw = w.raw_bytes().ok_or_else(|| anyhow!("raw q6 bytes missing"))?;
+        let mut out = Vec::with_capacity(w.cols);
+        for b in 0..blocks {
+            let blk = &raw[(row * blocks + b) * 210..][..210];
+            let d = half::f16::from_bits(u16::from_le_bytes([blk[208], blk[209]])).to_f32();
+            for k in 0..16 {
+                let sc = d * f32::from(blk[192 + k] as i8);
+                for i in 0..16 {
+                    out.push((f32::from(q6_raw_val(blk, k * 16 + i)) - 32.0) * sc);
+                }
+            }
+        }
+        return Ok(out);
+    }
     match &w.data {
         Matrix::Q6(data) => {
             let base = row * blocks;
@@ -1439,6 +1675,53 @@ mod tests {
             *slot = seed.wrapping_add((i as u8).wrapping_mul(17));
         }
         b
+    }
+
+    fn q6block(seed: u8) -> Vec<u8> {
+        let mut b = vec![0u8; 210];
+        b[208..210].copy_from_slice(&half::f16::from_f32(0.03).to_bits().to_le_bytes());
+        for (i, slot) in b.iter_mut().enumerate() {
+            *slot = seed.wrapping_add((i as u8).wrapping_mul(29));
+        }
+        for i in 0..16 {
+            b[192 + i] = (i as i8 - 8) as u8;
+        }
+        b
+    }
+
+    #[test]
+    fn raw_q4_matches_prepacked() {
+        let raw = qblock(5);
+        let prep = prep_q4(&raw);
+        let (sc, mn) = q4_raw_scales(&raw);
+        for g in 0..8 {
+            assert!((sc[g] - prep.scales[g]).abs() < 1e-6, "scale g {g}");
+            assert!((mn[g] - prep.mins[g]).abs() < 1e-6, "min g {g}");
+            for i in 0..32 {
+                assert_eq!(
+                    q4_raw_val(&raw[16..144], g, i),
+                    prep.qgroup(g)[i],
+                    "g {g} i {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_q6_matches_prepacked() {
+        let raw = q6block(7);
+        let prep = prep_q6(&raw);
+        let d = half::f16::from_bits(u16::from_le_bytes([raw[208], raw[209]])).to_f32();
+        for k in 0..16 {
+            let sc = d * f32::from(raw[192 + k] as i8);
+            assert!((sc - prep.scales[k]).abs() < 1e-6, "scale k {k}");
+            for i in 0..16 {
+                let v = k * 16 + i;
+                let q_raw = f32::from(q6_raw_val(&raw, v)) - 32.0;
+                let q_prep = f32::from(prep.q[v]) - 32.0;
+                assert_eq!(q_raw, q_prep, "k {k} i {i}");
+            }
+        }
     }
 
     #[test]

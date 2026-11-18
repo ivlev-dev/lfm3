@@ -242,6 +242,16 @@ impl GgufFile {
         &self.mmap[..]
     }
 
+    pub fn tensor_span(&self, name: &str) -> anyhow::Result<(usize, usize)> {
+        let ti = self.tensor(name).ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
+        let start = self.data_offset.checked_add(ti.offset).ok_or(GgufError::SizeOverflow)?;
+        let end = start.checked_add(ti.byte_size).ok_or(GgufError::SizeOverflow)?;
+        if end > self.mmap.len() as u64 {
+            return Err(GgufError::UnexpectedEof.into());
+        }
+        Ok((start as usize, end as usize))
+    }
+
     pub fn get_u32(&self, key: &str) -> Option<u32> {
         match self.metadata.get(key) {
             Some(MetadataValue::U32(v)) => Some(*v),
