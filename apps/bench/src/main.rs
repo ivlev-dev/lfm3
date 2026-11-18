@@ -194,6 +194,12 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         ids: Vec<u32>,
     },
+    KernelBin {
+        #[arg(long, default_value = "gemm_q4_k_i8_lds11")]
+        kernel: String,
+        #[arg(long, default_value = "/tmp/opencode/kernel.bin")]
+        out: PathBuf,
+    },
     DotRate {
         #[arg(long, default_value_t = 200000)]
         iters: u32,
@@ -402,6 +408,7 @@ fn main() -> Result<()> {
             gpu_cmp(&model, &ids, batch)
         }
         Cmd::GpuTrace { model, ids } => gpu_trace(&model, &ids),
+        Cmd::KernelBin { kernel, out } => kernel_bin(&kernel, &out),
         Cmd::DotRate { iters } => dot_rate(iters),
         Cmd::GemmCmp {
             model,
@@ -3569,6 +3576,35 @@ __kernel void f16_rate(__global const char *src, __global float *out, uint iters
             macs / (st.median_ms / 1e3) / 1e9,
             macs * 2.0 / (st.median_ms / 1e3) / 1e12
         );
+    }
+    Ok(())
+}
+
+fn kernel_bin(name: &str, out: &std::path::Path) -> Result<()> {
+    let gpu = Gpu::open(0)?;
+    let opts = "-cl-std=CL3.0 -DRGEMV=5 -DRGEMV_B=4 -DPB=6";
+    let program = gpu.build(LFM_KERNELS, opts)?;
+    let _k = Kernel::create(&program, name)?;
+    let sizes = program.get_binary_sizes()?;
+    let bins = program.get_binaries()?;
+    let mut wrote = 0usize;
+    for (i, (size, bin)) in sizes.iter().zip(bins.iter()).enumerate() {
+        if *size == 0 || bin.is_empty() {
+            continue;
+        }
+        let mut body = bin.clone();
+        body.truncate(*size);
+        let path = if sizes.len() == 1 {
+            out.to_path_buf()
+        } else {
+            out.with_extension(format!("bin{i}"))
+        };
+        std::fs::write(&path, &body)?;
+        println!("wrote {} ({} bytes)", path.display(), body.len());
+        wrote += 1;
+    }
+    if wrote == 0 {
+        return Err(anyhow!("driver returned no program binaries"));
     }
     Ok(())
 }

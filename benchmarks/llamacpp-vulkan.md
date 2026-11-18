@@ -66,6 +66,47 @@ f16-математика (`half2`), по 8 независимых аккумул
 Итого структурный потолок текущего ядра ≈76%, а фактически 25% — остальное дают простои
 на зависимой цепочке `acc += dot` (4 цепи на поток) и латентности LDS.
 
+### ISA-разбор (RADV dump)
+
+Дамп шейдеров: `RADV_DEBUG=shaders llama-bench ... 2>radv.log`. Скрипт разбора — в конце.
+
+| шейдер | инструкций | из них dp4a | LDS-чтений | распаковка (and/shr/or) | scratch |
+|---|---|---|---|---|---|
+| #3 (mul_mm) | 3269 | 1024 (31%) | 378 | 199 | 0 |
+| #11 (mul_mm) | 3286 | 1024 (31%) | 410 | 83 | 0 |
+| #17 | 2040 | 512 (25%) | 234 | 191 | 0 |
+| #22 (matvec) | 1364 | 56 (4%) | 0 | 310 | 0 |
+
+**Важная поправка к предыдущим выводам:** llama.cpp Vulkan для Q4_K тоже использует
+`v_dot4_i32_i8` (dp4a), а не f16-математику — то есть мы с ним в одном формате, и разрыв
+не в int8 против f16, а в планировании/тайлинге/занятости. Атрибуты их шейдера: 8
+аккумуляторов (TM=4, TN=2), 64×64 тайл, **ноль scratch-спилов**, ~410 LDS-чтений на 1024
+dp4a (≈2.5 dp4a на чтение).
+
+Своё ISA пока снять не удалось:
+- Rusticl отдаёт `CL_PROGRAM_BINARY` в своём контейнере (`rusticl\0` + метаданные + LLVM
+  bitcode), ELF внутри нет;
+- `clang -x cl -target amdgcn-amd-amdhsa -mcpu=gfx1034` (и NDK clang 21) не находят
+  builtin `dot()` — не активируется `cl_khr_integer_dot_product` (ни `-cl-ext=`, ни прагма);
+- остаётся: ROCm-clang 17+ с корректным `-cl-ext`, либо разбор контейнера Rusticl,
+  либо временная замена `dot(x,y)` на `__builtin_amdgcn_sdot4` в копии ядра для дампа.
+
+Скрипт разбора ISA:
+
+```python
+import re
+lines=open('radv.log',errors='ignore').read().split('\n')
+shaders=[];cur=None
+for l in lines:
+    if l.startswith('shader: MESA_SHADER'): cur=[]; shaders.append(cur)
+    elif cur is not None: cur.append(l)
+for idx,body in enumerate(shaders):
+    instr=[l for l in body if re.match(r'^\s+(v|s|ds|buffer|scratch|exp|image)_', l)]
+    if not instr: continue
+    dots=sum('v_dot4' in l for l in instr)
+    print(idx, len(instr), dots, sum('ds_' in l for l in instr))
+```
+
 ### Что уже проверили (не помогло)
 
 | гипотеза | результат |
