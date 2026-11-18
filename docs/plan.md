@@ -260,7 +260,12 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    Архитектура — `docs/backends.md`.
 2. **Vulkan/ROCm исключены** решением от 18.11. Остаются CPU и OpenCL.
 3. **Цель: обогнать llama.cpp** по prefill и decode на CPU и OpenCL
-   (бейзлайн — `benchmarks/llama-cpp.md`). Главный разрыв — prefill/GEMM.
+   (бейзлайн — `benchmarks/llama-cpp.md`).
+4. **Сделано: LDS-GEMM для prefill (OpenCL).** `gemm_q4_k_i8_lds11` (варп = 4 токена,
+   дорожка = строка, транспонированные веса и x в LDS, суммы активаций при загрузке)
+   + чанк prefill 128: OpenCL prefill 512 — 502 tok/s, 8192 — 345 (было 205/159),
+   decode не изменился (~64). Остался разрыв ~2.8× с llama.cpp Vulkan (1393/1236) и
+   Q6-GEMM; на CPU — батчевый AVX2-GEMM.
 
 ### P5. M7 — NPU и hardening
 

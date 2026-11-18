@@ -9,6 +9,11 @@ use std::time::Instant;
 
 const BENCH_CL: &str = include_str!("../kernels/bench.cl");
 const GEMV_CL: &str = include_str!("../kernels/gemv.cl");
+const LFM_KERNELS: &str = concat!(
+    include_str!("../../../crates/backend-opencl/kernels/decode.cl"),
+    "\n",
+    include_str!("../../../crates/backend-opencl/kernels/batch.cl")
+);
 const GROUP: usize = 32;
 
 #[derive(Parser)]
@@ -209,6 +214,22 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         ids: Vec<u32>,
     },
+    DotRate {
+        #[arg(long, default_value_t = 200000)]
+        iters: u32,
+    },
+    GemmCmp {
+        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
+        model: PathBuf,
+        #[arg(long, default_value = "blk.2.ffn_up.weight")]
+        tensor: String,
+        #[arg(long, default_value_t = 8)]
+        ntok: usize,
+        #[arg(long, default_value = "lds11")]
+        mode: String,
+        #[arg(long, default_value_t = 4)]
+        check_rows: usize,
+    },
     Gemb {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -401,6 +422,14 @@ fn main() -> Result<()> {
             gpu_cmp(&model, &ids, batch)
         }
         Cmd::GpuTrace { model, ids } => gpu_trace(&model, &ids),
+        Cmd::DotRate { iters } => dot_rate(iters),
+        Cmd::GemmCmp {
+            model,
+            tensor,
+            ntok,
+            mode,
+            check_rows,
+        } => gemm_cmp(&model, &tensor, ntok, &mode, check_rows),
         Cmd::Gemb {
             model,
             tensor,
@@ -3306,4 +3335,308 @@ mod tests {
         assert_eq!(view.scroll, 5);
         tui_render(&state, 10, 40);
     }
+}
+
+fn prepack_q4_key(src: &[u8]) -> Vec<u8> {
+    assert!(src.len() % 144 == 0);
+    let blocks = src.len() / 144;
+    let mut out = vec![0u8; blocks * 148];
+    for b in 0..blocks {
+        let s = &src[b * 144..(b + 1) * 144];
+        let d = &mut out[b * 148..(b + 1) * 148];
+        d[..4].copy_from_slice(&s[..4]);
+        for j in 0..8 {
+            let q = &s[4..16];
+            let jm = j & 3;
+            let h = j >> 2;
+            let a = q[jm];
+            let bq = q[jm + 4];
+            let c = q[jm + 8];
+            let (sc, m) = if h == 0 {
+                (a & 63, bq & 63)
+            } else {
+                ((c & 15) | ((a >> 6) << 4), (c >> 4) | ((bq >> 6) << 4))
+            };
+            d[4 + 2 * j] = sc;
+            d[4 + 2 * j + 1] = m;
+        }
+        d[20..148].copy_from_slice(&s[16..144]);
+    }
+    out
+}
+
+fn gemm_launch(
+    gpu: &Gpu,
+    program: &Program,
+    mode: &str,
+    rows: usize,
+    cols: usize,
+    ntok: usize,
+    wbytes: &[u8],
+    xq: &[i8],
+    xs: &[f32],
+) -> Result<(Vec<f32>, Stats)> {
+    let nsg = (64 / gpu.caps.sub_group_size.max(1)).max(1);
+    let (kernel, global, local) = match mode {
+        "lds11" => (
+            Kernel::create(program, "gemm_q4_k_i8_lds11")?,
+            rows.div_ceil(32) * ntok.div_ceil(32) * 256,
+            256usize,
+        ),
+        "lds10" => (
+            Kernel::create(program, "gemm_q4_k_i8_lds10")?,
+            rows.div_ceil(32) * ntok.div_ceil(32) * 256,
+            256usize,
+        ),
+        _ => (
+            Kernel::create(program, "gemm_q6_k_i8")?,
+            rows.div_ceil(2 * nsg) * 64,
+            64usize,
+        ),
+    };
+    let w = gpu.upload_bytes(wbytes)?;
+    let xqb = gpu.upload(xq)?;
+    let xsb = gpu.upload(xs)?;
+    let yb = gpu.alloc::<f32>(rows * ntok)?;
+    let launch = || -> Result<()> {
+        unsafe {
+            gpu.launch(
+                &kernel,
+                global,
+                local,
+                &[
+                    Arg::Mem(w.get()),
+                    Arg::Mem(xqb.get()),
+                    Arg::Mem(xsb.get()),
+                    Arg::Mem(yb.get()),
+                    Arg::U32(rows as u32),
+                    Arg::U32(cols as u32),
+                    Arg::U32(ntok as u32),
+                ],
+            )?;
+        }
+        Ok(())
+    };
+    launch()?;
+    let st = gpu.bench(2, 10, launch)?;
+    Ok((gpu.download(&yb, rows * ntok)?, st))
+}
+
+fn gemm_one(
+    gpu: &Gpu,
+    program: &Program,
+    name: &str,
+    ty: lfm_gguf::GgmlType,
+    rows: usize,
+    cols: usize,
+    bytes: &[u8],
+    ntok: usize,
+    mode: &str,
+    check_rows: usize,
+    verbose: bool,
+) -> Result<f32> {
+    let mut x = Vec::with_capacity(ntok * cols);
+    for t in 0..ntok {
+        for (i, v) in make_x(cols).into_iter().enumerate() {
+            x.push(v * (1.0 + t as f32 * 0.03) * if (i + t) % 3 == 0 { -1.0 } else { 1.0 });
+        }
+    }
+    let mut xq = Vec::with_capacity(ntok * cols);
+    let mut xs = Vec::with_capacity(ntok * cols / GROUP);
+    for t in 0..ntok {
+        let (q, sc) = quantize_ref(&x[t * cols..(t + 1) * cols], GROUP);
+        xq.extend_from_slice(&q);
+        xs.extend_from_slice(&sc);
+    }
+    let wbytes = if ty == lfm_gguf::GgmlType::Q4_K {
+        prepack_q4_key(bytes)
+    } else {
+        bytes.to_vec()
+    };
+    let (out, st) = gemm_launch(gpu, program, mode, rows, cols, ntok, &wbytes, &xq, &xs)?;
+    let row_bytes = bytes.len() / rows;
+    let mut max_rel = 0.0f32;
+    let mut worst = (0usize, 0usize, 0.0f32, 0.0f32);
+    for r in 0..check_rows.min(rows) {
+        let slice = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        for t in 0..ntok {
+            let g = out[t * rows + r];
+            let refv = dot_i8(
+                ty,
+                slice,
+                &xq[t * cols..(t + 1) * cols],
+                &xs[t * cols / GROUP..(t + 1) * cols / GROUP],
+            )?;
+            let rel = (g - refv).abs() / refv.abs().max(1e-3);
+            if rel > max_rel {
+                max_rel = rel;
+                worst = (r, t, g, refv);
+            }
+        }
+    }
+    if verbose {
+        println!(
+            "{mode} {name} {ty:?} {rows}x{cols} ntok={ntok}: {}",
+            describe(&st)
+        );
+        println!(
+            "  rows {} x ntok {ntok}: max_rel {:.2e} (worst row {} tok {} gpu {:.4} ref {:.4})",
+            check_rows.min(rows), max_rel, worst.0, worst.1, worst.2, worst.3
+        );
+    }
+    Ok(max_rel)
+}
+
+fn gemm_cmp(
+    model: &PathBuf,
+    tensor: &str,
+    ntok: usize,
+    mode: &str,
+    check_rows: usize,
+) -> Result<()> {
+    let gguf = lfm_gguf::GgufFile::open(model)?;
+    let gpu = Gpu::open(0)?;
+    let program = gpu.build(LFM_KERNELS, "-cl-std=CL3.0 -DRGEMV=4 -DRGEMV_B=64 -DPB=6")?;
+    if tensor != "*" {
+        let info = gguf
+            .tensor(tensor)
+            .ok_or_else(|| anyhow!("tensor {tensor} not found"))?
+            .clone();
+        if mode != "q6" && info.ggml_type != lfm_gguf::GgmlType::Q4_K {
+            return Err(anyhow!("mode {mode} needs Q4_K weights"));
+        }
+        if mode == "q6" && info.ggml_type != lfm_gguf::GgmlType::Q6_K {
+            return Err(anyhow!("mode q6 needs Q6_K weights"));
+        }
+        let bytes = gguf.tensor_bytes(tensor)?;
+        gemm_one(
+            &gpu,
+            &program,
+            tensor,
+            info.ggml_type,
+            info.dims[1] as usize,
+            info.dims[0] as usize,
+            bytes,
+            ntok,
+            mode,
+            check_rows,
+            true,
+        )?;
+        return Ok(());
+    }
+    let mut worst = (String::new(), 0.0f32);
+    for t in gguf.tensors() {
+        if t.dims.len() != 2 {
+            continue;
+        }
+        let m = match t.ggml_type {
+            lfm_gguf::GgmlType::Q4_K => "lds11",
+            lfm_gguf::GgmlType::Q6_K => "q6",
+            _ => continue,
+        };
+        if mode != "all" && mode != m {
+            continue;
+        }
+        let bytes = gguf.tensor_bytes(&t.name)?;
+        let rel = gemm_one(
+            &gpu,
+            &program,
+            &t.name,
+            t.ggml_type,
+            t.dims[1] as usize,
+            t.dims[0] as usize,
+            bytes,
+            ntok,
+            m,
+            check_rows,
+            false,
+        )?;
+        if rel > worst.1 {
+            worst = (format!("{} {}({})", t.name, m, t.ggml_type == lfm_gguf::GgmlType::Q6_K), rel);
+        }
+    }
+    println!("worst: {} max_rel {:.2e}", worst.0, worst.1);
+    Ok(())
+}
+
+fn dot_rate(iters: u32) -> Result<()> {
+    let gpu = Gpu::open(0)?;
+    let src = r#"
+__kernel void dot_rate(__global int *out, uint iters) {
+    char4 a0 = (char4)(1, 2, 3, 4);
+    char4 a1 = (char4)(4, 3, 2, 1);
+    char4 a2 = (char4)(2, 5, 1, 7);
+    char4 a3 = (char4)(9, 1, 4, 2);
+    char4 b0 = (char4)(5, 6, 7, 8);
+    char4 b1 = (char4)(1, 2, 5, 4);
+    char4 b2 = (char4)(3, 7, 2, 6);
+    char4 b3 = (char4)(2, 8, 3, 5);
+    int c0 = 0;
+    int c1 = 0;
+    int c2 = 0;
+    int c3 = 0;
+    for (uint i = 0; i < iters; ++i) {
+        c0 += dot(a0, b0);
+        c1 += dot(a1, b1);
+        c2 += dot(a2, b2);
+        c3 += dot(a3, b3);
+        a0 = (char4)(c0 & 3, a0.s1, c1 & 3, a0.s3);
+        b0 = (char4)(c2 & 3, b0.s1, c3 & 3, b0.s3);
+    }
+    out[get_global_id(0)] = c0 + c1 + c2 + c3;
+}
+__kernel void fma_rate(__global float *out, uint iters) {
+    float4 a0 = (float4)(1.0f, 2.0f, 3.0f, 4.0f);
+    float4 b0 = (float4)(0.5f, 0.25f, 0.125f, 1.5f);
+    float4 c0 = (float4)(0.0f);
+    float4 c1 = (float4)(0.0f);
+    float4 c2 = (float4)(0.0f);
+    float4 c3 = (float4)(0.0f);
+    for (uint i = 0; i < iters; ++i) {
+        c0 = fma(a0, b0, c0);
+        c1 = fma(a0, b0, c1);
+        c2 = fma(a0, b0, c2);
+        c3 = fma(a0, b0, c3);
+        b0 = (float4)(c0.x * 1e-9f + 0.5f, b0.y, b0.z, b0.w);
+    }
+    out[get_global_id(0)] = c0.x + c1.y + c2.z + c3.w;
+}
+"#;
+    let program = gpu.build(src, "-cl-std=CL3.0")?;
+    let grid = 12 * 64 * 64;
+    for name in ["dot_rate", "fma_rate"] {
+        let k = Kernel::create(&program, name)?;
+        if name == "dot_rate" {
+            let out = gpu.alloc::<i32>(grid)?;
+            let st = gpu.bench(2, 5, || -> Result<()> {
+                unsafe {
+                    gpu.launch(&k, grid, 64, &[Arg::Mem(out.get()), Arg::U32(iters)])?;
+                }
+                Ok(())
+            })?;
+            let ops = grid as f64 * iters as f64 * 4.0;
+            println!(
+                "{name}: {} -> {:.2} T dot4/s ({:.2} T MAC/s)",
+                describe(&st),
+                ops / (st.median_ms / 1e3) / 1e12,
+                ops * 4.0 / (st.median_ms / 1e3) / 1e12
+            );
+        } else {
+            let out = gpu.alloc::<f32>(grid)?;
+            let st = gpu.bench(2, 5, || -> Result<()> {
+                unsafe {
+                    gpu.launch(&k, grid, 64, &[Arg::Mem(out.get()), Arg::U32(iters)])?;
+                }
+                Ok(())
+            })?;
+            let ops = grid as f64 * iters as f64 * 4.0;
+            println!(
+                "{name}: {} -> {:.2} T fma4/s ({:.2} T MAC/s)",
+                describe(&st),
+                ops / (st.median_ms / 1e3) / 1e12,
+                ops * 4.0 / (st.median_ms / 1e3) / 1e12
+            );
+        }
+    }
+    Ok(())
 }

@@ -99,7 +99,8 @@ struct Kernels {
     q4_b: Kernel,
     q4p_b: Kernel,
     q4x4p_b: Kernel,
-    gemm_q4: Kernel,
+    gemm_q4_lds10: Kernel,
+    gemm_q4_lds11: Kernel,
     gemm_q6: Kernel,
     q6_b: Kernel,
     conv_b: Kernel,
@@ -420,6 +421,8 @@ pub struct GpuModel {
     pb: usize,
     prefill_batch: usize,
     batch_cap: usize,
+    gemm_force: Option<String>,
+    gemm_q4: String,
     rgemv: usize,
     rgemv_b: usize,
     wg: usize,
@@ -659,8 +662,10 @@ impl GpuModel {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v: &usize| (1..=128).contains(v))
-            .unwrap_or(pb);
+            .unwrap_or(128);
         let batch_cap = pb.max(prefill_batch);
+        let gemm_force: Option<String> = std::env::var("LFM_GEMM_FORCE").ok().filter(|v| !v.is_empty());
+        let gemm_q4: String = std::env::var("LFM_GEMM_Q4").unwrap_or_else(|_| "lds11".to_string());
         let rgemv: usize = std::env::var("LFM_RGEMV")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -716,7 +721,8 @@ impl GpuModel {
             q4_b: Kernel::create(&program, "gemv_q4_k_i8_b")?,
             q4p_b: Kernel::create(&program, "gemv_q4_k_i8_p_b")?,
             q4x4p_b: Kernel::create(&program, "gemv_q4_k_i8_4p_b")?,
-            gemm_q4: Kernel::create(&program, "gemm_q4_k_i8_p")?,
+            gemm_q4_lds10: Kernel::create(&program, "gemm_q4_k_i8_lds10")?,
+            gemm_q4_lds11: Kernel::create(&program, "gemm_q4_k_i8_lds11")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
             conv_b: Kernel::create(&program, "conv_step_b")?,
@@ -860,6 +866,8 @@ impl GpuModel {
             pb,
             prefill_batch,
             batch_cap,
+            gemm_force,
+            gemm_q4,
             rgemv,
             rgemv_b,
             wg,
@@ -943,14 +951,24 @@ impl GpuModel {
         } else {
             None
         };
-        if ntok > self.pb {
+        let force = self
+            .gemm_force
+            .as_deref()
+            .is_some_and(|list| list.split(',').any(|pat| !pat.is_empty() && name.contains(pat)));
+        if ntok > self.pb || force {
             if let (Weight::Q4(_), Some(p)) = (weight, packed) {
-                let grid = rows.div_ceil(2) * 64;
+                let tps = ntok.div_ceil(32);
+                let grid = rows.div_ceil(32) * tps * 256;
                 unsafe {
+                    let kq = if self.gemm_q4 == "lds10" {
+                        &self.kernels.gemm_q4_lds10
+                    } else {
+                        &self.kernels.gemm_q4_lds11
+                    };
                     self.gpu.launch(
-                        &self.kernels.gemm_q4,
+                        kq,
                         grid,
-                        64,
+                        256,
                         &[
                             Arg::Mem(p.get()),
                             Arg::Mem(xq.get()),
@@ -965,7 +983,8 @@ impl GpuModel {
                 return Ok(());
             }
             if let Weight::Q6(b) = weight {
-                let grid = rows.div_ceil(2) * 64;
+                let nsg = (64 / self.gpu.caps.sub_group_size.max(1)).max(1);
+                let grid = rows.div_ceil(2 * nsg) * 64;
                 unsafe {
                     self.gpu.launch(
                         &self.kernels.gemm_q6,
@@ -2074,7 +2093,7 @@ impl GpuModel {
             ("q4", &self.kernels.q4),
             ("q4p_b", &self.kernels.q4p_b),
             ("q4x4p_b", &self.kernels.q4x4p_b),
-            ("gemm_q4", &self.kernels.gemm_q4),
+            ("gemm_q4_lds10", &self.kernels.gemm_q4_lds10),
             ("gemm_q6", &self.kernels.gemm_q6),
             ("q6", &self.kernels.q6),
             ("q4_b", &self.kernels.q4_b),
@@ -2405,7 +2424,9 @@ impl GpuModel {
                 _ => {
                     let kv_heads = self.cfg.kv_heads_of(layer);
                     let kvg = kv_heads * head_dim;
-                    let fused = if ntok <= self.pb && self
+                    let fused = if ntok > self.pb {
+                        None
+                    } else if self
                         .prepacked
                         .contains_key(&format!("{prefix}.attn_qkvg.weight"))
                     {
