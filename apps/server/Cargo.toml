@@ -13,4 +13,3 @@ lfm-app.workspace = true
 lfm-tokenizer.workspace = true
 lfm-chat.workspace = true
 lfm-gpu.workspace = true
-lfm-backend-cpu.workspace = true

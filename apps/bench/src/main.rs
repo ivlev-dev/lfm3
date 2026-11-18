@@ -174,26 +174,6 @@ enum Cmd {
         #[arg(long, default_value_t = 2048)]
         ctx: usize,
     },
-    CpuPrefill {
-        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
-        model: PathBuf,
-        #[arg(long, default_value_t = 512)]
-        tokens: usize,
-        #[arg(long, default_value_t = 1024)]
-        ctx: usize,
-    },
-    CpuPort {
-        #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
-        model: PathBuf,
-        #[arg(long, default_value = "models/hf/tokenizer.json")]
-        tokenizer: PathBuf,
-        #[arg(long, default_value = "The capital of France is")]
-        prompt: String,
-        #[arg(long, default_value_t = 8)]
-        tokens: usize,
-        #[arg(long, default_value_t = 1024)]
-        ctx: usize,
-    },
     GpuTp {
         #[arg(long, default_value = "models/LFM3-1.7B-Q4_K_M.gguf")]
         model: PathBuf,
@@ -486,14 +466,6 @@ fn main() -> Result<()> {
             devices,
             ctx,
         } => gpu_tp(&model, &tokenizer, &prompt, tokens, &devices, ctx),
-        Cmd::CpuPrefill { model, tokens, ctx } => cpu_prefill(&model, tokens, ctx),
-        Cmd::CpuPort {
-            model,
-            tokenizer,
-            prompt,
-            tokens,
-            ctx,
-        } => cpu_port(&model, &tokenizer, &prompt, tokens, ctx),
         Cmd::RefPpl {
             model,
             tokenizer,
@@ -2812,39 +2784,6 @@ __kernel void probe(__global uint *out) {
             v[0], v[1], v[2], v[3], v[4], v[5], v[6]
         );
     }
-    Ok(())
-}
-
-fn cpu_prefill(model: &PathBuf, tokens: usize, ctx: usize) -> Result<()> {
-    let mut backend = lfm_backend_cpu::CpuBackend::load(model, ctx)?;
-    let ids: Vec<u32> = (0..tokens).map(|i| ((i * 2654435761usize) % 60000) as u32 + 100).collect();
-    let slot = backend.create_sequence()?;
-    let started = Instant::now();
-    let _ = backend.prefill(slot, &ids, false)?;
-    let elapsed = started.elapsed().as_secs_f64();
-    println!("cpu prefill {tokens} tok in {elapsed:.3}s ({:.1} tok/s)", tokens as f64 / elapsed);
-    Ok(())
-}
-
-fn cpu_port(
-    model: &PathBuf,
-    tokenizer: &PathBuf,
-    prompt: &str,
-    tokens: usize,
-    ctx: usize,
-) -> Result<()> {
-    let started = Instant::now();
-    let mut backend = lfm_backend_cpu::CpuBackend::load(model, ctx)?;
-    let load = started.elapsed().as_secs_f64();
-    let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
-    let started = Instant::now();
-    let out = lfm_app::Generate::new(&mut backend, &tok).run(prompt, tokens)?;
-    let elapsed = started.elapsed().as_secs_f64();
-    println!("cpu load {load:.2}s");
-    println!("ids: {:?}", out.ids);
-    println!("finish: {:?}", out.finish);
-    println!("text: {}", out.text);
-    println!("{:.2} tok/s", out.ids.len() as f64 / elapsed.max(1e-9));
     Ok(())
 }
 

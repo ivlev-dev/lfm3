@@ -983,20 +983,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lfm-backend-cpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "half",
- "lfm-app",
- "lfm-domain",
- "lfm-gguf",
- "lfm-quant",
- "rayon",
-]
-
-[[package]]
 name = "lfm-bench"
 version = "0.1.0"
 dependencies = [
@@ -1004,7 +990,6 @@ dependencies = [
  "clap",
  "half",
  "lfm-app",
- "lfm-backend-cpu",
  "lfm-chat",
  "lfm-cpu",
  "lfm-domain",
@@ -1012,17 +997,6 @@ dependencies = [
  "lfm-gpu",
  "lfm-opencl",
  "lfm-quant",
- "lfm-tokenizer",
-]
-
-[[package]]
-name = "lfm-bench-cpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "lfm-app",
- "lfm-backend-cpu",
  "lfm-tokenizer",
 ]
 
@@ -1117,7 +1091,6 @@ dependencies = [
  "anyhow",
  "clap",
  "lfm-app",
- "lfm-backend-cpu",
  "lfm-chat",
  "lfm-domain",
  "lfm-gpu",

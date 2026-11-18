@@ -35,34 +35,16 @@ apps/*  (composition root: выбор бэкенда по CLI/env)
 ## Выбор бэкенда
 
 Env/CLI (composition root):
-- `LFM_BACKEND=cpu|opencl|vulkan|rocm` (default opencl);
+- бэкенд один — OpenCL;
 - `LFM_DEVICE` — индекс устройства у OpenCL;
 - `LFM_TIERS` — PP по слоям (OpenCL), `LFM_TP` — full TP (OpenCL);
 - фичи Cargo: `backend-cpu` (default), `backend-opencl` (default); Vulkan/ROCm
   исключены.
 
-## backend-cpu (готов, W4A8 + AVX2)
+## CPU и ARMv7
 
-- Веса Q4_K/Q6_K **предпаковываются при загрузке**:
-  - Q4: нибблы `u8 q[128]` (значение `i` — младший ниббл байта `i`, `i+128` — старший)
-    + 8 пар `d*scale`, `dmin*min` (f32). 192 Б на 256 значений;
-  - Q6: `u8 q[256]` (0..63) + 16 `d*scale` (f32). 320 Б на 256 значений.
-  Память ≈ 1.2 ГБ на 1.7B Q4.
-- Активации квантуются в i8 по группам 32 (`q`, `s`, суммы по 32 и 16).
-- Ядра: `_mm256_maddubs_epi16` + `_mm256_madd_epi16`, распаковка нибблов
-  `and`/`srli`; аккумулятор — 8 f32-доржек на строку, горизонтальная редукция
-  **один раз на строку**; скалярные `mn*sum` собраны в отдельный аккумулятор
-  (в prefill — векторный по 8 группам). runtime-детект `avx2/fma` кешируется,
-  есть скалярный fallback (`LFM_CPU_SCALAR=1`).
-- **Prefill батчевый**: `forward_batch` обрабатывает 8 токенов за проход
-  (`matmul_batch`), веса читаются раз на тайл; Q6-ветка считает по 32 значения
-  за итерацию (по 16-групповым скейлам). attention/conv/нормы — по токену, KV общий.
-- Decode (`matvec`) — та же векторизация, Rayon по строкам; attention/conv/нормы f32,
-  KV непрерывный (без страниц), радикс-кэша нет (`prefill_begin → 0`).
-- Результат на i5-10400: prefill 512 ≈ 54.5 tok/s, decode ≈ 15.7 tok/s (llama.cpp
-  CPU: 141.5 / 23.3); `cpu-port` совпадает с GPU Q4 по greedy-ids на 8 токенах.
-- Дальше по CPU: prefetch/стриминг весов, f16-KV, отказ от аллокаций в forward,
-  NEON-ветка (aarch64).
+Вынесены в отдельные проекты (в этом репозитории остаётся только OpenCL):
+CPU-бэкенд W4A8/AVX2 и ARMv7 (NEON + OpenCL 1.1 для Adreno 330).
 
 ## Vulkan/ROCm
 
@@ -75,7 +57,7 @@ llama.cpp по prefill и decode.
 - `*-gen --tokens N` — greedy-ids/текст;
 - `*-cmp --len N --batch B` — батч == последовательный (cos/top-5);
 - `*-multi --seqs N` — mixed batch;
-- `Generate` через порты (`gpu-port`/`cpu-port`);
+- `Generate` через порты (`gpu-port`);
 - сервер: `/v1/chat/completions`, `tools/loadtest.py`, `/metrics`.
 
 Перф-метрики: decode/prefill tok/s на ctx 512/2048/8192, агрегат 4–6 стримов,

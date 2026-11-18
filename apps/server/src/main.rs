@@ -36,11 +36,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let backend: lfm_app::BackendLoader = match std::env::var("LFM_BACKEND") {
-        Ok(name) if name == "cpu" => Box::new(|path, ctx| {
-            Ok(Box::new(lfm_backend_cpu::CpuBackend::load(path, ctx)?))
-        }),
-        _ => match std::env::var("LFM_TP") {
+    let backend: lfm_app::BackendLoader = match std::env::var("LFM_TP") {
         Ok(devices) if !devices.is_empty() => Box::new(move |path, ctx| {
             let devices: Vec<usize> = devices
                 .split('/')
@@ -64,7 +60,6 @@ fn main() -> Result<()> {
                 )?))
             }),
             _ => Box::new(|path, ctx| Ok(Box::new(lfm_gpu::GpuModel::load(path, ctx)?))),
-        },
         },
     };
     let tokenizer: lfm_app::TokenizerLoader = Box::new(|path| {

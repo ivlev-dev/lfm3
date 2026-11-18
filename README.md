@@ -54,13 +54,8 @@
   даёт те же greedy-ids, что одиночный GPU (16 токенов), `logits cos 0.999824`,
   top-5 совпадает; сервер с `LFM_TIERS` отдаёт ответы и переиспользует радикс-кэш
   на обеих ступенях (повтор — reused 192 токена).
-- **Модульные бэкенды: CPU-бэкенд готов.** Новый крейт `backend-cpu` (pure Rust):
-  веса Q4_K/Q6_K предпакованы (Q4 — нибблы + скейлы/мины, 1.2 ГБ вместо 6.8 ГБ f32),
-  активации W4A8 по группам 32, AVX2 (`maddubs`/`fmadd`, кешируемый runtime-детект,
-  scalar fallback), батчевый prefill по 8 токенов и векторизованный `matvec`.
-  `cpu-port` даёт те же greedy-ids, что GPU Q4 (8 токенов); prefill ≈ 54.5 tok/s,
-  decode ≈ 15.7 tok/s на i5-10400; сервер запускается с `LFM_BACKEND=cpu`.
-  Архитектура — `docs/backends.md`.
+- **Бэкенд: OpenCL.** Единственный вычислительный бэкенд в этом репозитории.
+  CPU-бэкенд (W4A8/AVX2) и ARMv7/OpenCL 1.1 вынесены в отдельные проекты.
 - **M6 (tensor parallel) — готов.** Full TP на двух устройствах: q/k/v/g и gate —
   по головам, `attn_output` — по столбцам, FFN — `up/gate` по строкам и `down`
   по столбцам, lm_head — по словарю с host-gather. `LFM_TP=0/1`/`gpu-tp`: ids
@@ -113,12 +108,10 @@
 5. **Цель — обогнать llama.cpp** (`benchmarks/llama-cpp.md`) на CPU и OpenCL:
    prefill и decode. Бейзлайн: CPU 142 pp512 / 23 tg128, Vulkan 1393 / 91.
    Главный разрыв — prefill (GEMM): CPU ×2.6, OpenCL ×2.3 (512) / ×3.1 (8192);
-   decode CPU ×1.5, OpenCL ×1.4.
-   Готовы: CPU — батчевый prefill + AVX2-векторизация (prefill 54.5, decode 15.7 tok/s,
-   было 10 / 8.2); OpenCL — LDS-GEMM для Q4 (`gemm_q4_k_i8_lds11`), int8-предпак для Q6
-   (`gemm_q6_i8_pp`) и attention по 4 позиции за итерацию (prefill 512 — 597, 2048 — 525,
-   8192 — 402). Дальше — attention на длинном контексте (40% времени при 8192),
-   эффективность Q4-GEMM и CPU-prefetch.
+   decode OpenCL ×1.4.
+   Готовы: LDS-GEMM для Q4 (`gemm_q4_k_i8_lds11`), int8-предпак для Q6 (`gemm_q6_i8_pp`)
+   и attention по 4 позиции за итерацию (prefill 512 — 597, 2048 — 525, 8192 — 402).
+   Дальше — attention на длинном контексте (40% времени при 8192) и эффективность Q4-GEMM.
    Vulkan/ROCm исключены из плана.
 
 ## Железо и целевые показатели
@@ -186,8 +179,6 @@ cargo run --release -p lfm-bench -- gpu-gen --tokens 64      # текст + tok/
 cargo run --release -p lfm-bench -- gpu-port --tokens 24     # через порты + Generate
 cargo run --release -p lfm-bench -- gpu-pp --tokens 8 --tiers 20/80/0  # PP: GPU+PoCL
 cargo run --release -p lfm-bench -- gpu-tp --tokens 8 --devices 0/1      # full TP
-cargo run --release -p lfm-bench -- cpu-port --tokens 8                   # CPU W4A8/AVX2
-cargo run --release -p lfm-bench-cpu -- prefill --tokens 512              # CPU-стенд (в т.ч. armv7)
 cargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
 cargo run --release -p lfm-bench -- gpu-chat --user "What is the capital of Japan?"
 cargo run --release -p lfm-bench -- gpu-multi --seqs 6 --tokens 48   # 6 стримов
@@ -224,7 +215,7 @@ prefill-attention), `LFM_WG` / `LFM_WG_B` (workgroup decode/batch GEMV, по у�
 256/64), `LFM_RGEMV` / `LFM_RGEMV_B` (строк на подгруппу decode/batch, 4/5),
 `LFM_DEVICE` (индекс OpenCL-устройства: 0 — rusticl GPU, 1 — PoCL CPU),
 `LFM_TIERS=20/80/0` (PP-раскладка по устройствам), `LFM_TP=0/1` (full TP по устройствам),
-`LFM_BACKEND=cpu` (CPU-бэкенд вместо OpenCL),
+`LFM_TP`/`LFM_TIERS` (PP/TP),
 `LFM_PREFILL_BUDGET` (prefill-токенов
 на шаг планировщика, по умолчанию 12), `LFM_SCHED_LOG=1` (лог шагов планировщика).
 
