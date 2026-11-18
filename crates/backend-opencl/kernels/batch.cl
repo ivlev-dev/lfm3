@@ -1649,9 +1649,7 @@ __kernel void gemm_q4_k_i8_lds11(__global const uchar *w, __global const char *x
             }
         }
     }
-}
-
-__kernel void gemm_q6_i8_pp(__global const char *w, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+}__kernel void gemm_q6_i8_pp(__global const char *w, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
     uint lid = get_local_id(0);
     uint tps = (ntok + 31u) / 32u;
     uint gid = get_group_id(0);
@@ -1894,3 +1892,4 @@ __kernel void attention_split_b_h4_p4(__global const float *q, __global const ha
         }
     }
 }
+
