@@ -474,7 +474,7 @@ impl Worker {
         let gpu = backend(&cfg.model, cfg.ctx)?;
         let max_batch = env_range("LFM_PB", 6, 1, 12);
         let max_active = env_range("LFM_SEQS", 8, 1, 16);
-        let prefill_budget = env_usize("LFM_PREFILL_BUDGET", 12).clamp(1, 64);
+        let prefill_budget = env_usize("LFM_PREFILL_BUDGET", 64).clamp(1, 128);
         let sched = Scheduler::new(SchedulerConfig::new(
             gpu.max_ctx(),
             max_active,
@@ -690,7 +690,12 @@ impl Worker {
     }
 
     fn mixed_step(&mut self, rows: &[StepRow], _need_logits: bool) {
-        let max_batch = self.sched.config().max_batch.max(1);
+        let max_batch = self
+            .sched
+            .config()
+            .max_batch
+            .max(self.gpu.prefill_batch_size())
+            .max(1);
         for slice in rows.chunks(max_batch) {
             if !self.mixed_slice(slice) {
                 return;

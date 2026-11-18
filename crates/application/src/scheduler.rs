@@ -221,10 +221,16 @@ impl Scheduler {
             .iter()
             .any(|seq| seq.phase == Phase::Decode);
         if !has_decode {
-            match self.active.iter().find(|seq| seq.phase == Phase::Prefill) {
-                Some(seq) if seq.prefilled == 0 => return StepPlan::AtomicPrefill(seq.id),
-                Some(_) => {}
-                None => return StepPlan::Idle,
+            let pending: Vec<&ActiveSeq> = self
+                .active
+                .iter()
+                .filter(|seq| seq.phase == Phase::Prefill && seq.prompt_remaining() > 0)
+                .collect();
+            if pending.len() == 1 && self.waiting.is_empty() && pending[0].prefilled == 0 {
+                return StepPlan::AtomicPrefill(pending[0].id);
+            }
+            if pending.is_empty() {
+                return StepPlan::Idle;
             }
         }
 
@@ -252,21 +258,26 @@ impl Scheduler {
         let mut progress = prefs.iter().any(|seq| seq.prompt_remaining() > 0);
         while budget > 0 && progress {
             progress = false;
+            let per = (budget / prefs.len().max(1)).max(1);
             for (i, seq) in prefs.iter().enumerate() {
                 if budget == 0 {
                     break;
                 }
-                if taken[i] >= seq.prompt_remaining() {
+                let remaining = seq.prompt_remaining() - taken[i];
+                if remaining == 0 {
                     continue;
                 }
-                let index = seq.prefilled + taken[i];
-                rows.push(StepRow {
-                    id: seq.id,
-                    pos: index,
-                    token: StepToken::Prompt(index),
-                });
-                taken[i] += 1;
-                budget -= 1;
+                let take = remaining.min(per).min(budget);
+                for k in 0..take {
+                    let index = seq.prefilled + taken[i] + k;
+                    rows.push(StepRow {
+                        id: seq.id,
+                        pos: index,
+                        token: StepToken::Prompt(index),
+                    });
+                }
+                taken[i] += take;
+                budget -= take;
                 progress = true;
             }
         }
@@ -653,6 +664,29 @@ mod tests {
         assert_eq!(seq.used_pages(), 1);
         assert_eq!(seq.future_pages(), 2);
         assert_eq!(s.available_for_new(3), 1);
+    }
+
+    #[test]
+    fn concurrent_prefills_are_chunked_not_atomic() {
+        let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 16, 4));
+        let a = s.enqueue(40, 4).unwrap();
+        let b = s.enqueue(40, 4).unwrap();
+        admit_all(&mut s, 128);
+        match s.plan_step() {
+            StepPlan::Mixed { rows, .. } => {
+                assert!(rows.iter().any(|r| r.id == a.id));
+                assert!(rows.iter().any(|r| r.id == b.id));
+            }
+            other => panic!("expected mixed prefills, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_prefill_stays_atomic() {
+        let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 16, 4));
+        let a = s.enqueue(40, 4).unwrap();
+        admit_all(&mut s, 128);
+        assert_eq!(s.plan_step(), StepPlan::AtomicPrefill(a.id));
     }
 
     #[test]
