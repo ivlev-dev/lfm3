@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     channel, Receiver, RecvTimeoutError, Sender, TryRecvError,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct ServeConfig {
@@ -88,6 +88,7 @@ pub struct Engine {
     tx: Sender<Job>,
     metrics: Arc<EngineMetrics>,
     log_requests: bool,
+    worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 pub struct EngineMetrics {
@@ -199,7 +200,7 @@ impl Engine {
         let (ready_tx, ready_rx) = channel::<Result<()>>();
         let metrics = Arc::new(EngineMetrics::new(cfg.ctx));
         let worker_metrics = Arc::clone(&metrics);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("engine".to_string())
             .spawn(move || {
                 let mut worker = match Worker::load(cfg, worker_metrics, backend, tokenizer) {
@@ -219,6 +220,7 @@ impl Engine {
                 tx: job_tx,
                 metrics,
                 log_requests,
+                worker: Arc::new(Mutex::new(Some(worker))),
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!("engine thread stopped during load")),
@@ -235,6 +237,29 @@ impl Engine {
 
     pub fn log_requests(&self) -> bool {
         self.log_requests
+    }
+
+    pub fn shutdown(self) {
+        let Engine {
+            tx, worker, ..
+        } = self;
+        drop(tx);
+        let handle = match worker.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
+        };
+        let Some(handle) = handle else {
+            return;
+        };
+        let (done_tx, done_rx) = channel::<()>();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        if done_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+            eprintln!("lfm-server: движок не остановился за 10 с, выходим принудительно");
+            std::process::exit(0);
+        }
     }
 
     pub fn metrics(&self) -> EngineMetricsSnapshot {

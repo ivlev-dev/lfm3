@@ -226,8 +226,9 @@ fn main() -> Result<()> {
     }
     let left = active.load(Ordering::SeqCst);
     if left > 0 {
-        eprintln!("lfm-server: принудительный выход, соединений осталось {left}");
+        eprintln!("lfm-server: соединений осталось {left}, останавливаем движок");
     }
+    engine.shutdown();
     println!("lfm-server: остановлен");
     Ok(())
 }
