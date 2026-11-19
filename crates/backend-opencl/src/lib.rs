@@ -173,6 +173,7 @@ struct Kernels {
     kv_store_b_h_rot: Kernel,
     attn_b_h_rot: Kernel,
     attn_split_b_h_rot: Kernel,
+    attn_split_b_fa_qk: Kernel,
     attn_h_qk: Kernel,
     attn_split_h_qk: Kernel,
     attn_combine_b: Kernel,
@@ -890,6 +891,7 @@ impl GpuModel {
             kv_store_b_h_rot: Kernel::create(&program, "kv_store_b_h_rot")?,
             attn_b_h_rot: Kernel::create(&program, "attention_b_h_rot")?,
             attn_split_b_h_rot: Kernel::create(&program, "attention_split_b_h_rot")?,
+            attn_split_b_fa_qk: Kernel::create(&program, "attention_split_b_fa_qk")?,
             attn_h_qk: Kernel::create(&program, "attention_h_qk")?,
             attn_split_h_qk: Kernel::create(&program, "attention_split_h_qk")?,
             attn_combine_b: Kernel::create(&program, "attention_combine_b")?,
@@ -3607,9 +3609,17 @@ impl GpuModel {
                                             _ => return Err(anyhow!("mixed kv variants")),
                                         };
 
+                                        let use_fa =
+                                            self.subgroup == 64 && kv_heads == 4 && heads == 16;
                                         self.gpu.launch(
-                                            &self.kernels.attn_split_b_h_rot,
-                                            ntok * heads * splits * 64,
+                                            if use_fa {
+                                                &self.kernels.attn_split_b_fa_qk
+                                            } else {
+                                                &self.kernels.attn_split_b_h_rot
+                                            },
+                                            ntok * (if use_fa { kv_heads } else { heads })
+                                                * splits
+                                                * 64,
                                             64,
                                             &[
                                                 Arg::Mem(self.bufs.qb.get()),

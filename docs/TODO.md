@@ -370,6 +370,8 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 | Редукция | LDS-склад в attention kvarn и f16-decode заменён на `sub_group_reduce_add` при подгруппе 64 (`LFM_SG64`). AMD: f16 decode 8192 — 28.8 → 43.2 tok/s, kvarn decode 8192 — 28.4 → 41.5, kvarn prefill 512/4096 — 676/440 → 757/483. cos f16 0.998532, kvarn 0.998435 |
 | Сервер | одиночный decode-шаг в сервере шёл через батчевые ядра: avg_step 1150 → 256 мс; логіты переносятся в батчевый буфер для `logits_row`. На iGPU с kvarn: TTFT 2.24 с, стрим корректен, обрыв освобождает слот |
 | Память kvarn | staging-кольцо = `prefill_ntok`: 128 → 143 МБ, 64 → 118, 32 → 106 МБ при ctx 8192 (prefill −7…−11%), cos не меняется |
+| Flash kvarn | `attention_split_b_fa_qk`: 4 головы × 16 полос, векторный декод кодов, обратное вращение Hadamard в регистрах через `shuffle_xor`. kvarn prefill 8192: 342 → 482 tok/s, 4096: 483 → 621 |
+| Найденные баги | (1) split-ядра kvarn писали нормированные частичные суммы, а combine делит на `l` ещё раз — при splits > 1 kvarn-внимание (и decode, и batch) считало неверно; (2) знак кросс-полосной бабочки Hadamard в регистровой версии |
 | Вывод | decode-GEMV на iGPU упирается в перекрытие загрузки/счёт и латентность dot4; kvarn меняет память (403 → 106–143 МБ) на скорость prefill (−11…−48%) |
 
 ## Сессия 13 (kvarn: staging по последовательностям)

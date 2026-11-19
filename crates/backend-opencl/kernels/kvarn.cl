@@ -512,9 +512,8 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         acc1 = acc1 * corr + w * v.y;
         m = mn;
     }
-    float inv = 1.0f / l;
-    qs[2u * lane] = acc0 * inv;
-    qs[2u * lane + 1u] = acc1 * inv;
+    qs[2u * lane] = acc0;
+    qs[2u * lane + 1u] = acc1;
     barrier(CLK_LOCAL_MEM_FENCE);
     lfm_tq_rot_inv(qs, lane);
     ulong pbase = ((ulong)head * splits + sp) * 128u;
@@ -744,9 +743,8 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
         acc1 = acc1 * corr + w * v.y;
         m = mn;
     }
-    float inv = 1.0f / l;
-    qs[2u * lane] = acc0 * inv;
-    qs[2u * lane + 1u] = acc1 * inv;
+    qs[2u * lane] = acc0;
+    qs[2u * lane + 1u] = acc1;
     barrier(CLK_LOCAL_MEM_FENCE);
     lfm_tq_rot_inv(qs, lane);
     ulong pbase = ((ulong)t * n_heads + head) * splits + sp;
@@ -758,3 +756,175 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
         pml[pbase * 2u + 1u] = l;
     }
 }
+
+static void lfm_tq_had8(float v[8], uint jlane) {
+    #pragma unroll
+    for (uint st = 1u; st <= 4u; st <<= 1) {
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) {
+            if ((i & st) == 0u) {
+                float a = v[i];
+                float b = v[i + st];
+                v[i] = a + b;
+                v[i + st] = a - b;
+            }
+        }
+    }
+    #pragma unroll
+    for (uint mask = 1u; mask <= 8u; mask <<= 1) {
+        float sgn = ((jlane & mask) == 0u) ? 1.0f : -1.0f;
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) {
+            float b = sub_group_shuffle_xor(v[i], mask);
+            v[i] = sgn * v[i] + b;
+        }
+    }
+}
+
+static void lfm_tq_rot_fwd8(float v[8], uint jlane) {
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        v[i] *= lfm_tq_sign(jlane * 8u + i);
+    }
+    lfm_tq_had8(v, jlane);
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        v[i] *= 0.0883883476f;
+    }
+}
+
+static void lfm_tq_rot_inv8(float v[8], uint jlane) {
+    lfm_tq_had8(v, jlane);
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        v[i] *= 0.0883883476f * lfm_tq_sign(jlane * 8u + i);
+    }
+}
+
+static void lfm_kvarn_k8(__global const uchar *kcode, __global const KV_T *ka, __global const KV_T *kc,
+                         uint phys, uint tok, uint kvh, uint kv_heads, uint j, float k[8]) {
+    uint base = phys * kv_heads + kvh;
+    __global const uchar *cp = kcode + ((phys << 5 | tok) * kv_heads + kvh) * 64u + j * 4u;
+    uchar4 c = vload4(0, cp);
+    float a[8];
+    vstore8(convert_float8(kv_load8(0, ka + base * 128u + j * 8u)), 0, a);
+    float ct = (float)kc[base * 32u + tok];
+    k[0] = (float)((int)(c.s0 & 15u) - 8);
+    k[1] = (float)((int)((c.s0 >> 4) & 15u) - 8);
+    k[2] = (float)((int)(c.s1 & 15u) - 8);
+    k[3] = (float)((int)((c.s1 >> 4) & 15u) - 8);
+    k[4] = (float)((int)(c.s2 & 15u) - 8);
+    k[5] = (float)((int)((c.s2 >> 4) & 15u) - 8);
+    k[6] = (float)((int)(c.s3 & 15u) - 8);
+    k[7] = (float)((int)((c.s3 >> 4) & 15u) - 8);
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        k[i] *= a[i] * ct;
+    }
+}
+
+static void lfm_kvarn_v8(__global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz,
+                         __global const KV_T *vc, uint phys, uint tok, uint kvh, uint kv_heads, uint j, float v[8]) {
+    uint base = phys * kv_heads + kvh;
+    __global const uchar *cp = vcode + ((phys << 5 | tok) * kv_heads + kvh) * 32u + j * 2u;
+    uint c = (uint)cp[0] | ((uint)cp[1] << 8);
+    float sc[8];
+    vstore8(convert_float8(kv_load8(0, vc + base * 128u + j * 8u)), 0, sc);
+    float bt = (float)vb[base * 32u + tok];
+    float zero = (float)vbz[base * 32u + tok];
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        v[i] = (float)((c >> (2u * i)) & 3u) * bt + zero;
+    }
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        v[i] *= sc[i];
+    }
+}
+
+__kernel void attention_split_b_fa_qk(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf,
+                                      __global const uchar *kcode, __global const KV_T *ka, __global const KV_T *kc,
+                                      __global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz, __global const KV_T *vc,
+                                      __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b,
+                                      __global const uint *seq_b, __global float *pacc, __global float *pml,
+                                      uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits, uint seq_cap) {
+    uint gid = get_group_id(0);
+    uint lane = get_local_id(0);
+    uint per_tok = kv_heads * splits;
+    uint t = gid / per_tok;
+    uint rem = gid % per_tok;
+    uint kvh = rem / splits;
+    uint sp = rem % splits;
+    if (t >= ntok) {
+        return;
+    }
+    uint seq = seq_b[t];
+    if (seq >= seq_cap) {
+        return;
+    }
+    uint h = lane >> 4;
+    uint j = lane & 15u;
+    uint head = kvh * (n_heads / kv_heads) + h;
+    uint len = pos_b[t] + 1u;
+    uint start = (window > 0u && len > window) ? len - window : 0u;
+    uint toff = tbl_off[t];
+    uint full_end = (len / 32u) * 32u;
+    uint kv_shift = seq * 128u;
+    uint span = len - start;
+    uint chunk = (span + splits - 1u) / splits;
+    uint p0 = start + sp * chunk;
+    uint p1 = min(p0 + chunk, len);
+    float qv[8];
+    vstore8(vload8(0, q + ((ulong)t * n_heads + head) * head_dim + j * 8u), 0, qv);
+    lfm_tq_rot_fwd8(qv, j);
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[8];
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        acc[i] = 0.0f;
+    }
+    float scale = 1.0f / sqrt((float)head_dim);
+    uint kvd = kv_heads * head_dim;
+    for (uint pos = p0; pos < p1; ++pos) {
+        float k8[8];
+        float v8[8];
+        if (pos < full_end) {
+            uint phys = tbl[toff + (pos >> 5)];
+            lfm_kvarn_k8(kcode, ka, kc, phys, pos & 31u, kvh, kv_heads, j, k8);
+            lfm_kvarn_v8(vcode, vb, vbz, vc, phys, pos & 31u, kvh, kv_heads, j, v8);
+        } else {
+            ulong slot = (ulong)(kv_shift + (pos & 127u));
+            vstore8(convert_float8(kv_load8(0, kbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, k8);
+            vstore8(convert_float8(kv_load8(0, vbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, v8);
+        }
+        float d = 0.0f;
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) {
+            d += qv[i] * k8[i];
+        }
+        d += sub_group_shuffle_xor(d, 8u);
+        d += sub_group_shuffle_xor(d, 4u);
+        d += sub_group_shuffle_xor(d, 2u);
+        d += sub_group_shuffle_xor(d, 1u);
+        float sv = d * scale;
+        float mn = fmax(m, sv);
+        float corr = exp(m - mn);
+        float w = exp(sv - mn);
+        l = l * corr + w;
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) {
+            acc[i] = acc[i] * corr + w * v8[i];
+        }
+        m = mn;
+    }
+    lfm_tq_rot_inv8(acc, j);
+    ulong pbase = ((ulong)t * n_heads + head) * splits + sp;
+    __global float *pa = pacc + pbase * head_dim;
+    vstore8(vload8(0, acc), 0, pa + j * 8u);
+    if (j == 0u) {
+        pml[pbase * 2u] = m;
+        pml[pbase * 2u + 1u] = l;
+    }
+}
+
