@@ -140,7 +140,7 @@ impl Options {
         if let Some(v) = num("LFM_WG_B", 64, 512) {
             o.wg_b = v / 64 * 64;
         }
-        if let Some(v) = num("LFM_RGEMV", 1, 8) {
+        if let Some(v) = num("LFM_RGEMV", 1, 16) {
             o.rgemv = v;
         }
         if let Some(v) = num("LFM_RGEMV_B", 1, 8) {
@@ -191,7 +191,7 @@ impl Options {
                 self.wg_b
             ));
         }
-        if !(1..=8).contains(&self.rgemv) || !(1..=8).contains(&self.rgemv_b) {
+        if !(1..=16).contains(&self.rgemv) || !(1..=8).contains(&self.rgemv_b) {
             return Err("rgemv/rgemv_b must be in 1..=8".to_string());
         }
         if !(1..=16).contains(&self.max_seqs) {

@@ -819,7 +819,7 @@ impl GpuModel {
         let batch_cap = pb.max(prefill_batch);
         let gemm_force = opts.gemm_force.clone();
         let rgemv = if gpu.caps.sub_group_size <= 16 {
-            opts.rgemv.max(8)
+            opts.rgemv.max(16)
         } else {
             opts.rgemv
         };
