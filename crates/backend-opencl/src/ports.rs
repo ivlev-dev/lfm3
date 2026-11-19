@@ -34,6 +34,14 @@ impl InferenceBackend for GpuModel {
     }
 
     fn step(&mut self, steps: &[SequenceStep], need_logits: bool) -> Result<()> {
+        // Один токен с логитами — это decode: идём быстрым путём (свои ядра
+        // GEMV на один токен), а не через батчевый `step_mixed`.
+        if need_logits && steps.len() == 1 {
+            let s = steps[0];
+            self.forward_seq(s.slot, s.token, s.pos)?;
+            self.logits_to_batch_row()?;
+            return Ok(());
+        }
         let reqs: Vec<StepReq> = steps
             .iter()
             .map(|step| StepReq {

@@ -2892,6 +2892,24 @@ impl GpuModel {
         )
     }
 
+    /// После decode-пути логиты лежат в `logits`; для потребителей, которые
+    /// читают `logits_row`, переносим строку в батчевый буфер.
+    pub fn logits_to_batch_row(&mut self) -> Result<()> {
+        let bytes = self.cfg.vocab_size * 4;
+        unsafe {
+            self.gpu.queue.enqueue_copy_buffer(
+                &self.bufs.logits,
+                &mut self.bufs.logitsb,
+                0,
+                0,
+                bytes,
+                &[],
+            )?;
+        }
+        self.logits_off = Some(0);
+        Ok(())
+    }
+
     pub fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
         self.gpu.download_at(
             &self.bufs.logitsb,
