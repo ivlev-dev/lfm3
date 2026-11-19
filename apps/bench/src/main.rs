@@ -2543,6 +2543,15 @@ fn gpu_multi(model: &Path, nseq: usize, tokens: usize, prompt_len: usize) -> Res
     }
     let elapsed = started.elapsed().as_secs_f64();
     gpu.finish()?;
+    if std::env::var("LFM_PROFILE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        println!("  -- decode kernels --");
+        for (name, calls, avg_us, total_ms) in gpu.profile_report().iter().take(10) {
+            println!("  {name:24} {calls} calls {avg_us:.1} us {total_ms:.1} ms");
+        }
+    }
     let decoded = (outs.iter().map(|o| o.len()).sum::<usize>()) as f64;
     println!(
         "seqs={nseq} prompt={prompt_len}: prefill {total_prompt} tok in {prefill_s:.2} s = {:.1} tok/s; decode {decoded:.0} tok in {elapsed:.2} s = {:.1} tok/s; total {:.1} tok/s",
