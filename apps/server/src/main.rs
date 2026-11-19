@@ -49,7 +49,10 @@ struct Cli {
     prefill_budget: Option<usize>,
     #[arg(long, help = "индекс OpenCL-устройства [0]")]
     device: Option<usize>,
-    #[arg(long, help = "тип KV-кэша: f16, q4, kvarn (=kvarn_k4v2), kvarn_k4v4 [f16]")]
+    #[arg(
+        long,
+        help = "тип KV-кэша: f16, q4, kvarn (=kvarn_k4v2), kvarn_k4v4 [f16]"
+    )]
     kv: Option<String>,
     #[arg(long, help = "порог батчевого GEMV, 1..=12 [6]")]
     pb: Option<usize>,
@@ -63,6 +66,108 @@ struct Cli {
     no_cache: bool,
     #[arg(long, help = "собирать тайминги ядер (LFM_PROFILE)")]
     profile: bool,
+    #[arg(long, help = "отключить слияние q/k/v/g и gate/up")]
+    no_fuse: bool,
+    #[arg(long, help = "отключить prepack (148-байтная раскладка и int8-копии)")]
+    no_prepack: bool,
+    #[arg(long, help = "отключить пары позиций в коротком внимании")]
+    no_attn2: bool,
+    #[arg(long, help = "отключить GQA-шеринг K/V (4 головы на группу)")]
+    no_attn4: bool,
+    #[arg(long, help = "отключить flash-внимание (4 головы × 16 полос)")]
+    no_flash: bool,
+    #[arg(long, help = "отключить два токена на волну в split-внимании")]
+    no_flash2: bool,
+    #[arg(long, help = "отключить префетч x в b8-ядрах decode")]
+    no_b8p: bool,
+    #[arg(long, help = "отключить префетч весов группы в int8-GEMM")]
+    no_i8pf: bool,
+    #[arg(long, help = "отключить int8-перепаковку Q4_K для prefill")]
+    no_q4i8: bool,
+    #[arg(long, help = "отключить Q6-prefill на int8-ядре")]
+    no_q6i8: bool,
+    #[arg(long, help = "строк на подгруппу в decode-GEMV, 1..=16 [4]")]
+    rgemv: Option<usize>,
+    #[arg(long, help = "строк на подгруппу в батчевом GEMV, 1..=8 [5]")]
+    rgemv_b: Option<usize>,
+    #[arg(long, help = "размер рабочей группы decode-GEMV, кратен 64 [256]")]
+    wg: Option<usize>,
+    #[arg(long, help = "размер рабочей группы батчевого GEMV, кратен 64 [64]")]
+    wg_b: Option<usize>,
+    #[arg(long, help = "принудительный GEMM по подстроке имени тензора []")]
+    gemm_force: Option<String>,
+}
+
+fn apply_engine_cli(opts: &mut lfm_gpu::Options, cli: &Cli) {
+    if let Some(v) = cli.device {
+        opts.device = v;
+    }
+    if let Some(v) = &cli.kv {
+        opts.kv = v.clone();
+    }
+    if let Some(v) = cli.pb {
+        opts.pb = v;
+    }
+    if let Some(v) = cli.prefill_ntok {
+        opts.prefill_ntok = v;
+    }
+    if let Some(v) = cli.max_seqs {
+        opts.max_seqs = v;
+    }
+    if let Some(v) = cli.splits {
+        opts.splits = v;
+    }
+    if cli.no_cache {
+        opts.cache = false;
+    }
+    if cli.profile {
+        opts.profile = true;
+    }
+    if cli.no_fuse {
+        opts.fuse = false;
+    }
+    if cli.no_prepack {
+        opts.prepack = false;
+    }
+    if cli.no_attn2 {
+        opts.attn2 = false;
+    }
+    if cli.no_attn4 {
+        opts.attn4 = false;
+    }
+    if cli.no_flash {
+        opts.flash = false;
+    }
+    if cli.no_flash2 {
+        opts.flash2 = false;
+    }
+    if cli.no_b8p {
+        opts.b8p = false;
+    }
+    if cli.no_i8pf {
+        opts.i8pf = false;
+    }
+    if cli.no_q4i8 {
+        opts.q4i8 = false;
+    }
+    if cli.no_q6i8 {
+        opts.q6i8 = false;
+    }
+    if let Some(v) = cli.rgemv {
+        opts.rgemv = v;
+    }
+    if let Some(v) = cli.rgemv_b {
+        opts.rgemv_b = v;
+    }
+    if let Some(v) = cli.wg {
+        opts.wg = v / 64 * 64;
+    }
+    if let Some(v) = cli.wg_b {
+        opts.wg_b = v / 64 * 64;
+    }
+    if let Some(v) = &cli.gemm_force {
+        opts.gemm_force = if v.is_empty() { None } else { Some(v.clone()) };
+    }
 }
 
 fn backend_name() -> String {
@@ -82,30 +187,7 @@ fn main() -> Result<()> {
         None => config::FileConfig::default(),
     };
     let mut engine_opts = file.engine(lfm_gpu::Options::from_env());
-    if let Some(v) = cli.device {
-        engine_opts.device = v;
-    }
-    if let Some(v) = &cli.kv {
-        engine_opts.kv = v.clone();
-    }
-    if let Some(v) = cli.pb {
-        engine_opts.pb = v;
-    }
-    if let Some(v) = cli.prefill_ntok {
-        engine_opts.prefill_ntok = v;
-    }
-    if let Some(v) = cli.max_seqs {
-        engine_opts.max_seqs = v;
-    }
-    if let Some(v) = cli.splits {
-        engine_opts.splits = v;
-    }
-    if cli.no_cache {
-        engine_opts.cache = false;
-    }
-    if cli.profile {
-        engine_opts.profile = true;
-    }
+    apply_engine_cli(&mut engine_opts, &cli);
     let overrides = config::Overrides {
         model: cli.model.clone(),
         tokenizer: cli.tokenizer.clone(),
@@ -729,5 +811,50 @@ mod tests {
         assert_eq!(v["cache_hits"], 6);
         assert_eq!(v["reused_tokens"], 8);
         assert_eq!(v["uptime_s"].as_f64(), Some(9.5));
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn engine_flags_override_config() {
+        let cli = Cli::parse_from([
+            "lfm-server",
+            "--no-flash",
+            "--no-q4i8",
+            "--no-prepack",
+            "--rgemv",
+            "6",
+            "--wg",
+            "128",
+            "--gemm-force",
+            "ffn_down",
+        ]);
+        let mut opts = lfm_gpu::Options::default();
+        opts.flash = true;
+        opts.q4i8 = true;
+        opts.prepack = true;
+        opts.rgemv = 4;
+        opts.wg = 256;
+        apply_engine_cli(&mut opts, &cli);
+        assert!(!opts.flash);
+        assert!(!opts.q4i8);
+        assert!(!opts.prepack);
+        assert!(opts.q6i8, "флаги не должны трогать остальные ключи");
+        assert_eq!(opts.rgemv, 6);
+        assert_eq!(opts.wg, 128);
+        assert_eq!(opts.gemm_force.as_deref(), Some("ffn_down"));
+    }
+
+    #[test]
+    fn empty_gemm_force_clears() {
+        let cli = Cli::parse_from(["lfm-server", "--gemm-force", ""]);
+        let mut opts = lfm_gpu::Options::default();
+        opts.gemm_force = Some("ffn".to_string());
+        apply_engine_cli(&mut opts, &cli);
+        assert!(opts.gemm_force.is_none());
     }
 }

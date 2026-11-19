@@ -30,34 +30,38 @@
 
 ## Движок (`[engine]`)
 
-Доступно только через файл, кроме отмеченных флагами. Те же значения читаются
-из переменных окружения (для `lfm-bench` и обратной совместимости).
+Все ключи можно задать флагом сервера (приоритет CLI > файл > env > дефолт).
+Булевы ключи со значением `true` по умолчанию выключаются отрицательными
+флагами: `--no-prepack`, `--no-fuse`, `--no-attn2`, `--no-attn4`,
+`--no-flash`, `--no-flash2`, `--no-b8p`, `--no-i8pf`, `--no-q4i8`,
+`--no-q6i8`, `--no-cache`. Те же значения читаются из переменных окружения
+(для `lfm-bench` и обратной совместимости).
 
 | ключ TOML | env | флаг CLI | дефолт | смысл |
 |---|---|---|---|---|
 | `device` | `LFM_DEVICE` | `--device` | `0` | индекс OpenCL-устройства |
 | `profile` | `LFM_PROFILE` | `--profile` | `false` | тайминги ядер (`lfm-bench gpu-prefill` печатает профиль) |
 | `kv` | `LFM_KV` | `--kv` | `f16` | тип KV-кэша: `f16`, `q4`, `k4v4`, `kvarn` (=`kvarn_k4v2`, K 4 бита + V 2 бита), `kvarn_k4v4` (K 4 бита + V 4 бита, память +25 МБ, качество ближе к f16); на устройстве без fp16 `f16` хранится во float, `kvarn*` работают на float-скейлах, `q4` недоступен |
-| `prepack` | `LFM_PREPACK` | — | `true` | 148-байтная раскладка Q4_K и int8-копии; `false` оставляет только decode (prefill требует prepack) |
-| `fuse` | `LFM_FUSE` | — | `true` | слияние `q‖k‖g` и `gate‖up` |
+| `prepack` | `LFM_PREPACK` | `--no-prepack` | `true` | 148-байтная раскладка Q4_K и int8-копии; `false` оставляет только decode (prefill требует prepack) |
+| `fuse` | `LFM_FUSE` | `--no-fuse` | `true` | слияние `q‖k‖g` и `gate‖up` |
 | `pb` | `LFM_PB` | `--pb` | `6` | порог батчевого GEMV, 1..=12 |
 | `prefill_ntok` | `LFM_PREFILL_NTOK` | `--prefill-ntok` | `128` | размер чанка prefill, 1..=128; у `kv=kvarn` задаёт ещё и размер staging-кольца (память KV: 128 → 143 МБ, 64 → 118, 32 → 106 при ctx 8192) |
 | `max_seqs` | `LFM_SEQS` | `--max-seqs` | `8` | одновременных последовательностей, 1..=16 |
 | `cache` | `LFM_CACHE` | `--no-cache` | `true` | кэш префиксов (radix) |
 | `splits` | `LFM_SPLITS` | `--splits` | `16` | максимум сплитов внимания, 1..=16 |
-| `attn4` | `LFM_ATTN4` | — | `true` | GQA-шеринг K/V (4 головы на группу) |
-| `attn2` | `LFM_ATTN2` | — | `true` | пары позиций в коротком внимании |
-| `flash` | `LFM_FLASH` | — | `true` | flash-внимание: 4 головы × 16 полос |
-| `flash2` | `LFM_FLASH2` | — | `true` | два токена на волну в split-внимании |
-| `b8p` | `LFM_B8P` | — | `true` | префетч x в b8-ядрах decode |
-| `i8pf` | `LFM_I8PF` | — | `true` | префетч весов группы в int8-GEMM; на устройстве с подгруппой ≤16 выключается (не хватает регистров) |
-| `q4i8` | `LFM_Q4I8` | — | `true` | int8-перепаковка Q4_K для prefill |
-| `q6i8` | `LFM_Q6I8` | — | `true` | Q6-prefill на int8-ядре |
-| `wg` | `LFM_WG` | — | `256` | размер рабочей группы decode-GEMV (кратен 64) |
-| `wg_b` | `LFM_WG_B` | — | `64` | рабочая группа батчевого GEMV |
-| `rgemv` | `LFM_RGEMV` | — | `4` | строк на подгруппу в decode-GEMV, 1..=16; на устройстве с подгруппой ≤16 поднимается до 16 |
-| `rgemv_b` | `LFM_RGEMV_B` | — | `5` | строк на подгруппу в батчевом GEMV, 1..=8 |
-| `gemm_force` | `LFM_GEMM_FORCE` | — | `""` | принудительный GEMM по подстроке имени тензора |
+| `attn4` | `LFM_ATTN4` | `--no-attn4` | `true` | GQA-шеринг K/V (4 головы на группу) |
+| `attn2` | `LFM_ATTN2` | `--no-attn2` | `true` | пары позиций в коротком внимании |
+| `flash` | `LFM_FLASH` | `--no-flash` | `true` | flash-внимание: 4 головы × 16 полос |
+| `flash2` | `LFM_FLASH2` | `--no-flash2` | `true` | два токена на волну в split-внимании |
+| `b8p` | `LFM_B8P` | `--no-b8p` | `true` | префетч x в b8-ядрах decode |
+| `i8pf` | `LFM_I8PF` | `--no-i8pf` | `true` | префетч весов группы в int8-GEMM; на устройстве с подгруппой ≤16 выключается (не хватает регистров) |
+| `q4i8` | `LFM_Q4I8` | `--no-q4i8` | `true` | int8-перепаковка Q4_K для prefill |
+| `q6i8` | `LFM_Q6I8` | `--no-q6i8` | `true` | Q6-prefill на int8-ядре |
+| `wg` | `LFM_WG` | `--wg` | `256` | размер рабочей группы decode-GEMV (кратен 64) |
+| `wg_b` | `LFM_WG_B` | `--wg-b` | `64` | рабочая группа батчевого GEMV |
+| `rgemv` | `LFM_RGEMV` | `--rgemv` | `4` | строк на подгруппу в decode-GEMV, 1..=16; на устройстве с подгруппой ≤16 поднимается до 16 |
+| `rgemv_b` | `LFM_RGEMV_B` | `--rgemv-b` | `5` | строк на подгруппу в батчевом GEMV, 1..=8 |
+| `gemm_force` | `LFM_GEMM_FORCE` | `--gemm-force` | `""` | принудительный GEMM по подстроке имени тензора |
 
 ## Переменные, которых нет в файле
 
