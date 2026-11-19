@@ -555,7 +555,7 @@ fn info() -> Result<()> {
 
 fn bw(mb: usize, reps: usize) -> Result<()> {
     let gpu = Gpu::open(0)?;
-    let program = gpu.build(BENCH_CL, "-cl-std=CL3.0")?;
+    let program = gpu.build(BENCH_CL, &lfm_gpu::build_flags(&gpu, "-cl-std=CL3.0"))?;
     let n_bytes = mb * 1024 * 1024;
     let n4 = n_bytes / 16;
     let zeros = vec![0u8; n_bytes];
@@ -614,7 +614,7 @@ fn bw(mb: usize, reps: usize) -> Result<()> {
 fn laten(iters: usize, grid: usize) -> Result<()> {
     for profiling in [true, false] {
         let gpu = Gpu::open_with(0, profiling)?;
-        let program = gpu.build(BENCH_CL, "-cl-std=CL3.0")?;
+        let program = gpu.build(BENCH_CL, &lfm_gpu::build_flags(&gpu, "-cl-std=CL3.0"))?;
         let sink = gpu.alloc::<u32>(grid)?;
         let nop = Kernel::create(&program, "nop")?;
         for _ in 0..50 {
@@ -642,7 +642,7 @@ fn laten(iters: usize, grid: usize) -> Result<()> {
 
 fn peak(iters: u32) -> Result<()> {
     let gpu = Gpu::open(0)?;
-    let program = gpu.build(BENCH_CL, "-cl-std=CL3.0")?;
+    let program = gpu.build(BENCH_CL, &lfm_gpu::build_flags(&gpu, "-cl-std=CL3.0"))?;
     let global = gpu.caps.compute_units as usize * 64 * 32;
     let sinkf = gpu.alloc::<f32>(global)?;
     let sinku = gpu.alloc::<u32>(global)?;
@@ -664,6 +664,9 @@ fn peak(iters: u32) -> Result<()> {
         describe(&st),
         ops / (st.median_ms / 1e3) / 1e12
     );
+    if !gpu.caps.fp16 {
+        return Ok(());
+    }
     let fp16 = Kernel::create(&program, "peak_fp16")?;
     let st = gpu.bench(3, 10, || -> Result<()> {
         unsafe {
@@ -1302,7 +1305,7 @@ fn dump(path: &Path, name: &str) -> Result<()> {
 
 fn mixed(iters: u32) -> Result<()> {
     let gpu = Gpu::open(0)?;
-    let program = gpu.build(BENCH_CL, "-cl-std=CL3.0")?;
+    let program = gpu.build(BENCH_CL, &lfm_gpu::build_flags(&gpu, "-cl-std=CL3.0"))?;
     let kernel = Kernel::create(&program, "peak_mixed")?;
     let global = gpu.caps.compute_units as usize * 64 * 32;
     let sinkf = gpu.alloc::<f32>(global)?;

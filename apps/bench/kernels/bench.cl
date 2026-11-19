@@ -1,4 +1,6 @@
+#ifndef LFM_F32_KV
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 
 __kernel void bw_read(__global const uint4 *src, __global float *sink, uint n4) {
@@ -45,6 +47,7 @@ __kernel void peak_fp32(__global float *sink, uint iters) {
     sink[get_global_id(0)] = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
 }
 
+#ifndef LFM_F32_KV
 __kernel void peak_fp16(__global float *sink, uint iters) {
     half2 b = (half2)((half)0.9995f, (half)0.9995f);
     half2 c = (half2)((half)0.5f, (half)0.5f);
@@ -69,6 +72,8 @@ __kernel void peak_fp16(__global float *sink, uint iters) {
     sink[get_global_id(0)] = (float)(a0.s0 + a0.s1 + a1.s0 + a1.s1 + a2.s0 + a2.s1 + a3.s0 + a3.s1
         + a4.s0 + a4.s1 + a5.s0 + a5.s1 + a6.s0 + a6.s1 + a7.s0 + a7.s1);
 }
+
+#endif
 
 __kernel void peak_i8dot(__global uint *sink, uint iters) {
     uchar4 a = (uchar4)(1u, 2u, 3u, 4u);
@@ -140,7 +145,9 @@ __kernel void peak_mixed(__global float *sinkf, __global uint *sinku, uint iters
             acc7 += dot(a, b7);
         }
         sinku[get_global_id(0)] = acc0 ^ acc1 ^ acc2 ^ acc3 ^ acc4 ^ acc5 ^ acc6 ^ acc7;
-    } else {
+    }
+#ifndef LFM_F32_KV
+    else {
         half2 b = (half2)((half)0.9995f, (half)0.9995f);
         half2 c = (half2)((half)0.5f, (half)0.5f);
         half2 a0 = (half2)((half)1.0f, (half)1.1f);
@@ -164,4 +171,29 @@ __kernel void peak_mixed(__global float *sinkf, __global uint *sinku, uint iters
         sinkf[get_global_id(0)] = (float)(a0.s0 + a0.s1 + a1.s0 + a1.s1 + a2.s0 + a2.s1 + a3.s0 + a3.s1
             + a4.s0 + a4.s1 + a5.s0 + a5.s1 + a6.s0 + a6.s1 + a7.s0 + a7.s1);
     }
+#else
+    else {
+        float b = 0.9995f;
+        float c = 0.5f;
+        float a0 = 1.0f + (float)get_global_id(0) * 1e-7f;
+        float a1 = a0 + 0.1f;
+        float a2 = a0 + 0.2f;
+        float a3 = a0 + 0.3f;
+        float a4 = a0 + 0.4f;
+        float a5 = a0 + 0.5f;
+        float a6 = a0 + 0.6f;
+        float a7 = a0 + 0.7f;
+        for (uint i = 0u; i < iters; ++i) {
+            a0 = a0 * b + c;
+            a1 = a1 * b + c;
+            a2 = a2 * b + c;
+            a3 = a3 * b + c;
+            a4 = a4 * b + c;
+            a5 = a5 * b + c;
+            a6 = a6 * b + c;
+            a7 = a7 * b + c;
+        }
+        sinkf[get_global_id(0)] = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+    }
+#endif
 }
