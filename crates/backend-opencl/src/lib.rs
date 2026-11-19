@@ -166,8 +166,10 @@ struct Kernels {
     attn_combine_b: Kernel,
     attn_b_h: Kernel,
     attn_b_h2: Kernel,
+    attn_b_fa: Kernel,
     attn_split_b_h: Kernel,
     attn_split_b_h4_p4: Kernel,
+    attn_split_b_fa: Kernel,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -468,6 +470,7 @@ pub struct GpuModel {
     prepack_on: bool,
     q6_i8_gz_on: bool,
     q4_b8p_on: bool,
+    flash_on: bool,
     kernels: Kernels,
     rope_full: Buffer<f32>,
     rope_sliding: Buffer<f32>,
@@ -563,6 +566,7 @@ impl GpuModel {
         let q4_i8_on = std::env::var("LFM_Q4I8").map(|v| v != "0").unwrap_or(true);
         let q6_i8_gz_on = std::env::var("LFM_Q6I8").map(|v| v != "0").unwrap_or(true);
         let q4_b8p_on = std::env::var("LFM_B8P").map(|v| v != "0").unwrap_or(true);
+        let flash_on = std::env::var("LFM_FLASH").map(|v| v != "0").unwrap_or(true);
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
@@ -847,8 +851,10 @@ impl GpuModel {
             attn_combine_b: Kernel::create(&program, "attention_combine_b")?,
             attn_b_h: Kernel::create(&program, "attention_b_h")?,
             attn_b_h2: Kernel::create(&program, "attention_b_h2")?,
+            attn_b_fa: Kernel::create(&program, "attention_b_fa")?,
             attn_split_b_h: Kernel::create(&program, "attention_split_b_h")?,
             attn_split_b_h4_p4: Kernel::create(&program, "attention_split_b_h4_p4")?,
+            attn_split_b_fa: Kernel::create(&program, "attention_split_b_fa")?,
         };
         let h = cfg.hidden_size;
         let qd = cfg.q_dim();
@@ -978,6 +984,7 @@ impl GpuModel {
             prepack_on,
             q6_i8_gz_on,
             q4_b8p_on,
+            flash_on,
             kernels,
             rope_full,
             rope_sliding,
@@ -3204,15 +3211,18 @@ impl GpuModel {
                                         && !self.kv_q4
                                         && head_dim == 128
                                         && heads % 4 == 0;
-                                    let kernel = if use2 {
-                                        &self.kernels.attn_b_h2
+                                    let use_fa = use2 && self.flash_on && kv_heads == 4 && heads == 16;
+                                    let (kernel, grid) = if use_fa {
+                                        (&self.kernels.attn_b_fa, ntok * 256)
+                                    } else if use2 {
+                                        (&self.kernels.attn_b_h2, ntok * (heads / 4) * 256)
                                     } else {
-                                        &self.kernels.attn_b_h
+                                        (&self.kernels.attn_b_h, ntok * heads * 256)
                                     };
                                     unsafe {
                                         self.gpu.launch(
                                             kernel,
-                                            ntok * (heads / 4) * 256,
+                                            grid,
                                             256,
                                             &[
                                                 Arg::Mem(self.bufs.qb.get()),
@@ -3294,7 +3304,12 @@ impl GpuModel {
                                         && !self.kv_q4
                                         && heads == kv_heads * 4
                                         && head_dim == 128;
-                                    let (kernel, grid) = if use4 {
+                                    let (kernel, grid) = if use4 && self.flash_on {
+                                        (
+                                            &self.kernels.attn_split_b_fa,
+                                            ntok * kv_heads * splits * 64,
+                                        )
+                                    } else if use4 {
                                         (
                                             &self.kernels.attn_split_b_h4_p4,
                                             ntok * kv_heads * splits * 64,

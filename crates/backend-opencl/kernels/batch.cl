@@ -753,6 +753,50 @@ __kernel void attention_b_h(__global const float *q, __global const half *kbuf, 
     o[2u * lane + 1u] = (acc1 / l) * gs;
 }
 
+__kernel void attention_b_fa(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
+    uint lid = get_local_id(0);
+    uint lane = lid & 63u;
+    uint sg = lid >> 6;
+    uint t = get_group_id(0);
+    if (t >= ntok) {
+        return;
+    }
+    uint head = sg * 4u + (lane >> 4);
+    uint j = lane & 15u;
+    uint kvh = sg;
+    uint len = pos_b[t] + 1u;
+    uint start = (window > 0u && len > window) ? len - window : 0u;
+    uint toff = tbl_off[t];
+    float8 qv = vload8(0, q + ((ulong)t * n_heads + head) * head_dim + j * 8u);
+    float m = -INFINITY;
+    float l = 0.0f;
+    float8 acc = (float8)(0.0f);
+    float scale = 1.0f / sqrt((float)head_dim);
+    uint kv_stride = kv_heads * head_dim;
+    uint koff = kvh * head_dim + j * 8u;
+    for (uint pos = start; pos < len; ++pos) {
+        ulong slot = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
+        float8 kv = convert_float8(vload8(0, kbuf + slot * kv_stride + koff));
+        float8 vv = convert_float8(vload8(0, vbuf + slot * kv_stride + koff));
+        float d = qv.s0 * kv.s0 + qv.s1 * kv.s1 + qv.s2 * kv.s2 + qv.s3 * kv.s3
+                + qv.s4 * kv.s4 + qv.s5 * kv.s5 + qv.s6 * kv.s6 + qv.s7 * kv.s7;
+        d += sub_group_shuffle_xor(d, 8u);
+        d += sub_group_shuffle_xor(d, 4u);
+        d += sub_group_shuffle_xor(d, 2u);
+        d += sub_group_shuffle_xor(d, 1u);
+        float sv = d * scale;
+        float mn = fmax(m, sv);
+        float corr = exp(m - mn);
+        float w = exp(sv - mn);
+        l = l * corr + w;
+        acc = acc * corr + w * vv;
+        m = mn;
+    }
+    float gs = 1.0f / (1.0f + exp(-gate[t * n_heads + head]));
+    float8 res = (acc / l) * gs;
+    vstore8(res, 0, out + ((ulong)t * n_heads + head) * head_dim + j * 8u);
+}
+
 __kernel void attention_b_h2(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
     uint lid = get_local_id(0);
     uint lane = lid & 63u;
@@ -1265,6 +1309,88 @@ __kernel void gemm_q6_i8_pp(__global const char *w, __global const float *wsc, _
                 y[(ulong)(t0 + t) * rows + row0 + lane] = acc[j];
             }
         }
+    }
+}
+
+__kernel void attention_split_b_fa(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
+    uint gid = get_group_id(0);
+    uint lane = get_local_id(0);
+    uint per_tok = kv_heads * splits;
+    uint t = gid / per_tok;
+    uint rem = gid % per_tok;
+    uint kvh = rem / splits;
+    uint sp = rem % splits;
+    if (t >= ntok) {
+        return;
+    }
+    uint h = lane >> 4;
+    uint j = lane & 15u;
+    uint head = kvh * (n_heads / kv_heads) + h;
+    uint len = pos_b[t] + 1u;
+    uint start = (window > 0u && len > window) ? len - window : 0u;
+    uint toff = tbl_off[t];
+    uint span = len - start;
+    uint chunk = (span + splits - 1u) / splits;
+    uint p0 = start + sp * chunk;
+    uint p1 = min(p0 + chunk, len);
+    float8 qv = vload8(0, q + ((ulong)t * n_heads + head) * head_dim + j * 8u);
+    float m = -INFINITY;
+    float l = 0.0f;
+    float8 acc = (float8)(0.0f);
+    float scale = 1.0f / sqrt((float)head_dim);
+    uint kv_stride = kv_heads * head_dim;
+    uint koff = kvh * head_dim + j * 8u;
+    uint pos = p0;
+    for (; pos + 3u < p1; pos += 4u) {
+        float2 s[4];
+        float8 v[4];
+        #pragma unroll
+        for (uint u = 0u; u < 4u; ++u) {
+            ulong slot = (ulong)((tbl[toff + ((pos + u) >> 5)] << 5) | ((pos + u) & 31u));
+            float8 kv = convert_float8(vload8(0, kbuf + slot * kv_stride + koff));
+            v[u] = convert_float8(vload8(0, vbuf + slot * kv_stride + koff));
+            float d = qv.s0 * kv.s0 + qv.s1 * kv.s1 + qv.s2 * kv.s2 + qv.s3 * kv.s3
+                    + qv.s4 * kv.s4 + qv.s5 * kv.s5 + qv.s6 * kv.s6 + qv.s7 * kv.s7;
+            d += sub_group_shuffle_xor(d, 8u);
+            d += sub_group_shuffle_xor(d, 4u);
+            d += sub_group_shuffle_xor(d, 2u);
+            d += sub_group_shuffle_xor(d, 1u);
+            s[u] = (float2)(d * scale, 0.0f);
+        }
+        float m_new = fmax(fmax(m, s[0].x), fmax(fmax(s[1].x, s[2].x), s[3].x));
+        float corr = exp(m - m_new);
+        #pragma unroll
+        for (uint u = 0u; u < 4u; ++u) {
+            float w = exp(s[u].x - m_new);
+            l = l * (u == 0u ? corr : 1.0f) + w;
+            acc = acc * (u == 0u ? corr : 1.0f) + w * v[u];
+        }
+        m = m_new;
+    }
+    for (; pos < p1; ++pos) {
+        ulong slot = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
+        float8 kv = convert_float8(vload8(0, kbuf + slot * kv_stride + koff));
+        float8 vv = convert_float8(vload8(0, vbuf + slot * kv_stride + koff));
+        float d = qv.s0 * kv.s0 + qv.s1 * kv.s1 + qv.s2 * kv.s2 + qv.s3 * kv.s3
+                + qv.s4 * kv.s4 + qv.s5 * kv.s5 + qv.s6 * kv.s6 + qv.s7 * kv.s7;
+        d += sub_group_shuffle_xor(d, 8u);
+        d += sub_group_shuffle_xor(d, 4u);
+        d += sub_group_shuffle_xor(d, 2u);
+        d += sub_group_shuffle_xor(d, 1u);
+        float sv = d * scale;
+        float m_new = fmax(m, sv);
+        float corr = exp(m - m_new);
+        float w = exp(sv - m_new);
+        l = l * corr + w;
+        acc = acc * corr + w * vv;
+        m = m_new;
+    }
+    ulong pbase = ((ulong)t * n_heads + head) * splits + sp;
+    __global float *pa = pacc + pbase * head_dim;
+    vstore8(acc, 0, pa + j * 8u);
+    if (j == 0u) {
+        pml[pbase * 2u] = m;
+        pml[pbase * 2u + 1u] = l;
     }
 }
 
