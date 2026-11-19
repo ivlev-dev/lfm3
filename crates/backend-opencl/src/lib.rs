@@ -65,6 +65,7 @@ const KERNELS: &str = concat!(
 const GROUP: usize = 32;
 pub(crate) const MAX_SPLITS: usize = 16;
 const KV_PAGE: usize = PAGE;
+const KV_STAGE: usize = 4 * KV_PAGE;
 
 #[derive(Clone, Copy)]
 enum DecKv {
@@ -419,6 +420,7 @@ struct Bufs {
     xsg: Buffer<f32>,
     logitsg: Buffer<f32>,
     pos_b: Buffer<u32>,
+    seq_b: Buffer<u32>,
     tbl_off_b: Buffer<u32>,
     conv_off_b: Buffer<u32>,
     tbl_all: Buffer<u32>,
@@ -904,10 +906,10 @@ impl GpuModel {
                 "kv type {kv_kind:?} требует cl_khr_fp16; без fp16 доступны kv=f16 и kv=kvarn"
             ));
         }
-        if kv_kvarn {
-            eprintln!(
-                "lfm-gpu: kvarn держит полный f16-staging для неполной страницы, поэтому память под KV не уменьшается"
-            );
+        if kv_kvarn && batch_cap > KV_STAGE {
+            return Err(anyhow!(
+                "kvarn: батч {batch_cap} больше staging-кольца {KV_STAGE} токенов"
+            ));
         }
         if (kv_q4 || kv_kvarn) && shard.is_some() {
             return Err(anyhow!(
@@ -954,6 +956,7 @@ impl GpuModel {
             xsg: gpu.alloc::<f32>(batch_cap * (h / GROUP))?,
             logitsg: gpu.alloc::<f32>(batch_cap * vocab)?,
             pos_b: gpu.alloc::<u32>(batch_cap)?,
+            seq_b: gpu.alloc::<u32>(batch_cap)?,
             tbl_off_b: gpu.alloc::<u32>(batch_cap)?,
             conv_off_b: gpu.alloc::<u32>(batch_cap)?,
             tbl_all: gpu.alloc::<u32>(max_seqs * kv_blocks.max(1))?,
@@ -994,6 +997,7 @@ impl GpuModel {
                         kv_q4,
                         kv_kvarn,
                         kv_f32,
+                        opts.max_seqs,
                         kv_slots,
                         kv_blocks,
                         kvd,
@@ -1004,6 +1008,7 @@ impl GpuModel {
                         kv_q4,
                         kv_kvarn,
                         kv_f32,
+                        opts.max_seqs,
                         kv_slots,
                         kv_blocks,
                         kvd,
@@ -1179,10 +1184,9 @@ impl GpuModel {
                 .any(|pat| !pat.is_empty() && name.contains(pat))
         });
         if self.kv_f32 && matches!(weight, Weight::Q6(_)) {
-            let (w8, wsc, _) = self
-                .prepacked_i8
-                .get(name)
-                .ok_or_else(|| anyhow!("Q6 без fp16 считает только int8-ядро, нужен prepack: {name}"))?;
+            let (w8, wsc, _) = self.prepacked_i8.get(name).ok_or_else(|| {
+                anyhow!("Q6 без fp16 считает только int8-ядро, нужен prepack: {name}")
+            })?;
             let tps = ntok.div_ceil(32);
             unsafe {
                 self.gpu.launch(
@@ -1915,6 +1919,7 @@ impl GpuModel {
                                         Arg::U32(pos as u32),
                                         Arg::U32(kv_heads as u32),
                                         Arg::U32(head_dim as u32),
+                                        Arg::U32(slot as u32),
                                     ],
                                 )?;
                             }
@@ -2007,6 +2012,7 @@ impl GpuModel {
                                     Arg::U32(page),
                                     Arg::U32(kv_heads as u32),
                                     Arg::U32(head_dim as u32),
+                                    Arg::U32(slot as u32),
                                 ],
                             )?;
                         }
@@ -2054,6 +2060,7 @@ impl GpuModel {
                                         Arg::U32(full_end),
                                         Arg::U32(kv_heads as u32),
                                         Arg::U32(heads as u32),
+                                        Arg::U32(slot as u32),
                                     ],
                                 )?;
                             },
@@ -2136,6 +2143,7 @@ impl GpuModel {
                                         Arg::U32(kv_heads as u32),
                                         Arg::U32(heads as u32),
                                         Arg::U32(splits as u32),
+                                        Arg::U32(slot as u32),
                                     ],
                                 )?;
                             },
@@ -2901,6 +2909,7 @@ impl GpuModel {
         }
         let conv_len = (self.cfg.conv_cache - 1) * self.cfg.hidden_size;
         let pos_host: Vec<u32> = reqs.iter().map(|r| r.pos as u32).collect();
+        let seq_host: Vec<u32> = reqs.iter().map(|r| r.slot as u32).collect();
         let tbl_off_host: Vec<u32> = reqs.iter().map(|r| (r.slot * kv_blocks) as u32).collect();
         let conv_off_host: Vec<u32> = reqs.iter().map(|r| (r.slot * conv_len) as u32).collect();
         let token_host: Vec<u32> = reqs.iter().map(|r| r.token).collect();
@@ -2946,6 +2955,9 @@ impl GpuModel {
             self.gpu
                 .queue
                 .enqueue_write_buffer(&mut self.bufs.pos_b, 1, 0, &pos_host, &[])?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.seq_b, 1, 0, &seq_host, &[])?;
             self.gpu.queue.enqueue_write_buffer(
                 &mut self.bufs.tbl_off_b,
                 1,
@@ -3255,9 +3267,11 @@ impl GpuModel {
                                         Arg::Mem(self.bufs.tbl_all.get()),
                                         Arg::Mem(self.bufs.tbl_off_b.get()),
                                         Arg::Mem(self.bufs.pos_b.get()),
+                                        Arg::Mem(self.bufs.seq_b.get()),
                                         Arg::U32(kv_heads as u32),
                                         Arg::U32(head_dim as u32),
                                         Arg::U32(ntok as u32),
+                                        Arg::U32(self.max_seqs as u32),
                                     ],
                                 )?;
                                 None
@@ -3351,6 +3365,7 @@ impl GpuModel {
                                             Arg::U32(page),
                                             Arg::U32(kv_heads as u32),
                                             Arg::U32(head_dim as u32),
+                                            Arg::U32(r.slot as u32),
                                         ],
                                     )?;
                                 }
@@ -3385,7 +3400,17 @@ impl GpuModel {
                                     )?;
                                 }
                                 None => {
-                                    if let KvBuf::Kvarn { staging: ks, .. } = k_buf {
+                                    if let KvBuf::Kvarn {
+                                        staging: ks,
+                                        kcode,
+                                        ka,
+                                        kc,
+                                        vcode,
+                                        vb,
+                                        vbz,
+                                        vc,
+                                    } = k_buf
+                                    {
                                         let vs = match v_buf {
                                             KvBuf::Kvarn { staging, .. } => staging,
                                             _ => return Err(anyhow!("mixed kv variants")),
@@ -3399,9 +3424,17 @@ impl GpuModel {
                                                 Arg::Mem(self.bufs.qb.get()),
                                                 Arg::Mem(ks.get()),
                                                 Arg::Mem(vs.get()),
+                                                Arg::Mem(kcode.get()),
+                                                Arg::Mem(ka.get()),
+                                                Arg::Mem(kc.get()),
+                                                Arg::Mem(vcode.get()),
+                                                Arg::Mem(vb.get()),
+                                                Arg::Mem(vbz.get()),
+                                                Arg::Mem(vc.get()),
                                                 Arg::Mem(self.bufs.tbl_all.get()),
                                                 Arg::Mem(self.bufs.tbl_off_b.get()),
                                                 Arg::Mem(self.bufs.pos_b.get()),
+                                                Arg::Mem(self.bufs.seq_b.get()),
                                                 Arg::Mem(self.bufs.gb.get()),
                                                 Arg::Mem(self.bufs.attnb.get()),
                                                 Arg::U32(ntok as u32),
@@ -3409,6 +3442,7 @@ impl GpuModel {
                                                 Arg::U32(head_dim as u32),
                                                 Arg::U32(heads as u32),
                                                 Arg::U32(window as u32),
+                                                Arg::U32(self.max_seqs as u32),
                                             ],
                                         )?;
                                     } else {
@@ -3477,7 +3511,17 @@ impl GpuModel {
                                     )?;
                                 }
                                 None => {
-                                    if let KvBuf::Kvarn { staging: ks, .. } = k_buf {
+                                    if let KvBuf::Kvarn {
+                                        staging: ks,
+                                        kcode,
+                                        ka,
+                                        kc,
+                                        vcode,
+                                        vb,
+                                        vbz,
+                                        vc,
+                                    } = k_buf
+                                    {
                                         let vs = match v_buf {
                                             KvBuf::Kvarn { staging, .. } => staging,
                                             _ => return Err(anyhow!("mixed kv variants")),
@@ -3491,9 +3535,17 @@ impl GpuModel {
                                                 Arg::Mem(self.bufs.qb.get()),
                                                 Arg::Mem(ks.get()),
                                                 Arg::Mem(vs.get()),
+                                                Arg::Mem(kcode.get()),
+                                                Arg::Mem(ka.get()),
+                                                Arg::Mem(kc.get()),
+                                                Arg::Mem(vcode.get()),
+                                                Arg::Mem(vb.get()),
+                                                Arg::Mem(vbz.get()),
+                                                Arg::Mem(vc.get()),
                                                 Arg::Mem(self.bufs.tbl_all.get()),
                                                 Arg::Mem(self.bufs.tbl_off_b.get()),
                                                 Arg::Mem(self.bufs.pos_b.get()),
+                                                Arg::Mem(self.bufs.seq_b.get()),
                                                 Arg::Mem(self.bufs.pacc_b.get()),
                                                 Arg::Mem(self.bufs.pml_b.get()),
                                                 Arg::U32(ntok as u32),
@@ -3502,6 +3554,7 @@ impl GpuModel {
                                                 Arg::U32(heads as u32),
                                                 Arg::U32(window as u32),
                                                 Arg::U32(splits as u32),
+                                                Arg::U32(self.max_seqs as u32),
                                             ],
                                         )?;
                                     } else {
@@ -4172,9 +4225,10 @@ impl GpuModel {
                 ) => {
                     let heads = self.cfg.kv_dim() / self.cfg.head_dim;
                     let blocks = self.kv_blocks;
+                    let stage_len = self.max_seqs * KV_STAGE * self.cfg.kv_dim();
                     let sizes = [
-                        (ks.get(), kv_len),
-                        (vst.get(), kv_len),
+                        (ks.get(), stage_len),
+                        (vst.get(), stage_len),
                         (kcode.get(), (kv_len / self.cfg.head_dim) * 32),
                         (vcode.get(), (kv_len / self.cfg.head_dim) * 16),
                         (ka.get(), blocks * heads * 128),
@@ -4574,6 +4628,7 @@ fn make_kv(
     q4: bool,
     kvarn: bool,
     f32_kv: bool,
+    max_seqs: usize,
     slots: usize,
     blocks: usize,
     kvd: usize,
@@ -4581,9 +4636,10 @@ fn make_kv(
 ) -> Result<KvBuf> {
     let heads = kvd / head_dim;
     let kv_wide = if f32_kv { 2 } else { 1 };
+    let staging_slots = max_seqs * KV_STAGE;
     Ok(if kvarn {
         KvBuf::Kvarn {
-            staging: gpu.alloc::<u16>(slots * kvd * kv_wide)?,
+            staging: gpu.alloc::<u16>(staging_slots * kvd * kv_wide)?,
             kcode: gpu.alloc::<u8>(slots * heads * 64)?,
             ka: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,
             kc: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
