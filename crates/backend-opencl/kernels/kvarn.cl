@@ -5,11 +5,12 @@
 
 __kernel void kv_store_h_rot(__global const float *ksrc, __global const float *vsrc,
                              __global KV_T *kdst, __global KV_T *vdst,
-                             __global const uint *tbl, uint pos, uint kv_heads, uint head_dim, uint seq) {
+                             __global const uint *tbl, uint pos, uint kv_heads, uint head_dim, uint seq, uint rbits) {
+    uint rmask = (1u << rbits) - 1u;
     uint lane = get_local_id(0);
     uint h = get_group_id(0);
     __local float buf[128];
-    ulong slot = (ulong)seq * 128u + (pos & 127u);
+    ulong slot = ((ulong)seq << rbits) + (pos & rmask);
     ulong base = slot * kv_heads * 128u + (ulong)h * 128u;
     ulong src = (ulong)h * 128u;
     buf[2u * lane] = ksrc[src + 2u * lane];
@@ -31,7 +32,8 @@ __kernel void kv_store_b_h_rot(__global const float *ksrc, __global const float 
                                __global KV_T *kdst, __global KV_T *vdst,
                                __global const uint *tbl, __global const uint *tbl_off,
                                __global const uint *pos_b, __global const uint *seq_b,
-                               uint kv_heads, uint head_dim, uint ntok, uint seq_cap) {
+                               uint kv_heads, uint head_dim, uint ntok, uint seq_cap, uint rbits) {
+    uint rmask = (1u << rbits) - 1u;
     uint lane = get_local_id(0);
     uint gid = get_group_id(0);
     uint t = gid / kv_heads;
@@ -45,7 +47,7 @@ __kernel void kv_store_b_h_rot(__global const float *ksrc, __global const float 
         return;
     }
     uint pos = pos_b[t];
-    ulong slot = (ulong)seq * 128u + (pos & 127u);
+    ulong slot = ((ulong)seq << rbits) + (pos & rmask);
     ulong base = slot * kv_heads * 128u + (ulong)h * 128u;
     ulong src = ((ulong)t * kv_heads + h) * 128u;
     buf[2u * lane] = ksrc[src + 2u * lane];
@@ -99,7 +101,8 @@ static float lfm_kvarn_ch_var(__local const float *t, __local const float *ic, _
 __kernel void kvarn_commit(__global const KV_T *kst, __global const KV_T *vst,
                            __global uchar *kcode, __global KV_T *ka, __global KV_T *kc,
                            __global uchar *vcode, __global KV_T *vb, __global KV_T *vbz, __global KV_T *vc,
-                           __global const uint *tbl, uint tbl_off, uint page, uint kv_heads, uint head_dim, uint seq) {
+                           __global const uint *tbl, uint tbl_off, uint page, uint kv_heads, uint head_dim, uint seq, uint rbits) {
+    uint rmask = (1u << rbits) - 1u;
     uint lane = get_local_id(0);
     uint h = get_group_id(0);
     if (h >= kv_heads || head_dim != 128u) {
@@ -115,7 +118,7 @@ __kernel void kvarn_commit(__global const KV_T *kst, __global const KV_T *vst,
     __local float bz[32];
     ulong phys = (ulong)tbl[tbl_off + page];
     uint kstride = kv_heads * head_dim;
-    ulong stbase = ((ulong)seq * 128u + ((ulong)page * 32u & 127u)) * kstride + (ulong)h * head_dim;
+    ulong stbase = (((ulong)seq << rbits) + ((ulong)page * 32u & rmask)) * kstride + (ulong)h * head_dim;
     for (uint tok = 0u; tok < 32u; ++tok) {
         ulong off = stbase + (ulong)tok * kstride;
         t[tok * 128u + 2u * lane] = (float)kst[off + 2u * lane];
@@ -267,7 +270,8 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
                              __global const uchar *kcode, __global const KV_T *ka, __global const KV_T *kc,
                              __global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz, __global const KV_T *vc,
                              __global const uint *tbl, __global const float *gate, __global float *out,
-                             uint len, uint start, uint full_end, uint kv_heads, uint n_heads, uint seq) {
+                             uint len, uint start, uint full_end, uint kv_heads, uint n_heads, uint seq, uint rbits) {
+    uint rmask = (1u << rbits) - 1u;
     uint lane = get_local_id(0);
     uint head = get_group_id(0);
     __local float sred[128];
@@ -289,12 +293,12 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
         if (pos < full_end) {
             k0 = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            k0 = kv_load2(lane, kst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
+            k0 = kv_load2(lane, kst + (((ulong)seq << rbits) + (pos & rmask)) * kstride + kvh * 128u);
         }
         if (pos + 1u < full_end) {
             k1 = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            k1 = kv_load2(lane, kst + ((ulong)seq * 128u + ((pos + 1u) & 127u)) * kstride + kvh * 128u);
+            k1 = kv_load2(lane, kst + (((ulong)seq << rbits) + ((pos + 1u) & rmask)) * kstride + kvh * 128u);
         }
 #ifdef LFM_SG64
         float sc0 = sub_group_reduce_add(q0 * k0.x + q1 * k0.y) * scale;
@@ -329,12 +333,12 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
         if (pos < full_end) {
             v0 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            v0 = kv_load2(lane, vst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
+            v0 = kv_load2(lane, vst + (((ulong)seq << rbits) + (pos & rmask)) * kstride + kvh * 128u);
         }
         if (pos + 1u < full_end) {
             v1 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            v1 = kv_load2(lane, vst + ((ulong)seq * 128u + ((pos + 1u) & 127u)) * kstride + kvh * 128u);
+            v1 = kv_load2(lane, vst + (((ulong)seq << rbits) + ((pos + 1u) & rmask)) * kstride + kvh * 128u);
         }
         acc0 = acc0 * corr + w0 * v0.x + w1 * v1.x;
         acc1 = acc1 * corr + w0 * v0.y + w1 * v1.y;
@@ -346,7 +350,7 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
         if (pos < full_end) {
             k = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            k = kv_load2(lane, kst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
+            k = kv_load2(lane, kst + (((ulong)seq << rbits) + (pos & rmask)) * kstride + kvh * 128u);
         }
 #ifdef LFM_SG64
         float sv = sub_group_reduce_add(q0 * k.x + q1 * k.y) * scale;
@@ -372,7 +376,7 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
         if (pos < full_end) {
             v = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            v = kv_load2(lane, vst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
+            v = kv_load2(lane, vst + (((ulong)seq << rbits) + (pos & rmask)) * kstride + kvh * 128u);
         }
         acc0 = acc0 * corr + w * v.x;
         acc1 = acc1 * corr + w * v.y;
@@ -392,7 +396,8 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
                                    __global const uchar *kcode, __global const KV_T *ka, __global const KV_T *kc,
                                    __global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz, __global const KV_T *vc,
                                    __global const uint *tbl, __global float *pacc, __global float *pml,
-                                   uint len, uint start, uint full_end, uint kv_heads, uint n_heads, uint splits, uint seq) {
+                                   uint len, uint start, uint full_end, uint kv_heads, uint n_heads, uint splits, uint seq, uint rbits) {
+    uint rmask = (1u << rbits) - 1u;
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);
     uint head = gid / splits;
@@ -423,12 +428,12 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         if (pos < full_end) {
             k0 = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            k0 = kv_load2(lane, kst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
+            k0 = kv_load2(lane, kst + (((ulong)seq << rbits) + (pos & rmask)) * kstride + kvh * 128u);
         }
         if (pos + 1u < full_end) {
             k1 = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            k1 = kv_load2(lane, kst + ((ulong)seq * 128u + ((pos + 1u) & 127u)) * kstride + kvh * 128u);
+            k1 = kv_load2(lane, kst + (((ulong)seq << rbits) + ((pos + 1u) & rmask)) * kstride + kvh * 128u);
         }
 #ifdef LFM_SG64
         float sc0 = sub_group_reduce_add(q0 * k0.x + q1 * k0.y) * scale;
@@ -463,12 +468,12 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         if (pos < full_end) {
             v0 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            v0 = kv_load2(lane, vst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
+            v0 = kv_load2(lane, vst + (((ulong)seq << rbits) + (pos & rmask)) * kstride + kvh * 128u);
         }
         if (pos + 1u < full_end) {
             v1 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            v1 = kv_load2(lane, vst + ((ulong)seq * 128u + ((pos + 1u) & 127u)) * kstride + kvh * 128u);
+            v1 = kv_load2(lane, vst + (((ulong)seq << rbits) + ((pos + 1u) & rmask)) * kstride + kvh * 128u);
         }
         acc0 = acc0 * corr + w0 * v0.x + w1 * v1.x;
         acc1 = acc1 * corr + w0 * v0.y + w1 * v1.y;
@@ -480,7 +485,7 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         if (pos < full_end) {
             k = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            k = kv_load2(lane, kst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
+            k = kv_load2(lane, kst + (((ulong)seq << rbits) + (pos & rmask)) * kstride + kvh * 128u);
         }
 #ifdef LFM_SG64
         float sv = sub_group_reduce_add(q0 * k.x + q1 * k.y) * scale;
@@ -506,7 +511,7 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         if (pos < full_end) {
             v = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            v = kv_load2(lane, vst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
+            v = kv_load2(lane, vst + (((ulong)seq << rbits) + (pos & rmask)) * kstride + kvh * 128u);
         }
         acc0 = acc0 * corr + w * v.x;
         acc1 = acc1 * corr + w * v.y;
@@ -530,7 +535,8 @@ __kernel void attention_b_h_rot(__global const float *q, __global const KV_T *kb
                                 __global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz, __global const KV_T *vc,
                                 __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b,
                                 __global const uint *seq_b, __global const float *gate, __global float *out,
-                                uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint seq_cap) {
+                                uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint seq_cap, uint rbits) {
+    uint rmask = (1u << rbits) - 1u;
     uint lid = get_local_id(0);
     uint lane = lid & 63u;
     uint grp = lid >> 6;
@@ -551,7 +557,7 @@ __kernel void attention_b_h_rot(__global const float *q, __global const KV_T *kb
     uint len = pos_b[t] + 1u;
     uint start = (window > 0u && len > window) ? len - window : 0u;
     uint full_end = (len / 32u) * 32u;
-    uint kv_shift = seq * 128u;
+    uint kv_shift = (seq << rbits);
     uint toff = tbl_off[t];
     __global const float *qh = q + (ulong)t * n_heads * 128u + head * 128u;
     qs[grp * 128u + 2u * lane] = qh[2u * lane];
@@ -572,7 +578,7 @@ __kernel void attention_b_h_rot(__global const float *q, __global const KV_T *kb
             k = lfm_kvarn_k(kcode, ka, kc, tbl[toff + (pos >> 5)], pos & 31u, kvh, kv_heads, lane);
             v = lfm_kvarn_v(vcode, vb, vbz, vc, tbl[toff + (pos >> 5)], pos & 31u, kvh, kv_heads, lane);
         } else {
-            ulong slot = (ulong)(kv_shift + (pos & 127u));
+            ulong slot = (ulong)(kv_shift + (pos & rmask));
             k = kv_load2(lane, kbuf + slot * kv_heads * 128u + kvh * 128u);
             v = kv_load2(lane, vbuf + slot * kv_heads * 128u + kvh * 128u);
         }
@@ -614,7 +620,8 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
                                       __global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz, __global const KV_T *vc,
                                       __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b,
                                       __global const uint *seq_b, __global float *pacc, __global float *pml,
-                                      uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits, uint seq_cap) {
+                                      uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits, uint seq_cap, uint rbits) {
+    uint rmask = (1u << rbits) - 1u;
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);
     uint per_tok = n_heads * splits;
@@ -635,7 +642,7 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
     uint len = pos_b[t] + 1u;
     uint start = (window > 0u && len > window) ? len - window : 0u;
     uint full_end = (len / 32u) * 32u;
-    uint kv_shift = seq * 128u;
+    uint kv_shift = (seq << rbits);
     uint toff = tbl_off[t];
     uint span = len - start;
     uint chunk = (span + splits - 1u) / splits;
@@ -663,7 +670,7 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
             k0 = lfm_kvarn_k(kcode, ka, kc, tbl[toff + (pos >> 5)], pos & 31u, kvh, kv_heads, lane);
             v0 = lfm_kvarn_v(vcode, vb, vbz, vc, tbl[toff + (pos >> 5)], pos & 31u, kvh, kv_heads, lane);
         } else {
-            ulong sl0 = (ulong)(kv_shift + (pos & 127u));
+            ulong sl0 = (ulong)(kv_shift + (pos & rmask));
             k0 = kv_load2(lane, kbuf + sl0 * kv_heads * 128u + kvh * 128u);
             v0 = kv_load2(lane, vbuf + sl0 * kv_heads * 128u + kvh * 128u);
         }
@@ -671,7 +678,7 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
             k1 = lfm_kvarn_k(kcode, ka, kc, tbl[toff + ((pos + 1u) >> 5)], (pos + 1u) & 31u, kvh, kv_heads, lane);
             v1 = lfm_kvarn_v(vcode, vb, vbz, vc, tbl[toff + ((pos + 1u) >> 5)], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            ulong sl1 = (ulong)(kv_shift + ((pos + 1u) & 127u));
+            ulong sl1 = (ulong)(kv_shift + ((pos + 1u) & rmask));
             k1 = kv_load2(lane, kbuf + sl1 * kv_heads * 128u + kvh * 128u);
             v1 = kv_load2(lane, vbuf + sl1 * kv_heads * 128u + kvh * 128u);
         }
@@ -715,7 +722,7 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
             k = lfm_kvarn_k(kcode, ka, kc, tbl[toff + (pos >> 5)], pos & 31u, kvh, kv_heads, lane);
             v = lfm_kvarn_v(vcode, vb, vbz, vc, tbl[toff + (pos >> 5)], pos & 31u, kvh, kv_heads, lane);
         } else {
-            ulong sl = (ulong)(kv_shift + (pos & 127u));
+            ulong sl = (ulong)(kv_shift + (pos & rmask));
             k = kv_load2(lane, kbuf + sl * kv_heads * 128u + kvh * 128u);
             v = kv_load2(lane, vbuf + sl * kv_heads * 128u + kvh * 128u);
         }
@@ -889,7 +896,8 @@ __kernel void attention_split_b_fa_qk(__global const float *q, __global const KV
                                       __global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz, __global const KV_T *vc,
                                       __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b,
                                       __global const uint *seq_b, __global float *pacc, __global float *pml,
-                                      uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits, uint seq_cap) {
+                                      uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits, uint seq_cap, uint rbits) {
+    uint rmask = (1u << rbits) - 1u;
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);
     uint per_tok = kv_heads * splits;
@@ -911,7 +919,7 @@ __kernel void attention_split_b_fa_qk(__global const float *q, __global const KV
     uint start = (window > 0u && len > window) ? len - window : 0u;
     uint toff = tbl_off[t];
     uint full_end = (len / 32u) * 32u;
-    uint kv_shift = seq * 128u;
+    uint kv_shift = (seq << rbits);
     uint span = len - start;
     uint chunk = (span + splits - 1u) / splits;
     uint p0 = start + sp * chunk;
@@ -959,7 +967,7 @@ __kernel void attention_split_b_fa_qk(__global const float *q, __global const KV
                 lfm_kvarn_k8_c(kcode, ct, ka8, phys, pp & 31u, kvh, kv_heads, j, k8);
                 lfm_kvarn_v8_c(vcode, bt, zero, vc8, phys, pp & 31u, kvh, kv_heads, j, vv[u]);
             } else {
-                ulong slot = (ulong)(kv_shift + (pp & 127u));
+                ulong slot = (ulong)(kv_shift + (pp & rmask));
                 vstore8(convert_float8(kv_load8(0, kbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, k8);
                 vstore8(convert_float8(kv_load8(0, vbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, vv[u]);
             }
@@ -1005,7 +1013,7 @@ __kernel void attention_split_b_fa_qk(__global const float *q, __global const KV
             lfm_kvarn_k8_c(kcode, ct, ka8, phys, pos & 31u, kvh, kv_heads, j, k8);
             lfm_kvarn_v8_c(vcode, bt, zero, vc8, phys, pos & 31u, kvh, kv_heads, j, v8);
         } else {
-            ulong slot = (ulong)(kv_shift + (pos & 127u));
+            ulong slot = (ulong)(kv_shift + (pos & rmask));
             vstore8(convert_float8(kv_load8(0, kbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, k8);
             vstore8(convert_float8(kv_load8(0, vbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, v8);
         }

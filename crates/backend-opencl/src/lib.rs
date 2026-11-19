@@ -499,6 +499,7 @@ pub struct GpuModel {
     kv_q4: bool,
     kv_f32: bool,
     kv_stage: usize,
+    kv_ring_bits: u32,
     splits_cap: usize,
     cache: RadixCache,
     cache_on: bool,
@@ -921,11 +922,13 @@ impl GpuModel {
                 "kv type {kv_kind:?} требует cl_khr_fp16; без fp16 доступны kv=f16 и kv=kvarn"
             ));
         }
-        let kv_stage = if kv_kvarn {
-            prefill_batch.max(1).div_ceil(KV_PAGE) * KV_PAGE
-        } else {
-            KV_PAGE
-        };
+        let mut kv_stage = KV_PAGE;
+        if kv_kvarn {
+            while kv_stage < prefill_batch.max(1) {
+                kv_stage *= 2;
+            }
+        }
+        let kv_ring_bits = kv_stage.trailing_zeros();
         if kv_kvarn && batch_cap > kv_stage {
             return Err(anyhow!(
                 "kvarn: батч {batch_cap} больше staging-кольца {kv_stage} токенов"
@@ -1081,6 +1084,7 @@ impl GpuModel {
             kv_q4,
             kv_f32,
             kv_stage,
+            kv_ring_bits,
             splits_cap,
             cache: RadixCache::new(kv_blocks),
             cache_on,
@@ -1984,6 +1988,7 @@ impl GpuModel {
                                         Arg::U32(kv_heads as u32),
                                         Arg::U32(head_dim as u32),
                                         Arg::U32(slot as u32),
+                                        Arg::U32(self.kv_ring_bits),
                                     ],
                                 )?;
                             }
@@ -2077,6 +2082,7 @@ impl GpuModel {
                                     Arg::U32(kv_heads as u32),
                                     Arg::U32(head_dim as u32),
                                     Arg::U32(slot as u32),
+                                    Arg::U32(self.kv_ring_bits),
                                 ],
                             )?;
                         }
@@ -2125,6 +2131,7 @@ impl GpuModel {
                                         Arg::U32(kv_heads as u32),
                                         Arg::U32(heads as u32),
                                         Arg::U32(slot as u32),
+                                        Arg::U32(self.kv_ring_bits),
                                     ],
                                 )?;
                             },
@@ -2208,6 +2215,7 @@ impl GpuModel {
                                         Arg::U32(heads as u32),
                                         Arg::U32(splits as u32),
                                         Arg::U32(slot as u32),
+                                        Arg::U32(self.kv_ring_bits),
                                     ],
                                 )?;
                             },
@@ -3354,6 +3362,7 @@ impl GpuModel {
                                         Arg::U32(head_dim as u32),
                                         Arg::U32(ntok as u32),
                                         Arg::U32(self.max_seqs as u32),
+                                        Arg::U32(self.kv_ring_bits),
                                     ],
                                 )?;
                                 None
@@ -3448,6 +3457,7 @@ impl GpuModel {
                                             Arg::U32(kv_heads as u32),
                                             Arg::U32(head_dim as u32),
                                             Arg::U32(r.slot as u32),
+                                            Arg::U32(self.kv_ring_bits),
                                         ],
                                     )?;
                                 }
@@ -3525,6 +3535,7 @@ impl GpuModel {
                                                 Arg::U32(heads as u32),
                                                 Arg::U32(window as u32),
                                                 Arg::U32(self.max_seqs as u32),
+                                                Arg::U32(self.kv_ring_bits),
                                             ],
                                         )?;
                                     } else {
@@ -3645,6 +3656,7 @@ impl GpuModel {
                                                 Arg::U32(window as u32),
                                                 Arg::U32(splits as u32),
                                                 Arg::U32(self.max_seqs as u32),
+                                                Arg::U32(self.kv_ring_bits),
                                             ],
                                         )?;
                                     } else {
