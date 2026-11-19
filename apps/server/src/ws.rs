@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -97,6 +97,9 @@ pub fn handshake(stream: &mut TcpStream, client_key: &str) -> Result<()> {
     Ok(())
 }
 
+const MAX_FRAME: usize = 8 * 1024 * 1024;
+const MAX_MESSAGE: usize = 4 * 1024 * 1024;
+
 pub struct WsConn {
     stream: TcpStream,
 }
@@ -137,8 +140,15 @@ impl WsConn {
         let mut b = [0u8; 2];
         self.stream.read_exact(&mut b)?;
         let fin = b[0] & 0x80 != 0;
+        let rsv = b[0] & 0x70;
         let opcode = b[0] & 0x0f;
         let masked = b[1] & 0x80 != 0;
+        if rsv != 0 {
+            return Err(anyhow!("ws: reserved bits set"));
+        }
+        if !masked {
+            return Err(anyhow!("ws: client frames must be masked"));
+        }
         let mut len = (b[1] & 0x7f) as usize;
         if len == 126 {
             let mut x = [0u8; 2];
@@ -149,13 +159,14 @@ impl WsConn {
             self.stream.read_exact(&mut x)?;
             len = u64::from_be_bytes(x) as usize;
         }
-        if len > 8 * 1024 * 1024 {
+        if len > MAX_FRAME {
             return Err(anyhow!("ws frame too large: {len}"));
         }
-        let mut mask = [0u8; 4];
-        if masked {
-            self.stream.read_exact(&mut mask)?;
+        if opcode >= 0x8 && (len > 125 || !fin) {
+            return Err(anyhow!("ws: bad control frame"));
         }
+        let mut mask = [0u8; 4];
+        self.stream.read_exact(&mut mask)?;
         let mut payload = vec![0u8; len];
         self.stream.read_exact(&mut payload)?;
         if masked {
@@ -183,6 +194,10 @@ impl WsConn {
                 0x0 => {
                     if !started {
                         return Err(anyhow!("continuation without message"));
+                    }
+                    if acc.len() + payload.len() > MAX_MESSAGE {
+                        let _ = self.send_close();
+                        return Err(anyhow!("ws: message too large"));
                     }
                     acc.extend_from_slice(&payload);
                 }
@@ -214,7 +229,10 @@ mod tests {
     fn sha1_vectors() {
         let hex = |d: [u8; 20]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(hex(sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(hex(sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            hex(sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
         assert_eq!(
             hex(sha1(b"The quick brown fox jumps over the lazy dog")),
             "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12"
@@ -273,7 +291,10 @@ mod tests {
             let mask = [9u8; 4];
             let mut out = Vec::new();
             for (i, part) in [b"he".as_slice(), b"ll", b"o"].iter().enumerate() {
-                let mut frame = vec![if i == 2 { 0x80 } else { 0x01 } | 0x00, 0x80 | part.len() as u8];
+                let mut frame = vec![
+                    if i == 2 { 0x80 } else { 0x01 } | 0x00,
+                    0x80 | part.len() as u8,
+                ];
                 if i == 0 {
                     frame[0] = 0x01;
                 } else {

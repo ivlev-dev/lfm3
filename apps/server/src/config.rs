@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use lfm_gpu::Options;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -49,8 +49,8 @@ pub struct EngineFile {
 }
 
 pub fn load(path: &Path) -> Result<FileConfig> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read config {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))
 }
 
@@ -202,9 +202,13 @@ pub fn resolve(file: &FileConfig, cli: &Overrides, engine: Options) -> Result<Re
         return Err(anyhow!("ctx must be a positive multiple of 32, got {ctx}"));
     }
     if max_body < 1024 {
-        return Err(anyhow!("max_body must be at least 1024 bytes, got {max_body}"));
+        return Err(anyhow!(
+            "max_body must be at least 1024 bytes, got {max_body}"
+        ));
     }
-    engine.validate().map_err(|e| anyhow!("bad engine options: {e}"))?;
+    engine
+        .validate()
+        .map_err(|e| anyhow!("bad engine options: {e}"))?;
     Ok(Resolved {
         model,
         tokenizer,
@@ -230,11 +234,16 @@ pub fn dump(cfg: &Resolved, backend: &str) -> String {
     out.push_str(&format!("addr = \"{}\"\n", cfg.addr));
     out.push_str(&format!("ctx = {}\n", cfg.ctx));
     out.push_str(&format!("name = \"{}\"\n", cfg.name));
-    out.push_str(&format!("system = \"{}\"\n", cfg.system.replace('"', "\\\"")));
+    out.push_str(&format!(
+        "system = \"{}\"\n",
+        cfg.system.replace('"', "\\\"")
+    ));
     out.push_str(&format!("log_requests = {}\n", cfg.log_requests));
     out.push_str(&format!("max_body = {}\n", cfg.max_body));
     out.push_str(&format!("prefill_budget = {}\n", cfg.prefill_budget));
-    out.push_str(&format!("# backend = \"{backend}\" (для справки, не читается)\n"));
+    out.push_str(&format!(
+        "# backend = \"{backend}\" (для справки, не читается)\n"
+    ));
     out.push_str("\n[engine]\n");
     out.push_str(&format!("device = {}\n", e.device));
     out.push_str(&format!("profile = {}\n", e.profile));

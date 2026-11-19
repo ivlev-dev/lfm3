@@ -38,7 +38,7 @@
 | `device` | `LFM_DEVICE` | `--device` | `0` | индекс OpenCL-устройства |
 | `profile` | `LFM_PROFILE` | `--profile` | `false` | тайминги ядер (`lfm-bench gpu-prefill` печатает профиль) |
 | `kv` | `LFM_KV` | `--kv` | `f16` | тип KV-кэша: `f16`, `q4`, `k4v4`, `kvarn`, `kvarn_k4v2` |
-| `prepack` | `LFM_PREPACK` | — | `true` | 148-байтная раскладка Q4_K и int8-копии |
+| `prepack` | `LFM_PREPACK` | — | `true` | 148-байтная раскладка Q4_K и int8-копии; `false` оставляет только decode (prefill требует prepack) |
 | `fuse` | `LFM_FUSE` | — | `true` | слияние `q‖k‖g` и `gate‖up` |
 | `pb` | `LFM_PB` | `--pb` | `6` | порог батчевого GEMV, 1..=12 |
 | `prefill_ntok` | `LFM_PREFILL_NTOK` | `--prefill-ntok` | `128` | размер чанка prefill, 1..=128 |
@@ -65,14 +65,13 @@
 |---|---|---|
 | `LFM_TP` | сервер | tensor parallel, устройства через `/`: `LFM_TP=0/1` |
 | `LFM_TIERS` | сервер | pipeline parallel, проценты слоёв: `LFM_TIERS=60/40` |
-| `LFM_BACKEND` | сервер | `cpu` — CPU-бэкенд вместо OpenCL |
 | `LFM_SCHED_LOG` | сервер | алиас `log_requests` |
 | `LFM_PLATFORM` | infra-opencl | индекс OpenCL-платформы |
 | `LFM_LAUNCH_DEBUG` | infra-opencl | печать параметров запуска ядер |
 | `LFM_CPU_W4A8` | infra-cpu | W4A8-веса на CPU |
 | `LFM_VERBOSE`, `LFM_OLD` | bench | диагностика бенчмарка |
 
-Важно: при `LFM_TP`/`LFM_TIERS`/`LFM_BACKEND=cpu` настройки `[engine]` из файла
+Важно: при `LFM_TP`/`LFM_TIERS` настройки `[engine]` из файла
 не применяются — эти пути читают окружение сами (см. `docs/backends.md`).
 `lfm-bench` файл конфигурации не читает, только окружение.
 

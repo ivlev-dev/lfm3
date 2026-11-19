@@ -1,5 +1,5 @@
 use crate::hpack_tables::{HUFFMAN, STATIC_TABLE};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -17,6 +17,10 @@ impl Default for HpackCtx {
     }
 }
 
+pub const HPACK_MAX_TABLE: usize = 4096;
+pub const HPACK_MAX_HEADERS: usize = 64;
+pub const HPACK_MAX_BLOCK: usize = 32 * 1024;
+
 impl HpackCtx {
     pub fn new() -> Self {
         Self {
@@ -31,9 +35,15 @@ impl HpackCtx {
         self.dynamic.len()
     }
 
-    pub fn set_max_size(&mut self, size: usize) {
+    pub fn set_max_size(&mut self, size: usize) -> Result<()> {
+        if size > HPACK_MAX_TABLE {
+            return Err(anyhow!(
+                "hpack: table size {size} exceeds advertised maximum {HPACK_MAX_TABLE}"
+            ));
+        }
         self.max = size;
         self.evict();
+        Ok(())
     }
 
     pub fn get(&self, idx: u32) -> Option<Header> {
@@ -59,27 +69,34 @@ impl HpackCtx {
             let Some((name, value)) = self.dynamic.pop() else {
                 break;
             };
-            self.size = self
-                .size
-                .saturating_sub(name.len() + value.len() + 32);
+            self.size = self.size.saturating_sub(name.len() + value.len() + 32);
         }
-    }
-
-    fn set_max(&mut self, max: usize) {
-        self.max = max;
-        self.evict();
     }
 }
 
 pub fn decode(block: &[u8], ctx: &mut HpackCtx) -> Result<Vec<Header>> {
-    let mut out = Vec::new();
+    let mut out: Vec<Header> = Vec::new();
     let mut pos = 0usize;
+    let mut total: usize;
+    if block.len() > HPACK_MAX_BLOCK {
+        return Err(anyhow!("hpack: header block too large"));
+    }
     while pos < block.len() {
+        if out.len() >= HPACK_MAX_HEADERS {
+            return Err(anyhow!("hpack: too many headers"));
+        }
+        total = out.iter().map(|(n, v)| n.len() + v.len()).sum();
+        if total > HPACK_MAX_BLOCK {
+            return Err(anyhow!("hpack: headers too large"));
+        }
         let byte = block[pos];
         if byte & 0x80 != 0 {
             let (idx, next) = read_int(block, pos, 7)?;
             pos = next;
-            out.push(ctx.get(idx).ok_or_else(|| anyhow!("hpack: bad index {idx}"))?);
+            out.push(
+                ctx.get(idx)
+                    .ok_or_else(|| anyhow!("hpack: bad index {idx}"))?,
+            );
         } else if byte & 0x40 != 0 {
             let (idx, next) = read_int(block, pos, 6)?;
             let (name, next) = read_name(block, next, idx, ctx)?;
@@ -90,7 +107,7 @@ pub fn decode(block: &[u8], ctx: &mut HpackCtx) -> Result<Vec<Header>> {
         } else if byte & 0x20 != 0 {
             let (max, next) = read_int(block, pos, 5)?;
             pos = next;
-            ctx.set_max(max as usize);
+            ctx.set_max_size(max as usize)?;
         } else {
             let (idx, next) = read_int(block, pos, 4)?;
             let (name, next) = read_name(block, next, idx, ctx)?;
@@ -106,14 +123,18 @@ fn read_name(block: &[u8], pos: usize, idx: u32, ctx: &HpackCtx) -> Result<(Stri
     if idx == 0 {
         read_string(block, pos)
     } else {
-        let (name, _) = ctx.get(idx).ok_or_else(|| anyhow!("hpack: bad name index {idx}"))?;
+        let (name, _) = ctx
+            .get(idx)
+            .ok_or_else(|| anyhow!("hpack: bad name index {idx}"))?;
         Ok((name, pos))
     }
 }
 
 fn read_int(buf: &[u8], pos: usize, prefix: u8) -> Result<(u32, usize)> {
     let mask = (1u32 << prefix) - 1;
-    let first = *buf.get(pos).ok_or_else(|| anyhow!("hpack: truncated int"))? as u32;
+    let first = *buf
+        .get(pos)
+        .ok_or_else(|| anyhow!("hpack: truncated int"))? as u32;
     let mut value = first & mask;
     let mut pos = pos + 1;
     if value < mask {
@@ -121,7 +142,9 @@ fn read_int(buf: &[u8], pos: usize, prefix: u8) -> Result<(u32, usize)> {
     }
     let mut shift = 0u32;
     loop {
-        let byte = *buf.get(pos).ok_or_else(|| anyhow!("hpack: truncated int"))?;
+        let byte = *buf
+            .get(pos)
+            .ok_or_else(|| anyhow!("hpack: truncated int"))?;
         pos += 1;
         let part = ((byte & 0x7f) as u32)
             .checked_shl(shift)
@@ -279,7 +302,10 @@ mod tests {
         let mut ctx = HpackCtx::new();
         let headers = decode(&block, &mut ctx).unwrap();
         assert_eq!(headers[0], (":status".to_string(), "302".to_string()));
-        assert_eq!(headers[1], ("cache-control".to_string(), "private".to_string()));
+        assert_eq!(
+            headers[1],
+            ("cache-control".to_string(), "private".to_string())
+        );
         assert_eq!(
             headers[2],
             (
@@ -289,7 +315,10 @@ mod tests {
         );
         assert_eq!(
             headers[3],
-            ("location".to_string(), "https://www.example.com".to_string())
+            (
+                "location".to_string(),
+                "https://www.example.com".to_string()
+            )
         );
         assert_eq!(ctx.dynamic_len(), 4);
     }
@@ -313,9 +342,9 @@ mod tests {
         for text in ["www.example.com", "Mon, 21 Oct 2013 20:13:21 GMT", "", "a"] {
             let encoded = match text {
                 "www.example.com" => hex("f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff"),
-                "Mon, 21 Oct 2013 20:13:21 GMT" => hex(
-                    "d0 7a be 94 10 54 d4 44 a8 20 05 95 04 0b 81 66 e0 82 a6 2d 1b ff",
-                ),
+                "Mon, 21 Oct 2013 20:13:21 GMT" => {
+                    hex("d0 7a be 94 10 54 d4 44 a8 20 05 95 04 0b 81 66 e0 82 a6 2d 1b ff")
+                }
                 "a" => hex("1f"),
                 _ => Vec::new(),
             };

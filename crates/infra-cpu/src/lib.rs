@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use lfm_domain::{LayerKind, ModelConfig};
 use lfm_gguf::{GgmlType, GgufFile};
 use rayon::prelude::*;
@@ -76,7 +76,10 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn matvec(t: &Tensor, x: &[f32]) -> Vec<f32> {
-    (0..t.ne1).into_par_iter().map(|o| dot(t.row(o), x)).collect()
+    (0..t.ne1)
+        .into_par_iter()
+        .map(|o| dot(t.row(o), x))
+        .collect()
 }
 
 fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
@@ -137,21 +140,20 @@ impl Lfm3Ref {
                 continue;
             }
             let ne0 = info.dims[0] as usize;
-            let ne1 = info
-                .dims
-                .get(1)
-                .map(|v| *v as usize)
-                .unwrap_or(1)
-                .max(1);
+            let ne1 = info.dims.get(1).map(|v| *v as usize).unwrap_or(1).max(1);
             let count = ne0 * ne1;
             let bytes = file.tensor_bytes(&info.name)?;
             let data = match info.ggml_type {
                 GgmlType::F32 => bytes
-                    .as_chunks::<4>().0.iter()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect::<Vec<f32>>(),
                 GgmlType::F16 => bytes
-                    .as_chunks::<2>().0.iter()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
                     .collect::<Vec<f32>>(),
                 GgmlType::Q4_K => lfm_quant::dequant_row_q4_k(bytes, count)?,
@@ -240,7 +242,11 @@ impl Lfm3Ref {
             let down = self.t(&format!("{prefix}.ffn_down.weight"))?;
             let u = matvec(up, &self.q(&ffn_in));
             let g = matvec(gate, &self.q(&ffn_in));
-            let act: Vec<f32> = u.iter().zip(&g).map(|(up, gate)| silu(*gate) * up).collect();
+            let act: Vec<f32> = u
+                .iter()
+                .zip(&g)
+                .map(|(up, gate)| silu(*gate) * up)
+                .collect();
             let ffn_out = matvec(down, &self.q(&act));
             let post_ffn = self.t(&format!("{prefix}.post_ffw_norm.weight"))?;
             let ffn_post = rms_norm(&ffn_out, &post_ffn.data, cfg.norm_eps);
@@ -440,7 +446,11 @@ impl Lfm3Ref {
             let down = self.t(&format!("{prefix}.ffn_down.weight"))?;
             let u = matvec(up, &self.q(&ffn_in));
             let g = matvec(gate, &self.q(&ffn_in));
-            let act: Vec<f32> = u.iter().zip(&g).map(|(up, gate)| silu(*gate) * up).collect();
+            let act: Vec<f32> = u
+                .iter()
+                .zip(&g)
+                .map(|(up, gate)| silu(*gate) * up)
+                .collect();
             let ffn_out = matvec(down, &self.q(&act));
             let post_ffn = self.t(&format!("{prefix}.post_ffw_norm.weight"))?;
             let ffn_post = rms_norm(&ffn_out, &post_ffn.data, cfg.norm_eps);
@@ -473,7 +483,11 @@ impl Lfm3Ref {
         self.conv_block(layer, h, &mut st)
     }
 
-    pub fn ffn_debug(&self, layer: usize, x: &[f32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    pub fn ffn_debug(
+        &self,
+        layer: usize,
+        x: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
         let cfg = &self.cfg;
         let prefix = format!("blk.{layer}");
         let ffn_norm = self.t(&format!("{prefix}.ffn_norm.weight"))?;
@@ -483,7 +497,11 @@ impl Lfm3Ref {
         let down = self.t(&format!("{prefix}.ffn_down.weight"))?;
         let u = matvec(up, &self.q(&ffn_in));
         let g = matvec(gate, &self.q(&ffn_in));
-        let act: Vec<f32> = u.iter().zip(&g).map(|(up, gate)| silu(*gate) * up).collect();
+        let act: Vec<f32> = u
+            .iter()
+            .zip(&g)
+            .map(|(up, gate)| silu(*gate) * up)
+            .collect();
         let ffn_out = matvec(down, &self.q(&act));
         let post_ffn = self.t(&format!("{prefix}.post_ffw_norm.weight"))?;
         let post = rms_norm(&ffn_out, &post_ffn.data, cfg.norm_eps);

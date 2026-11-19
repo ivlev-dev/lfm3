@@ -32,8 +32,8 @@ const VOCAB_SIZE: usize = 128000;
 impl LfmTokenizer {
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
-        let tokenizer = tokenizers::Tokenizer::from_bytes(&bytes)
-            .map_err(|e| Error::Parse(e.to_string()))?;
+        let tokenizer =
+            tokenizers::Tokenizer::from_bytes(&bytes).map_err(|e| Error::Parse(e.to_string()))?;
         let json = std::str::from_utf8(&bytes).map_err(|e| Error::Parse(e.to_string()))?;
         let (bos_id, eos_id, pad_id) = special_ids(json)?;
         Ok(Self {
@@ -105,9 +105,10 @@ fn special_ids(json: &str) -> anyhow::Result<(u32, u32, u32)> {
     let find = |needle: &str| -> Option<u32> {
         for entry in added {
             if entry.get("content").and_then(|v| v.as_str()) == Some(needle)
-                && let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
-                    return Some(id as u32);
-                }
+                && let Some(id) = entry.get("id").and_then(|v| v.as_u64())
+            {
+                return Some(id as u32);
+            }
         }
         None
     };

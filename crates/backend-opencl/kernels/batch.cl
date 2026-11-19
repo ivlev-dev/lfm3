@@ -1433,7 +1433,7 @@ __kernel void attention_split_b_fa2(__global const float *q, __global const half
     uint chunk = (span + splits - 1u) / splits;
     uint p0 = gstart + sp * chunk;
     uint p1 = min(p0 + chunk, gend);
-    uint toff = tbl_off[t0];
+    uint toff = tbl_off[active ? t : t0];
     uint head = kvh * 4u + hh;
     __global const float *qp = q + ((ulong)(t0 + s) * n_heads + head) * head_dim + j * 16u;
     float16 qv = (float16)(0.0f);

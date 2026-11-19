@@ -53,13 +53,19 @@ fn real_model_layout() {
     assert_eq!(q.ggml_type, GgmlType::Q4_K);
     assert_eq!(q.dims, vec![2048, 2048]);
     assert_eq!(q.byte_size, 2359296);
-    assert_eq!(f.tensor_bytes("blk.2.attn_q.weight").unwrap().len(), 2359296);
+    assert_eq!(
+        f.tensor_bytes("blk.2.attn_q.weight").unwrap().len(),
+        2359296
+    );
 
     let emb = f.tensor("token_embd.weight").unwrap();
     assert_eq!(emb.ggml_type, GgmlType::Q6_K);
     assert_eq!(emb.dims, vec![2048, 128000]);
     assert_eq!(emb.byte_size, 215040000);
-    assert_eq!(f.tensor_bytes("token_embd.weight").unwrap().len(), 215040000);
+    assert_eq!(
+        f.tensor_bytes("token_embd.weight").unwrap().len(),
+        215040000
+    );
 
     let down = f.tensor("blk.0.ffn_down.weight").unwrap();
     assert_eq!(down.ggml_type, GgmlType::Q6_K);
@@ -133,12 +139,67 @@ fn synthetic_file() {
 #[test]
 fn rejects_broken_files() {
     let bad = std::env::temp_dir().join("lfm_gguf_bad.gguf");
-    std::fs::write(&bad, b"GGUF\x03\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00").unwrap();
+    std::fs::write(
+        &bad,
+        b"GGUF\x03\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00",
+    )
+    .unwrap();
     assert!(GgufFile::open(&bad).is_err());
 
     let bad_magic = std::env::temp_dir().join("lfm_gguf_bad_magic.gguf");
-    std::fs::write(&bad_magic, b"XXXX\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+    std::fs::write(
+        &bad_magic,
+        b"XXXX\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+    )
+    .unwrap();
     assert!(GgufFile::open(&bad_magic).is_err());
     let _ = std::fs::remove_file(bad);
     let _ = std::fs::remove_file(bad_magic);
+}
+
+fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn rejects_zero_dims() {
+    for (label, n_dims, dim_value) in [("zero_dims", 0u32, 4u64), ("zero_dim_value", 1u32, 0u64)] {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let name = b"t0";
+        out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&n_dims.to_le_bytes());
+        for _ in 0..n_dims {
+            out.extend_from_slice(&dim_value.to_le_bytes());
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let path = write_temp(&format!("lfm_gguf_{label}.gguf"), &out);
+        assert!(GgufFile::open(&path).is_err(), "{label} must be rejected");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn rejects_huge_array_count() {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"GGUF");
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&1u64.to_le_bytes());
+    let key = b"test.arr";
+    out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(&9u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&u64::MAX.to_le_bytes());
+    let path = write_temp("lfm_gguf_huge_array.gguf", &out);
+    assert!(GgufFile::open(&path).is_err());
+    let _ = std::fs::remove_file(path);
 }

@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use lfm_domain::{Message, Role, SamplingParams, ToolCall, ToolDef};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::EngineMetricsSnapshot;
@@ -114,9 +114,11 @@ impl ChatRequest {
             .map(|t| ToolDef {
                 name: t.function.name.clone(),
                 description: t.function.description.clone(),
-                parameters: t.function.parameters.clone().unwrap_or_else(
-                    || json!({"type": "object", "properties": {}}),
-                ),
+                parameters: t
+                    .function
+                    .parameters
+                    .clone()
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
             })
             .collect()
     }
@@ -236,7 +238,7 @@ impl CompletionRequest {
                 return Err(anyhow!(
                     "token array prompts are not supported ({} tokens)",
                     v.len()
-                ))
+                ));
             }
         };
         if prompts.is_empty() || prompts.iter().any(|p| p.is_empty()) {
@@ -455,7 +457,8 @@ mod tests {
 
     #[test]
     fn parses_basic_request() {
-        let req = parse(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#);
+        let req =
+            parse(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#);
         assert!(req.stream);
         let msgs = req.to_messages().unwrap();
         assert_eq!(msgs.len(), 1);
@@ -467,7 +470,10 @@ mod tests {
         let one = parse(r#"{"messages":[],"stop":"\n\n"}"#);
         assert_eq!(one.to_params().stop, vec!["\n\n".to_string()]);
         let many = parse(r#"{"messages":[],"stop":["a","b"]}"#);
-        assert_eq!(many.to_params().stop, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            many.to_params().stop,
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
@@ -683,7 +689,10 @@ mod tests {
         assert_eq!(one.to_params().max_tokens, 4);
 
         let many = parse_completion(r#"{"prompt":["a","b"]}"#);
-        assert_eq!(many.to_prompts().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            many.to_prompts().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
 
         let tokens = parse_completion(r#"{"prompt":[1,2,3]}"#);
         assert!(tokens.to_prompts().is_err());

@@ -76,9 +76,8 @@ pub fn dequant_q6_k(block: &[u8; 210]) -> [f32; 256] {
     for n in (0..256).step_by(128) {
         for l in 0..32usize {
             let is = l / 16;
-            let q1 = (((ql0[ql_off + l] & 0x0F) as i32)
-                | (((qh0[qh_off + l] & 3) as i32) << 4))
-                - 32;
+            let q1 =
+                (((ql0[ql_off + l] & 0x0F) as i32) | (((qh0[qh_off + l] & 3) as i32) << 4)) - 32;
             let q2 = (((ql0[ql_off + l + 32] & 0x0F) as i32)
                 | ((((qh0[qh_off + l] >> 2) & 3) as i32) << 4))
                 - 32;
@@ -88,14 +87,10 @@ pub fn dequant_q6_k(block: &[u8; 210]) -> [f32; 256] {
             let q4 = (((ql0[ql_off + l + 32] >> 4) as i32)
                 | ((((qh0[qh_off + l] >> 6) & 3) as i32) << 4))
                 - 32;
-            y[n + l] =
-                d * (sc0[sc_off + is] as i8 as f32) * (q1 as f32);
-            y[n + l + 32] =
-                d * (sc0[sc_off + is + 2] as i8 as f32) * (q2 as f32);
-            y[n + l + 64] =
-                d * (sc0[sc_off + is + 4] as i8 as f32) * (q3 as f32);
-            y[n + l + 96] =
-                d * (sc0[sc_off + is + 6] as i8 as f32) * (q4 as f32);
+            y[n + l] = d * (sc0[sc_off + is] as i8 as f32) * (q1 as f32);
+            y[n + l + 32] = d * (sc0[sc_off + is + 2] as i8 as f32) * (q2 as f32);
+            y[n + l + 64] = d * (sc0[sc_off + is + 4] as i8 as f32) * (q3 as f32);
+            y[n + l + 96] = d * (sc0[sc_off + is + 6] as i8 as f32) * (q4 as f32);
         }
         ql_off += 64;
         qh_off += 32;

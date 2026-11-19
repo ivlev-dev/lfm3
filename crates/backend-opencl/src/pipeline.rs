@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use lfm_app::{CacheStats, InferenceBackend, SequenceStep};
 use lfm_domain::ModelConfig;
 use lfm_gguf::GgufFile;
@@ -13,11 +13,7 @@ pub struct PipelineModel {
 }
 
 impl PipelineModel {
-    pub fn load_tiers(
-        path: &Path,
-        max_ctx: usize,
-        tiers: &[(usize, usize)],
-    ) -> Result<Self> {
+    pub fn load_tiers(path: &Path, max_ctx: usize, tiers: &[(usize, usize)]) -> Result<Self> {
         let total: usize = tiers.iter().map(|(_, percent)| *percent).sum();
         if total != 100 {
             return Err(anyhow!("tier percentages must sum to 100"));
@@ -47,7 +43,13 @@ impl PipelineModel {
             if from >= to {
                 continue;
             }
-            stages.push(GpuModel::load_stage(path, max_ctx, Some(device), Some((from, to)), None)?);
+            stages.push(GpuModel::load_stage(
+                path,
+                max_ctx,
+                Some(device),
+                Some((from, to)),
+                None,
+            )?);
         }
         if stages.is_empty() {
             return Err(anyhow!("no pipeline stages"));

@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Context as _, Result};
-use opencl3::command_queue::{CommandQueue, CL_QUEUE_PROFILING_ENABLE};
+use anyhow::{Context as _, Result, anyhow};
+use opencl3::command_queue::{CL_QUEUE_PROFILING_ENABLE, CommandQueue};
 use opencl3::context::Context;
-use opencl3::device::{get_all_devices, Device, CL_DEVICE_TYPE_ALL};
+use opencl3::device::{CL_DEVICE_TYPE_ALL, Device, get_all_devices};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::CL_MEM_READ_WRITE;
-use opencl3::types::{cl_mem, CL_BLOCKING};
+use opencl3::types::{CL_BLOCKING, cl_mem};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -82,7 +82,11 @@ impl Gpu {
             .ok_or_else(|| anyhow!("no OpenCL device at index {index}, found {}", ids.len()))?;
         let device = Device::new(id);
         let context = Context::from_device(&device).context("clCreateContext")?;
-        let flags = if profiling { CL_QUEUE_PROFILING_ENABLE } else { 0 };
+        let flags = if profiling {
+            CL_QUEUE_PROFILING_ENABLE
+        } else {
+            0
+        };
         let queue = CommandQueue::create_default_with_properties(&context, flags, 0)
             .context("clCreateCommandQueue")?;
         let extensions: Vec<String> = device
@@ -104,9 +108,7 @@ impl Gpu {
                 .preferred_work_group_size_multiple()
                 .unwrap_or_default(),
             fp16: extensions.iter().any(|e| e == "cl_khr_fp16"),
-            integer_dot: extensions
-                .iter()
-                .any(|e| e == "cl_khr_integer_dot_product")
+            integer_dot: extensions.iter().any(|e| e == "cl_khr_integer_dot_product")
                 || device.integer_dot_product_capabilities_khr().unwrap_or(0) != 0,
             subgroups: extensions.iter().any(|e| e.starts_with("cl_khr_subgroup")),
             sub_group_size: 0,
@@ -287,7 +289,8 @@ impl Gpu {
     }
 }
 
-const PROBE_SRC: &str = "__kernel void probe_sgs(__global uint *out) { out[0] = get_sub_group_size(); }";
+const PROBE_SRC: &str =
+    "__kernel void probe_sgs(__global uint *out) { out[0] = get_sub_group_size(); }";
 
 fn probe_sub_group_size(context: &Context, queue: &CommandQueue) -> Result<usize> {
     let program = Program::create_and_build_from_source(context, PROBE_SRC, "-cl-std=CL3.0")

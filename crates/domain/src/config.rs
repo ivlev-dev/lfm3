@@ -88,21 +88,22 @@ impl ModelConfig {
         let num_layers = src
             .get_u32("lfm3.block_count")
             .ok_or(ConfigError::MissingKey("lfm3.block_count"))? as usize;
-        let hidden_size = src
-            .get_u32("lfm3.embedding_length")
-            .ok_or(ConfigError::MissingKey("lfm3.embedding_length"))? as usize;
-        let ffn_size = src
-            .get_u32("lfm3.feed_forward_length")
-            .ok_or(ConfigError::MissingKey("lfm3.feed_forward_length"))? as usize;
-        let num_heads = src
-            .get_u32("lfm3.attention.head_count")
-            .ok_or(ConfigError::MissingKey("lfm3.attention.head_count"))? as usize;
-        let head_dim = src
-            .get_u32("lfm3.attention.key_length")
-            .ok_or(ConfigError::MissingKey("lfm3.attention.key_length"))? as usize;
+        let hidden_size =
+            src.get_u32("lfm3.embedding_length")
+                .ok_or(ConfigError::MissingKey("lfm3.embedding_length"))? as usize;
+        let ffn_size =
+            src.get_u32("lfm3.feed_forward_length")
+                .ok_or(ConfigError::MissingKey("lfm3.feed_forward_length"))? as usize;
+        let num_heads =
+            src.get_u32("lfm3.attention.head_count")
+                .ok_or(ConfigError::MissingKey("lfm3.attention.head_count"))? as usize;
+        let head_dim =
+            src.get_u32("lfm3.attention.key_length")
+                .ok_or(ConfigError::MissingKey("lfm3.attention.key_length"))? as usize;
         let value_dim = src
             .get_u32("lfm3.attention.value_length")
-            .ok_or(ConfigError::MissingKey("lfm3.attention.value_length"))? as usize;
+            .ok_or(ConfigError::MissingKey("lfm3.attention.value_length"))?
+            as usize;
         if value_dim != head_dim {
             return Err(ConfigError::Invalid {
                 key: "lfm3.attention.value_length",
@@ -113,8 +114,17 @@ impl ModelConfig {
             .get_i32_array("lfm3.attention.head_count_kv")
             .ok_or(ConfigError::MissingKey("lfm3.attention.head_count_kv"))?
             .into_iter()
-            .map(|v| v.max(0) as usize)
-            .collect();
+            .map(|v| {
+                if v < 0 {
+                    Err(ConfigError::Invalid {
+                        key: "lfm3.attention.head_count_kv",
+                        value: v.to_string(),
+                    })
+                } else {
+                    Ok(v as usize)
+                }
+            })
+            .collect::<Result<Vec<usize>, ConfigError>>()?;
         let swa: Vec<bool> = src
             .get_bool_array("lfm3.attention.sliding_window_pattern")
             .ok_or(ConfigError::MissingKey(
@@ -128,14 +138,14 @@ impl ModelConfig {
             });
         }
         let layer_kinds = derive_layer_kinds(&kv_heads, &swa);
-        let norm_eps = src
-            .get_f32("lfm3.attention.layer_norm_rms_epsilon")
-            .ok_or(ConfigError::MissingKey(
-                "lfm3.attention.layer_norm_rms_epsilon",
-            ))?;
-        let conv_cache = src
-            .get_u32("lfm3.shortconv.l_cache")
-            .ok_or(ConfigError::MissingKey("lfm3.shortconv.l_cache"))? as usize;
+        let norm_eps =
+            src.get_f32("lfm3.attention.layer_norm_rms_epsilon")
+                .ok_or(ConfigError::MissingKey(
+                    "lfm3.attention.layer_norm_rms_epsilon",
+                ))?;
+        let conv_cache =
+            src.get_u32("lfm3.shortconv.l_cache")
+                .ok_or(ConfigError::MissingKey("lfm3.shortconv.l_cache"))? as usize;
         let sliding_window = src
             .get_u32("lfm3.attention.sliding_window")
             .ok_or(ConfigError::MissingKey("lfm3.attention.sliding_window"))?
@@ -143,10 +153,9 @@ impl ModelConfig {
         let theta_full = src
             .get_f32("lfm3.rope.freq_base")
             .ok_or(ConfigError::MissingKey("lfm3.rope.freq_base"))? as f64;
-        let theta_swa = src
-            .get_f32("lfm3.rope.freq_base_swa")
-            .ok_or(ConfigError::MissingKey("lfm3.rope.freq_base_swa"))?
-            as f64;
+        let theta_swa =
+            src.get_f32("lfm3.rope.freq_base_swa")
+                .ok_or(ConfigError::MissingKey("lfm3.rope.freq_base_swa"))? as f64;
         let emb_dims = src
             .tensor_dims("token_embd.weight")
             .ok_or(ConfigError::MissingKey("token_embd.weight"))?;
@@ -192,6 +201,44 @@ impl ModelConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.num_layers == 0 || self.ffn_size == 0 || self.vocab_size == 0 {
+            return Err(ConfigError::Invalid {
+                key: "sizes",
+                value: format!(
+                    "layers={} ffn={} vocab={}",
+                    self.num_layers, self.ffn_size, self.vocab_size
+                ),
+            });
+        }
+        if let Some((layer, kv)) = self.kv_heads.iter().enumerate().find(|(_, kv)| {
+            **kv > self.num_heads || (**kv > 0 && !self.num_heads.is_multiple_of(**kv))
+        }) {
+            return Err(ConfigError::Invalid {
+                key: "lfm3.attention.head_count_kv",
+                value: format!(
+                    "layer {layer}: {kv} heads vs {} query heads",
+                    self.num_heads
+                ),
+            });
+        }
+        if !self.rope_full.theta.is_finite() || self.rope_full.theta <= 1.0 {
+            return Err(ConfigError::Invalid {
+                key: "lfm3.rope.freq_base",
+                value: format!("{}", self.rope_full.theta),
+            });
+        }
+        if !self.rope_sliding.theta.is_finite() || self.rope_sliding.theta <= 1.0 {
+            return Err(ConfigError::Invalid {
+                key: "lfm3.rope.freq_base_swa",
+                value: format!("{}", self.rope_sliding.theta),
+            });
+        }
+        if !self.norm_eps.is_finite() || self.norm_eps <= 0.0 {
+            return Err(ConfigError::Invalid {
+                key: "lfm3.attention.layer_norm_rms_epsilon",
+                value: format!("{}", self.norm_eps),
+            });
+        }
         if self.num_heads == 0 || self.head_dim == 0 || self.hidden_size == 0 {
             return Err(ConfigError::Invalid {
                 key: "dims",
@@ -324,10 +371,10 @@ impl SamplingParams {
         if let Some(t) = src.get_f32("general.sampling.temp") {
             params.temperature = t;
         }
-        if let Some(k) = src
-            .get_u32("general.sampling.top_k")
-            .or_else(|| src.get_i32("general.sampling.top_k").map(|v| v.max(0) as u32))
-        {
+        if let Some(k) = src.get_u32("general.sampling.top_k").or_else(|| {
+            src.get_i32("general.sampling.top_k")
+                .map(|v| v.max(0) as u32)
+        }) {
             params.top_k = k as usize;
         }
         if let Some(p) = src.get_f32("general.sampling.penalty_repeat") {
@@ -381,8 +428,7 @@ mod tests {
 
     fn lfm3_meta() -> FakeMeta {
         let mut m = FakeMeta::default();
-        m.strs
-            .insert("general.architecture".into(), "lfm3".into());
+        m.strs.insert("general.architecture".into(), "lfm3".into());
         m.u32s.insert("lfm3.block_count".into(), 24);
         m.u32s.insert("lfm3.embedding_length".into(), 2048);
         m.u32s.insert("lfm3.feed_forward_length".into(), 7680);
@@ -397,11 +443,12 @@ mod tests {
         m.f32s.insert("lfm3.rope.freq_base_swa".into(), 1e4);
         m.f32s.insert("general.sampling.temp".into(), 0.1);
         m.u32s.insert("general.sampling.top_k".into(), 50);
-        m.f32s
-            .insert("general.sampling.penalty_repeat".into(), 1.1);
+        m.f32s.insert("general.sampling.penalty_repeat".into(), 1.1);
         m.i32s.insert(
             "lfm3.attention.head_count_kv".into(),
-            vec![0, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0],
+            vec![
+                0, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0,
+            ],
         );
         let mut swa = vec![false; 24];
         for i in [4usize, 8, 12, 16, 20] {
@@ -474,8 +521,7 @@ mod tests {
     #[test]
     fn rejects_wrong_arch() {
         let mut m = lfm3_meta();
-        m.strs
-            .insert("general.architecture".into(), "llama".into());
+        m.strs.insert("general.architecture".into(), "llama".into());
         assert!(matches!(
             ModelConfig::from_metadata(&m),
             Err(ConfigError::UnsupportedArch(_))

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use lfm_app::{CacheStats, InferenceBackend, SequenceStep};
 use lfm_domain::{LayerKind, ModelConfig};
 use lfm_gguf::GgufFile;

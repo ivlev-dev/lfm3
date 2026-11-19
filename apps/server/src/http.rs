@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -28,6 +28,21 @@ pub fn parse_head(head: &str) -> Result<(String, String, Vec<(String, String)>)>
     Ok((method.to_string(), path.to_string(), headers))
 }
 
+fn early_error(stream: &mut TcpStream, code: u16, reason: &str, message: &str) -> Result<()> {
+    let body = format!(
+        "{{\"error\":{{\"message\":\"{}\",\"type\":\"invalid_request_error\"}}}}",
+        message.replace('"', "'")
+    );
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
 fn head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
@@ -50,13 +65,37 @@ pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Option<Re
     };
     let head = std::str::from_utf8(&buf[..end])?;
     let (method, path, headers) = parse_head(head)?;
-    let len = headers
+    if headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(0);
+        .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        early_error(
+            stream,
+            400,
+            "Bad Request",
+            "transfer-encoding is not supported",
+        )?;
+        return Ok(None);
+    }
+    let mut len: Option<usize> = None;
+    for (k, v) in &headers {
+        if k.eq_ignore_ascii_case("content-length") {
+            let parsed = v
+                .parse::<usize>()
+                .map_err(|_| anyhow!("bad content-length {v:?}"))?;
+            if let Some(prev) = len {
+                if prev != parsed {
+                    early_error(stream, 400, "Bad Request", "conflicting content-length")?;
+                    return Ok(None);
+                }
+            }
+            len = Some(parsed);
+        }
+    }
+    let len = len.unwrap_or(0);
     if len > max_body {
-        return Err(anyhow!("request body {} bytes exceeds limit {}", len, max_body));
+        early_error(stream, 413, "Payload Too Large", "request body too large")?;
+        return Ok(None);
     }
     let mut body = buf[end + 4..].to_vec();
     while body.len() < len {
@@ -67,6 +106,9 @@ pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Option<Re
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(len);
+    if body.len() != len {
+        return Err(anyhow!("short body: got {} of {} bytes", body.len(), len));
+    }
     Ok(Some(Request {
         method,
         path,
@@ -122,7 +164,9 @@ mod tests {
 
     #[test]
     fn parses_request_line_and_headers() {
-        let (m, p, h) = parse_head("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 12").unwrap();
+        let (m, p, h) =
+            parse_head("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 12")
+                .unwrap();
         assert_eq!(m, "POST");
         assert_eq!(p, "/v1/chat/completions");
         assert_eq!(h.len(), 2);
@@ -133,7 +177,10 @@ mod tests {
     #[test]
     fn header_lookup_is_case_insensitive() {
         let (_, _, h) = parse_head("GET / HTTP/1.0\r\ncontent-length: 3").unwrap();
-        assert!(h.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "3"));
+        assert!(
+            h.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "3")
+        );
     }
 
     #[test]

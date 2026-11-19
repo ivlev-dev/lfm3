@@ -229,9 +229,16 @@ impl GgufFile {
     }
 
     pub fn tensor_bytes(&self, name: &str) -> anyhow::Result<&[u8]> {
-        let ti = self.tensor(name).ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
-        let start = self.data_offset.checked_add(ti.offset).ok_or(GgufError::SizeOverflow)?;
-        let end = start.checked_add(ti.byte_size).ok_or(GgufError::SizeOverflow)?;
+        let ti = self
+            .tensor(name)
+            .ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
+        let start = self
+            .data_offset
+            .checked_add(ti.offset)
+            .ok_or(GgufError::SizeOverflow)?;
+        let end = start
+            .checked_add(ti.byte_size)
+            .ok_or(GgufError::SizeOverflow)?;
         if end > self.mmap.len() as u64 {
             return Err(GgufError::UnexpectedEof.into());
         }
@@ -243,9 +250,16 @@ impl GgufFile {
     }
 
     pub fn tensor_span(&self, name: &str) -> anyhow::Result<(usize, usize)> {
-        let ti = self.tensor(name).ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
-        let start = self.data_offset.checked_add(ti.offset).ok_or(GgufError::SizeOverflow)?;
-        let end = start.checked_add(ti.byte_size).ok_or(GgufError::SizeOverflow)?;
+        let ti = self
+            .tensor(name)
+            .ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
+        let start = self
+            .data_offset
+            .checked_add(ti.offset)
+            .ok_or(GgufError::SizeOverflow)?;
+        let end = start
+            .checked_add(ti.byte_size)
+            .ok_or(GgufError::SizeOverflow)?;
         if end > self.mmap.len() as u64 {
             return Err(GgufError::UnexpectedEof.into());
         }
@@ -329,12 +343,16 @@ fn parse(buf: &[u8]) -> anyhow::Result<(BTreeMap<String, MetadataValue>, Vec<Ten
     for _ in 0..tensor_count {
         let name = read_string(buf, &mut pos)?;
         let n_dims = read_u32(buf, &mut pos)?;
-        if n_dims > 8 {
+        if !(1..=4).contains(&n_dims) {
             return Err(GgufError::SizeOverflow.into());
         }
         let mut dims = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
-            dims.push(read_u64(buf, &mut pos)?);
+            let d = read_u64(buf, &mut pos)?;
+            if d == 0 {
+                return Err(GgufError::SizeOverflow.into());
+            }
+            dims.push(d);
         }
         let type_code = read_u32(buf, &mut pos)?;
         let ggml_type = GgmlType::from_u32(type_code);
@@ -380,11 +398,7 @@ fn align_up(x: u64, align: u64) -> u64 {
         return x;
     }
     let r = x % align;
-    if r == 0 {
-        x
-    } else {
-        x + (align - r)
-    }
+    if r == 0 { x } else { x + (align - r) }
 }
 
 fn parse_value(buf: &[u8], pos: &mut usize, vtype: u32) -> anyhow::Result<MetadataValue> {
@@ -418,10 +432,10 @@ fn parse_value(buf: &[u8], pos: &mut usize, vtype: u32) -> anyhow::Result<Metada
             let count = read_u64(buf, pos)?;
             let min_size = min_elem_size(elem_type);
             let remaining = (buf.len() as u64).saturating_sub(*pos as u64);
-            if count > remaining / min_size.max(1) + 1 {
+            if count > remaining / min_size.max(1) + 1 || count > MAX_ARRAY_ELEMS {
                 return Err(GgufError::UnexpectedEof.into());
             }
-            let mut values = Vec::with_capacity(count as usize);
+            let mut values = Vec::with_capacity((count as usize).min(4096));
             for _ in 0..count {
                 values.push(parse_value(buf, pos, elem_type)?);
             }
@@ -436,6 +450,8 @@ fn parse_value(buf: &[u8], pos: &mut usize, vtype: u32) -> anyhow::Result<Metada
         x => Err(GgufError::BadType(x).into()),
     }
 }
+
+const MAX_ARRAY_ELEMS: u64 = 1 << 24;
 
 fn min_elem_size(t: u32) -> u64 {
     match t {

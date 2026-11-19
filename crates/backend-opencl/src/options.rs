@@ -6,7 +6,6 @@ pub struct Options {
     pub device: usize,
     pub profile: bool,
     pub kv: String,
-    pub kv_nc: bool,
     pub prepack: bool,
     pub fuse: bool,
     pub pb: usize,
@@ -35,7 +34,6 @@ impl Default for Options {
             device: 0,
             profile: false,
             kv: "f16".to_string(),
-            kv_nc: true,
             prepack: true,
             fuse: true,
             pb: 6,
@@ -61,7 +59,13 @@ impl Default for Options {
 }
 
 fn flag(name: &str) -> Option<bool> {
-    env::var(name).ok().map(|v| v != "0")
+    let raw = env::var(name).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn num(name: &str, lo: usize, hi: usize) -> Option<usize> {
@@ -81,11 +85,9 @@ impl Options {
             o.profile = v;
         }
         if let Ok(v) = env::var("LFM_KV")
-            && !v.is_empty() {
-                o.kv = v;
-            }
-        if let Some(v) = flag("LFM_KV_NC") {
-            o.kv_nc = v;
+            && !v.is_empty()
+        {
+            o.kv = v;
         }
         if let Some(v) = flag("LFM_PREPACK") {
             o.prepack = v;
@@ -145,21 +147,22 @@ impl Options {
             o.rgemv_b = v;
         }
         if let Ok(v) = env::var("LFM_GEMM_FORCE")
-            && !v.is_empty() {
-                o.gemm_force = Some(v);
-            }
+            && !v.is_empty()
+        {
+            o.gemm_force = Some(v);
+        }
         o
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !matches!(self.kv.as_str(), "f16" | "q4" | "k4v4" | "kvarn" | "kvarn_k4v2") {
+        if !matches!(
+            self.kv.as_str(),
+            "f16" | "q4" | "k4v4" | "kvarn" | "kvarn_k4v2"
+        ) {
             return Err(format!(
                 "unknown kv kind {:?} (f16, q4, k4v4, kvarn, kvarn_k4v2)",
                 self.kv
             ));
-        }
-        if !self.kv_nc {
-            return Err("QJL correction (kv_nc = false) is not implemented".to_string());
         }
         if self.pb == 0 || self.pb > 12 {
             return Err(format!("pb must be in 1..=12, got {}", self.pb));
@@ -171,10 +174,16 @@ impl Options {
             ));
         }
         if self.splits == 0 || self.splits > MAX_SPLITS {
-            return Err(format!("splits must be in 1..={MAX_SPLITS}, got {}", self.splits));
+            return Err(format!(
+                "splits must be in 1..={MAX_SPLITS}, got {}",
+                self.splits
+            ));
         }
         if !self.wg.is_multiple_of(64) || !(64..=512).contains(&self.wg) {
-            return Err(format!("wg must be a multiple of 64 in 64..=512, got {}", self.wg));
+            return Err(format!(
+                "wg must be a multiple of 64 in 64..=512, got {}",
+                self.wg
+            ));
         }
         if !self.wg_b.is_multiple_of(64) || !(64..=512).contains(&self.wg_b) {
             return Err(format!(

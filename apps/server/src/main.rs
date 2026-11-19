@@ -10,8 +10,8 @@ mod ws;
 use anyhow::Result;
 use clap::Parser;
 use engine::{ChatJob, Engine, Event, ServeConfig};
-use http::{end_sse, read_request, start_sse, write_event, write_json, Request};
-use protocol::{metrics_json, models_json, ChatRequest, CompletionMeta, CompletionRequest};
+use http::{Request, end_sse, read_request, start_sse, write_event, write_json};
+use protocol::{ChatRequest, CompletionMeta, CompletionRequest, metrics_json, models_json};
 use serde_json::json;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -66,9 +66,6 @@ struct Cli {
 }
 
 fn backend_name() -> String {
-    if std::env::var("LFM_BACKEND").as_deref() == Ok("cpu") {
-        return "cpu".to_string();
-    }
     match std::env::var("LFM_TP") {
         Ok(v) if !v.is_empty() => format!("tp:{v}"),
         _ => match std::env::var("LFM_TIERS") {
@@ -156,9 +153,8 @@ fn main() -> Result<()> {
             }),
         },
     };
-    let tokenizer: lfm_app::TokenizerLoader = Box::new(|path| {
-        Ok(Box::new(lfm_tokenizer::LfmTokenizer::from_file(path)?))
-    });
+    let tokenizer: lfm_app::TokenizerLoader =
+        Box::new(|path| Ok(Box::new(lfm_tokenizer::LfmTokenizer::from_file(path)?)));
     let engine = Engine::spawn(
         ServeConfig {
             model: cfg.model.clone(),
@@ -203,19 +199,32 @@ fn main() -> Result<()> {
                 let info = Arc::clone(&info);
                 let active = Arc::clone(&active);
                 active.fetch_add(1, Ordering::SeqCst);
-                thread::spawn(move || {
-                    if let Err(e) = handle(stream, &engine, &info, cfg.max_body) {
-                        eprintln!("conn: {e}");
-                    }
-                    active.fetch_sub(1, Ordering::SeqCst);
-                });
+                let spawned = thread::Builder::new()
+                    .name("conn".to_string())
+                    .spawn(move || {
+                        let guard = ActiveGuard(active);
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handle(stream, &engine, &info, cfg.max_body)
+                            }));
+                        match outcome {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => eprintln!("conn: {e}"),
+                            Err(_) => eprintln!("conn: panic"),
+                        }
+                        drop(guard);
+                    });
+                if let Err(e) = spawned {
+                    eprintln!("spawn: {e}");
+                    thread::sleep(Duration::from_millis(20));
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(2));
             }
             Err(e) => {
                 eprintln!("accept: {e}");
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(20));
             }
         }
     }
@@ -231,6 +240,14 @@ fn main() -> Result<()> {
     engine.shutdown();
     println!("lfm-server: остановлен");
     Ok(())
+}
+
+struct ActiveGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub struct ServerInfo {
@@ -282,11 +299,18 @@ fn route(method: &str, path: &str) -> Route {
     }
 }
 
-fn handle(mut stream: TcpStream, engine: &Engine, info: &ServerInfo, max_body: usize) -> Result<()> {
+fn handle(
+    mut stream: TcpStream,
+    engine: &Engine,
+    info: &ServerInfo,
+    max_body: usize,
+) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut peek = [0u8; 24];
     let seen = stream.peek(&mut peek).unwrap_or(0);
-    if h2::is_preface(&peek[..seen]) {
-        return h2::serve(stream, engine, info);
+    if seen > 0 && h2::is_preface(&peek[..seen]) && seen < peek.len() {
+        return h2::serve(stream, engine, info, max_body);
     }
     let started = Instant::now();
     let request = match read_request(&mut stream, max_body)? {
@@ -295,7 +319,10 @@ fn handle(mut stream: TcpStream, engine: &Engine, info: &ServerInfo, max_body: u
     };
     let (method, path) = (request.method.clone(), request.path.clone());
     let result = match route(&method, &path) {
-        Route::Health => write_json(&mut stream, 200, &info.health_json()),
+        Route::Health => {
+            let code = if engine.alive() { 200 } else { 503 };
+            write_json(&mut stream, code, &info.health_json())
+        }
         Route::Models => write_json(&mut stream, 200, &models_json(&info.model, 0)),
         Route::Chat => chat(stream, engine, &info.model, &request),
         Route::Completions => completions(stream, engine, &info.model, &request),
@@ -309,7 +336,10 @@ fn handle(mut stream: TcpStream, engine: &Engine, info: &ServerInfo, max_body: u
     };
     if engine.log_requests() {
         match &result {
-            Ok(()) => eprintln!("req: {method} {path} ok {} ms", started.elapsed().as_millis()),
+            Ok(()) => eprintln!(
+                "req: {method} {path} ok {} ms",
+                started.elapsed().as_millis()
+            ),
             Err(e) => eprintln!("req: {method} {path} error {e}"),
         }
     }
@@ -325,6 +355,9 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
         Ok(messages) => messages,
         Err(e) => return write_json(&mut stream, 400, &error_body(&format!("{e}"))),
     };
+    if messages.is_empty() {
+        return write_json(&mut stream, 400, &error_body("messages must not be empty"));
+    }
     let params = parsed.to_params();
     let job = ChatJob::chat(messages, params, parsed.thinking(), parsed.to_tools());
     let events = engine.submit(job)?;
@@ -338,6 +371,7 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
         )?;
         let mut tool_index = 0usize;
         let mut finish_reason = "stop";
+        let mut finished = false;
         for event in events {
             match event {
                 Event::Delta(text) => {
@@ -356,14 +390,27 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
                 Event::Final {
                     finish_reason: reason,
                     ..
-                } => finish_reason = reason,
+                } => {
+                    finish_reason = reason;
+                    finished = true;
+                }
                 Event::Error(e) => {
+                    eprintln!("engine error: {e}");
                     write_event(
                         &mut stream,
-                        &meta.chunk(json!({ "content": format!("\n[error] {e}") }), None),
+                        &meta.chunk(json!({ "content": "\n[error] generation failed" }), None),
                     )?;
+                    finish_reason = "error";
                 }
             }
+        }
+        if !finished {
+            write_event(
+                &mut stream,
+                &json!({"error": {"message": "generation interrupted", "type": "server_error"}})
+                    .to_string(),
+            )?;
+            return end_sse(&mut stream);
         }
         write_event(&mut stream, &meta.chunk(json!({}), Some(finish_reason)))?;
         write_event(&mut stream, "[DONE]")?;
@@ -390,7 +437,10 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
                 finish_reason = reason;
                 usage = (prompt_tokens, completion_tokens);
             }
-            Event::Error(e) => return write_json(&mut stream, 500, &error_body(&e)),
+            Event::Error(e) => {
+                eprintln!("engine error: {e}");
+                return write_json(&mut stream, 500, &error_body("generation failed"));
+            }
             Event::Delta(_) | Event::Thinking(_) | Event::ToolCall(_) => {}
         }
     }
@@ -408,7 +458,12 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
     )
 }
 
-fn completions(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) -> Result<()> {
+fn completions(
+    mut stream: TcpStream,
+    engine: &Engine,
+    model: &str,
+    request: &Request,
+) -> Result<()> {
     let parsed: CompletionRequest = match serde_json::from_slice(&request.body) {
         Ok(parsed) => parsed,
         Err(e) => return write_json(&mut stream, 400, &error_body(&format!("bad json: {e}"))),
@@ -432,6 +487,7 @@ fn completions(mut stream: TcpStream, engine: &Engine, model: &str, request: &Re
         start_sse(&mut stream)?;
         write_event(&mut stream, &meta.completion_chunk("", None))?;
         let mut finish_reason = "stop";
+        let mut finished = false;
         for event in events {
             match event {
                 Event::Delta(text) => {
@@ -440,15 +496,24 @@ fn completions(mut stream: TcpStream, engine: &Engine, model: &str, request: &Re
                 Event::Final {
                     finish_reason: reason,
                     ..
-                } => finish_reason = reason,
+                } => {
+                    finish_reason = reason;
+                    finished = true;
+                }
                 Event::Error(e) => {
-                    write_event(
-                        &mut stream,
-                        &meta.completion_chunk(&format!("\n[error] {e}"), None),
-                    )?;
+                    eprintln!("engine error: {e}");
+                    finish_reason = "error";
                 }
                 Event::Thinking(_) | Event::ToolCall(_) => {}
             }
+        }
+        if !finished {
+            write_event(
+                &mut stream,
+                &json!({"error": {"message": "generation interrupted", "type": "server_error"}})
+                    .to_string(),
+            )?;
+            return end_sse(&mut stream);
         }
         write_event(&mut stream, &meta.completion_chunk("", Some(finish_reason)))?;
         write_event(&mut stream, "[DONE]")?;
@@ -475,7 +540,10 @@ fn completions(mut stream: TcpStream, engine: &Engine, model: &str, request: &Re
                     prompt_tokens += p;
                     completion_tokens += c;
                 }
-                Event::Error(e) => return write_json(&mut stream, 500, &error_body(&e)),
+                Event::Error(e) => {
+                    eprintln!("engine error: {e}");
+                    return write_json(&mut stream, 500, &error_body("generation failed"));
+                }
                 Event::Delta(_) | Event::Thinking(_) | Event::ToolCall(_) => {}
             }
         }
@@ -497,6 +565,22 @@ fn ws_session(mut stream: TcpStream, engine: &Engine, request: &Request) -> Resu
     let Some(key) = key else {
         return write_json(&mut stream, 400, &error_body("missing sec-websocket-key"));
     };
+    let header = |name: &str| {
+        request
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    };
+    let upgrade_ok = header("upgrade").eq_ignore_ascii_case("websocket");
+    let connection_ok = header("connection")
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case("upgrade"));
+    let version_ok = header("sec-websocket-version") == "13";
+    if !upgrade_ok || !connection_ok || !version_ok || key.len() < 16 {
+        return write_json(&mut stream, 400, &error_body("bad websocket handshake"));
+    }
     ws::handshake(&mut stream, &key)?;
     let mut conn = ws::WsConn::new(stream);
     loop {
@@ -506,7 +590,9 @@ fn ws_session(mut stream: TcpStream, engine: &Engine, request: &Request) -> Resu
         let parsed: ChatRequest = match serde_json::from_str(&text) {
             Ok(parsed) => parsed,
             Err(e) => {
-                conn.send_text(&json!({ "type": "error", "message": format!("bad json: {e}") }).to_string())?;
+                conn.send_text(
+                    &json!({ "type": "error", "message": format!("bad json: {e}") }).to_string(),
+                )?;
                 continue;
             }
         };
@@ -623,10 +709,7 @@ mod tests {
     fn metrics_route_returns_200_json() {
         let (head, body) = roundtrip(&metrics_json("lfm3", &sample_snapshot()));
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
-        assert!(
-            head.contains("Content-Type: application/json"),
-            "{head}"
-        );
+        assert!(head.contains("Content-Type: application/json"), "{head}");
         assert!(head.contains(&format!("Content-Length: {}", body.len())));
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["model"], "lfm3");

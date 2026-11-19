@@ -72,7 +72,9 @@ fn q8_0_values() {
 }
 
 fn lcg(state: &mut u64) -> u32 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (*state >> 33) as u32
 }
 
@@ -112,7 +114,9 @@ fn pseudo_q6_blocks(n: usize, seed: u64) -> Vec<u8> {
 fn dot_matches_dequant_q4_k() {
     let bytes = pseudo_q4_blocks(4, 7);
     let mut s = 11u64;
-    let x: Vec<f32> = (0..1024).map(|_| (lcg(&mut s) % 2000) as f32 / 1000.0 - 1.0).collect();
+    let x: Vec<f32> = (0..1024)
+        .map(|_| (lcg(&mut s) % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     let y = dequant_row_q4_k(&bytes, 1024).unwrap();
     let reference: f32 = y.iter().zip(&x).map(|(a, b)| a * b).sum();
     let dot = dot_row_q4_k(&bytes, &x).unwrap();
@@ -123,7 +127,9 @@ fn dot_matches_dequant_q4_k() {
 fn dot_matches_dequant_q6_k() {
     let bytes = pseudo_q6_blocks(4, 13);
     let mut s = 17u64;
-    let x: Vec<f32> = (0..1024).map(|_| (lcg(&mut s) % 2000) as f32 / 1000.0 - 1.0).collect();
+    let x: Vec<f32> = (0..1024)
+        .map(|_| (lcg(&mut s) % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     let y = dequant_row_q6_k(&bytes, 1024).unwrap();
     let reference: f32 = y.iter().zip(&x).map(|(a, b)| a * b).sum();
     let dot = dot_row_q6_k(&bytes, &x).unwrap();

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use lfm_app::InferenceBackend;
 use lfm_opencl::{Arg, Buffer, ClMem, Event, Gpu, Kernel, Program, Stats};
@@ -94,7 +94,10 @@ enum Cmd {
         model: PathBuf,
         #[arg(long, default_value = "models/hf/tokenizer.json")]
         tokenizer: PathBuf,
-        #[arg(long, default_value = "The quick brown fox jumps over the lazy dog. In the beginning, the universe was created. This has made a lot of people very angry and been widely regarded as a bad move.")]
+        #[arg(
+            long,
+            default_value = "The quick brown fox jumps over the lazy dog. In the beginning, the universe was created. This has made a lot of people very angry and been widely regarded as a bad move."
+        )]
         text: String,
     },
     GpuGen {
@@ -348,7 +351,7 @@ fn main() -> Result<()> {
         other => {
             return Err(anyhow!(
                 "unknown --kv-cache {other}, expected f16|k4v4|k4v3|kvarn_k4v2"
-            ))
+            ));
         }
     };
     unsafe {
@@ -426,7 +429,9 @@ fn main() -> Result<()> {
             len,
         } => {
             let ids = if len > 0 {
-                (0..len).map(|i| ((i * 2654435761usize) % 60000) as u32 + 100).collect()
+                (0..len)
+                    .map(|i| ((i * 2654435761usize) % 60000) as u32 + 100)
+                    .collect()
             } else {
                 ids
             };
@@ -538,10 +543,7 @@ fn info() -> Result<()> {
         gpu.caps.global_mem_bytes as f64 / (1u64 << 30) as f64
     );
     println!("max_work_group_size: {}", gpu.caps.max_work_group_size);
-    println!(
-        "preferred_wg_multiple: {}",
-        gpu.caps.preferred_wg_multiple
-    );
+    println!("preferred_wg_multiple: {}", gpu.caps.preferred_wg_multiple);
     println!("sub_group_size: {}", gpu.caps.sub_group_size);
     println!("fp16: {}", gpu.caps.fp16);
     println!("integer_dot: {}", gpu.caps.integer_dot);
@@ -589,7 +591,11 @@ fn bw(mb: usize, reps: usize) -> Result<()> {
                 &copy,
                 n4,
                 256,
-                &[Arg::Mem(src.get()), Arg::Mem(dst.get()), Arg::U32(n4 as u32)],
+                &[
+                    Arg::Mem(src.get()),
+                    Arg::Mem(dst.get()),
+                    Arg::U32(n4 as u32),
+                ],
             )?;
         }
         Ok(())
@@ -642,7 +648,12 @@ fn peak(iters: u32) -> Result<()> {
     let ops = iters as f64 * 8.0 * 2.0 * global as f64;
     let st = gpu.bench(3, 10, || -> Result<()> {
         unsafe {
-            gpu.launch(&fp32, global, 256, &[Arg::Mem(sinkf.get()), Arg::U32(iters)])?;
+            gpu.launch(
+                &fp32,
+                global,
+                256,
+                &[Arg::Mem(sinkf.get()), Arg::U32(iters)],
+            )?;
         }
         Ok(())
     })?;
@@ -654,7 +665,12 @@ fn peak(iters: u32) -> Result<()> {
     let fp16 = Kernel::create(&program, "peak_fp16")?;
     let st = gpu.bench(3, 10, || -> Result<()> {
         unsafe {
-            gpu.launch(&fp16, global, 256, &[Arg::Mem(sinkf.get()), Arg::U32(iters)])?;
+            gpu.launch(
+                &fp16,
+                global,
+                256,
+                &[Arg::Mem(sinkf.get()), Arg::U32(iters)],
+            )?;
         }
         Ok(())
     })?;
@@ -883,7 +899,7 @@ fn gemv(
         let gs = gpu.download(&xs, cols / GROUP)?;
         let dq = gq.iter().zip(&xq_ref).filter(|(a, b)| a != b).count();
         let ds = gs.iter().zip(&xs_ref).filter(|(a, b)| a != b).count();
-        println!("  quant: xq diff {dq}/{cols}, xs diff {ds}", );
+        println!("  quant: xq diff {dq}/{cols}, xs diff {ds}",);
     }
     let row_bytes = bytes.len() / rows;
     if let Some(j) = onehot {
@@ -1154,14 +1170,17 @@ fn step(path: &PathBuf, rgemv: u32, mode: &str, reps: usize) -> Result<()> {
             quantize_on_gpu(&gpu, &k.quant, &xb, &xq, &xs, *cols)?.wait()?;
             prepared.push((xq, xs));
         }
-        let enq_fused = |groups: &Vec<(Vec<usize>, Buffer<u8>, Buffer<f32>, usize, usize, bool)>, prepared: &Vec<(Buffer<i8>, Buffer<f32>)>| -> Result<()> {
-            for (gi, (_, w, y, rows, cols, is_q4)) in groups.iter().enumerate() {
-                let kern = if *is_q4 { &k.q4 } else { &k.q6 };
-                let (xq, xs) = &prepared[gi];
-                launch_gemv(&gpu, kern, w, xq, xs, y, *rows, *cols, rgemv as usize)?;
-            }
-            Ok(())
-        };
+        let enq_fused =
+            |groups: &Vec<(Vec<usize>, Buffer<u8>, Buffer<f32>, usize, usize, bool)>,
+             prepared: &Vec<(Buffer<i8>, Buffer<f32>)>|
+             -> Result<()> {
+                for (gi, (_, w, y, rows, cols, is_q4)) in groups.iter().enumerate() {
+                    let kern = if *is_q4 { &k.q4 } else { &k.q6 };
+                    let (xq, xs) = &prepared[gi];
+                    launch_gemv(&gpu, kern, w, xq, xs, y, *rows, *cols, rgemv as usize)?;
+                }
+                Ok(())
+            };
         enq_fused(&groups, &prepared)?;
         gpu.queue.finish()?;
         let mut samples = Vec::with_capacity(reps);
@@ -1265,7 +1284,10 @@ fn dump(path: &PathBuf, name: &str) -> Result<()> {
         lfm_gguf::GgmlType::Q6_K => lfm_quant::dequant_row_q6_k(&bytes[..row_bytes], cols)?,
         other => return Err(anyhow!("unsupported type {other:?}")),
     };
-    println!("first8 {:?}", y[..8].iter().map(|v| format!("{v:.9}")).collect::<Vec<_>>());
+    println!(
+        "first8 {:?}",
+        y[..8].iter().map(|v| format!("{v:.9}")).collect::<Vec<_>>()
+    );
     let x = make_x(cols);
     let dot = match t.ggml_type {
         lfm_gguf::GgmlType::Q4_K => lfm_quant::dot_row_q4_k(&bytes[..row_bytes], &x)?,
@@ -1336,7 +1358,11 @@ fn reference_debug(model: &PathBuf, ids: &[u32], out: Option<&PathBuf>) -> Resul
         println!("  {i:>2}: {n:.4}");
     }
     let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|a, b| {
+        logits[*b]
+            .partial_cmp(&logits[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     println!("top5:");
     for k in 0..5 {
         println!("  {} = {:.4}", idx[k], logits[idx[k]]);
@@ -1345,7 +1371,10 @@ fn reference_debug(model: &PathBuf, ids: &[u32], out: Option<&PathBuf>) -> Resul
     let var = logits.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / logits.len() as f32;
     let min = logits.iter().copied().fold(f32::INFINITY, f32::min);
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    println!("logits: min {min:.4} max {max:.4} mean {mean:.4} std {:.4}", var.sqrt());
+    println!(
+        "logits: min {min:.4} max {max:.4} mean {mean:.4} std {:.4}",
+        var.sqrt()
+    );
     println!("argmax {}", idx[0]);
     if let Some(path) = out {
         let mut bytes = Vec::with_capacity(logits.len() * 4);
@@ -1453,13 +1482,23 @@ fn gpu_chat(
     let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
     let chat = lfm_chat::ChatTemplate::from_file(template)?;
     if tui {
-        return tui_chat(model, tokenizer, template, system, max_new, thinking, params, ctx);
+        return tui_chat(
+            model, tokenizer, template, system, max_new, thinking, params, ctx,
+        );
     }
     let mut gpu = lfm_gpu::GpuModel::load(model, ctx)?;
     let mut history = vec![lfm_domain::Message::system(system)];
     if !interactive {
         history.push(lfm_domain::Message::user(user));
-        return answer(&mut gpu, &tok, &chat, &mut history, max_new, thinking, params);
+        return answer(
+            &mut gpu,
+            &tok,
+            &chat,
+            &mut history,
+            max_new,
+            thinking,
+            params,
+        );
     }
     println!(
         "интерактивный чат ({} токенов контекста). /exit — выход, /reset — очистить историю.",
@@ -1488,7 +1527,15 @@ fn gpu_chat(
         history.push(lfm_domain::Message::user(text));
         print!("assistant> ");
         std::io::stdout().flush()?;
-        if let Err(e) = answer(&mut gpu, &tok, &chat, &mut history, max_new, thinking, params) {
+        if let Err(e) = answer(
+            &mut gpu,
+            &tok,
+            &chat,
+            &mut history,
+            max_new,
+            thinking,
+            params,
+        ) {
             eprintln!("ошибка: {e}");
             history.pop();
         }
@@ -1586,9 +1633,11 @@ fn term_size() -> (usize, usize) {
         let mut parts = text.split_whitespace();
         if let (Some(r), Some(c)) = (parts.next(), parts.next())
             && let (Ok(r), Ok(c)) = (r.parse::<usize>(), c.parse::<usize>())
-                && r > 4 && c > 20 {
-                    return (r, c);
-                }
+            && r > 4
+            && c > 20
+        {
+            return (r, c);
+        }
     }
     (24, 80)
 }
@@ -1939,7 +1988,9 @@ fn tui_chat(
     set_term_raw(true)?;
     print!("\x1b[?1049h\x1b[2J");
     let _ = std::io::stdout().flush();
-    let result = tui_loop(&mut gpu, &tok, &chat, system, max_new, thinking, params, &mut state);
+    let result = tui_loop(
+        &mut gpu, &tok, &chat, system, max_new, thinking, params, &mut state,
+    );
     print!("\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
     set_term_raw(false)?;
@@ -1975,7 +2026,9 @@ fn tui_loop(
         state.input_history.push(&text);
         state.scroll = 0;
         if text == "/help" {
-            state.history.push(("sys".to_string(), TUI_HELP.to_string()));
+            state
+                .history
+                .push(("sys".to_string(), TUI_HELP.to_string()));
             continue;
         }
         if text == "/reset" {
@@ -1995,7 +2048,11 @@ fn tui_loop(
         let ids = tok.encode(&prompt, false)?;
         let avail = gpu.max_ctx();
         if ids.len() + 1 >= avail {
-            state.status = format!("история не влезает: {} токенов при ctx {}", ids.len(), avail);
+            state.status = format!(
+                "история не влезает: {} токенов при ctx {}",
+                ids.len(),
+                avail
+            );
             history.pop();
             continue;
         }
@@ -2443,7 +2500,10 @@ fn gpu_multi(model: &PathBuf, nseq: usize, tokens: usize, prompt_len: usize) -> 
     }
     gpu.finish()?;
     let prefill_s = prefill_started.elapsed().as_secs_f64();
-    if std::env::var("LFM_PROFILE").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("LFM_PROFILE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         println!("  -- prefill kernels --");
         for (name, calls, avg_us, total_ms) in gpu.profile_report().iter().take(8) {
             println!("  {name:24} {calls} calls {avg_us:.1} us {total_ms:.1} ms");
@@ -2505,8 +2565,16 @@ fn gpu_check(model: &PathBuf, ids: &[u32]) -> Result<()> {
         .zip(&gpu_logits)
         .map(|(a, b)| (*a as f64) * (*b as f64))
         .sum();
-    let na: f64 = cpu_logits.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = gpu_logits.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+    let na: f64 = cpu_logits
+        .iter()
+        .map(|v| (*v as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let nb: f64 = gpu_logits
+        .iter()
+        .map(|v| (*v as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
     println!("cos(cpu,gpu) {:.6}", c / (na * nb + 1e-12));
     let mut ci: Vec<usize> = (0..cpu_logits.len()).collect();
     ci.sort_by(|a, b| cpu_logits[*b].partial_cmp(&cpu_logits[*a]).unwrap());
@@ -2560,14 +2628,8 @@ fn gemb(path: &PathBuf, tensor: &str, pb: u32, rgemv: u32, threads: u32) -> Resu
     let s0mut = s0;
     for t in 0..pb {
         unsafe {
-            gpu.queue.enqueue_copy_buffer(
-                &q0mut,
-                &mut xq,
-                0,
-                t * cols,
-                cols,
-                &[],
-            )?;
+            gpu.queue
+                .enqueue_copy_buffer(&q0mut, &mut xq, 0, t * cols, cols, &[])?;
             gpu.queue.enqueue_copy_buffer(
                 &s0mut,
                 &mut xs,
@@ -2576,14 +2638,8 @@ fn gemb(path: &PathBuf, tensor: &str, pb: u32, rgemv: u32, threads: u32) -> Resu
                 cols / GROUP * 4,
                 &[],
             )?;
-            gpu.queue.enqueue_copy_buffer(
-                &xrow,
-                &mut xb,
-                0,
-                t * cols * 4,
-                cols * 4,
-                &[],
-            )?;
+            gpu.queue
+                .enqueue_copy_buffer(&xrow, &mut xb, 0, t * cols * 4, cols * 4, &[])?;
         }
     }
     let y = gpu.alloc::<f32>(pb * rows)?;
@@ -2655,11 +2711,7 @@ fn gpu_prefill(model: &PathBuf, tokens: usize, decode: usize) -> Result<()> {
     let ids: Vec<u32> = (0..tokens)
         .map(|i| ((i * 2654435761usize) % 60000) as u32 + 100)
         .collect();
-    gpu.forward_batch(
-        &ids[..gpu.prefill_batch_size().min(ids.len())],
-        0,
-        true,
-    )?;
+    gpu.forward_batch(&ids[..gpu.prefill_batch_size().min(ids.len())], 0, true)?;
     gpu.reset()?;
     let started = Instant::now();
     let mut pos = 0;
@@ -2684,9 +2736,7 @@ fn gpu_prefill(model: &PathBuf, tokens: usize, decode: usize) -> Result<()> {
     if !report.is_empty() {
         println!("  -- prefill, per chunk --");
         for (name, calls, avg_us, total_ms) in report {
-            println!(
-                "  {name:<22} {calls:>6} calls  {avg_us:>8.1} us  {total_ms:>7.2} ms total"
-            );
+            println!("  {name:<22} {calls:>6} calls  {avg_us:>8.1} us  {total_ms:>7.2} ms total");
         }
     }
     gpu.reset_profile();
@@ -2705,9 +2755,7 @@ fn gpu_prefill(model: &PathBuf, tokens: usize, decode: usize) -> Result<()> {
             decode as f64 / elapsed.max(1e-9)
         );
         for (name, calls, avg_us, total_ms) in gpu.profile_report() {
-            println!(
-                "  {name:<22} {calls:>6} calls  {avg_us:>8.1} us  {total_ms:>7.2} ms/tok"
-            );
+            println!("  {name:<22} {calls:>6} calls  {avg_us:>8.1} us  {total_ms:>7.2} ms/tok");
         }
     }
     Ok(())
@@ -2759,11 +2807,33 @@ fn gpu_cmp(model: &PathBuf, ids: &[u32], batch: usize) -> Result<()> {
     let btok = (ids.len() - 1) % batch.max(1);
     let bat_x = gpu.debug_x(true, btok)?;
     println!("x cos {:.6}", cosine(&seq_x, &bat_x));
-    println!("x max|d| {:.4}", seq_x.iter().zip(&bat_x).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max));
+    println!(
+        "x max|d| {:.4}",
+        seq_x
+            .iter()
+            .zip(&bat_x)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    );
     println!("kv0 cos {:.6}", cosine(&seq_state.1, &bat_state.1));
-    println!("kv0 max|d| {:.4}", seq_state.1.iter().zip(&bat_state.1).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max));
+    println!(
+        "kv0 max|d| {:.4}",
+        seq_state
+            .1
+            .iter()
+            .zip(&bat_state.1)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    );
     println!("conv0 cos {:.6}", cosine(&seq_conv0, &bat_conv0));
-    println!("conv0 max|d| {:.4}", seq_conv0.iter().zip(&bat_conv0).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max));
+    println!(
+        "conv0 max|d| {:.4}",
+        seq_conv0
+            .iter()
+            .zip(&bat_conv0)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    );
     println!("batch cos {:.6}", cosine(&seq, &bat));
     let max_d = seq
         .iter()
@@ -2976,8 +3046,14 @@ fn gpu_embed(model: &PathBuf, id: u32) -> Result<()> {
         .ok_or_else(|| anyhow!("no conv weight"))?;
     println!("conv w cpu {:?}", &cw_cpu[..6]);
     println!("conv w gpu {:?}", &cw_gpu[..6]);
-    println!("bcx |gpu| {:?}", bcx_gpu[..3].iter().map(|v| v.abs()).collect::<Vec<f32>>());
-    println!("bcx |cpu| {:?}", bcx_cpu[..3].iter().map(|v| v.abs()).collect::<Vec<f32>>());
+    println!(
+        "bcx |gpu| {:?}",
+        bcx_gpu[..3].iter().map(|v| v.abs()).collect::<Vec<f32>>()
+    );
+    println!(
+        "bcx |cpu| {:?}",
+        bcx_cpu[..3].iter().map(|v| v.abs()).collect::<Vec<f32>>()
+    );
     println!("in_proj cos {:.6}", cosine(&bcx_cpu, &bcx_gpu));
     println!("cpu bcx[0..4] {:?}", &bcx_cpu[..4]);
     println!("gpu bcx[0..4] {:?}", &bcx_gpu[..4]);
@@ -3016,7 +3092,11 @@ fn gpu_embed(model: &PathBuf, id: u32) -> Result<()> {
     let (gq, gs) = gpu.debug_quant(&xq)?;
     let (rq, rs) = quantize_ref(&xq, GROUP);
     let dq = gq.iter().zip(&rq).filter(|(a, b)| a != b).count();
-    let ds = gs.iter().zip(&rs).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let ds = gs
+        .iter()
+        .zip(&rs)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     println!("quant diff {dq}/{} xs max|d| {ds:.3e}", gq.len());
     println!("  gs[0..4] {:?}", &gs[..4]);
     println!("  rs[0..4] {:?}", &rs[..4]);
@@ -3028,18 +3108,34 @@ fn gpu_embed(model: &PathBuf, id: u32) -> Result<()> {
     let (gx, gq, gs) = gpu.debug_norm_add_quant(&op, &post, &res, &next_w)?;
     let ss: f32 = op.iter().map(|v| v * v).sum();
     let sc = 1.0 / (ss / n as f32 + 1e-5).sqrt();
-    let v: Vec<f32> = op.iter().zip(&post).zip(&res).map(|((a, b), c)| a * sc * b + c).collect();
+    let v: Vec<f32> = op
+        .iter()
+        .zip(&post)
+        .zip(&res)
+        .map(|((a, b), c)| a * sc * b + c)
+        .collect();
     let ss2: f32 = v.iter().map(|x| x * x).sum();
     let sc2 = 1.0 / (ss2 / n as f32 + 1e-5).sqrt();
     let w: Vec<f32> = v.iter().zip(&next_w).map(|(a, b)| a * sc2 * b).collect();
     let (rq, rs) = quantize_ref(&w, GROUP);
     let dq = gq.iter().zip(&rq).filter(|(a, b)| a != b).count();
-    let ds = gs.iter().zip(&rs).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    println!("naq x cos {:.6}, quant diff {dq}/{}, xs max|d| {ds:.3e}", cosine(&v, &gx), gq.len());
+    let ds = gs
+        .iter()
+        .zip(&rs)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!(
+        "naq x cos {:.6}, quant diff {dq}/{}, xs max|d| {ds:.3e}",
+        cosine(&v, &gx),
+        gq.len()
+    );
     println!("ref scale {sc:.8} ss {ss:.4}");
     for i in 0..4 {
         let k = (gx[i] - res[i]) / (op[i] * post[i]);
-        println!("  k[{i}] {k:.8} op {:.5} post {:.5} res {:.5}", op[i], post[i], res[i]);
+        println!(
+            "  k[{i}] {k:.8} op {:.5} post {:.5} res {:.5}",
+            op[i], post[i], res[i]
+        );
     }
     let mut shown = 0;
     for i in 0..n {
@@ -3062,7 +3158,11 @@ fn gpu_embed(model: &PathBuf, id: u32) -> Result<()> {
         .collect();
     let (rq, rs) = quantize_ref(&act, GROUP);
     let dq = sq.iter().zip(&rq).filter(|(a, b)| a != b).count();
-    let ds = ss.iter().zip(&rs).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let ds = ss
+        .iter()
+        .zip(&rs)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     println!("silu quant diff {dq}/{ffn}, xs max|d| {ds:.3e}");
     println!("lmhead cos {:.6}", cosine(&cl, &gl));
     println!("cpu dot[0..4] {:?}", &cl[..4]);
@@ -3103,9 +3203,7 @@ mod tests {
     fn chat_state(messages: usize) -> TuiState {
         let mut state = empty_state();
         for i in 0..messages {
-            state
-                .history
-                .push(("you".to_string(), format!("m{i}")));
+            state.history.push(("you".to_string(), format!("m{i}")));
         }
         state
     }
@@ -3180,9 +3278,7 @@ mod tests {
     #[test]
     fn visible_lines_small_window_keeps_tail() {
         let mut state = empty_state();
-        state
-            .history
-            .push(("ai".to_string(), "tail".to_string()));
+        state.history.push(("ai".to_string(), "tail".to_string()));
         let view = visible_lines(&state, 3, 40);
         assert_eq!(view.area, 1);
         assert_eq!(view.body.len(), 1);
@@ -3222,7 +3318,9 @@ mod tests {
     fn visible_lines_renders_tools_after_answer() {
         let mut state = empty_state();
         state.assistant = "ans".to_string();
-        state.tools.push(("calc".to_string(), "{\"a\":1}".to_string()));
+        state
+            .tools
+            .push(("calc".to_string(), "{\"a\":1}".to_string()));
         let view = visible_lines(&state, 12, 40);
         let text = view.body.join("\n");
         assert!(text.contains("ai>  ans"));
@@ -3356,7 +3454,7 @@ fn gemm_launch(
             64usize,
         ),
         "q6b8" => {
-            let (w8, wsc) = lfm_gpu::prepack::prepack_q6_i8(wbytes, cols);
+            let (w8, wsc) = lfm_gpu::prepack::prepack_q6_i8(wbytes, cols)?;
             let w8b = gpu.upload(&w8)?;
             let wscb = gpu.upload(&wsc)?;
             let kernel = Kernel::create(program, "gemm_q6_i8_b8")?;
@@ -3485,7 +3583,12 @@ fn gemm_one(
         );
         println!(
             "  rows {} x ntok {ntok}: max_rel {:.2e} (worst row {} tok {} gpu {:.4} ref {:.4})",
-            check_rows.min(rows), max_rel, worst.0, worst.1, worst.2, worst.3
+            check_rows.min(rows),
+            max_rel,
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3
         );
     }
     Ok(max_rel)
@@ -3556,7 +3659,15 @@ fn gemm_cmp(
             false,
         )?;
         if rel > worst.1 {
-            worst = (format!("{} {}({})", t.name, m, t.ggml_type == lfm_gguf::GgmlType::Q6_K), rel);
+            worst = (
+                format!(
+                    "{} {}({})",
+                    t.name,
+                    m,
+                    t.ggml_type == lfm_gguf::GgmlType::Q6_K
+                ),
+                rel,
+            );
         }
     }
     println!("worst: {} max_rel {:.2e}", worst.0, worst.1);
@@ -3620,9 +3731,19 @@ __kernel void f16_rate(__global const char *src, __global float *out, uint iters
         let st = gpu.bench(2, 5, || -> Result<()> {
             unsafe {
                 if name == "dot_rate" {
-                    gpu.launch(&k, grid, 64, &[Arg::Mem(sbuf.get()), Arg::Mem(out_i.get()), Arg::U32(iters)])?;
+                    gpu.launch(
+                        &k,
+                        grid,
+                        64,
+                        &[Arg::Mem(sbuf.get()), Arg::Mem(out_i.get()), Arg::U32(iters)],
+                    )?;
                 } else {
-                    gpu.launch(&k, grid, 64, &[Arg::Mem(sbuf.get()), Arg::Mem(out_f.get()), Arg::U32(iters)])?;
+                    gpu.launch(
+                        &k,
+                        grid,
+                        64,
+                        &[Arg::Mem(sbuf.get()), Arg::Mem(out_f.get()), Arg::U32(iters)],
+                    )?;
                 }
             }
             Ok(())

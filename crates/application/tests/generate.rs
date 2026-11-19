@@ -1,10 +1,8 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
-use anyhow::{anyhow, Result};
-use lfm_app::{
-    CacheStats, FinishReason, Generate, InferenceBackend, SequenceStep, TokenizerPort,
-};
+use anyhow::{Result, anyhow};
+use lfm_app::{CacheStats, FinishReason, Generate, InferenceBackend, SequenceStep, TokenizerPort};
 
 struct FakeTokenizer {
     eos: u32,
@@ -120,7 +118,10 @@ fn generates_greedy_tokens_and_frees_sequence() {
     assert_eq!(outcome.finish, FinishReason::Length);
     assert_eq!(outcome.text, "\u{5}\u{6}\u{7}");
     assert_eq!(backend.prefilled.len(), 1);
-    assert_eq!(backend.prefilled[0].1, vec![u32::from(b'h'), u32::from(b'i')]);
+    assert_eq!(
+        backend.prefilled[0].1,
+        vec![u32::from(b'h'), u32::from(b'i')]
+    );
     assert_eq!(
         backend.steps,
         vec![
@@ -156,7 +157,9 @@ fn stops_on_eos_without_steps() {
 fn zero_max_tokens_returns_empty_length() {
     let mut backend = FakeBackend::new(vec![logit(5, 12)]);
     let tokenizer = FakeTokenizer { eos: 11 };
-    let outcome = Generate::new(&mut backend, &tokenizer).run("hi", 0).unwrap();
+    let outcome = Generate::new(&mut backend, &tokenizer)
+        .run("hi", 0)
+        .unwrap();
     assert!(outcome.ids.is_empty());
     assert_eq!(outcome.finish, FinishReason::Length);
     assert!(backend.steps.is_empty());

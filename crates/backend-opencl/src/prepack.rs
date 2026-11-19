@@ -3,12 +3,13 @@ pub const Q4K_PACKED: usize = 148;
 pub const Q4K_SCALES: usize = 4;
 pub const Q4K_QUANTS: usize = 20;
 
-pub fn prepack_q4_k(src: &[u8]) -> Vec<u8> {
-    assert!(
-        src.len().is_multiple_of(Q4K_BLOCK),
-        "q4_k bytes {} not a multiple of {Q4K_BLOCK}",
-        src.len()
-    );
+pub fn prepack_q4_k(src: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if src.is_empty() || !src.len().is_multiple_of(Q4K_BLOCK) {
+        anyhow::bail!(
+            "q4_k bytes {} not a non-zero multiple of {Q4K_BLOCK}",
+            src.len()
+        );
+    }
     let blocks = src.len() / Q4K_BLOCK;
     let mut out = vec![0u8; blocks * Q4K_PACKED];
     for b in 0..blocks {
@@ -22,26 +23,29 @@ pub fn prepack_q4_k(src: &[u8]) -> Vec<u8> {
         }
         d[Q4K_QUANTS..Q4K_QUANTS + 128].copy_from_slice(&s[16..144]);
     }
-    out
+    Ok(out)
 }
 
 pub const Q6K_BLOCK: usize = 210;
 
-pub fn prepack_q6_i8(src: &[u8], cols: usize) -> (Vec<i8>, Vec<f32>) {
-    assert!(cols.is_multiple_of(256), "q6 cols {cols} not a multiple of 256");
+pub fn prepack_q6_i8(src: &[u8], cols: usize) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
+    if cols == 0 || !cols.is_multiple_of(256) {
+        anyhow::bail!("q6 cols {cols} not a non-zero multiple of 256");
+    }
     let block_bytes = cols / 256 * Q6K_BLOCK;
-    assert!(
-        src.len().is_multiple_of(block_bytes),
-        "q6 bytes {} not a multiple of {block_bytes}",
-        src.len()
-    );
+    if src.is_empty() || !src.len().is_multiple_of(block_bytes) {
+        anyhow::bail!(
+            "q6 bytes {} not a non-zero multiple of {block_bytes}",
+            src.len()
+        );
+    }
     let rows = src.len() / block_bytes;
     let groups = cols / 32;
     let mut q = vec![0i8; groups * rows * 32];
     let mut scales = vec![0f32; groups * rows];
     for r in 0..rows {
         let row = &src[r * block_bytes..(r + 1) * block_bytes];
-        let vals = lfm_quant::dequant_row_q6_k(row, cols).expect("q6 row dequant");
+        let vals = lfm_quant::dequant_row_q6_k(row, cols)?;
         for g in 0..groups {
             let chunk = &vals[g * 32..(g + 1) * 32];
             let amax = chunk.iter().fold(0f32, |a, v| a.max(v.abs()));
@@ -54,7 +58,7 @@ pub fn prepack_q6_i8(src: &[u8], cols: usize) -> (Vec<i8>, Vec<f32>) {
             }
         }
     }
-    (q, scales)
+    Ok((q, scales))
 }
 
 pub fn scale_min(blk: &[u8], j: usize) -> (u8, u8) {
@@ -68,11 +72,7 @@ pub fn scale_min(blk: &[u8], j: usize) -> (u8, u8) {
     let lo_m = b & 63;
     let hi_d = (c & 15) | ((a >> 6) << 4);
     let hi_m = (c >> 4) | ((b >> 6) << 4);
-    if h == 0 {
-        (lo_d, lo_m)
-    } else {
-        (hi_d, hi_m)
-    }
+    if h == 0 { (lo_d, lo_m) } else { (hi_d, hi_m) }
 }
 
 #[cfg(test)]
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn packed_size_and_layout() {
         let src = block(1, 0x3c00, 0x3400);
-        let out = prepack_q4_k(&src);
+        let out = prepack_q4_k(&src).unwrap();
         assert_eq!(out.len(), Q4K_PACKED);
         assert_eq!(&out[..4], &src[..4]);
         assert_eq!(&out[Q4K_QUANTS..Q4K_QUANTS + 128], &src[16..144]);
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn scales_match_source_layout() {
         let src = block(9, 0x3c00, 0x3400);
-        let out = prepack_q4_k(&src);
+        let out = prepack_q4_k(&src).unwrap();
         for j in 0..8 {
             let (sc, m) = scale_min(&src, j);
             assert_eq!(out[Q4K_SCALES + 2 * j], sc, "scale {j}");
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn kernel_lane_window_is_four_bytes() {
         let src = block(5, 0x3c00, 0x3400);
-        let out = prepack_q4_k(&src);
+        let out = prepack_q4_k(&src).unwrap();
         for u in 0..8usize {
             let sb = (u >> 1) * 2;
             let off = Q4K_SCALES + 4 * (u >> 1);
@@ -132,7 +132,7 @@ mod tests {
     fn multiple_blocks_are_independent() {
         let mut src = block(3, 0x3c00, 0x3400);
         src.extend_from_slice(&block(200, 0x3800, 0x3000));
-        let out = prepack_q4_k(&src);
+        let out = prepack_q4_k(&src).unwrap();
         assert_eq!(out.len(), 2 * Q4K_PACKED);
         for j in 0..8 {
             let (sc, m) = scale_min(&src, j);
@@ -160,15 +160,21 @@ mod tests {
                 src[9] = b ^ 0x33;
                 src[12] = 0b0000_1010;
                 src[13] = 0b1111_0101;
-                let out = prepack_q4_k(&src);
+                let out = prepack_q4_k(&src).unwrap();
                 let (a2, b2) = (src[5], src[9]);
                 let expect = [
                     (a & 63, b & 63),
                     (a2 & 63, b2 & 63),
                     (0, 0),
                     (0, 0),
-                    ((src[12] & 15) | ((a >> 6) << 4), (src[12] >> 4) | ((b >> 6) << 4)),
-                    ((src[13] & 15) | ((a2 >> 6) << 4), (src[13] >> 4) | ((b2 >> 6) << 4)),
+                    (
+                        (src[12] & 15) | ((a >> 6) << 4),
+                        (src[12] >> 4) | ((b >> 6) << 4),
+                    ),
+                    (
+                        (src[13] & 15) | ((a2 >> 6) << 4),
+                        (src[13] >> 4) | ((b2 >> 6) << 4),
+                    ),
                 ];
                 for (j, (sc, m)) in expect.iter().enumerate() {
                     if *sc == 0 && *m == 0 {
@@ -185,7 +191,7 @@ mod tests {
 
     #[test]
     fn rejects_unaligned_input() {
-        assert!(std::panic::catch_unwind(|| prepack_q4_k(&[0u8; 143])).is_err());
+        assert!(prepack_q4_k(&[0u8; 143]).is_err());
     }
 
     fn q6_block(seed: u8) -> Vec<u8> {
@@ -211,7 +217,7 @@ mod tests {
             src.extend_from_slice(&q6_block(seed * 11));
             src.extend_from_slice(&q6_block(seed * 7 + 3));
         }
-        let (q, sc) = prepack_q6_i8(&src, cols);
+        let (q, sc) = prepack_q6_i8(&src, cols).unwrap();
         assert_eq!(q.len(), cols * 2);
         assert_eq!(sc.len(), (cols / 32) * 2);
         for r in 0..2 {
@@ -233,18 +239,73 @@ mod tests {
 
     #[test]
     fn q6_i8_rejects_unaligned_cols() {
-        assert!(std::panic::catch_unwind(|| prepack_q6_i8(&[0u8; 210], 128)).is_err());
+        assert!(prepack_q6_i8(&[0u8; 210], 128).is_err());
+    }
+    fn q4_block(seed: u8) -> Vec<u8> {
+        let mut b = vec![0u8; Q4K_BLOCK];
+        b[0..2].copy_from_slice(&0x2c00u16.to_le_bytes());
+        b[2..4].copy_from_slice(&0x1c00u16.to_le_bytes());
+        for i in 0..12 {
+            b[4 + i] = (i as u8).wrapping_mul(17).wrapping_add(seed);
+        }
+        for i in 0..128 {
+            b[16 + i] = (i as u8)
+                .wrapping_mul(43)
+                .wrapping_add(seed.wrapping_mul(7));
+        }
+        b
+    }
+
+    #[test]
+    fn q4_i8_matches_reference_dequant() {
+        let cols = 256usize;
+        let rows = 2usize;
+        let mut raw = Vec::new();
+        for r in 0..rows {
+            raw.extend_from_slice(&q4_block(r as u8 * 13));
+        }
+        let packed = prepack_q4_k(&raw).unwrap();
+        let (q, sc) = prepack_q4_i8(&packed, cols).unwrap();
+        let groups = cols / 32;
+        assert_eq!(q.len(), rows * cols);
+        assert_eq!(sc.len(), groups * rows);
+        for r in 0..rows {
+            let row = &raw[r * Q4K_BLOCK..(r + 1) * Q4K_BLOCK];
+            let reference = lfm_quant::dequant_row_q4_k(row, cols).unwrap();
+            for g in 0..groups {
+                let scale = sc[g * rows + r];
+                assert!(scale.is_finite() && scale >= 0.0);
+                for i in 0..32 {
+                    let got = q[(g * rows + r) * 32 + i] as f32 * scale;
+                    let want = reference[g * 32 + i];
+                    assert!(
+                        (got - want).abs() <= scale.max(1e-6),
+                        "row {r} group {g} i {i}: {got} vs {want} (scale {scale})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q4_i8_rejects_bad_shapes() {
+        assert!(prepack_q4_i8(&[], 256).is_err());
+        assert!(prepack_q4_i8(&[0u8; Q4K_PACKED], 0).is_err());
+        assert!(prepack_q4_i8(&[0u8; Q4K_PACKED], 512).is_err());
     }
 }
 
-pub fn prepack_q4_i8(src: &[u8], cols: usize) -> (Vec<i8>, Vec<f32>) {
-    assert!(cols.is_multiple_of(256), "q4 cols {cols} not a multiple of 256");
+pub fn prepack_q4_i8(src: &[u8], cols: usize) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
+    if cols == 0 || !cols.is_multiple_of(256) {
+        anyhow::bail!("q4 cols {cols} not a non-zero multiple of 256");
+    }
     let per_row = cols / 256 * Q4K_PACKED;
-    assert!(
-        src.len().is_multiple_of(per_row),
-        "q4 packed bytes {} not a multiple of {per_row}",
-        src.len()
-    );
+    if src.is_empty() || !src.len().is_multiple_of(per_row) {
+        anyhow::bail!(
+            "q4 packed bytes {} not a non-zero multiple of {per_row}",
+            src.len()
+        );
+    }
     let rows = src.len() / per_row;
     let groups = cols / 32;
     let mut q = vec![0i8; groups * rows * 32];
@@ -276,5 +337,5 @@ pub fn prepack_q4_i8(src: &[u8], cols: usize) -> (Vec<i8>, Vec<f32>) {
             }
         }
     }
-    (q, scales)
+    Ok((q, scales))
 }

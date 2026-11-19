@@ -42,6 +42,5 @@ pub trait InferenceBackend: Send {
     fn cache_stats(&self) -> CacheStats;
 }
 
-pub type BackendLoader =
-    Box<dyn FnOnce(&Path, usize) -> Result<Box<dyn InferenceBackend>> + Send>;
+pub type BackendLoader = Box<dyn FnOnce(&Path, usize) -> Result<Box<dyn InferenceBackend>> + Send>;
 pub type TokenizerLoader = Box<dyn FnOnce(&Path) -> Result<Box<dyn TokenizerPort>> + Send>;

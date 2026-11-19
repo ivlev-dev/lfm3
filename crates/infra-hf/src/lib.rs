@@ -95,7 +95,9 @@ impl HubClient {
                             .and_then(|v| v.to_str().ok())
                             .map(|s| s.trim().to_string());
                         let local_size = fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
-                        let stored_etag = fs::read_to_string(&etag_path).ok().map(|s| s.trim().to_string());
+                        let stored_etag = fs::read_to_string(&etag_path)
+                            .ok()
+                            .map(|s| s.trim().to_string());
 
                         let size_ok = remote_size.is_none_or(|s| s == local_size);
                         let mut etag_ok = true;
@@ -130,11 +132,9 @@ impl HubClient {
     ) -> anyhow::Result<PathBuf> {
         let url = self.file_url(repo, file, revision);
         let target = self.cache_path(repo, file, revision);
-        let parent = target.parent().ok_or_else(|| {
-            anyhow::Error::from(HubError::Io(std::io::Error::other(
-                "no parent",
-            )))
-        })?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| anyhow::Error::from(HubError::Io(std::io::Error::other("no parent"))))?;
         fs::create_dir_all(parent)?;
         let part = part_path_for(&target);
         let etag_path = etag_path_for(&target);
@@ -173,7 +173,9 @@ impl HubClient {
         };
 
         let mut req = if downloaded > 0 {
-            self.client.get(url).header("Range", format!("bytes={}-", downloaded))
+            self.client
+                .get(url)
+                .header("Range", format!("bytes={}-", downloaded))
         } else {
             self.client.get(url)
         };
@@ -246,17 +248,18 @@ impl HubClient {
         drop(file);
 
         if let Some(sha) = x_linked
-            && is_hex64(&sha) {
-                let actual = Self::sha256_file(part)?;
-                if actual != sha.to_lowercase() {
-                    let _ = fs::remove_file(part);
-                    return Err(HubError::ShaMismatch {
-                        expected: sha,
-                        actual,
-                    }
-                    .into());
+            && is_hex64(&sha)
+        {
+            let actual = Self::sha256_file(part)?;
+            if actual != sha.to_lowercase() {
+                let _ = fs::remove_file(part);
+                return Err(HubError::ShaMismatch {
+                    expected: sha,
+                    actual,
                 }
+                .into());
             }
+        }
 
         if let Some(e) = remote_etag {
             let _ = fs::write(etag_path, e);

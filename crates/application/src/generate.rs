@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::argmax;
 use crate::ports::{InferenceBackend, SequenceStep, TokenizerPort};
@@ -22,10 +22,7 @@ pub struct Generate<'a> {
 }
 
 impl<'a> Generate<'a> {
-    pub fn new(
-        backend: &'a mut dyn InferenceBackend,
-        tokenizer: &'a dyn TokenizerPort,
-    ) -> Self {
+    pub fn new(backend: &'a mut dyn InferenceBackend, tokenizer: &'a dyn TokenizerPort) -> Self {
         Self { backend, tokenizer }
     }
 
@@ -68,14 +65,8 @@ impl<'a> Generate<'a> {
                 break;
             }
             let pos = prompt.len() + ids.len() - 1;
-            self.backend.step(
-                &[SequenceStep {
-                    slot,
-                    token,
-                    pos,
-                }],
-                true,
-            )?;
+            self.backend
+                .step(&[SequenceStep { slot, token, pos }], true)?;
             logits = self.backend.logits_row(0)?;
         }
         let text = self.tokenizer.decode(&ids, true)?;

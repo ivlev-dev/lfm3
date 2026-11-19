@@ -38,7 +38,9 @@ Env/CLI (composition root):
 - бэкенд один — OpenCL;
 - `LFM_DEVICE` — индекс устройства у OpenCL;
 - `LFM_TIERS` — PP по слоям (OpenCL), `LFM_TP` — full TP (OpenCL);
-- фичи Cargo: `backend-cpu` (default), `backend-opencl` (default); Vulkan/ROCm
+- Cargo-фич для выбора бэкенда нет: `infra-cpu` — эталонная CPU-реализация для
+  сверки (`lfm-bench gpu-check`, `ref-gen`), серверный инференс идёт через
+  `backend-opencl`; Vulkan/ROCm
   исключены.
 
 ## CPU и ARMv7

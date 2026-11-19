@@ -76,8 +76,11 @@ impl Sampler {
         let scale = 1.0 / self.params.temperature;
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let k = self.params.top_k;
-        let mut candidates: Vec<(u32, f32)> =
-            Vec::with_capacity(if k > 0 { k.min(logits.len()) } else { logits.len() });
+        let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(if k > 0 {
+            k.min(logits.len())
+        } else {
+            logits.len()
+        });
         if k > 0 && k < logits.len() {
             let mut min_pos = 0usize;
             let mut filled = 0usize;
@@ -136,10 +139,7 @@ impl Sampler {
             candidates.truncate(keep.max(1));
         }
         if self.params.min_p > 0.0 {
-            let max_p = candidates
-                .iter()
-                .map(|(_, p)| *p)
-                .fold(0.0f32, f32::max);
+            let max_p = candidates.iter().map(|(_, p)| *p).fold(0.0f32, f32::max);
             let cutoff = max_p * self.params.min_p;
             candidates.retain(|(_, p)| *p >= cutoff);
             if candidates.is_empty() {

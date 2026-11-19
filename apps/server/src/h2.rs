@@ -1,9 +1,7 @@
 use crate::engine::{ChatJob, Engine, Event};
 use crate::hpack::{self, HpackCtx};
-use crate::protocol::{
-    metrics_json, models_json, ChatRequest, CompletionMeta, CompletionRequest,
-};
-use anyhow::{anyhow, Result};
+use crate::protocol::{ChatRequest, CompletionMeta, CompletionRequest, metrics_json, models_json};
+use anyhow::{Result, anyhow};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -99,9 +97,7 @@ impl FlowControl {
     }
 
     fn open_stream(&mut self, stream_id: u32) {
-        self.streams
-            .entry(stream_id)
-            .or_insert(self.initial_stream);
+        self.streams.entry(stream_id).or_insert(self.initial_stream);
     }
 
     fn close_stream(&mut self, stream_id: u32) {
@@ -318,12 +314,7 @@ impl Conn {
 
     fn send_settings(&mut self) -> Result<()> {
         let mut payload = Vec::with_capacity(20);
-        for (id, value) in [
-            (0x1u16, 4096u32),
-            (0x3, 8),
-            (0x4, 1 << 20),
-            (0x5, 16_384),
-        ] {
+        for (id, value) in [(0x1u16, 4096u32), (0x3, 8), (0x4, 1 << 20), (0x5, 16_384)] {
             payload.extend_from_slice(&id.to_be_bytes());
             payload.extend_from_slice(&value.to_be_bytes());
         }
@@ -375,9 +366,10 @@ impl Conn {
             let id = u16::from_be_bytes([pair[0], pair[1]]);
             let value = u32::from_be_bytes([pair[2], pair[3], pair[4], pair[5]]);
             if id == SETTINGS_INITIAL_WINDOW_SIZE
-                && let Err(error) = self.flow.apply_initial_window(value) {
-                    self.handle_flow_error(error)?;
-                }
+                && let Err(error) = self.flow.apply_initial_window(value)
+            {
+                self.handle_flow_error(error)?;
+            }
         }
         self.settings_ack()
     }
@@ -406,12 +398,7 @@ impl Conn {
         self.write_frame(FRAME_HEADERS, flags, stream_id, block)
     }
 
-    fn send_data(
-        &mut self,
-        stream_id: u32,
-        payload: &[u8],
-        end_stream: bool,
-    ) -> Result<SendState> {
+    fn send_data(&mut self, stream_id: u32, payload: &[u8], end_stream: bool) -> Result<SendState> {
         if payload.is_empty() {
             if end_stream {
                 self.write_frame(FRAME_DATA, FLAG_END_STREAM, stream_id, &[])?;
@@ -434,7 +421,11 @@ impl Conn {
                 .min(payload.len() - offset)
                 .min(MAX_DATA_LEN);
             let last = offset + len == payload.len();
-            let flags = if end_stream && last { FLAG_END_STREAM } else { 0 };
+            let flags = if end_stream && last {
+                FLAG_END_STREAM
+            } else {
+                0
+            };
             self.write_frame(FRAME_DATA, flags, stream_id, &payload[offset..offset + len])?;
             if let Err(error) = self.flow.consume(stream_id, len) {
                 return match self.handle_flow_error(error) {
@@ -510,7 +501,12 @@ struct Pending {
     end_stream: bool,
 }
 
-pub fn serve(stream: TcpStream, engine: &Engine, info: &crate::ServerInfo) -> Result<()> {
+pub fn serve(
+    stream: TcpStream,
+    engine: &Engine,
+    info: &crate::ServerInfo,
+    max_body: usize,
+) -> Result<()> {
     let mut conn = Conn::new(stream);
     conn.read_preface()?;
     conn.send_settings()?;
@@ -532,7 +528,8 @@ pub fn serve(stream: TcpStream, engine: &Engine, info: &crate::ServerInfo) -> Re
                         let id = u16::from_be_bytes([pair[0], pair[1]]);
                         let value = u32::from_be_bytes([pair[2], pair[3], pair[4], pair[5]]);
                         if id == SETTINGS_HEADER_TABLE_SIZE {
-                            ctx.set_max_size(value as usize);
+                            let capped = (value as usize).min(hpack::HPACK_MAX_TABLE);
+                            ctx.set_max_size(capped)?;
                         }
                     }
                     conn.apply_settings(&frame.payload)?;
@@ -548,7 +545,11 @@ pub fn serve(stream: TcpStream, engine: &Engine, info: &crate::ServerInfo) -> Re
                 let mut pad = 0usize;
                 conn.flow.open_stream(frame.stream_id);
                 if frame.flags & FLAG_PADDED != 0 {
-                    pad = *frame.payload.first().ok_or_else(|| anyhow!("padded headers"))? as usize;
+                    pad = *frame
+                        .payload
+                        .first()
+                        .ok_or_else(|| anyhow!("padded headers"))?
+                        as usize;
                     off = 1;
                 }
                 if frame.flags & FLAG_PRIORITY != 0 {
@@ -561,7 +562,12 @@ pub fn serve(stream: TcpStream, engine: &Engine, info: &crate::ServerInfo) -> Re
                 block = frame.payload[off..end].to_vec();
                 let end_stream = frame.flags & FLAG_END_STREAM != 0;
                 if frame.flags & FLAG_END_HEADERS != 0 {
-                    pending = Some(build_request(&block, frame.stream_id, end_stream, &mut ctx)?);
+                    pending = Some(build_request(
+                        &block,
+                        frame.stream_id,
+                        end_stream,
+                        &mut ctx,
+                    )?);
                     if end_stream {
                         let req = pending.take().expect("request");
                         handle(&mut conn, engine, info, req)?;
@@ -582,10 +588,7 @@ pub fn serve(stream: TcpStream, engine: &Engine, info: &crate::ServerInfo) -> Re
                 }
                 block.extend_from_slice(&frame.payload);
                 if frame.flags & FLAG_END_HEADERS != 0 {
-                    let stream_id = pending
-                        .as_ref()
-                        .map(|p| p.id)
-                        .unwrap_or(frame.stream_id);
+                    let stream_id = pending.as_ref().map(|p| p.id).unwrap_or(frame.stream_id);
                     let end_stream = pending.as_ref().map(|p| p.end_stream).unwrap_or(false);
                     pending = Some(build_request(&block, stream_id, end_stream, &mut ctx)?);
                     if end_stream {
@@ -596,10 +599,16 @@ pub fn serve(stream: TcpStream, engine: &Engine, info: &crate::ServerInfo) -> Re
             }
             FRAME_DATA => {
                 if let Some(req) = pending.as_mut() {
-                    req.body.extend_from_slice(&frame.payload);
-                    if req.body.len() > 8 << 20 {
-                        return Err(anyhow!("request body too large"));
+                    if req.id != frame.stream_id {
+                        conn.send_rst(frame.stream_id, 2)?;
+                        continue;
                     }
+                    if req.body.len() + frame.payload.len() > max_body {
+                        conn.send_rst(frame.stream_id, 3)?;
+                        pending = None;
+                        continue;
+                    }
+                    req.body.extend_from_slice(&frame.payload);
                     if !frame.flow_applied && !frame.payload.is_empty() {
                         let inc = frame.payload.len() as u32;
                         conn.window_update(0, inc)?;
@@ -685,11 +694,19 @@ fn route(method: &str, path: &str) -> Route {
 
 fn handle(conn: &mut Conn, engine: &Engine, info: &crate::ServerInfo, req: Pending) -> Result<()> {
     match route(&req.method, &req.path) {
-        Route::Health => send_json(conn, req.id, "200", &info.health_json()),
+        Route::Health => {
+            let code = if engine.alive() { "200" } else { "503" };
+            send_json(conn, req.id, code, &info.health_json())
+        }
         Route::Models => send_json(conn, req.id, "200", &models_json(&info.model, 0)),
         Route::Chat => chat(conn, engine, &info.model, req),
         Route::Completions => completions(conn, engine, &info.model, req),
-        Route::Metrics => send_json(conn, req.id, "200", &metrics_json(&info.model, &engine.metrics())),
+        Route::Metrics => send_json(
+            conn,
+            req.id,
+            "200",
+            &metrics_json(&info.model, &engine.metrics()),
+        ),
         Route::NotFound => send_json(
             conn,
             req.id,
@@ -708,7 +725,7 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
                 req.id,
                 "400",
                 &json!({"error": {"message": format!("bad json: {e}")}}).to_string(),
-            )
+            );
         }
     };
     let messages = match parsed.to_messages() {
@@ -719,7 +736,7 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
                 req.id,
                 "400",
                 &json!({"error": {"message": format!("{e}")}}).to_string(),
-            )
+            );
         }
     };
     let params = parsed.to_params();
@@ -808,7 +825,7 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
                     req.id,
                     "500",
                     &json!({"error": {"message": e}}).to_string(),
-                )
+                );
             }
             Event::Delta(_) | Event::Thinking(_) | Event::ToolCall(_) => {}
         }
@@ -837,7 +854,7 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
                 req.id,
                 "400",
                 &json!({"error": {"message": format!("bad json: {e}")}}).to_string(),
-            )
+            );
         }
     };
     let prompts = match parsed.to_prompts() {
@@ -848,7 +865,7 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
                 req.id,
                 "400",
                 &json!({"error": {"message": format!("{e}")}}).to_string(),
-            )
+            );
         }
     };
     let params = parsed.to_params();
@@ -875,10 +892,7 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
         let mut finish_reason = "stop";
         for event in events {
             let payload = match event {
-                Event::Delta(text) => format!(
-                    "data: {}\n\n",
-                    meta.completion_chunk(&text, None)
-                ),
+                Event::Delta(text) => format!("data: {}\n\n", meta.completion_chunk(&text, None)),
                 Event::Final {
                     finish_reason: reason,
                     ..
@@ -934,7 +948,7 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
                         req.id,
                         "500",
                         &json!({"error": {"message": e}}).to_string(),
-                    )
+                    );
                 }
                 Event::Delta(_) | Event::Thinking(_) | Event::ToolCall(_) => {}
             }
@@ -1005,7 +1019,11 @@ mod tests {
             let len = ((head[0] as usize) << 16) | ((head[1] as usize) << 8) | head[2] as usize;
             let mut payload = vec![0u8; len];
             stream.read_exact(&mut payload).unwrap();
-            (head[3], u32::from_be_bytes([head[5], head[6], head[7], head[8]]), payload)
+            (
+                head[3],
+                u32::from_be_bytes([head[5], head[6], head[7], head[8]]),
+                payload,
+            )
         });
         let (stream, _) = listener.accept().unwrap();
         let mut conn = Conn::new(stream);
@@ -1123,10 +1141,7 @@ mod tests {
         flow.apply_initial_window(MAX_WINDOW as u32).unwrap();
         assert_eq!(flow.stream_window(1), Some(MAX_WINDOW));
         let error = flow.window_update(1, 1).unwrap_err();
-        assert_eq!(
-            error.scope,
-            FlowScope::Stream(1)
-        );
+        assert_eq!(error.scope, FlowScope::Stream(1));
         assert_eq!(error.code, ERR_FLOW_CONTROL);
     }
 
@@ -1176,9 +1191,8 @@ mod tests {
         conn.flow.open_stream(1);
         let payload = vec![0x5au8; 100];
         let expected = payload.clone();
-        let writer = std::thread::spawn(move || -> SendState {
-            conn.send_data(1, &payload, true).unwrap()
-        });
+        let writer =
+            std::thread::spawn(move || -> SendState { conn.send_data(1, &payload, true).unwrap() });
         let mut received = Vec::new();
         let mut pong = false;
         let mut settings_ack = false;
@@ -1241,11 +1255,10 @@ mod tests {
         let (mut conn, mut client) = pair();
         conn.flow.apply_initial_window(0).unwrap();
         conn.flow.open_stream(1);
-        let writer =
-            std::thread::spawn(move || {
-                let state = conn.send_data(1, &[7u8; 40], true).unwrap();
-                (conn, state)
-            });
+        let writer = std::thread::spawn(move || {
+            let state = conn.send_data(1, &[7u8; 40], true).unwrap();
+            (conn, state)
+        });
         send_frame(&mut client, FRAME_HEADERS, FLAG_END_HEADERS, 3, b"\x82");
         send_frame(&mut client, FRAME_DATA, 0, 3, b"body");
         send_frame(&mut client, FRAME_WINDOW_UPDATE, 0, 0, &40u32.to_be_bytes());
@@ -1368,4 +1381,3 @@ mod tests {
         assert_eq!(value["uptime_s"].as_f64(), Some(9.25));
     }
 }
-

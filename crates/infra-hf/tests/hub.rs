@@ -20,13 +20,18 @@ fn download_and_cache() {
     let dir = cache_dir();
     let _ = fs::remove_dir_all(&dir);
     let client = HubClient::new(&dir);
-    let path = client.ensure_file("LiquidAI/LFM3-1.7B", "config.json", "main").unwrap();
+    let path = client
+        .ensure_file("LiquidAI/LFM3-1.7B", "config.json", "main")
+        .unwrap();
     assert!(path.exists());
-    let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert!(value.get("architectures").is_some());
 
     let before = fs::metadata(&path).unwrap().modified().unwrap();
-    let path2 = client.ensure_file("LiquidAI/LFM3-1.7B", "config.json", "main").unwrap();
+    let path2 = client
+        .ensure_file("LiquidAI/LFM3-1.7B", "config.json", "main")
+        .unwrap();
     assert_eq!(path, path2);
     let after = fs::metadata(&path).unwrap().modified().unwrap();
     assert_eq!(before, after);
@@ -75,11 +80,15 @@ fn offline_returns_cached() {
     let dir = cache_dir();
     let _ = fs::remove_dir_all(&dir);
     let client = HubClient::new(&dir);
-    let path = client.ensure_file("LiquidAI/LFM3-1.7B", "config.json", "main").unwrap();
+    let path = client
+        .ensure_file("LiquidAI/LFM3-1.7B", "config.json", "main")
+        .unwrap();
     assert!(path.exists());
 
     let offline = HubClient::new(&dir).with_endpoint("http://127.0.0.1:1");
-    let path2 = offline.ensure_file("LiquidAI/LFM3-1.7B", "config.json", "main").unwrap();
+    let path2 = offline
+        .ensure_file("LiquidAI/LFM3-1.7B", "config.json", "main")
+        .unwrap();
     assert_eq!(path, path2);
     let _ = fs::remove_dir_all(&dir);
 }

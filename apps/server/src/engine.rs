@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use lfm_app::{
     ActiveSeq, BackendLoader, CacheStats, ChatSession, InferenceBackend, JobId, Sampler, Scheduler,
     SchedulerConfig, SequenceStep, SessionEvent, StepPlan, StepRow, StepToken, TokenizerLoader,
@@ -9,9 +9,7 @@ use lfm_domain::{Message, SamplingParams, ToolCall, ToolDef};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{
-    channel, Receiver, RecvTimeoutError, Sender, TryRecvError,
-};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -93,6 +91,7 @@ pub struct Engine {
 
 pub struct EngineMetrics {
     started: Instant,
+    alive: std::sync::atomic::AtomicBool,
     ctx: AtomicUsize,
     active: AtomicU32,
     waiting: AtomicU32,
@@ -135,9 +134,18 @@ pub struct EngineMetricsSnapshot {
 }
 
 impl EngineMetrics {
+    pub fn set_alive(&self, alive: bool) {
+        self.alive.store(alive, Ordering::SeqCst);
+    }
+
+    pub fn alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
     fn new(ctx: usize) -> Self {
         Self {
             started: Instant::now(),
+            alive: std::sync::atomic::AtomicBool::new(true),
             ctx: AtomicUsize::new(ctx),
             active: AtomicU32::new(0),
             waiting: AtomicU32::new(0),
@@ -156,7 +164,8 @@ impl EngineMetrics {
         self.active.store(update.active, Ordering::Relaxed);
         self.waiting.store(update.waiting, Ordering::Relaxed);
         self.steps.store(update.steps, Ordering::Relaxed);
-        self.avg_step_us.store(update.avg_step_us, Ordering::Relaxed);
+        self.avg_step_us
+            .store(update.avg_step_us, Ordering::Relaxed);
         self.kv_used_pages
             .store(update.kv_used_pages, Ordering::Relaxed);
         self.kv_free_pages
@@ -195,25 +204,35 @@ impl Engine {
         tokenizer: TokenizerLoader,
     ) -> Result<Self> {
         let log_requests = cfg.log_requests
-            || std::env::var("LFM_SCHED_LOG").map(|v| v != "0").unwrap_or(false);
+            || std::env::var("LFM_SCHED_LOG")
+                .map(|v| v != "0")
+                .unwrap_or(false);
         let (job_tx, job_rx) = channel::<Job>();
         let (ready_tx, ready_rx) = channel::<Result<()>>();
         let metrics = Arc::new(EngineMetrics::new(cfg.ctx));
         let worker_metrics = Arc::clone(&metrics);
+        let alive = Arc::clone(&metrics);
         let worker = std::thread::Builder::new()
             .name("engine".to_string())
             .spawn(move || {
-                let mut worker = match Worker::load(cfg, worker_metrics, backend, tokenizer) {
-                    Ok(worker) => {
-                        let _ = ready_tx.send(Ok(()));
-                        worker
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
-                worker.run(job_rx);
+                let mut worker =
+                    match Worker::load(cfg, log_requests, worker_metrics, backend, tokenizer) {
+                        Ok(worker) => {
+                            let _ = ready_tx.send(Ok(()));
+                            worker
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker.run(job_rx);
+                }));
+                if outcome.is_err() {
+                    eprintln!("engine: воркер упал");
+                }
+                alive.set_alive(false);
             })?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -239,10 +258,12 @@ impl Engine {
         self.log_requests
     }
 
+    pub fn alive(&self) -> bool {
+        self.metrics.alive()
+    }
+
     pub fn shutdown(self) {
-        let Engine {
-            tx, worker, ..
-        } = self;
+        let Engine { tx, worker, .. } = self;
         drop(tx);
         let handle = match worker.lock() {
             Ok(mut slot) => slot.take(),
@@ -332,11 +353,11 @@ impl RequestState {
         let Ok(text) = tok.decode(&self.tokens, true) else {
             return TokenFlow::Continue;
         };
-        if !(text.len() > self.printed.len() && text.starts_with(&self.printed)) {
+        let (delta, printed) = next_delta(&text, &self.printed);
+        self.printed = printed;
+        if delta.is_empty() {
             return TokenFlow::Continue;
         }
-        let delta = text[self.printed.len()..].to_string();
-        self.printed = text;
         if self.raw {
             return self.push_text(&delta);
         }
@@ -484,6 +505,31 @@ fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// Текст, который можно отдавать клиенту: незавершённый UTF-8 (ByteLevel BPE
+/// отдаёт U+FFFD на хвосте, если символ разбит между токенами) откладывается
+/// до следующего токена.
+fn stable_text(text: &str) -> &str {
+    text.trim_end_matches('\u{FFFD}')
+}
+
+/// Прирост относительно уже отданного текста. При рассинхронизации (декодер
+/// переписал ранее отданный префикс) возвращается общий хвост, чтобы не терять
+/// вывод: дубликат лучше молчаливой обрезки.
+fn next_delta(text: &str, printed: &str) -> (String, String) {
+    let stable = stable_text(text);
+    if let Some(rest) = stable.strip_prefix(printed) {
+        return (rest.to_string(), stable.to_string());
+    }
+    let mut common = 0usize;
+    for (a, b) in stable.chars().zip(printed.chars()) {
+        if a != b {
+            break;
+        }
+        common += a.len_utf8();
+    }
+    (stable[common..].to_string(), stable.to_string())
+}
+
 fn saturating_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -502,6 +548,7 @@ struct Worker {
 impl Worker {
     fn load(
         cfg: ServeConfig,
+        log_requests: bool,
         shared: Arc<EngineMetrics>,
         backend: BackendLoader,
         tokenizer: TokenizerLoader,
@@ -526,7 +573,7 @@ impl Worker {
             system: cfg.system,
             sched,
             reqs: HashMap::new(),
-            metrics: Metrics::new(cfg.log_requests),
+            metrics: Metrics::new(log_requests),
             shared,
         };
         worker.publish();
@@ -818,10 +865,11 @@ impl Worker {
                     };
                     let slot = self.reqs.get(&row.id).map(|state| state.slot);
                     if let Some(slot) = slot
-                        && let Err(e) = self.gpu.prefill_finish(slot) {
-                            self.fail_request(row.id, format!("{e}"));
-                            continue;
-                        }
+                        && let Err(e) = self.gpu.prefill_finish(slot)
+                    {
+                        self.fail_request(row.id, format!("{e}"));
+                        continue;
+                    }
                     self.sched.complete_prefill(row.id);
                     self.accept_token(row.id, logits);
                 }
@@ -898,8 +946,12 @@ impl Worker {
             prompt_tokens,
             completion_tokens,
         });
-        self.metrics
-            .log_final(id, prompt_tokens, completion_tokens, self.sched.active_len());
+        self.metrics.log_final(
+            id,
+            prompt_tokens,
+            completion_tokens,
+            self.sched.active_len(),
+        );
     }
 
     fn fail_request(&mut self, id: JobId, message: String) {
@@ -1127,5 +1179,37 @@ mod tests {
         assert_eq!(saturating_u32(usize::MAX), u32::MAX);
         assert_eq!(saturating_u64(7), 7);
         assert_eq!(saturating_u64(usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn delta_handles_split_utf8() {
+        let (d, printed) = next_delta("Привет", "");
+        assert_eq!(d, "Привет");
+        assert_eq!(printed, "Привет");
+        let (d, printed) = next_delta("Привет, мир", "Привет");
+        assert_eq!(d, ", мир");
+        assert_eq!(printed, "Привет, мир");
+        let (d, _) = next_delta("Привет, мир", "Привет, мир");
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn delta_holds_back_incomplete_char() {
+        let (d, printed) = next_delta("Привет\u{FFFD}", "Привет");
+        assert!(d.is_empty());
+        assert_eq!(printed, "Привет");
+        let (d, printed) = next_delta("Привет!", "Привет");
+        assert_eq!(d, "!");
+        assert_eq!(printed, "Привет!");
+    }
+
+    #[test]
+    fn delta_resyncs_instead_of_dropping() {
+        let (d, printed) = next_delta("abcdef", "abcX");
+        assert_eq!(d, "def");
+        assert_eq!(printed, "abcdef");
+        let (d, printed) = next_delta("ab", "abcd");
+        assert!(d.is_empty());
+        assert_eq!(printed, "ab");
     }
 }

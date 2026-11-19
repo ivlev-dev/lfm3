@@ -38,7 +38,7 @@ apps/bench (CLI), apps/server, apps/tui (клиент к серверу)   ко�
   и активные последовательности, admission по свободным KV-страницам (`ceil(len/32)`
   с учётом резерва под `max_new` активных), план шага (атомарный `prefill`, когда
   декодов нет, иначе `step_mixed`: по 1 токену на декод + prefill-чанки в бюджете
-  `LFM_PREFILL_BUDGET`), проверка контекста, отмена, позиции декода. Без I/O и GPU —
+  `prefill_budget` (конфиг) или `LFM_PREFILL_BUDGET`), проверка контекста, отмена, позиции декода. Без I/O и GPU —
   покрыт юнит-тестами.
 - Дальше: порты `InferenceBackend`, `TokenizerPort`, `ModelRepository`, `KvTier`,
   use-cases `Generate`, `Serve`, `LoadModel`; tools/`tool_calls` в сервере.
@@ -107,7 +107,7 @@ apps/bench (CLI), apps/server, apps/tui (клиент к серверу)   ко�
   считать одним проходом по весам (`step_mixed`).
 - K/V хранятся в fp16 (`half`) в той же раскладке; лейн читает пару соседних dim
   через `vload_half2`, что вдвое режет трафик внимания и VRAM под кэш. Партиалы
-  split-K остаются f32. Переключатель `LFM_KV=f32` — старый путь для A/B
+  split-K остаются f32. Тип KV-кэша задаётся `LFM_KV` (`f16` по умолчанию).
   (`KvBuf` в `LayerBufs`, набор ядер `attention_h`/`attention_b_h`/`kv_store_h`).
   Тайлинг 8 позиций в регистрах/LDS замерен и откачен: не быстрее простого варианта.
 - Sliding-слои (окно 256) — окно по позициям; conv-слои — состояние

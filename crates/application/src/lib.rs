@@ -7,10 +7,10 @@ pub use generate::{FinishReason, Generate, GenerateOutcome};
 pub use ports::{
     BackendLoader, CacheStats, InferenceBackend, SequenceStep, TokenizerLoader, TokenizerPort,
 };
-pub use sampling::{argmax, Sampler};
+pub use sampling::{Sampler, argmax};
 pub use scheduler::{
-    pages_for, ActiveSeq, AdmitError, AdmitOutcome, Enqueued, JobId, Phase, Scheduler,
-    SchedulerConfig, StepPlan, StepRow, StepToken,
+    ActiveSeq, AdmitError, AdmitOutcome, Enqueued, JobId, Phase, Scheduler, SchedulerConfig,
+    StepPlan, StepRow, StepToken, pages_for,
 };
 
 use lfm_domain::{Message, Role, ToolCall};
@@ -204,7 +204,10 @@ impl ChatSession {
                             self.tool_acc.clear();
                         }
                         (None, None) => {
-                            let hold = longest_suffix_prefix(&self.buf, &[Self::THINK_OPEN, Self::TOOL_OPEN]);
+                            let hold = longest_suffix_prefix(
+                                &self.buf,
+                                &[Self::THINK_OPEN, Self::TOOL_OPEN],
+                            );
                             let mut split = self.buf.len() - hold;
                             while split > 0 && !self.buf.is_char_boundary(split) {
                                 split -= 1;
@@ -249,7 +252,8 @@ impl ChatSession {
                         if let Some(tc) = parse_tool_call(&raw) {
                             self.push_toolcall(&mut events, tc);
                         } else {
-                            let reconstructed = format!("{}{}{}", Self::TOOL_OPEN, raw, Self::TOOL_CLOSE);
+                            let reconstructed =
+                                format!("{}{}{}", Self::TOOL_OPEN, raw, Self::TOOL_CLOSE);
                             self.push_content(&mut events, reconstructed);
                         }
                         self.buf = self.buf[p + Self::TOOL_CLOSE.len()..].to_string();

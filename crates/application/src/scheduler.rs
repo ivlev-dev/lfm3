@@ -112,7 +112,10 @@ pub struct StepRow {
 pub enum StepPlan {
     Idle,
     AtomicPrefill(JobId),
-    Mixed { rows: Vec<StepRow>, need_logits: bool },
+    Mixed {
+        rows: Vec<StepRow>,
+        need_logits: bool,
+    },
 }
 
 impl StepPlan {
@@ -130,6 +133,10 @@ impl StepPlan {
 
 pub fn pages_for(tokens: usize) -> usize {
     tokens.div_ceil(KV_PAGE_SIZE)
+}
+
+fn pages_tokens(pages: usize) -> usize {
+    pages * KV_PAGE_SIZE
 }
 
 pub struct Scheduler {
@@ -155,7 +162,11 @@ impl Scheduler {
         &self.cfg
     }
 
-    pub fn enqueue(&mut self, prompt_len: usize, requested_max_new: usize) -> Result<Enqueued, AdmitError> {
+    pub fn enqueue(
+        &mut self,
+        prompt_len: usize,
+        requested_max_new: usize,
+    ) -> Result<Enqueued, AdmitError> {
         if prompt_len == 0 {
             return Err(AdmitError::EmptyPrompt);
         }
@@ -165,9 +176,7 @@ impl Scheduler {
                 max_ctx: self.cfg.max_ctx,
             });
         }
-        let max_new = requested_max_new
-            .max(1)
-            .min(self.cfg.max_ctx - prompt_len);
+        let max_new = requested_max_new.max(1).min(self.cfg.max_ctx - prompt_len);
         let id = JobId(self.next_id);
         self.next_id += 1;
         self.waiting.push_back(WaitingJob {
@@ -184,10 +193,15 @@ impl Scheduler {
             let Some(front) = self.waiting.front().copied() else {
                 break;
             };
-            let needed = pages_for(front.prompt_len + front.max_new);
             let available = self.available_for_new(free_pages);
-            if needed > available {
-                if self.active.is_empty() {
+            if available == 0 {
+                break;
+            }
+            let needed = pages_for(front.prompt_len + front.max_new);
+            let (needed, max_new) = if needed > available {
+                let fit_tokens = pages_tokens(available);
+                let max_new = fit_tokens.saturating_sub(front.prompt_len);
+                if max_new == 0 {
                     self.waiting.pop_front();
                     out.push(AdmitOutcome::Rejected(
                         front.id,
@@ -195,14 +209,19 @@ impl Scheduler {
                     ));
                     continue;
                 }
-                break;
-            }
+                (
+                    pages_for(front.prompt_len + max_new).min(available),
+                    max_new,
+                )
+            } else {
+                (needed, front.max_new)
+            };
             self.waiting.pop_front();
             self.active.push(ActiveSeq {
                 id: front.id,
                 phase: Phase::Prefill,
                 prompt_len: front.prompt_len,
-                max_new: front.max_new,
+                max_new,
                 prefilled: 0,
                 generated: 0,
                 reserved_pages: needed,
@@ -218,10 +237,7 @@ impl Scheduler {
     }
 
     pub fn plan_step(&mut self) -> StepPlan {
-        let has_decode = self
-            .active
-            .iter()
-            .any(|seq| seq.phase == Phase::Decode);
+        let has_decode = self.active.iter().any(|seq| seq.phase == Phase::Decode);
         if !has_decode {
             let pending: Vec<&ActiveSeq> = self
                 .active
@@ -327,6 +343,9 @@ impl Scheduler {
     }
 
     pub fn finish(&mut self, id: JobId) -> Option<ActiveSeq> {
+        if let Some(index) = self.waiting.iter().position(|job| job.id == id) {
+            self.waiting.remove(index);
+        }
         let index = self.active.iter().position(|seq| seq.id == id)?;
         Some(self.active.remove(index))
     }
@@ -438,32 +457,31 @@ mod tests {
     }
 
     #[test]
-    fn admission_respects_pages_and_head_order() {
+    fn admission_clamps_max_new_to_free_pages() {
         let mut s = Scheduler::new(cfg());
         let a = s.enqueue(64, 64).unwrap();
         let b = s.enqueue(64, 64).unwrap();
         let ids = admit_all(&mut s, 7);
-        assert_eq!(ids, vec![a.id]);
-        assert!(s.admit(7).is_empty());
-        assert_eq!(s.waiting_len(), 1);
-
-        s.finish(a.id);
-        let free = s.available_for_new(7);
-        let ids = admit_all(&mut s, free);
-        assert_eq!(ids, vec![b.id]);
+        assert_eq!(ids, vec![a.id, b.id]);
+        assert_eq!(s.waiting_len(), 0);
+        let sa = s.active_seq(a.id).unwrap();
+        assert_eq!(sa.reserved_pages, pages_for(128));
+        let sb = s.active_seq(b.id).unwrap();
+        assert!(sb.max_new < 64, "b must be clamped, got {}", sb.max_new);
+        assert_eq!(sb.reserved_pages, 7 - sa.reserved_pages);
     }
 
     #[test]
     fn lone_request_rejected_when_pages_do_not_fit() {
         let mut s = Scheduler::new(cfg());
-        let queued = s.enqueue(64, 64).unwrap();
+        let queued = s.enqueue(128, 64).unwrap();
         let out = s.admit(3);
         assert_eq!(
             out,
             vec![AdmitOutcome::Rejected(
                 queued.id,
                 AdmitError::KvOverflow {
-                    needed: 4,
+                    needed: 6,
                     available: 3
                 }
             )]
@@ -538,10 +556,7 @@ mod tests {
         let plan = s.plan_step();
         let rows = plan.rows();
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            rows.iter().filter(|row| row.id == b.id).count(),
-            2
-        );
+        assert_eq!(rows.iter().filter(|row| row.id == b.id).count(), 2);
         assert!(matches!(rows[1].token, StepToken::Prompt(0)));
         assert!(matches!(rows[2].token, StepToken::Prompt(1)));
     }

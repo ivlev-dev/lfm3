@@ -31,8 +31,9 @@ impl ChatTemplate {
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let src = std::fs::read_to_string(path.as_ref())
-            .with_context(|| format!("failed to read template file: {}", path.as_ref().display()))?;
+        let src = std::fs::read_to_string(path.as_ref()).with_context(|| {
+            format!("failed to read template file: {}", path.as_ref().display())
+        })?;
         Self::from_str("chat", &src)
     }
 
@@ -119,25 +120,18 @@ impl ChatTemplate {
         });
 
         let value = json_to_value(&ctx);
-        let tmpl = self
-            .env
-            .get_template("chat")
-            .map_err(anyhow::Error::from)?;
+        let tmpl = self.env.get_template("chat").map_err(anyhow::Error::from)?;
         let out = tmpl.render(value).map_err(anyhow::Error::from)?;
         Ok(out)
     }
 
     pub fn render_json(&self, ctx: JsonValue) -> anyhow::Result<String> {
         let value = json_to_value(&ctx);
-        let tmpl = self
-            .env
-            .get_template("chat")
-            .map_err(anyhow::Error::from)?;
+        let tmpl = self.env.get_template("chat").map_err(anyhow::Error::from)?;
         let out = tmpl.render(value).map_err(anyhow::Error::from)?;
         Ok(out)
     }
 }
-
 
 fn json_to_value(value: &JsonValue) -> minijinja::Value {
     match value {
@@ -168,7 +162,6 @@ fn json_to_value(value: &JsonValue) -> minijinja::Value {
         }
     }
 }
-
 
 fn strip_generation_tags(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
@@ -204,10 +197,12 @@ fn strip_generation_tags(src: &str) -> String {
     let out = out.replace(".items()", " | items");
     let out = out.replace(".endswith(", " | endswith(");
     let out = out.replace(".split(", " | split(");
-    
-    out.replace("content | split(\"</think>\")[-1]", "(content | split(\"</think>\"))[-1]")
-}
 
+    out.replace(
+        "content | split(\"</think>\")[-1]",
+        "(content | split(\"</think>\"))[-1]",
+    )
+}
 
 fn endswith_filter(value: minijinja::Value, suffix: minijinja::Value) -> bool {
     let s = value.as_str().unwrap_or("");

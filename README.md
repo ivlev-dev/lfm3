@@ -21,7 +21,7 @@
   `attention_split_b_h` + `kv_store_h`. VRAM под KV вдвое меньше (402 → 201 МБ при
   ctx 8192), A/B на 8192 (три пары чередующихся прогонов) — **+4–10% decode**;
   `gpu-gen` даёт те же ids/текст, `gpu-cmp --len 601 --batch 6` cos 0.999937,
-  `gpu-cache` повтор бит-в-бит. Отключение — `LFM_KV=f32`. Тайлинг 8 позиций на
+  `gpu-cache` повтор бит-в-бит. Тайлинг 8 позиций на
   тайл (регистры/LDS) замерен и откачен: 930 против 835 мкс на вызов
   `attention_split` при 8192 — ядро упирается не в трафик и не в барьеры.
 - **M4 (radix prefix cache) — готов.** `GpuModel::prefill` находит самый длинный
@@ -109,7 +109,7 @@
    prefill и decode. Бейзлайн: CPU 142 pp512 / 23 tg128, Vulkan 1393 / 91.
    Главный разрыв — prefill (GEMM): CPU ×2.6, OpenCL ×2.3 (512) / ×3.1 (8192);
    decode OpenCL ×1.4.
-   Готовы: LDS-GEMM для Q4 (`gemm_q4_k_i8_lds11`), int8-предпак для Q6 (`gemm_q6_i8_pp`)
+   Готовы: LDS-GEMM для Q4 (`gemm_q4_k_i8_lds17`), int8-предпак для Q6 (`gemm_q6_i8_pp`)
    и attention по 4 позиции за итерацию (prefill 512 — 597, 2048 — 525, 8192 — 402).
    Дальше — attention на длинном контексте (40% времени при 8192) и эффективность Q4-GEMM.
    Vulkan/ROCm исключены из плана.
@@ -259,14 +259,14 @@ echo auto | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_lev
 `LFM_PROFILE=1` (сбор событий OpenCL по ядрам, замедляет диспатч),
 `LFM_CACHE=0` (выключить радикс-кэш префиксов и снапшоты conv-состояния),
 `LFM_PREPACK=0` (не строить prepacked-копию Q4-весов для батчевого prefill),
-`LFM_KV=f32` (хранить KV во float вместо half — для A/B и отладки),
+`LFM_KV` (тип KV-кэша: `f16` по умолчанию, `q4`, `kvarn`),
 `LFM_FUSE=0` (не сливать q/k/gate GEMV), `LFM_ATTN4=0` (не шарить K/V на 4 q-головы
 в split prefill-attention), `LFM_ATTN2=0` (не обрабатывать пары позиций в sliding
 prefill-attention), `LFM_WG` / `LFM_WG_B` (workgroup decode/batch GEMV, по умолчанию
 256/64), `LFM_RGEMV` / `LFM_RGEMV_B` (строк на подгруппу decode/batch, 4/5),
 `LFM_DEVICE` (индекс OpenCL-устройства: 0 — rusticl GPU, 1 — PoCL CPU),
 `LFM_TIERS=20/80/0` (PP-раскладка по устройствам), `LFM_TP=0/1` (full TP по устройствам),
-`LFM_PREFILL_BUDGET` (prefill-токенов
+`LFM_PREFILL_BUDGET` / `prefill_budget` (prefill-токенов
 на шаг планировщика, по умолчанию 12), `LFM_SCHED_LOG=1` (лог шагов планировщика).
 
 ## Ключевые решения (M0)
