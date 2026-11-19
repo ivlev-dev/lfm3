@@ -202,6 +202,73 @@ __kernel void gemv_q4_k_i8(__global const uchar *w, __global const char *xq, __g
     }
 }
 
+
+__kernel void gemv_q4_k_i8_pk(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols) {
+    uint lane = get_sub_group_local_id();
+    uint sgs = get_sub_group_size();
+    uint sgid = get_sub_group_id();
+    uint nsg = get_num_sub_groups();
+    uint row0 = (get_group_id(0) * nsg + sgid) * RGEMV;
+    bool valid = row0 + RGEMV <= rows;
+    if (!valid) {
+        row0 = rows - RGEMV;
+    }
+    uint u = lane & 7u;
+    uint bpi = sgs >> 3;
+    uint blocks = cols >> 8;
+    ulong row_stride = (ulong)blocks * 148ul;
+    __global const uchar *base_w = w + (ulong)row0 * row_stride;
+    uint sb_lo = (u >> 1) << 1;
+    uint wbase = (u >> 1) * 64u + (u & 1u) * 16u;
+    const char4 ones = (char4)(1);
+    float acc[RGEMV];
+    #pragma unroll
+    for (uint r = 0u; r < RGEMV; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (uint b0 = 0u; b0 < blocks; b0 += bpi) {
+        uint b = b0 + (lane >> 3);
+        if (b < blocks) {
+            uint w_lo = b * 256u + wbase;
+            char16 xl = vload16(0, xq + w_lo);
+            char16 xh = vload16(0, xq + w_lo + 32u);
+            float xs_lo = xs[w_lo >> 5];
+            float xs_hi = xs[(w_lo + 32u) >> 5];
+            int sum_lo = (int)LFM_DOT(xl.s0123, ones) + (int)LFM_DOT(xl.s4567, ones)
+                       + (int)LFM_DOT(xl.s89ab, ones) + (int)LFM_DOT(xl.scdef, ones);
+            int sum_hi = (int)LFM_DOT(xh.s0123, ones) + (int)LFM_DOT(xh.s4567, ones)
+                       + (int)LFM_DOT(xh.s89ab, ones) + (int)LFM_DOT(xh.scdef, ones);
+            #pragma unroll
+            for (uint r = 0u; r < RGEMV; ++r) {
+                __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 148ul;
+                __global const uchar *scp = blk + 4;
+                float d = (float)vload_half(0, (__global const half *)blk);
+                float dmin = (float)vload_half(0, (__global const half *)(blk + 2));
+                uchar sl = scp[2u * sb_lo];
+                uchar ml = scp[2u * sb_lo + 1u];
+                uchar sh = scp[2u * (sb_lo + 1u)];
+                uchar mh = scp[2u * (sb_lo + 1u) + 1u];
+                uint4 pkl = vload4(0, (__global const uint *)(blk + 20u + u * 16u));
+                uint4 lo = pkl & (uint4)(0x0F0F0F0Fu);
+                uint4 hi = (pkl >> 4) & (uint4)(0x0F0F0F0Fu);
+                float dl = (float)(LFM_DOT(as_char4(lo.x), xl.s0123) + LFM_DOT(as_char4(lo.y), xl.s4567)
+                                 + LFM_DOT(as_char4(lo.z), xl.s89ab) + LFM_DOT(as_char4(lo.w), xl.scdef));
+                float dh = (float)(LFM_DOT(as_char4(hi.x), xh.s0123) + LFM_DOT(as_char4(hi.y), xh.s4567)
+                                 + LFM_DOT(as_char4(hi.z), xh.s89ab) + LFM_DOT(as_char4(hi.w), xh.scdef));
+                acc[r] += xs_lo * (dl * (d * (float)sl) - (float)sum_lo * (dmin * (float)ml));
+                acc[r] += xs_hi * (dh * (d * (float)sh) - (float)sum_hi * (dmin * (float)mh));
+            }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0u; r < RGEMV; ++r) {
+        float total = sub_group_reduce_add(acc[r]);
+        if (lane == 0u && valid) {
+            y[row0 + r] = total;
+        }
+    }
+}
+
 __kernel void gemv_q6_k_i8(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols) {
     uint lane = get_sub_group_local_id();
     uint sgid = get_sub_group_id();

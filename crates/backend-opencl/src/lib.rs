@@ -117,6 +117,7 @@ struct Kernels {
     rms_add: Kernel,
     quant: Kernel,
     q4: Kernel,
+    q4pk: Kernel,
     q6: Kernel,
     silu: Kernel,
     conv: Kernel,
@@ -589,9 +590,16 @@ impl GpuModel {
                 GgmlType::Q4_K => {
                     if prepack_on {
                         let packed = prepack::prepack_q4_k(data.as_ref());
+                        if info.dims.len() == 2 && cols % 256 == 0 && rows > 0 && q4_i8_on {
+                            let (q8, sc) = prepack::prepack_q4_i8(&packed, cols);
+                            prepacked_q4_i8
+                                .insert(info.name.clone(), (gpu.upload(&q8)?, gpu.upload(&sc)?));
+                        }
                         prepacked.insert(info.name.clone(), gpu.upload_bytes(&packed)?);
+                        Weight::Q4(gpu.upload_bytes(&[0u8; 16])?)
+                    } else {
+                        Weight::Q4(gpu.upload_bytes(data.as_ref())?)
                     }
-                    Weight::Q4(gpu.upload_bytes(data.as_ref())?)
                 }
                 GgmlType::Q6_K => {
                     if prepack_on && shard.is_none() && info.dims.len() == 2 {
@@ -679,15 +687,20 @@ impl GpuModel {
                             gpu.upload_bytes(&fused)?,
                         );
                     }
-                    let mut fused = gpu.alloc::<u8>(gate_s.len() + up_s.len())?;
-                    unsafe {
-                        gpu.queue.enqueue_write_buffer(&mut fused, 1, 0, &gate_s, &[])?;
-                        gpu.queue.enqueue_write_buffer(&mut fused, 1, gate_s.len(), &up_s, &[])?;
-                    }
                     let weight = match up_info.ggml_type {
-                        GgmlType::Q4_K => Weight::Q4(fused),
-                        GgmlType::Q6_K => Weight::Q6(fused),
-                        _ => continue,
+                        GgmlType::Q4_K if prepack_on => Weight::Q4(gpu.upload_bytes(&[0u8; 16])?),
+                        _ => {
+                            let mut fused = gpu.alloc::<u8>(gate_s.len() + up_s.len())?;
+                            unsafe {
+                                gpu.queue.enqueue_write_buffer(&mut fused, 1, 0, &gate_s, &[])?;
+                                gpu.queue.enqueue_write_buffer(&mut fused, 1, gate_s.len(), &up_s, &[])?;
+                            }
+                            match up_info.ggml_type {
+                                GgmlType::Q4_K => Weight::Q4(fused),
+                                GgmlType::Q6_K => Weight::Q6(fused),
+                                _ => continue,
+                            }
+                        }
                     };
                     weights.insert(format!("blk.{layer}.ffn_ug.weight"), weight);
                 }
@@ -781,6 +794,7 @@ impl GpuModel {
             rms_add: Kernel::create(&program, "rms_norm_add")?,
             quant: Kernel::create(&program, "quantize_q8")?,
             q4: Kernel::create(&program, "gemv_q4_k_i8")?,
+            q4pk: Kernel::create(&program, "gemv_q4_k_i8_pk")?,
             q6: Kernel::create(&program, "gemv_q6_k_i8")?,
             silu: Kernel::create(&program, "silu_mul")?,
             conv: Kernel::create(&program, "conv_step")?,
@@ -1007,6 +1021,32 @@ impl GpuModel {
         cols: usize,
     ) -> Result<()> {
         let weight = self.weight(name)?;
+        if matches!(weight, Weight::Q4(_)) {
+            let packed = if self.prepack_on {
+                self.prepacked.get(name)
+            } else {
+                None
+            };
+            let p = packed.ok_or_else(|| anyhow!("q4 gemv needs prepacked weights: {name}"))?;
+            let per_wg = (self.wg / self.subgroup).max(1) * self.rgemv;
+            let grid = rows.div_ceil(per_wg) * self.wg;
+            unsafe {
+                self.gpu.launch(
+                    &self.kernels.q4pk,
+                    grid,
+                    self.wg_b,
+                    &[
+                        Arg::Mem(p.get()),
+                        Arg::Mem(xq.get()),
+                        Arg::Mem(xs.get()),
+                        Arg::Mem(y.get()),
+                        Arg::U32(rows as u32),
+                        Arg::U32(cols as u32),
+                    ],
+                )?;
+            }
+            return Ok(());
+        }
         let kernel = match weight {
             Weight::Q4(_) => &self.kernels.q4,
             Weight::Q6(_) => &self.kernels.q6,
