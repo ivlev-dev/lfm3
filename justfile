@@ -46,3 +46,15 @@ power-high:
 
 power-auto:
     echo auto | sudo tee {{power}}
+
+bench-check:
+    tools/bench_check.sh amd
+
+bench-check-igpu:
+    tools/bench_check.sh igpu
+
+bench-check-server:
+    tools/bench_check.sh amd --server
+
+bench-check-igpu-full:
+    tools/bench_check.sh igpu-full

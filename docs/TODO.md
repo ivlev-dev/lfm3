@@ -1,9 +1,9 @@
 # TODO — продолжить с пустой сессии
 
-Актуальное состояние (конец сессии 15): `main` = `origin/main`, дерево чистое,
+Актуальное состояние (конец сессии 16): `main` = `origin/main`, дерево чистое,
 `cargo build --release --workspace` без предупреждений, `cargo test --workspace`
 зелёный. Ядра не оптимизируем: результат зафиксирован в `benchmarks/machine.md` и
-`benchmarks/llama-cpp.md`. Итоги последней сессии — раздел «Сессия 15» ниже.
+`benchmarks/llama-cpp.md`. Итоги последней сессии — раздел «Сессия 16» ниже.
 
 Дополнительно с сессии 12: работает второй бэкенд-путь без fp16 (Intel UHD 630
 через Rusticl, `RUSTICL_ENABLE=iris`) — KV во float, 64-полосные ядра и
@@ -356,6 +356,15 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
   запусков, профиль prefill 8192, обновлённые приоритеты.
 - Код движка не изменился: SoA-раскладка и decode-фьюжн реализованы, замерены и
   полностью откачены (рабочее дерево чистое).
+
+## Сессия 16 (регрессионный прогон)
+
+`tools/bench_check.sh` + рецепты `just bench-check`, `bench-check-igpu`,
+`bench-check-igpu-full`, `bench-check-server`: `gpu-check` (f16/kvarn),
+`gpu-cmp` на 1024/64 и 2048/128 (именно split-пути), `gpu-gen`, sanity
+decode и серверный смоук. Пороги cos зафиксированы в `docs/backends.md`.
+AMD: все проверки зелёные (kvarn 0.990922 на 1024/64, 0.995045 на 2048/128,
+сервер отвечает); iGPU: быстрый профиль зелёный.
 
 ## Сессия 15 (flash kvarn, сервер, память kvarn)
 
