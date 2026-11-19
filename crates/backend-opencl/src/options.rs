@@ -157,10 +157,10 @@ impl Options {
     pub fn validate(&self) -> Result<(), String> {
         if !matches!(
             self.kv.as_str(),
-            "f16" | "q4" | "k4v4" | "kvarn" | "kvarn_k4v2"
+            "f16" | "q4" | "k4v4" | "kvarn" | "kvarn_k4v2" | "kvarn_k4v4"
         ) {
             return Err(format!(
-                "unknown kv kind {:?} (f16, q4, k4v4, kvarn, kvarn_k4v2)",
+                "unknown kv kind {:?} (f16, q4, k4v4, kvarn, kvarn_k4v2, kvarn_k4v4)",
                 self.kv
             ));
         }

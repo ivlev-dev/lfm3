@@ -49,7 +49,7 @@ struct Cli {
     prefill_budget: Option<usize>,
     #[arg(long, help = "индекс OpenCL-устройства [0]")]
     device: Option<usize>,
-    #[arg(long, help = "тип KV-кэша: f16, q4, kvarn [f16]")]
+    #[arg(long, help = "тип KV-кэша: f16, q4, kvarn (=kvarn_k4v2), kvarn_k4v4 [f16]")]
     kv: Option<String>,
     #[arg(long, help = "порог батчевого GEMV, 1..=12 [6]")]
     pb: Option<usize>,

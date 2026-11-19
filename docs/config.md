@@ -37,7 +37,7 @@
 |---|---|---|---|---|
 | `device` | `LFM_DEVICE` | `--device` | `0` | индекс OpenCL-устройства |
 | `profile` | `LFM_PROFILE` | `--profile` | `false` | тайминги ядер (`lfm-bench gpu-prefill` печатает профиль) |
-| `kv` | `LFM_KV` | `--kv` | `f16` | тип KV-кэша: `f16`, `q4`, `k4v4`, `kvarn`, `kvarn_k4v2`; на устройстве без fp16 `f16` хранится во float, `kvarn` работает на float-скейлах, `q4` недоступен |
+| `kv` | `LFM_KV` | `--kv` | `f16` | тип KV-кэша: `f16`, `q4`, `k4v4`, `kvarn` (=`kvarn_k4v2`, K 4 бита + V 2 бита), `kvarn_k4v4` (K 4 бита + V 4 бита, память +25 МБ, качество ближе к f16); на устройстве без fp16 `f16` хранится во float, `kvarn*` работают на float-скейлах, `q4` недоступен |
 | `prepack` | `LFM_PREPACK` | — | `true` | 148-байтная раскладка Q4_K и int8-копии; `false` оставляет только decode (prefill требует prepack) |
 | `fuse` | `LFM_FUSE` | — | `true` | слияние `q‖k‖g` и `gate‖up` |
 | `pb` | `LFM_PB` | `--pb` | `6` | порог батчевого GEMV, 1..=12 |

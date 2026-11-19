@@ -834,12 +834,19 @@ impl GpuModel {
         };
         let wg_b = opts.wg_b;
         let kv_f32 = !gpu.caps.fp16;
+        let kv_kind = opts.kv.clone();
+        let kv_q4 = kv_kind == "q4" || kv_kind == "k4v4";
+        let kv_kvarn = kv_kind == "kvarn" || kv_kind == "kvarn_k4v2" || kv_kind == "kvarn_k4v4";
+        let kv4 = kv_kind == "kvarn_k4v4";
         let mut options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
         if kv_f32 {
             options.push_str(" -DLFM_F32_KV");
         }
         if subgroup == 64 {
             options.push_str(" -DLFM_SG64");
+        }
+        if kv4 {
+            options.push_str(" -DLFM_KV4");
         }
         let program: Program = gpu.build(KERNELS, &options)?;
         let kernels = Kernels {
@@ -916,9 +923,6 @@ impl GpuModel {
         let max_seqs = opts.max_seqs;
         let cache_on = opts.cache;
         let splits_cap = opts.splits;
-        let kv_kind = opts.kv.clone();
-        let kv_q4 = kv_kind == "q4" || kv_kind == "k4v4";
-        let kv_kvarn = kv_kind == "kvarn" || kv_kind == "kvarn_k4v2";
         if kv_f32 && kv_q4 {
             return Err(anyhow!(
                 "kv type {kv_kind:?} требует cl_khr_fp16; без fp16 доступны kv=f16 и kv=kvarn"
@@ -1022,6 +1026,7 @@ impl GpuModel {
                         kv_q4,
                         kv_kvarn,
                         kv_f32,
+                        kv4,
                         opts.max_seqs,
                         kv_stage,
                         kv_slots,
@@ -1034,6 +1039,7 @@ impl GpuModel {
                         kv_q4,
                         kv_kvarn,
                         kv_f32,
+                        kv4,
                         opts.max_seqs,
                         kv_stage,
                         kv_slots,
@@ -4737,6 +4743,7 @@ fn make_kv(
     q4: bool,
     kvarn: bool,
     f32_kv: bool,
+    kv4: bool,
     max_seqs: usize,
     stage: usize,
     slots: usize,
@@ -4753,7 +4760,7 @@ fn make_kv(
             kcode: gpu.alloc::<u8>(slots * heads * 64)?,
             ka: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,
             kc: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
-            vcode: gpu.alloc::<u8>(slots * heads * 32)?,
+            vcode: gpu.alloc::<u8>(slots * heads * if kv4 { 64 } else { 32 })?,
             vb: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
             vbz: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
             vc: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,

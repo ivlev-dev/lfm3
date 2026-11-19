@@ -347,10 +347,11 @@ fn main() -> Result<()> {
         "f16" => "f16",
         "k4v4" | "q4" => "q4",
         "kvarn_k4v2" | "kvarn" => "kvarn",
+        "kvarn_k4v4" => "kvarn_k4v4",
         "k4v3" => return Err(anyhow!("--kv-cache k4v3 is not implemented yet")),
         other => {
             return Err(anyhow!(
-                "unknown --kv-cache {other}, expected f16|k4v4|k4v3|kvarn_k4v2"
+                "unknown --kv-cache {other}, expected f16|k4v4|k4v3|kvarn_k4v2|kvarn_k4v4"
             ));
         }
     };

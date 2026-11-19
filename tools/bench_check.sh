@@ -58,6 +58,7 @@ check_min "gpu-check kvarn"        "$(cos_check 1,2,3 kvarn)" 0.9965
 if [ "$MODE" = "amd" ]; then
     check_min "gpu-cmp f16 1024/64"    "$(cos_cmp 1024 64 f16)"   0.9980
     check_min "gpu-cmp kvarn 1024/64"  "$(cos_cmp 1024 64 kvarn)" 0.9880
+    check_min "gpu-cmp kvarn_k4v4 1024/64" "$(cos_cmp 1024 64 kvarn_k4v4)" 0.9960
     check_min "gpu-cmp f16 2048/128"   "$(cos_cmp 2048 128 f16)"  0.9970
     check_min "gpu-cmp kvarn 2048/128" "$(cos_cmp 2048 128 kvarn)" 0.9920
 elif [ "$MODE" = "igpu-full" ]; then
