@@ -348,7 +348,7 @@ fn parse(buf: &[u8]) -> anyhow::Result<(BTreeMap<String, MetadataValue>, Vec<Ten
             n_elements.checked_mul(bb).ok_or(GgufError::SizeOverflow)?
         } else {
             let blocks = n_elements / be;
-            if n_elements % be != 0 {
+            if !n_elements.is_multiple_of(be) {
                 return Err(GgufError::SizeOverflow.into());
             }
             blocks.checked_mul(bb).ok_or(GgufError::SizeOverflow)?
@@ -441,9 +441,9 @@ fn min_elem_size(t: u32) -> u64 {
     match t {
         0 | 1 | 7 => 1,
         2 | 3 => 2,
-        4 | 5 | 6 => 4,
+        4..=6 => 4,
         8 => 8,
-        10 | 11 | 12 => 8,
+        10..=12 => 8,
         _ => 1,
     }
 }

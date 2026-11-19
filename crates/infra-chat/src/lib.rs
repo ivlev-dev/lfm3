@@ -122,8 +122,8 @@ impl ChatTemplate {
         let tmpl = self
             .env
             .get_template("chat")
-            .map_err(|e| anyhow::Error::from(e))?;
-        let out = tmpl.render(value).map_err(|e| anyhow::Error::from(e))?;
+            .map_err(anyhow::Error::from)?;
+        let out = tmpl.render(value).map_err(anyhow::Error::from)?;
         Ok(out)
     }
 
@@ -132,8 +132,8 @@ impl ChatTemplate {
         let tmpl = self
             .env
             .get_template("chat")
-            .map_err(|e| anyhow::Error::from(e))?;
-        let out = tmpl.render(value).map_err(|e| anyhow::Error::from(e))?;
+            .map_err(anyhow::Error::from)?;
+        let out = tmpl.render(value).map_err(anyhow::Error::from)?;
         Ok(out)
     }
 }
@@ -204,8 +204,8 @@ fn strip_generation_tags(src: &str) -> String {
     let out = out.replace(".items()", " | items");
     let out = out.replace(".endswith(", " | endswith(");
     let out = out.replace(".split(", " | split(");
-    let out = out.replace("content | split(\"</think>\")[-1]", "(content | split(\"</think>\"))[-1]");
-    out
+    
+    out.replace("content | split(\"</think>\")[-1]", "(content | split(\"</think>\"))[-1]")
 }
 
 

@@ -21,6 +21,10 @@ pub struct ServeConfig {
     pub template: PathBuf,
     pub ctx: usize,
     pub system: String,
+    pub log_requests: bool,
+    pub pb: usize,
+    pub max_seqs: usize,
+    pub prefill_budget: usize,
 }
 
 pub struct ChatJob {
@@ -83,6 +87,7 @@ struct Job {
 pub struct Engine {
     tx: Sender<Job>,
     metrics: Arc<EngineMetrics>,
+    log_requests: bool,
 }
 
 pub struct EngineMetrics {
@@ -188,6 +193,8 @@ impl Engine {
         backend: BackendLoader,
         tokenizer: TokenizerLoader,
     ) -> Result<Self> {
+        let log_requests = cfg.log_requests
+            || std::env::var("LFM_SCHED_LOG").map(|v| v != "0").unwrap_or(false);
         let (job_tx, job_rx) = channel::<Job>();
         let (ready_tx, ready_rx) = channel::<Result<()>>();
         let metrics = Arc::new(EngineMetrics::new(cfg.ctx));
@@ -211,6 +218,7 @@ impl Engine {
             Ok(Ok(())) => Ok(Self {
                 tx: job_tx,
                 metrics,
+                log_requests,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!("engine thread stopped during load")),
@@ -223,6 +231,10 @@ impl Engine {
             .send(Job { chat, tx })
             .map_err(|_| anyhow!("engine is not running"))?;
         Ok(rx)
+    }
+
+    pub fn log_requests(&self) -> bool {
+        self.log_requests
     }
 
     pub fn metrics(&self) -> EngineMetricsSnapshot {
@@ -374,10 +386,7 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new() -> Self {
-        let enabled = std::env::var("LFM_SCHED_LOG")
-            .map(|value| value == "1")
-            .unwrap_or(false);
+    fn new(enabled: bool) -> Self {
         Self {
             enabled,
             steps: 0,
@@ -474,9 +483,9 @@ impl Worker {
     ) -> Result<Self> {
         let mut gpu = backend(&cfg.model, cfg.ctx)?;
         let _ = gpu.free_sequence(0);
-        let max_batch = env_range("LFM_PB", 6, 1, 12);
-        let max_active = env_range("LFM_SEQS", 8, 1, 16).min(gpu.max_sequences());
-        let prefill_budget = env_usize("LFM_PREFILL_BUDGET", 64).clamp(1, 128);
+        let max_batch = cfg.pb.clamp(1, 12);
+        let max_active = cfg.max_seqs.clamp(1, 16).min(gpu.max_sequences());
+        let prefill_budget = cfg.prefill_budget.clamp(1, 128);
         let sched = Scheduler::new(SchedulerConfig::new(
             gpu.max_ctx(),
             max_active,
@@ -492,7 +501,7 @@ impl Worker {
             system: cfg.system,
             sched,
             reqs: HashMap::new(),
-            metrics: Metrics::new(),
+            metrics: Metrics::new(cfg.log_requests),
             shared,
         };
         worker.publish();
@@ -783,12 +792,11 @@ impl Worker {
                         }
                     };
                     let slot = self.reqs.get(&row.id).map(|state| state.slot);
-                    if let Some(slot) = slot {
-                        if let Err(e) = self.gpu.prefill_finish(slot) {
+                    if let Some(slot) = slot
+                        && let Err(e) = self.gpu.prefill_finish(slot) {
                             self.fail_request(row.id, format!("{e}"));
                             continue;
                         }
-                    }
                     self.sched.complete_prefill(row.id);
                     self.accept_token(row.id, logits);
                 }
@@ -891,22 +899,6 @@ impl Worker {
             state.slot = usize::MAX;
         }
     }
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-fn env_range(name: &str, default: usize, low: usize, high: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (low..=high).contains(value))
-        .unwrap_or(default)
 }
 
 fn first_stop(content: &str, stops: &[String]) -> Option<usize> {
@@ -1091,7 +1083,7 @@ mod tests {
 
     #[test]
     fn record_accumulates_steps_and_average() {
-        let mut metrics = Metrics::new();
+        let mut metrics = Metrics::new(false);
         assert_eq!(metrics.avg_step_us(), 0);
         metrics.record(Duration::from_micros(400), 3, 2);
         metrics.record(Duration::from_micros(600), 1, 4);

@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod pipeline;
+pub mod options;
 pub mod prepack;
+pub use options::Options;
 mod tp;
 mod ports;
 mod radix;
@@ -52,7 +54,7 @@ const KERNELS: &str = concat!(
     include_str!("../kernels/kvarn.cl")
 );
 const GROUP: usize = 32;
-const MAX_SPLITS: usize = 16;
+pub(crate) const MAX_SPLITS: usize = 16;
 const KV_PAGE: usize = PAGE;
 
 #[derive(Clone, Copy)]
@@ -365,11 +367,10 @@ fn tensor_needed(
     has_head: bool,
 ) -> bool {
     if let Some(rest) = name.strip_prefix("blk.") {
-        if let Some((idx, _)) = rest.split_once('.') {
-            if let Ok(layer) = idx.parse::<usize>() {
+        if let Some((idx, _)) = rest.split_once('.')
+            && let Ok(layer) = idx.parse::<usize>() {
                 return (start..end).contains(&layer);
             }
-        }
         return false;
     }
     if name == "token_embd.weight" {
@@ -525,17 +526,20 @@ fn pick_logits_rows(
     }
     sel.sort_unstable();
     sel.dedup();
-    if let Some(&last) = sel.last() {
-        if last >= ntok {
+    if let Some(&last) = sel.last()
+        && last >= ntok {
             return Err(anyhow!("logits row {last} outside batch of {ntok}"));
         }
-    }
     Ok(Some(sel))
 }
 
 impl GpuModel {
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
         Self::load_stage(path, max_ctx, None, None, None)
+    }
+
+    pub fn load_with(path: &Path, max_ctx: usize, opts: &Options) -> Result<Self> {
+        Self::load_opts(path, max_ctx, None, None, None, opts)
     }
 
     pub fn load_stage(
@@ -545,14 +549,20 @@ impl GpuModel {
         layers: Option<(usize, usize)>,
         shard: Option<TpShard>,
     ) -> Result<Self> {
-        let profiling = std::env::var("LFM_PROFILE").map(|v| v == "1").unwrap_or(false);
-        let device = match device {
-            Some(device) => device,
-            None => std::env::var("LFM_DEVICE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-        };
+        Self::load_opts(path, max_ctx, device, layers, shard, &Options::from_env())
+    }
+
+    pub fn load_opts(
+        path: &Path,
+        max_ctx: usize,
+        device: Option<usize>,
+        layers: Option<(usize, usize)>,
+        shard: Option<TpShard>,
+        opts: &Options,
+    ) -> Result<Self> {
+        opts.validate().map_err(|e| anyhow!("bad engine options: {e}"))?;
+        let profiling = opts.profile;
+        let device = device.unwrap_or(opts.device);
         let gpu = Gpu::open_with(device, profiling)?;
         let file = GgufFile::open(path)?;
         let cfg = ModelConfig::from_metadata(&file).map_err(|e| anyhow!("config: {e}"))?;
@@ -565,14 +575,14 @@ impl GpuModel {
         }
         let has_embed = layer_start == 0;
         let has_head = layer_end == cfg.num_layers;
-        let prepack_on = std::env::var("LFM_PREPACK").map(|v| v != "0").unwrap_or(true);
-        let fuse_on = std::env::var("LFM_FUSE").map(|v| v != "0").unwrap_or(true);
-        let q4_i8_on = std::env::var("LFM_Q4I8").map(|v| v != "0").unwrap_or(true);
-        let q6_i8_gz_on = std::env::var("LFM_Q6I8").map(|v| v != "0").unwrap_or(true);
-        let q4_b8p_on = std::env::var("LFM_B8P").map(|v| v != "0").unwrap_or(true);
-        let flash_on = std::env::var("LFM_FLASH").map(|v| v != "0").unwrap_or(true);
-        let flash2_on = std::env::var("LFM_FLASH2").map(|v| v != "0").unwrap_or(true);
-        let i8_pf_on = std::env::var("LFM_I8PF").map(|v| v != "0").unwrap_or(true);
+        let prepack_on = opts.prepack;
+        let fuse_on = opts.fuse;
+        let q4_i8_on = opts.q4i8;
+        let q6_i8_gz_on = opts.q6i8;
+        let q4_b8p_on = opts.b8p;
+        let flash_on = opts.flash;
+        let flash2_on = opts.flash2;
+        let i8_pf_on = opts.i8pf;
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
@@ -594,17 +604,17 @@ impl GpuModel {
                 match shard_slice(&info.name, rows, cols, cfg.head_dim, &shard) {
                     None => continue,
                     Some(spec) => {
-                        std::borrow::Cow::Owned(slice_shard(&bytes, info.ggml_type, cols, &spec)?)
+                        std::borrow::Cow::Owned(slice_shard(bytes, info.ggml_type, cols, &spec)?)
                     }
                 }
             } else {
-                std::borrow::Cow::Borrowed(&bytes)
+                std::borrow::Cow::Borrowed(bytes)
             };
             let weight = match info.ggml_type {
                 GgmlType::Q4_K => {
                     if prepack_on {
                         let packed = prepack::prepack_q4_k(data.as_ref());
-                        if info.dims.len() == 2 && cols % 256 == 0 && rows > 0 && q4_i8_on {
+                        if info.dims.len() == 2 && cols.is_multiple_of(256) && rows > 0 && q4_i8_on {
                             let (q8, sc) = prepack::prepack_q4_i8(&packed, cols);
                             prepacked_q4_i8
                                 .insert(info.name.clone(), (gpu.upload(&q8)?, gpu.upload(&sc)?));
@@ -619,7 +629,7 @@ impl GpuModel {
                     if prepack_on && shard.is_none() && info.dims.len() == 2 {
                         let cols = info.dims[0] as usize;
                         let rows = info.dims[1] as usize;
-                        if cols % 256 == 0 && rows > 0 {
+                        if cols.is_multiple_of(256) && rows > 0 {
                             let (q, sc) = prepack::prepack_q6_i8(data.as_ref(), cols);
                             prepacked_i8.insert(
                                 info.name.clone(),
@@ -631,7 +641,7 @@ impl GpuModel {
                 }
                 GgmlType::F32 => {
                     let data: Vec<f32> = data
-                        .chunks_exact(4)
+                        .as_chunks::<4>().0.iter()
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
                     Weight::F32(gpu.upload(&data)?)
@@ -652,7 +662,7 @@ impl GpuModel {
                 shard.vocab_start,
                 shard.vocab_start + shard.vocab_count,
             );
-            let data = slice_shard(&bytes, info.ggml_type, cols, &spec)?;
+            let data = slice_shard(bytes, info.ggml_type, cols, &spec)?;
             let weight = match info.ggml_type {
                 GgmlType::Q4_K => Weight::Q4(gpu.upload_bytes(&data)?),
                 GgmlType::Q6_K => Weight::Q6(gpu.upload_bytes(&data)?),
@@ -666,8 +676,8 @@ impl GpuModel {
             let gate_name = format!("blk.{layer}.ffn_gate.weight");
             let up_info = file.tensor(&up_name);
             let gate_info = file.tensor(&gate_name);
-            if let (Some(up_info), Some(gate_info)) = (up_info, gate_info) {
-                if up_info.ggml_type == gate_info.ggml_type
+            if let (Some(up_info), Some(gate_info)) = (up_info, gate_info)
+                && up_info.ggml_type == gate_info.ggml_type
                     && up_info.byte_size == gate_info.byte_size
                 {
                     let gate_bytes = file.tensor_bytes(&gate_name)?;
@@ -683,13 +693,13 @@ impl GpuModel {
                             Ok(bytes.to_vec())
                         }
                     };
-                    let gate_s = slice_ffn(&gate_bytes, gate_info)?;
-                    let up_s = slice_ffn(&up_bytes, up_info)?;
+                    let gate_s = slice_ffn(gate_bytes, gate_info)?;
+                    let up_s = slice_ffn(up_bytes, up_info)?;
                     if prepack_on && up_info.ggml_type == GgmlType::Q4_K {
                         let mut fused = prepack::prepack_q4_k(&gate_s);
                         fused.extend_from_slice(&prepack::prepack_q4_k(&up_s));
                         let cols = up_info.dims[0] as usize;
-                        if cols % 256 == 0 && q4_i8_on {
+                        if cols.is_multiple_of(256) && q4_i8_on {
                             let (q8, sc) = prepack::prepack_q4_i8(&fused, cols);
                             prepacked_q4_i8.insert(
                                 format!("blk.{layer}.ffn_ug.weight"),
@@ -718,7 +728,6 @@ impl GpuModel {
                     };
                     weights.insert(format!("blk.{layer}.ffn_ug.weight"), weight);
                 }
-            }
             if !prepack_on || !fuse_on || shard.is_some() {
                 continue;
             }
@@ -746,18 +755,18 @@ impl GpuModel {
                         && v_info.map(|i| i.dims[1] % 4 == 0).unwrap_or(false);
                     if fuse_v {
                         let v_bytes = file.tensor_bytes(&v_name)?;
-                        let mut fused = prepack::prepack_q4_k(&q_bytes);
-                        fused.extend_from_slice(&prepack::prepack_q4_k(&k_bytes));
-                        fused.extend_from_slice(&prepack::prepack_q4_k(&v_bytes));
-                        fused.extend_from_slice(&prepack::prepack_q4_k(&g_bytes));
+                        let mut fused = prepack::prepack_q4_k(q_bytes);
+                        fused.extend_from_slice(&prepack::prepack_q4_k(k_bytes));
+                        fused.extend_from_slice(&prepack::prepack_q4_k(v_bytes));
+                        fused.extend_from_slice(&prepack::prepack_q4_k(g_bytes));
                         prepacked.insert(
                             format!("blk.{layer}.attn_qkvg.weight"),
                             gpu.upload_bytes(&fused)?,
                         );
                     }
-                    let mut fused = prepack::prepack_q4_k(&q_bytes);
-                    fused.extend_from_slice(&prepack::prepack_q4_k(&k_bytes));
-                    fused.extend_from_slice(&prepack::prepack_q4_k(&g_bytes));
+                    let mut fused = prepack::prepack_q4_k(q_bytes);
+                    fused.extend_from_slice(&prepack::prepack_q4_k(k_bytes));
+                    fused.extend_from_slice(&prepack::prepack_q4_k(g_bytes));
                     prepacked.insert(
                         format!("blk.{layer}.attn_qkg.weight"),
                         gpu.upload_bytes(&fused)?,
@@ -765,40 +774,14 @@ impl GpuModel {
                 }
             }
         }
-        let pb: usize = std::env::var("LFM_PB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &usize| (1..=12).contains(v))
-            .unwrap_or(6);
-        let prefill_batch: usize = std::env::var("LFM_PREFILL_NTOK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &usize| (1..=128).contains(v))
-            .unwrap_or(128);
+        let pb = opts.pb;
+        let prefill_batch = opts.prefill_ntok;
         let batch_cap = pb.max(prefill_batch);
-        let gemm_force: Option<String> = std::env::var("LFM_GEMM_FORCE").ok().filter(|v| !v.is_empty());
-        let rgemv: usize = std::env::var("LFM_RGEMV")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &usize| (1..=8).contains(v))
-            .unwrap_or(4);
-        let rgemv_b: usize = std::env::var("LFM_RGEMV_B")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &usize| (1..=8).contains(v))
-            .unwrap_or(5);
-        let wg: usize = std::env::var("LFM_WG")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &usize| (64..=512).contains(v))
-            .map(|v| v / 64 * 64)
-            .unwrap_or(256);
-        let wg_b: usize = std::env::var("LFM_WG_B")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &usize| (64..=512).contains(v))
-            .map(|v| v / 64 * 64)
-            .unwrap_or(64);
+        let gemm_force = opts.gemm_force.clone();
+        let rgemv = opts.rgemv;
+        let rgemv_b = opts.rgemv_b;
+        let wg = opts.wg;
+        let wg_b = opts.wg_b;
         let subgroup = gpu.caps.sub_group_size.max(1);
         let options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
         let program: Program = gpu.build(KERNELS, &options)?;
@@ -871,32 +854,20 @@ impl GpuModel {
         let vocab = cfg.vocab_size;
         let kv_blocks = max_ctx.div_ceil(KV_PAGE);
         let kv_slots = kv_blocks * KV_PAGE;
-        let max_seqs: usize = std::env::var("LFM_SEQS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &usize| (1..=16).contains(v))
-            .unwrap_or(8);
-        let cache_on = std::env::var("LFM_CACHE").map(|v| v != "0").unwrap_or(true);
+        let max_seqs = opts.max_seqs;
+        let cache_on = opts.cache;
         if !gpu.caps.fp16 {
             return Err(anyhow!("device without fp16 is not supported"));
         }
-        let splits_cap: usize = std::env::var("LFM_SPLITS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &usize| (1..=MAX_SPLITS).contains(v))
-            .unwrap_or(MAX_SPLITS);
-        let kv_kind = std::env::var("LFM_KV").unwrap_or_else(|_| "f16".to_string());
+        let splits_cap = opts.splits;
+        let kv_kind = opts.kv.clone();
         let kv_q4 = kv_kind == "q4" || kv_kind == "k4v4";
         let kv_kvarn = kv_kind == "kvarn" || kv_kind == "kvarn_k4v2";
-        let kv_q4 = kv_q4;
-        if std::env::var("LFM_KV_NC").as_deref() == Ok("0") {
-            return Err(anyhow!("QJL correction (--kv-nc=false) is not implemented"));
-        }
         if (kv_q4 || kv_kvarn) && shard.is_some() {
             return Err(anyhow!("quantized KV is not supported with tensor parallelism"));
         }
-        let attn4 = std::env::var("LFM_ATTN4").map(|v| v != "0").unwrap_or(true);
-        let attn2 = std::env::var("LFM_ATTN2").map(|v| v != "0").unwrap_or(true);
+        let attn4 = opts.attn4;
+        let attn2 = opts.attn2;
         let bufs = Bufs {
             x: gpu.alloc::<f32>(h)?,
             h: gpu.alloc::<f32>(h)?,
@@ -1121,8 +1092,8 @@ impl GpuModel {
             .gemm_force
             .as_deref()
             .is_some_and(|list| list.split(',').any(|pat| !pat.is_empty() && name.contains(pat)));
-        if (2..=8).contains(&ntok) && !force {
-            if let (Weight::Q4(_), Some(p)) = (weight, packed) {
+        if (2..=8).contains(&ntok) && !force
+            && let (Weight::Q4(_), Some(p)) = (weight, packed) {
                 let grid = rows.div_ceil(64) * 64;
                 let k = if self.q4_b8p_on { &self.kernels.gemm_q4_b8p } else { &self.kernels.gemm_q4_b8 };
                 unsafe {
@@ -1143,7 +1114,6 @@ impl GpuModel {
                 }
                 return Ok(());
             }
-        }
         if ntok > self.pb || force {
             if let Some((w8, wsc)) = self.prepacked_q4_i8.get(name) {
                 let tps = ntok.div_ceil(32);
@@ -1852,8 +1822,8 @@ impl GpuModel {
                         (None, Some((kc, kn, vc, vs))) => DecKv::Q4 { kc, kn, vc, vs },
                         (None, None) => DecKv::F16,
                     };
-                    if kv_kvarn.is_some() {
-                        if (pos + 1) % KV_PAGE == 0 {
+                    if kv_kvarn.is_some()
+                        && (pos + 1).is_multiple_of(KV_PAGE) {
                             let page = ((pos + 1) / KV_PAGE - 1) as u32;
                             let (kst, vst, kcode, ka, kc, vcode, vb, vbz, vc) = kv_kvarn.unwrap();
                             unsafe {
@@ -1880,7 +1850,6 @@ impl GpuModel {
                                 )?;
                             }
                         }
-                    }
                     let start = if self.cfg.kind(layer) == LayerKind::SlidingAttention {
                         (pos + 1).saturating_sub(self.cfg.sliding_window)
                     } else {
@@ -2540,14 +2509,6 @@ impl GpuModel {
         }
     }
 
-    fn kv_store_b_kernel(&self) -> &Kernel {
-        if self.kv_q4 {
-            &self.kernels.kv_store_b_q
-        } else {
-            &self.kernels.kv_store_b_h
-        }
-    }
-
     fn attn_kernel(&self, split: bool) -> &Kernel {
         match (self.kv_q4, split) {
             (true, true) => &self.kernels.attn_split_h_q,
@@ -2557,6 +2518,7 @@ impl GpuModel {
         }
     }
 
+    #[allow(dead_code)]
     fn attn_b_kernel(&self, split: bool) -> &Kernel {
         match (self.kv_q4, split) {
             (true, true) => &self.kernels.attn_split_b_h_q,
@@ -3060,7 +3022,7 @@ impl GpuModel {
                     unsafe {
                     let kv_q4 = match (k_buf, v_buf) {
                         (KvBuf::Kvarn { staging: ks, .. }, KvBuf::Kvarn { staging: vs, .. }) => {
-                            unsafe {
+                            
                                 self.gpu.launch(
                                     &self.kernels.kv_store_b_h_rot,
                                     ntok * kv_heads * 64,
@@ -3078,11 +3040,10 @@ impl GpuModel {
                                         Arg::U32(ntok as u32),
                                     ],
                                 )?;
-                            }
                             None
                         }
                         (KvBuf::Q4 { code: kc, scale: kn }, KvBuf::Q4 { code: vc, scale: vs }) => {
-                            unsafe {
+                            
                                 self.gpu.launch(
                                     &self.kernels.kv_store_b_q,
                                     ntok * kv_heads * 64,
@@ -3102,11 +3063,10 @@ impl GpuModel {
                                         Arg::U32(ntok as u32),
                                     ],
                                 )?;
-                            }
                             Some((kc.get(), kn.get(), vc.get(), vs.get()))
                         }
                         _ => {
-                            unsafe {
+                            
                                 self.gpu.launch(
                                     &self.kernels.kv_store_b_h,
                                     ntok * kvd,
@@ -3123,7 +3083,6 @@ impl GpuModel {
                                         Arg::U32(n32),
                                     ],
                                 )?;
-                            }
                             None
                         }
                     };
@@ -3135,7 +3094,7 @@ impl GpuModel {
                         for (t, r) in reqs.iter().enumerate() {
                             if (r.pos + 1) % KV_PAGE == 0 {
                                 let page = (r.pos / KV_PAGE) as u32;
-                                unsafe {
+                                
                                     self.gpu.launch(
                                         &self.kernels.kvarn_commit,
                                         kv_heads * 64,
@@ -3157,7 +3116,6 @@ impl GpuModel {
                                             Arg::U32(head_dim as u32),
                                         ],
                                     )?;
-                                }
                             }
                         }
                     }
@@ -3166,7 +3124,7 @@ impl GpuModel {
                     let splits = (span_max / 512).clamp(1, self.splits_cap);
                     if splits <= 1 {
                         match kv_q4 {
-                            Some((kc, kn, vc, vs)) => unsafe {
+                            Some((kc, kn, vc, vs)) => {
                                 self.gpu.launch(
                                     &self.kernels.attn_b_h_q,
                                     ntok * (heads / 4) * 256,
@@ -3195,7 +3153,7 @@ impl GpuModel {
                                         KvBuf::Kvarn { staging, .. } => staging,
                                         _ => return Err(anyhow!("mixed kv variants")),
                                     };
-                                    unsafe {
+                                    
                                         self.gpu.launch(
                                             &self.kernels.attn_b_h_rot,
                                             ntok * (heads / 4) * 256,
@@ -3216,12 +3174,11 @@ impl GpuModel {
                                                 Arg::U32(window as u32),
                                             ],
                                         )?;
-                                    }
                                 } else {
                                     let use2 = self.attn2
                                         && !self.kv_q4
                                         && head_dim == 128
-                                        && heads % 4 == 0;
+                                        && heads.is_multiple_of(4);
                                     let use_fa = use2 && self.flash_on && kv_heads == 4 && heads == 16;
                                     let (kernel, grid) = if use_fa {
                                         (&self.kernels.attn_b_fa, ntok * 256)
@@ -3230,7 +3187,7 @@ impl GpuModel {
                                     } else {
                                         (&self.kernels.attn_b_h, ntok * heads * 256)
                                     };
-                                    unsafe {
+                                    
                                         self.gpu.launch(
                                             kernel,
                                             grid,
@@ -3251,13 +3208,12 @@ impl GpuModel {
                                                 Arg::U32(window as u32),
                                             ],
                                         )?;
-                                    }
                                 }
                             }
                         }
                     } else {
                         match kv_q4 {
-                            Some((kc, kn, vc, vs)) => unsafe {
+                            Some((kc, kn, vc, vs)) => {
                                 self.gpu.launch(
                                     &self.kernels.attn_split_b_h_q,
                                     ntok * heads * splits * 64,
@@ -3287,7 +3243,7 @@ impl GpuModel {
                                         KvBuf::Kvarn { staging, .. } => staging,
                                         _ => return Err(anyhow!("mixed kv variants")),
                                     };
-                                    unsafe {
+                                    
                                         self.gpu.launch(
                                             &self.kernels.attn_split_b_h_rot,
                                             ntok * heads * splits * 64,
@@ -3309,7 +3265,6 @@ impl GpuModel {
                                                 Arg::U32(splits as u32),
                                             ],
                                         )?;
-                                    }
                                 } else {
                                     let use4 = self.attn4
                                         && !self.kv_q4
@@ -3333,7 +3288,7 @@ impl GpuModel {
                                     } else {
                                         (&self.kernels.attn_split_b_h, ntok * heads * splits * 64)
                                     };
-                                    unsafe {
+                                    
                                         self.gpu.launch(
                                             kernel,
                                             grid,
@@ -3355,11 +3310,10 @@ impl GpuModel {
                                                 Arg::U32(splits as u32),
                                             ],
                                         )?;
-                                    }
                                 }
                             }
                         }
-                        unsafe {
+                        
                             self.gpu.launch(
                                 &self.kernels.attn_combine_b,
                                 ntok * heads * 64,
@@ -3375,7 +3329,6 @@ impl GpuModel {
                                     Arg::U32(splits as u32),
                                 ],
                             )?;
-                        }
                     }
                         self.gpu.launch(
                             &self.kernels.quant_b,

@@ -354,3 +354,21 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
   запусков, профиль prefill 8192, обновлённые приоритеты.
 - Код движка не изменился: SoA-раскладка и decode-фьюжн реализованы, замерены и
   полностью откачены (рабочее дерево чистое).
+
+## Сессия 10 (обвязка: конфигурация, сервер, TUI)
+
+Оптимизация ядер остановлена на зафиксированном результате (см.
+`benchmarks/machine.md`, `benchmarks/llama-cpp.md`); дальше — обвязка.
+
+| Блок | Итог |
+|---|---|
+| Конфигурация | `lfm_gpu::Options` (`from_env`, `validate`) вместо чтения env внутри `load_stage`; сервер: `--config <toml>` + `--print-config` (round-trip dump→load→dump), `docs/config.md` со всеми ключами и env; планировщик берёт `pb`/`max_seqs`/`prefill_budget` из конфига, а не из env |
+| Сервер | graceful shutdown по SIGINT/SIGTERM (дренаж активных соединений до 10 с, затем принудительный выход), `/health` с моделью/ctx/бэкендом/uptime/версией, `--log-requests` (access log + `sched:`), `--max-body`, проверка `ctx` (кратен 32), h2c отдаёт тот же `/health` |
+| TUI | `/help`, `/metrics` (панель из GET /metrics), `/model [name]` (список из /v1/models, переключение модели в запросах), `/system <текст>`, `hist N tok` в статус-строке, разделение уведомлений info/error |
+| Обвязка | 0 предупреждений сборки (было 13: 11 «unnecessary unsafe», 2 мёртвых метода), `cargo clippy --fix` (−76), README «Быстрый старт», `justfile` (build/test/clippy/fmt/serve/tui/bench/power) |
+| Тесты | 272 (было 251): +4 config, +3 options, +14 TUI |
+
+Проверено вживую: `/health` (`model`/`ctx`/`backend`/`uptime_s`/`version`),
+access log, конфиг round-trip, SIGINT во время SSE-стрима — стрим доходит до
+`[DONE]`, сервер печатает «остановлен» и выходит. Замеры не изменились
+(pp512 871–883, decode 70 при шумной машине).

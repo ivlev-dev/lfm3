@@ -77,7 +77,7 @@ pub fn dequant_q6_k(block: &[u8; 210]) -> [f32; 256] {
         for l in 0..32usize {
             let is = l / 16;
             let q1 = (((ql0[ql_off + l] & 0x0F) as i32)
-                | ((((qh0[qh_off + l] >> 0) & 3) as i32) << 4))
+                | (((qh0[qh_off + l] & 3) as i32) << 4))
                 - 32;
             let q2 = (((ql0[ql_off + l + 32] & 0x0F) as i32)
                 | ((((qh0[qh_off + l] >> 2) & 3) as i32) << 4))
@@ -88,8 +88,8 @@ pub fn dequant_q6_k(block: &[u8; 210]) -> [f32; 256] {
             let q4 = (((ql0[ql_off + l + 32] >> 4) as i32)
                 | ((((qh0[qh_off + l] >> 6) & 3) as i32) << 4))
                 - 32;
-            y[n + l + 0] =
-                d * (sc0[sc_off + is + 0] as i8 as f32) * (q1 as f32);
+            y[n + l] =
+                d * (sc0[sc_off + is] as i8 as f32) * (q1 as f32);
             y[n + l + 32] =
                 d * (sc0[sc_off + is + 2] as i8 as f32) * (q2 as f32);
             y[n + l + 64] =
@@ -114,7 +114,7 @@ pub fn dequant_q8_0(block: &[u8; 34]) -> [f32; 32] {
 }
 
 pub fn dequant_row_q4_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
-    if n % 256 != 0 {
+    if !n.is_multiple_of(256) {
         return Err(Error::InvalidN { n, multiple: 256 });
     }
     let nblocks = n / 256;
@@ -136,7 +136,7 @@ pub fn dequant_row_q4_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 }
 
 pub fn dequant_row_q6_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
-    if n % 256 != 0 {
+    if !n.is_multiple_of(256) {
         return Err(Error::InvalidN { n, multiple: 256 });
     }
     let nblocks = n / 256;
@@ -159,7 +159,7 @@ pub fn dequant_row_q6_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 
 pub fn dot_row_q4_k(bytes: &[u8], x: &[f32]) -> Result<f32> {
     let n = x.len();
-    if n % 256 != 0 {
+    if !n.is_multiple_of(256) {
         return Err(Error::InvalidN { n, multiple: 256 });
     }
     let nblocks = n / 256;
@@ -183,7 +183,7 @@ pub fn dot_row_q4_k(bytes: &[u8], x: &[f32]) -> Result<f32> {
 
 pub fn dot_row_q6_k(bytes: &[u8], x: &[f32]) -> Result<f32> {
     let n = x.len();
-    if n % 256 != 0 {
+    if !n.is_multiple_of(256) {
         return Err(Error::InvalidN { n, multiple: 256 });
     }
     let nblocks = n / 256;
@@ -207,7 +207,7 @@ pub fn dot_row_q6_k(bytes: &[u8], x: &[f32]) -> Result<f32> {
 
 pub fn dot_row_q8_0(bytes: &[u8], x: &[f32]) -> Result<f32> {
     let n = x.len();
-    if n % 32 != 0 {
+    if !n.is_multiple_of(32) {
         return Err(Error::InvalidN { n, multiple: 32 });
     }
     let nblocks = n / 32;

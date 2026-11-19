@@ -15,7 +15,7 @@ pub fn block_hash(parent: u64, tokens: &[u32]) -> u64 {
 pub fn chain_hashes(prompt: &[u32]) -> Vec<u64> {
     let mut out = Vec::with_capacity(prompt.len() / PAGE);
     let mut parent = 0u64;
-    for block in prompt.chunks_exact(PAGE) {
+    for block in prompt.as_chunks::<PAGE>().0 {
         parent = block_hash(parent, block);
         out.push(parent);
     }

@@ -147,11 +147,11 @@ impl Lfm3Ref {
             let bytes = file.tensor_bytes(&info.name)?;
             let data = match info.ggml_type {
                 GgmlType::F32 => bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect::<Vec<f32>>(),
                 GgmlType::F16 => bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>().0.iter()
                     .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
                     .collect::<Vec<f32>>(),
                 GgmlType::Q4_K => lfm_quant::dequant_row_q4_k(bytes, count)?,

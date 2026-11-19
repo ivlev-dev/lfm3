@@ -104,11 +104,10 @@ fn special_ids(json: &str) -> anyhow::Result<(u32, u32, u32)> {
 
     let find = |needle: &str| -> Option<u32> {
         for entry in added {
-            if entry.get("content").and_then(|v| v.as_str()) == Some(needle) {
-                if let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
+            if entry.get("content").and_then(|v| v.as_str()) == Some(needle)
+                && let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
                     return Some(id as u32);
                 }
-            }
         }
         None
     };

@@ -97,7 +97,7 @@ impl HubClient {
                         let local_size = fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
                         let stored_etag = fs::read_to_string(&etag_path).ok().map(|s| s.trim().to_string());
 
-                        let size_ok = remote_size.map_or(true, |s| s == local_size);
+                        let size_ok = remote_size.is_none_or(|s| s == local_size);
                         let mut etag_ok = true;
                         match (&remote_etag, &stored_etag) {
                             (Some(r), Some(s)) => {
@@ -131,8 +131,7 @@ impl HubClient {
         let url = self.file_url(repo, file, revision);
         let target = self.cache_path(repo, file, revision);
         let parent = target.parent().ok_or_else(|| {
-            anyhow::Error::from(HubError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            anyhow::Error::from(HubError::Io(std::io::Error::other(
                 "no parent",
             )))
         })?;
@@ -246,8 +245,8 @@ impl HubClient {
         file.flush()?;
         drop(file);
 
-        if let Some(sha) = x_linked {
-            if is_hex64(&sha) {
+        if let Some(sha) = x_linked
+            && is_hex64(&sha) {
                 let actual = Self::sha256_file(part)?;
                 if actual != sha.to_lowercase() {
                     let _ = fs::remove_file(part);
@@ -258,7 +257,6 @@ impl HubClient {
                     .into());
                 }
             }
-        }
 
         if let Some(e) = remote_etag {
             let _ = fs::write(etag_path, e);

@@ -368,17 +368,16 @@ impl Conn {
     }
 
     fn apply_settings(&mut self, payload: &[u8]) -> Result<()> {
-        if payload.len() % 6 != 0 {
+        if !payload.len().is_multiple_of(6) {
             return Err(anyhow!("bad settings frame"));
         }
-        for pair in payload.chunks_exact(6) {
+        for pair in payload.as_chunks::<6>().0 {
             let id = u16::from_be_bytes([pair[0], pair[1]]);
             let value = u32::from_be_bytes([pair[2], pair[3], pair[4], pair[5]]);
-            if id == SETTINGS_INITIAL_WINDOW_SIZE {
-                if let Err(error) = self.flow.apply_initial_window(value) {
+            if id == SETTINGS_INITIAL_WINDOW_SIZE
+                && let Err(error) = self.flow.apply_initial_window(value) {
                     self.handle_flow_error(error)?;
                 }
-            }
         }
         self.settings_ack()
     }
@@ -511,7 +510,7 @@ struct Pending {
     end_stream: bool,
 }
 
-pub fn serve(stream: TcpStream, engine: &Engine, model: &str) -> Result<()> {
+pub fn serve(stream: TcpStream, engine: &Engine, info: &crate::ServerInfo) -> Result<()> {
     let mut conn = Conn::new(stream);
     conn.read_preface()?;
     conn.send_settings()?;
@@ -529,7 +528,7 @@ pub fn serve(stream: TcpStream, engine: &Engine, model: &str) -> Result<()> {
                     if frame.payload.len() % 6 != 0 {
                         return Err(anyhow!("bad settings frame"));
                     }
-                    for pair in frame.payload.chunks_exact(6) {
+                    for pair in frame.payload.as_chunks::<6>().0 {
                         let id = u16::from_be_bytes([pair[0], pair[1]]);
                         let value = u32::from_be_bytes([pair[2], pair[3], pair[4], pair[5]]);
                         if id == SETTINGS_HEADER_TABLE_SIZE {
@@ -565,7 +564,7 @@ pub fn serve(stream: TcpStream, engine: &Engine, model: &str) -> Result<()> {
                     pending = Some(build_request(&block, frame.stream_id, end_stream, &mut ctx)?);
                     if end_stream {
                         let req = pending.take().expect("request");
-                        handle(&mut conn, engine, model, req)?;
+                        handle(&mut conn, engine, info, req)?;
                     }
                 } else {
                     pending = Some(Pending {
@@ -591,7 +590,7 @@ pub fn serve(stream: TcpStream, engine: &Engine, model: &str) -> Result<()> {
                     pending = Some(build_request(&block, stream_id, end_stream, &mut ctx)?);
                     if end_stream {
                         let req = pending.take().expect("request");
-                        handle(&mut conn, engine, model, req)?;
+                        handle(&mut conn, engine, info, req)?;
                     }
                 }
             }
@@ -608,7 +607,7 @@ pub fn serve(stream: TcpStream, engine: &Engine, model: &str) -> Result<()> {
                     }
                     if frame.flags & FLAG_END_STREAM != 0 {
                         let req = pending.take().expect("request");
-                        handle(&mut conn, engine, model, req)?;
+                        handle(&mut conn, engine, info, req)?;
                     }
                 }
             }
@@ -684,13 +683,13 @@ fn route(method: &str, path: &str) -> Route {
     }
 }
 
-fn handle(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<()> {
+fn handle(conn: &mut Conn, engine: &Engine, info: &crate::ServerInfo, req: Pending) -> Result<()> {
     match route(&req.method, &req.path) {
-        Route::Health => send_json(conn, req.id, "200", r#"{"status":"ok"}"#),
-        Route::Models => send_json(conn, req.id, "200", &models_json(model, 0)),
-        Route::Chat => chat(conn, engine, model, req),
-        Route::Completions => completions(conn, engine, model, req),
-        Route::Metrics => send_json(conn, req.id, "200", &metrics_json(model, &engine.metrics())),
+        Route::Health => send_json(conn, req.id, "200", &info.health_json()),
+        Route::Models => send_json(conn, req.id, "200", &models_json(&info.model, 0)),
+        Route::Chat => chat(conn, engine, &info.model, req),
+        Route::Completions => completions(conn, engine, &info.model, req),
+        Route::Metrics => send_json(conn, req.id, "200", &metrics_json(&info.model, &engine.metrics())),
         Route::NotFound => send_json(
             conn,
             req.id,

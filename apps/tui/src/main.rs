@@ -247,9 +247,47 @@ fn submit(
             app.load(path.as_deref());
             Ok(false)
         }
-        app::Command::Unknown(name) => {
-            app.notice(format!("неизвестная команда {name}"));
+        app::Command::Help => {
+            app.help();
             Ok(false)
+        }
+        app::Command::Metrics => {
+            show_metrics(app, url);
+            Ok(false)
+        }
+        app::Command::Model(name) => {
+            match name.as_deref() {
+                Some(name) => app.set_model(name),
+                None => show_models(app, url),
+            }
+            Ok(false)
+        }
+        app::Command::System(text) => {
+            app.set_system(text.as_deref());
+            Ok(false)
+        }
+        app::Command::Unknown(name) => {
+            app.error(format!("неизвестная команда {name}, см. /help"));
+            Ok(false)
+        }
+    }
+}
+
+fn show_metrics(app: &mut app::App, url: &Url) {
+    let client = Client::new(url.clone());
+    match client.metrics() {
+        Ok(metrics) => app.show_metrics(&metrics),
+        Err(e) => app.error(format!("метрики недоступны: {e}")),
+    }
+}
+
+fn show_models(app: &mut app::App, url: &Url) {
+    let client = Client::new(url.clone());
+    match client.models() {
+        Ok(models) => app.show_models(&models),
+        Err(e) => {
+            app.notice(format!("текущая модель: {}", app.model()));
+            app.error(format!("список моделей недоступен: {e}"));
         }
     }
 }
@@ -265,12 +303,12 @@ fn sampling(cli: &Cli) -> app::Sampling {
 
 fn stream_reply(app: &mut app::App, cli: &Cli, url: &Url, rx: &Receiver<Event>) -> Result<()> {
     let client = Client::new(url.clone());
-    let body = app::request_body(&app.transcript.request_messages(), &sampling(cli));
+    let body = app.request_body(&sampling(cli));
     let started = Instant::now();
     let mut stream = match client.chat_stream(body.as_bytes()) {
         Ok(stream) => stream,
         Err(e) => {
-            app.notice(format!("{e}"));
+            app.error(format!("{e}"));
             app.scroll.reset_to_bottom();
             draw(app)?;
             return Ok(());
@@ -366,9 +404,9 @@ fn stream_reply(app: &mut app::App, cli: &Cli, url: &Url, rx: &Receiver<Event>) 
     app.status.generating = false;
     if let Some(message) = error {
         if app.transcript.drop_empty_assistant() {
-            app.notice(format!("ошибка: {message}"));
+            app.error(format!("ошибка: {message}"));
         } else {
-            app.notice(format!("ошибка (ответ неполный): {message}"));
+            app.error(format!("ошибка (ответ неполный): {message}"));
         }
     }
     if interrupted {

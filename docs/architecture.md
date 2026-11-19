@@ -8,6 +8,8 @@
 
 ```
 apps/bench (CLI), apps/server, apps/tui (клиент к серверу)   композиция, транспорт, UX
+
+Конфигурация сервера (файл + CLI + env, приоритет и все ключи) — `docs/config.md`.
         │
         ├── infra-*: gguf, quant, cpu, opencl, hf, tokenizer, chat, npu
         │        │

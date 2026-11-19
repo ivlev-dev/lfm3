@@ -293,6 +293,12 @@ impl ChatSession {
     }
 }
 
+impl Default for ChatSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn parse_tool_call(raw: &str) -> Option<ToolCall> {
     let func_marker = "<function=";
     let func_start = raw.find(func_marker)?;

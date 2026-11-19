@@ -5,7 +5,7 @@ pub const Q4K_QUANTS: usize = 20;
 
 pub fn prepack_q4_k(src: &[u8]) -> Vec<u8> {
     assert!(
-        src.len() % Q4K_BLOCK == 0,
+        src.len().is_multiple_of(Q4K_BLOCK),
         "q4_k bytes {} not a multiple of {Q4K_BLOCK}",
         src.len()
     );
@@ -28,10 +28,10 @@ pub fn prepack_q4_k(src: &[u8]) -> Vec<u8> {
 pub const Q6K_BLOCK: usize = 210;
 
 pub fn prepack_q6_i8(src: &[u8], cols: usize) -> (Vec<i8>, Vec<f32>) {
-    assert!(cols % 256 == 0, "q6 cols {cols} not a multiple of 256");
+    assert!(cols.is_multiple_of(256), "q6 cols {cols} not a multiple of 256");
     let block_bytes = cols / 256 * Q6K_BLOCK;
     assert!(
-        src.len() % block_bytes == 0,
+        src.len().is_multiple_of(block_bytes),
         "q6 bytes {} not a multiple of {block_bytes}",
         src.len()
     );
@@ -238,10 +238,10 @@ mod tests {
 }
 
 pub fn prepack_q4_i8(src: &[u8], cols: usize) -> (Vec<i8>, Vec<f32>) {
-    assert!(cols % 256 == 0, "q4 cols {cols} not a multiple of 256");
+    assert!(cols.is_multiple_of(256), "q4 cols {cols} not a multiple of 256");
     let per_row = cols / 256 * Q4K_PACKED;
     assert!(
-        src.len() % per_row == 0,
+        src.len().is_multiple_of(per_row),
         "q4 packed bytes {} not a multiple of {per_row}",
         src.len()
     );

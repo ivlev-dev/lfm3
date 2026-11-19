@@ -932,7 +932,7 @@ fn sweep(path: &PathBuf, rgemv: u32) -> Result<()> {
         let tyname = format!("{:?}", t.ggml_type);
         let cols = t.dims[0] as usize;
         let rows = t.dims[1] as usize;
-        if cols % 256 != 0 || cols == 0 || rows == 0 {
+        if !cols.is_multiple_of(256) || cols == 0 || rows == 0 {
             continue;
         }
         let bytes = gguf.tensor_bytes(&t.name)?;
@@ -1051,7 +1051,7 @@ fn step(path: &PathBuf, rgemv: u32, mode: &str, reps: usize) -> Result<()> {
         };
         let cols = t.dims[0] as usize;
         let rows = t.dims[1] as usize;
-        if cols % 256 != 0 || cols == 0 || rows == 0 {
+        if !cols.is_multiple_of(256) || cols == 0 || rows == 0 {
             continue;
         }
         let bytes = gguf.tensor_bytes(&t.name)?;
@@ -1265,7 +1265,7 @@ fn dump(path: &PathBuf, name: &str) -> Result<()> {
         lfm_gguf::GgmlType::Q6_K => lfm_quant::dequant_row_q6_k(&bytes[..row_bytes], cols)?,
         other => return Err(anyhow!("unsupported type {other:?}")),
     };
-    println!("first8 {:?}", &y[..8].iter().map(|v| format!("{v:.9}")).collect::<Vec<_>>());
+    println!("first8 {:?}", y[..8].iter().map(|v| format!("{v:.9}")).collect::<Vec<_>>());
     let x = make_x(cols);
     let dot = match t.ggml_type {
         lfm_gguf::GgmlType::Q4_K => lfm_quant::dot_row_q4_k(&bytes[..row_bytes], &x)?,
@@ -1584,13 +1584,11 @@ fn term_size() -> (usize, usize) {
     if let Ok(out) = out {
         let text = String::from_utf8_lossy(&out.stdout);
         let mut parts = text.split_whitespace();
-        if let (Some(r), Some(c)) = (parts.next(), parts.next()) {
-            if let (Ok(r), Ok(c)) = (r.parse::<usize>(), c.parse::<usize>()) {
-                if r > 4 && c > 20 {
+        if let (Some(r), Some(c)) = (parts.next(), parts.next())
+            && let (Ok(r), Ok(c)) = (r.parse::<usize>(), c.parse::<usize>())
+                && r > 4 && c > 20 {
                     return (r, c);
                 }
-            }
-        }
     }
     (24, 80)
 }
@@ -2978,8 +2976,8 @@ fn gpu_embed(model: &PathBuf, id: u32) -> Result<()> {
         .ok_or_else(|| anyhow!("no conv weight"))?;
     println!("conv w cpu {:?}", &cw_cpu[..6]);
     println!("conv w gpu {:?}", &cw_gpu[..6]);
-    println!("bcx |gpu| {:?}", &bcx_gpu[..3].iter().map(|v| v.abs()).collect::<Vec<f32>>());
-    println!("bcx |cpu| {:?}", &bcx_cpu[..3].iter().map(|v| v.abs()).collect::<Vec<f32>>());
+    println!("bcx |gpu| {:?}", bcx_gpu[..3].iter().map(|v| v.abs()).collect::<Vec<f32>>());
+    println!("bcx |cpu| {:?}", bcx_cpu[..3].iter().map(|v| v.abs()).collect::<Vec<f32>>());
     println!("in_proj cos {:.6}", cosine(&bcx_cpu, &bcx_gpu));
     println!("cpu bcx[0..4] {:?}", &bcx_cpu[..4]);
     println!("gpu bcx[0..4] {:?}", &bcx_gpu[..4]);
@@ -3312,7 +3310,7 @@ mod tests {
 }
 
 fn prepack_q4_key(src: &[u8]) -> Vec<u8> {
-    assert!(src.len() % 144 == 0);
+    assert!(src.len().is_multiple_of(144));
     let blocks = src.len() / 144;
     let mut out = vec![0u8; blocks * 148];
     for b in 0..blocks {

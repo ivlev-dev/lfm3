@@ -519,6 +519,26 @@ impl Client {
         serde_json::from_str(&text)
             .with_context(|| format!("не удалось разобрать /metrics: {}", snippet(&text)))
     }
+
+    pub fn models(&self) -> Result<Vec<String>> {
+        let mut reader = self.open("GET", "/v1/models", None, "application/json")?;
+        let status = reader.status;
+        let text = reader.read_all_text()?;
+        if !(200..300).contains(&status) {
+            return Err(anyhow!(
+                "GET /v1/models вернул HTTP {status}: {}",
+                snippet(&text)
+            ));
+        }
+        let body: ModelsBody = serde_json::from_str(&text)
+            .with_context(|| format!("не удалось разобрать /v1/models: {}", snippet(&text)))?;
+        Ok(body
+            .data
+            .into_iter()
+            .map(|entry| entry.id)
+            .filter(|id| !id.trim().is_empty())
+            .collect())
+    }
 }
 
 fn connect(url: &Url) -> Result<TcpStream> {
@@ -681,6 +701,18 @@ impl ChatStream {
             },
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ModelEntry {
+    #[serde(default)]
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ModelsBody {
+    #[serde(default)]
+    pub data: Vec<ModelEntry>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -1022,6 +1054,48 @@ mod tests {
         assert_eq!(metrics.ctx, 4096);
         assert_eq!(metrics.active, 0);
         assert_eq!(metrics.avg_step_ms, 0.0);
+    }
+
+    #[test]
+    fn models_get_parses_ids() {
+        let body = r#"{"object":"list","data":[{"id":"lfm3","object":"model","created":1,"owned_by":"local"},{"id":"lfm3-mini","object":"model","created":2,"owned_by":"local"},{"id":"  "}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let server = FakeServer::start(response);
+        let client = Client::new(server.url.clone());
+        let models = client.models().expect("models");
+        assert_eq!(models, vec!["lfm3".to_string(), "lfm3-mini".to_string()]);
+        let request = server.request();
+        assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+        assert!(!request.contains("Content-Length"));
+    }
+
+    #[test]
+    fn models_accepts_empty_and_reports_error_status() {
+        let body = r#"{"object":"list","data":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let server = FakeServer::start(response);
+        let client = Client::new(server.url.clone());
+        assert!(client.models().expect("models").is_empty());
+
+        let body = r#"{"error":{"message":"nope"}}"#;
+        let response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let server = FakeServer::start(response);
+        let client = Client::new(server.url.clone());
+        let error = client.models().expect_err("must fail");
+        assert!(error.to_string().contains("503"));
+        assert!(error.to_string().contains("nope"));
     }
 
     #[test]

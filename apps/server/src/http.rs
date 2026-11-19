@@ -32,7 +32,7 @@ fn head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-pub fn read_request(stream: &mut TcpStream) -> Result<Option<Request>> {
+pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Option<Request>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
     let end = loop {
@@ -55,6 +55,9 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Option<Request>> {
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.parse::<usize>().ok())
         .unwrap_or(0);
+    if len > max_body {
+        return Err(anyhow!("request body {} bytes exceeds limit {}", len, max_body));
+    }
     let mut body = buf[end + 4..].to_vec();
     while body.len() < len {
         let n = stream.read(&mut tmp)?;

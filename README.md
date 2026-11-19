@@ -152,57 +152,108 @@ apps/bench/         бенчмарки и инструменты (GEMV, bandwidt
 
 ## Быстрый старт
 
+### 1. Модель и файлы HF
+
 ```bash
-# 1. Модель (Q4_K_M, ~1.1 ГБ)
+# Q4_K_M, ~1.1 ГБ
 mkdir -p models && curl -L -o models/LFM3-1.7B-Q4_K_M.gguf \
   https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-Q4_K_M.gguf
 
-# 2. Токенизатор и шаблон чата
 mkdir -p models/hf
 for f in tokenizer.json chat_template.jinja config.json; do
   curl -L -o models/hf/$f https://huggingface.co/LiquidAI/LFM3-1.7B/resolve/main/$f
 done
-
-# 3. Сборка и тесты
-cargo build --release
-cargo test --workspace
-
-# 4. Бенчмарки ядер
-cargo run --release -p lfm-bench -- info
-cargo run --release -p lfm-bench -- bw --mb 512
-cargo run --release -p lfm-bench -- peak
-cargo run --release -p lfm-bench -- step --mode fused --rgemv 4
-cargo run --release -p lfm-bench -- sweep
-
-# 5. Проверка корректности и производительности GPU-графа
-cargo run --release -p lfm-bench -- gpu-gen --tokens 64      # текст + tok/s
-cargo run --release -p lfm-bench -- gpu-port --tokens 24     # через порты + Generate
-cargo run --release -p lfm-bench -- gpu-pp --tokens 8 --tiers 20/80/0  # PP: GPU+PoCL
-cargo run --release -p lfm-bench -- gpu-tp --tokens 8 --devices 0/1      # full TP
-cargo run --release -p lfm-bench -- gpu-gen --tokens 64 --temp 0.7 --top-k 40 --top-p 0.95
-cargo run --release -p lfm-bench -- gpu-chat --user "What is the capital of Japan?"
-cargo run --release -p lfm-bench -- gpu-multi --seqs 6 --tokens 48   # 6 стримов
-cargo run --release -p lfm-bench -- gpu-cmp --ids 597,5205,302 --batch 5  # batch == seq
-cargo run --release -p lfm-bench -- gpu-prefill --tokens 512 --decode 32
-cargo run --release -p lfm-bench -- gpu-cache --tokens 512 --reps 3  # prefix cache
-cargo run --release -p lfm-bench -- gpu-mix --tokens 24        # prefill+decode одним проходом
-cargo run --release -p lfm-bench -- gpu-chat --tui             # in-process TUI-чат
-cargo run --release -p lfm-server -- --ctx 4096                # OpenAI-совместимый сервер
-cargo run --release -p lfm-tui                                 # TUI-клиент к серверу
-# HTTP/1.1, HTTP/2 (h2c), SSE и WebSocket на одном порту:
-curl -s http://127.0.0.1:8000/v1/models
-curl -s http://127.0.0.1:8000/metrics
-curl -s --http2-prior-knowledge http://127.0.0.1:8000/health
-curl -sN -X POST http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"stream":true,"messages":[{"role":"user","content":"Hi"}]}'
-# tool calling и /v1/completions:
-curl -s -X POST http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'
-curl -s -X POST http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' \
-  -d '{"prompt":"The capital of France is","max_tokens":16}'
-python3 tools/loadtest.py --conns 6                            # нагрузка на сервер
-cargo run --release -p lfm-bench -- gpu-embed --id 597       # сверка отдельных ядер
 ```
+
+### 2. Сборка и тесты
+
+```bash
+cargo build --release --workspace
+cargo test --workspace
+```
+
+### 3. Сервер
+
+```bash
+./target/release/lfm-server \
+  --model models/LFM3-1.7B-Q4_K_M.gguf \
+  --tokenizer models/hf/tokenizer.json \
+  --template models/hf/chat_template.jinja \
+  --addr 127.0.0.1:8000 \
+  --ctx 4096
+```
+
+Все флаги имеют значения по умолчанию, ровно как выше, поэтому достаточно
+`./target/release/lfm-server`. Дополнительно: `--system "..."` (системный
+промпт), `--name lfm3` (имя модели в `/v1/models` и `/metrics`).
+
+### 4. Запросы к серверу
+
+HTTP/1.1, HTTP/2 (h2c), SSE и WebSocket работают на одном порту.
+
+```bash
+# список моделей, health, метрики движка
+curl -s http://127.0.0.1:8000/v1/models
+curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/metrics
+
+# обычный ответ
+curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Say hello in one short sentence."}],"max_tokens":64}'
+
+# стрим (SSE)
+curl -sN -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Say hello in one short sentence."}],"max_tokens":64,"stream":true}'
+```
+
+Ещё есть `POST /v1/completions` (строка или массив промптов, стрим),
+`GET /ws` (WebSocket), tool calling через поле `tools` и `python3 tools/loadtest.py --conns 6`
+для нагрузки.
+
+### 5. TUI
+
+```bash
+./target/release/lfm-tui --url http://127.0.0.1:8000
+```
+
+### 6. Бенчмарки
+
+```bash
+./target/release/lfm-bench gpu-prefill --tokens 512 --decode 128
+./target/release/lfm-bench gpu-multi --seqs 8 --prompt 128 --tokens 64
+./target/release/lfm-bench gpu-cmp --len 601 --batch 64
+./target/release/lfm-bench gpu-check --ids 1,2,3,4,5,6,7,8,9,10
+./target/release/lfm-bench --help   # остальные подкоманды
+```
+
+`gpu-prefill` меряет prefill+decode одного потока, `gpu-multi` — агрегат по
+нескольким последовательностям, `gpu-cmp` сверяет батч с последовательным
+проходом, `gpu-check` — `cos(cpu,gpu)` на CPU-эталоне.
+
+### 7. Профиль питания GPU (для честных замеров)
+
+По умолчанию RX 6400 держит 500 МГц в простое и поднимается до 2320 МГц только
+под нагрузкой, поэтому короткие бенчмарки занижены на 20–40%. Перед замерами:
+
+```bash
+echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level
+cat /sys/class/drm/card1/device/pp_dpm_sclk   # 1: 2320Mhz *
+```
+
+После замеров вернуть `auto`:
+
+```bash
+echo auto | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level
+```
+
+Методика, контрольные цифры и шум среды — в [`benchmarks/machine.md`](benchmarks/machine.md).
+
+Все перечисленные команды есть в `justfile`: `just build`, `just test`,
+`just serve`, `just tui`, `just bench-prefill`, `just bench-multi`,
+`just bench-check`, `just power-high`, `just power-auto` (нужен установленный
+[`just`](https://github.com/casey/just)).
 
 Переменные окружения: `LFM_PB` (размер prefill-чанка, по умолчанию 6),
 `LFM_PROFILE=1` (сбор событий OpenCL по ядрам, замедляет диспатч),
@@ -215,7 +266,6 @@ prefill-attention), `LFM_WG` / `LFM_WG_B` (workgroup decode/batch GEMV, по у�
 256/64), `LFM_RGEMV` / `LFM_RGEMV_B` (строк на подгруппу decode/batch, 4/5),
 `LFM_DEVICE` (индекс OpenCL-устройства: 0 — rusticl GPU, 1 — PoCL CPU),
 `LFM_TIERS=20/80/0` (PP-раскладка по устройствам), `LFM_TP=0/1` (full TP по устройствам),
-`LFM_TP`/`LFM_TIERS` (PP/TP),
 `LFM_PREFILL_BUDGET` (prefill-токенов
 на шаг планировщика, по умолчанию 12), `LFM_SCHED_LOG=1` (лог шагов планировщика).
 

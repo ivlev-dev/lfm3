@@ -2,7 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const HINT: &str = "Enter — отправить · PgUp/PgDn · Home/End · Ctrl+C стоп · Ctrl+D выход · /reset /exit /save <file> /load <file>";
+pub const HINT: &str =
+    "Enter — отправить · PgUp/PgDn · Home/End · Ctrl+C стоп · Ctrl+D выход · /help — команды";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -76,6 +77,13 @@ impl Transcript {
 
     pub fn clear(&mut self) {
         self.messages.clear();
+    }
+
+    pub fn set_system(&mut self, text: &str) {
+        self.messages.retain(|message| message.role != Role::System);
+        if !text.trim().is_empty() {
+            self.messages.insert(0, Message::new(Role::System, text));
+        }
     }
 
     pub fn push_user(&mut self, text: impl Into<String>) {
@@ -191,6 +199,34 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    Info,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub kind: NoticeKind,
+    pub text: String,
+}
+
+impl Notice {
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            kind: NoticeKind::Info,
+            text: text.into(),
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            kind: NoticeKind::Error,
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
     System,
     User,
@@ -198,6 +234,7 @@ pub enum LineKind {
     Thinking,
     Tool,
     Notice,
+    Info,
     Blank,
 }
 
@@ -209,6 +246,7 @@ impl LineKind {
             LineKind::User => "\x1b[36m",
             LineKind::System => "\x1b[35m",
             LineKind::Notice => "\x1b[31m",
+            LineKind::Info => "\x1b[32m",
             LineKind::Assistant | LineKind::Blank => "",
         }
     }
@@ -233,7 +271,7 @@ fn block(out: &mut Vec<Line>, prefix: &str, text: &str, kind: LineKind, cols: us
     }
 }
 
-pub fn transcript_lines(messages: &[Message], notices: &[String], cols: usize) -> Vec<Line> {
+pub fn transcript_lines(messages: &[Message], notices: &[Notice], cols: usize) -> Vec<Line> {
     let mut out = Vec::new();
     for message in messages {
         match message.role {
@@ -279,7 +317,10 @@ pub fn transcript_lines(messages: &[Message], notices: &[String], cols: usize) -
         }
     }
     for notice in notices {
-        block(&mut out, "[!] ", notice, LineKind::Notice, cols);
+        match notice.kind {
+            NoticeKind::Info => block(&mut out, "· ", &notice.text, LineKind::Info, cols),
+            NoticeKind::Error => block(&mut out, "[!] ", &notice.text, LineKind::Notice, cols),
+        }
     }
     out
 }
@@ -385,6 +426,7 @@ pub struct Status {
     pub ttft_ms: Option<f64>,
     pub tok_per_s: Option<f64>,
     pub tokens: usize,
+    pub history_tokens: usize,
     pub generating: bool,
     pub online: bool,
     pub scroll: usize,
@@ -433,6 +475,9 @@ impl Status {
             None => parts.push("— tok/s".to_string()),
         }
         parts.push(format!("{} tok", self.tokens));
+        if self.history_tokens > 0 {
+            parts.push(format!("hist {} tok", self.history_tokens));
+        }
         if self.steps > 0 {
             parts.push(format!("steps {} {:.0}ms", self.steps, self.avg_step_ms));
         }
@@ -740,11 +785,19 @@ mod tests {
     fn transcript_renders_notices_after_messages() {
         let lines = transcript_lines(
             &[Message::new(Role::User, "hi")],
-            &["ошибка".to_string()],
+            &[Notice::error("ошибка")],
             80,
         );
         assert_eq!(lines.last().expect("notice").kind, LineKind::Notice);
         assert_eq!(lines.last().expect("notice").text, "[!] ошибка");
+    }
+
+    #[test]
+    fn transcript_renders_info_notices() {
+        let lines = transcript_lines(&[], &[Notice::info("готово")], 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].kind, LineKind::Info);
+        assert_eq!(lines[0].text, "· готово");
     }
 
     #[test]
@@ -876,6 +929,15 @@ mod tests {
         assert!(line.contains("12.5 tok/s"));
         assert!(line.contains("64 tok"));
         assert!(line.starts_with("▸ "));
+    }
+
+    #[test]
+    fn status_line_shows_history_tokens() {
+        let status = Status {
+            history_tokens: 42,
+            ..Status::default()
+        };
+        assert!(status.line().contains("hist 42 tok"));
     }
 
     #[test]
