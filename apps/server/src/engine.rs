@@ -20,7 +20,6 @@ pub struct ServeConfig {
     pub ctx: usize,
     pub system: String,
     pub log_requests: bool,
-    pub pb: usize,
     pub max_seqs: usize,
     pub prefill_budget: usize,
 }

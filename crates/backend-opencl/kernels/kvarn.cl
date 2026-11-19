@@ -830,49 +830,48 @@ static void lfm_tq_rot_inv8(float v[8], uint jlane) {
     }
 }
 
-static void lfm_kvarn_k8_c(__global const uchar *kcode, float ct, const float a[8],
-                           uint phys, uint tok, uint kvh, uint kv_heads, uint j, float k[8]) {
+
+static void lfm_kvarn_k8_pq(__global const uchar *kcode, float ct, const float a[8],
+                            uint phys, uint tok, uint kvh, uint kv_heads, uint j, float k[8]) {
     __global const uchar *cp = kcode + ((phys << 5 | tok) * kv_heads + kvh) * 64u + j * 4u;
     uchar4 c = vload4(0, cp);
-    k[0] = (float)((int)(c.s0 & 15u) - 8);
-    k[1] = (float)((int)((c.s0 >> 4) & 15u) - 8);
-    k[2] = (float)((int)(c.s1 & 15u) - 8);
-    k[3] = (float)((int)((c.s1 >> 4) & 15u) - 8);
-    k[4] = (float)((int)(c.s2 & 15u) - 8);
-    k[5] = (float)((int)((c.s2 >> 4) & 15u) - 8);
-    k[6] = (float)((int)(c.s3 & 15u) - 8);
-    k[7] = (float)((int)((c.s3 >> 4) & 15u) - 8);
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        k[i] *= a[i] * ct;
-    }
+    uchar8 q = (uchar8)(
+        c.s0 & 15u, (c.s0 >> 4) & 15u, c.s1 & 15u, (c.s1 >> 4) & 15u,
+        c.s2 & 15u, (c.s2 >> 4) & 15u, c.s3 & 15u, (c.s3 >> 4) & 15u);
+    float8 f = (convert_float8(q) - 8.0f) * vload8(0, a) * ct;
+    vstore8(f, 0, k);
 }
 
-static void lfm_kvarn_v8_c(__global const uchar *vcode, float bt, float zero, const float sc[8],
+static void lfm_kvarn_v8_v(__global const uchar *vcode, float bt, float zero, const float sc[8],
                            uint phys, uint tok, uint kvh, uint kv_heads, uint j, float v[8]) {
-#ifdef LFM_KV4
-    __global const uchar *cp = vcode + ((phys << 5 | tok) * kv_heads + kvh) * 64u + j * 4u;
-    uchar4 cv = vload4(0, cp);
-    v[0] = (float)(cv.s0 & 15u) * bt + zero;
-    v[1] = (float)((cv.s0 >> 4) & 15u) * bt + zero;
-    v[2] = (float)(cv.s1 & 15u) * bt + zero;
-    v[3] = (float)((cv.s1 >> 4) & 15u) * bt + zero;
-    v[4] = (float)(cv.s2 & 15u) * bt + zero;
-    v[5] = (float)((cv.s2 >> 4) & 15u) * bt + zero;
-    v[6] = (float)(cv.s3 & 15u) * bt + zero;
-    v[7] = (float)((cv.s3 >> 4) & 15u) * bt + zero;
-#else
     __global const uchar *cp = vcode + ((phys << 5 | tok) * kv_heads + kvh) * 32u + j * 2u;
-    uint c = (uint)cp[0] | ((uint)cp[1] << 8);
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        v[i] = (float)((c >> (2u * i)) & 3u) * bt + zero;
-    }
+    uchar b0 = cp[0];
+    uchar b1 = cp[1];
+    uchar8 q = (uchar8)(
+        b0 & 3u, (b0 >> 2) & 3u, (b0 >> 4) & 3u, (b0 >> 6) & 3u,
+        b1 & 3u, (b1 >> 2) & 3u, (b1 >> 4) & 3u, (b1 >> 6) & 3u);
+    float8 f = convert_float8(q) * bt + zero;
+    vstore8(f * vload8(0, sc), 0, v);
+}
+
+static void lfm_kvarn_v8_v4(__global const uchar *vcode, float bt, float zero, const float sc[8],
+                            uint phys, uint tok, uint kvh, uint kv_heads, uint j, float v[8]) {
+    __global const uchar *cp = vcode + ((phys << 5 | tok) * kv_heads + kvh) * 64u + j * 4u;
+    uchar4 c = vload4(0, cp);
+    uchar8 q = (uchar8)(
+        c.s0 & 15u, (c.s0 >> 4) & 15u, c.s1 & 15u, (c.s1 >> 4) & 15u,
+        c.s2 & 15u, (c.s2 >> 4) & 15u, c.s3 & 15u, (c.s3 >> 4) & 15u);
+    float8 f = convert_float8(q) * bt + zero;
+    vstore8(f * vload8(0, sc), 0, v);
+}
+
+static void lfm_kvarn_v8_best(__global const uchar *vcode, float bt, float zero, const float sc[8],
+                              uint phys, uint tok, uint kvh, uint kv_heads, uint j, float v[8]) {
+#ifdef LFM_KV4
+    lfm_kvarn_v8_v4(vcode, bt, zero, sc, phys, tok, kvh, kv_heads, j, v);
+#else
+    lfm_kvarn_v8_v(vcode, bt, zero, sc, phys, tok, kvh, kv_heads, j, v);
 #endif
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        v[i] *= sc[i];
-    }
 }
 
 __kernel void attention_split_b_fa_qk(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf,
@@ -948,12 +947,12 @@ __kernel void attention_split_b_fa_qk(__global const float *q, __global const KV
                 float ct = (float)kc[base * 32u + (pp & 31u)];
                 float bt = (float)vb[base * 32u + (pp & 31u)];
                 float zero = (float)vbz[base * 32u + (pp & 31u)];
-                lfm_kvarn_k8_c(kcode, ct, ka8, phys, pp & 31u, kvh, kv_heads, j, k8);
-                lfm_kvarn_v8_c(vcode, bt, zero, vc8, phys, pp & 31u, kvh, kv_heads, j, vv[u]);
+                lfm_kvarn_k8_pq(kcode, ct, ka8, phys, pp & 31u, kvh, kv_heads, j, k8);
+                lfm_kvarn_v8_best(vcode, bt, zero, vc8, phys, pp & 31u, kvh, kv_heads, j, vv[u]);
             } else {
                 ulong slot = (ulong)(kv_shift + (pp & rmask));
                 vstore8(convert_float8(kv_load8(0, kbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, k8);
-                vstore8(convert_float8(kv_load8(0, vbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, vv[u]);
+                    vstore8(convert_float8(kv_load8(0, vbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, vv[u]);
             }
             float d = 0.0f;
             #pragma unroll
@@ -994,8 +993,8 @@ __kernel void attention_split_b_fa_qk(__global const float *q, __global const KV
             float ct = (float)kc[base * 32u + (pos & 31u)];
             float bt = (float)vb[base * 32u + (pos & 31u)];
             float zero = (float)vbz[base * 32u + (pos & 31u)];
-            lfm_kvarn_k8_c(kcode, ct, ka8, phys, pos & 31u, kvh, kv_heads, j, k8);
-            lfm_kvarn_v8_c(vcode, bt, zero, vc8, phys, pos & 31u, kvh, kv_heads, j, v8);
+            lfm_kvarn_k8_pq(kcode, ct, ka8, phys, pos & 31u, kvh, kv_heads, j, k8);
+            lfm_kvarn_v8_best(vcode, bt, zero, vc8, phys, pos & 31u, kvh, kv_heads, j, v8);
         } else {
             ulong slot = (ulong)(kv_shift + (pos & rmask));
             vstore8(convert_float8(kv_load8(0, kbuf + slot * kvd + kvh * head_dim + j * 8u)), 0, k8);
@@ -1091,12 +1090,12 @@ __kernel void attention_split_h_fa_qk(__global const float *q, __global const KV
                 float ct = (float)kc[base * 32u + (pp & 31u)];
                 float bt = (float)vb[base * 32u + (pp & 31u)];
                 float zero = (float)vbz[base * 32u + (pp & 31u)];
-                lfm_kvarn_k8_c(kcode, ct, ka8, phys, pp & 31u, kvh, kv_heads, j, k8);
-                lfm_kvarn_v8_c(vcode, bt, zero, vc8, phys, pp & 31u, kvh, kv_heads, j, vv[u]);
+                lfm_kvarn_k8_pq(kcode, ct, ka8, phys, pp & 31u, kvh, kv_heads, j, k8);
+                lfm_kvarn_v8_best(vcode, bt, zero, vc8, phys, pp & 31u, kvh, kv_heads, j, vv[u]);
             } else {
                 ulong slot = ((ulong)seq << stage_shift) + (pp & rmask);
                 vstore8(convert_float8(kv_load8(0, kst + slot * kst_stride + kvh * 128u + j * 8u)), 0, k8);
-                vstore8(convert_float8(kv_load8(0, vst + slot * kst_stride + kvh * 128u + j * 8u)), 0, vv[u]);
+                    vstore8(convert_float8(kv_load8(0, vst + slot * kst_stride + kvh * 128u + j * 8u)), 0, vv[u]);
             }
             float d = 0.0f;
             #pragma unroll
@@ -1137,8 +1136,8 @@ __kernel void attention_split_h_fa_qk(__global const float *q, __global const KV
             float ct = (float)kc[base * 32u + (pos & 31u)];
             float bt = (float)vb[base * 32u + (pos & 31u)];
             float zero = (float)vbz[base * 32u + (pos & 31u)];
-            lfm_kvarn_k8_c(kcode, ct, ka8, phys, pos & 31u, kvh, kv_heads, j, k8);
-            lfm_kvarn_v8_c(vcode, bt, zero, vc8, phys, pos & 31u, kvh, kv_heads, j, v8);
+            lfm_kvarn_k8_pq(kcode, ct, ka8, phys, pos & 31u, kvh, kv_heads, j, k8);
+            lfm_kvarn_v8_best(vcode, bt, zero, vc8, phys, pos & 31u, kvh, kv_heads, j, v8);
         } else {
             ulong slot = ((ulong)seq << stage_shift) + (pos & rmask);
             vstore8(convert_float8(kv_load8(0, kst + slot * kst_stride + kvh * 128u + j * 8u)), 0, k8);

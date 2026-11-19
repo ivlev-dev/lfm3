@@ -245,7 +245,6 @@ fn main() -> Result<()> {
             ctx: cfg.ctx,
             system: cfg.system.clone(),
             log_requests: cfg.log_requests,
-            pb: cfg.engine.pb,
             max_seqs: cfg.engine.max_seqs,
             prefill_budget: cfg.prefill_budget,
         },
