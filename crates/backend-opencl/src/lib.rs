@@ -176,6 +176,7 @@ struct Kernels {
     attn_split_b_fa_qk: Kernel,
     attn_h_qk: Kernel,
     attn_split_h_qk: Kernel,
+    attn_split_h_fa_qk: Kernel,
     attn_combine_b: Kernel,
     attn_b_h: Kernel,
     attn_b_h2: Kernel,
@@ -895,6 +896,7 @@ impl GpuModel {
             attn_split_b_fa_qk: Kernel::create(&program, "attention_split_b_fa_qk")?,
             attn_h_qk: Kernel::create(&program, "attention_h_qk")?,
             attn_split_h_qk: Kernel::create(&program, "attention_split_h_qk")?,
+            attn_split_h_fa_qk: Kernel::create(&program, "attention_split_h_fa_qk")?,
             attn_combine_b: Kernel::create(&program, "attention_combine_b")?,
             attn_b_h: Kernel::create(&program, "attention_b_h")?,
             attn_b_h2: Kernel::create(&program, "attention_b_h2")?,
@@ -2190,9 +2192,14 @@ impl GpuModel {
                                 vbz,
                                 vc,
                             } => unsafe {
+                                let use_fa = self.subgroup == 64 && kv_heads == 4 && heads == 16;
                                 self.gpu.launch(
-                                    &self.kernels.attn_split_h_qk,
-                                    heads * splits * 64,
+                                    if use_fa {
+                                        &self.kernels.attn_split_h_fa_qk
+                                    } else {
+                                        &self.kernels.attn_split_h_qk
+                                    },
+                                    (if use_fa { kv_heads } else { heads }) * splits * 64,
                                     64,
                                     &[
                                         Arg::Mem(self.bufs.q.get()),
