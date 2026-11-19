@@ -319,6 +319,16 @@ fn shard_slice(
     Some(ShardSlice::Rows(0, usize::MAX))
 }
 
+fn local_dims(spec: &ShardSlice, rows: usize, cols: usize) -> (usize, usize) {
+    match *spec {
+        ShardSlice::Rows(r0, r1) => (r1.min(rows).saturating_sub(r0), cols),
+        ShardSlice::Blocks(r0, r1, b0, b1) => (
+            r1.min(rows).saturating_sub(r0),
+            (b1.saturating_sub(b0)) * 256,
+        ),
+    }
+}
+
 fn block_size(kind: GgmlType) -> usize {
     match kind {
         GgmlType::Q4_K => 144,
@@ -622,23 +632,32 @@ impl GpuModel {
             let bytes = file.tensor_bytes(&info.name)?;
             let cols = info.dims[0] as usize;
             let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
+            let (lrows, lcols);
             let data: std::borrow::Cow<[u8]> = if let Some(shard) = shard {
                 match shard_slice(&info.name, rows, cols, cfg.head_dim, &shard) {
                     None => continue,
                     Some(spec) => {
+                        let (lr, lc) = local_dims(&spec, rows, cols);
+                        lrows = lr;
+                        lcols = lc;
                         std::borrow::Cow::Owned(slice_shard(bytes, info.ggml_type, cols, &spec)?)
                     }
                 }
             } else {
+                lrows = rows;
+                lcols = cols;
                 std::borrow::Cow::Borrowed(bytes)
             };
             let weight = match info.ggml_type {
                 GgmlType::Q4_K => {
                     if prepack_on {
                         let packed = prepack::prepack_q4_k(data.as_ref())?;
-                        if info.dims.len() == 2 && cols.is_multiple_of(256) && rows > 0 && q4_i8_on
+                        if info.dims.len() == 2
+                            && lcols.is_multiple_of(256)
+                            && lrows > 0
+                            && q4_i8_on
                         {
-                            let (q8, sc) = prepack::prepack_q4_i8(&packed, cols)?;
+                            let (q8, sc) = prepack::prepack_q4_i8(&packed, lcols)?;
                             prepacked_q4_i8
                                 .insert(info.name.clone(), (gpu.upload(&q8)?, gpu.upload(&sc)?));
                         }
@@ -649,11 +668,9 @@ impl GpuModel {
                     }
                 }
                 GgmlType::Q6_K => {
-                    if prepack_on && shard.is_none() && info.dims.len() == 2 {
-                        let cols = info.dims[0] as usize;
-                        let rows = info.dims[1] as usize;
-                        if cols.is_multiple_of(256) && rows > 0 {
-                            let (q, sc) = prepack::prepack_q6_i8(data.as_ref(), cols)?;
+                    if prepack_on && info.dims.len() == 2 {
+                        if lcols.is_multiple_of(256) && lrows > 0 {
+                            let (q, sc) = prepack::prepack_q6_i8(data.as_ref(), lcols)?;
                             prepacked_i8.insert(
                                 info.name.clone(),
                                 (gpu.upload(&q)?, gpu.upload(&sc)?, rows),
@@ -692,7 +709,16 @@ impl GpuModel {
             let data = slice_shard(bytes, info.ggml_type, cols, &spec)?;
             let weight = match info.ggml_type {
                 GgmlType::Q4_K => Weight::Q4(gpu.upload_bytes(&data)?),
-                GgmlType::Q6_K => Weight::Q6(gpu.upload_bytes(&data)?),
+                GgmlType::Q6_K => {
+                    if prepack_on && cols.is_multiple_of(256) && rows > 0 {
+                        let (q, sc) = prepack::prepack_q6_i8(&data, cols)?;
+                        prepacked_i8.insert(
+                            "lm_head_shard".to_string(),
+                            (gpu.upload(&q)?, gpu.upload(&sc)?, rows),
+                        );
+                    }
+                    Weight::Q6(gpu.upload_bytes(&data)?)
+                }
                 other => return Err(anyhow!("unsupported lm_head type {other:?}")),
             };
             let _ = rows;
