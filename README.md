@@ -4,6 +4,9 @@
 сервинг (paged attention, continuous batching, radix prefix cache) с максимальной
 производительностью на потребительских GPU.
 
+Актуальные замеры и методика — `benchmarks/machine.md`; регрессионная
+проверка корректности — `just bench-check` (AMD) и `just bench-check-igpu`.
+
 ## Статус
 
 - **M0 (спайк ядер) — готов.** Замеры на RX 6400: `benchmarks/m0-rx6400.md`.
@@ -187,6 +190,30 @@ cargo test --workspace
 `./target/release/lfm-server`. Дополнительно: `--system "..."` (системный
 промпт), `--name lfm3` (имя модели в `/v1/models` и `/metrics`).
 
+### 3a. Intel iGPU (OpenCL без fp16)
+
+Gen9-встройка видна в OpenCL только через Rusticl с `RUSTICL_ENABLE=iris`
+(intel-compute-runtime и PoCL/Level Zero устройство не отдают):
+
+```bash
+RUSTICL_ENABLE=iris ./target/release/lfm-bench info
+RUSTICL_ENABLE=iris ./target/release/lfm-server --ctx 4096
+```
+
+KV-кэш автоматически хранится во `float` (fp16 на таких устройствах нет),
+64-полосные ядра внимания отключаются, Q6 идёт через int8-ядра. Работает и
+`--kv kvarn` (сжатый KV, см. ниже). Порядок величин: decode ~6.5 tok/s,
+prefill ~11.5 tok/s — встройка годится для проверки корректности и
+функциональности, не для скорости.
+
+### 3b. Сжатый KV (`--kv kvarn`)
+
+`f16` — 403 МБ на ctx 8192; `kvarn` (K 4 бита, V 2 бита) — 143 МБ при
+`prefill_ntok=128`, 118 при 64 и 106 при 32. Цена — prefill медленнее на
+10–31%, decode на длинном контексте −5%, точность `gpu-check` 0.9984 против
+0.9985. Память KV регулируется `--prefill-ntok` (это же и размер
+staging-кольца).
+
 ### 4. Запросы к серверу
 
 HTTP/1.1, HTTP/2 (h2c), SSE и WebSocket работают на одном порту.
@@ -268,6 +295,18 @@ prefill-attention), `LFM_WG` / `LFM_WG_B` (workgroup decode/batch GEMV, по у�
 `LFM_TIERS=20/80/0` (PP-раскладка по устройствам), `LFM_TP=0/1` (full TP по устройствам),
 `LFM_PREFILL_BUDGET` / `prefill_budget` (prefill-токенов
 на шаг планировщика, по умолчанию 12), `LFM_SCHED_LOG=1` (лог шагов планировщика).
+
+## Проверки
+
+```bash
+just bench-check           # AMD: gpu-check/com/cmp split-путей/gen + пороги cos
+just bench-check-igpu      # Intel iGPU, быстрый профиль
+just bench-check-server    # плюс смоук lfm-server (health + запрос)
+```
+
+Пороги и таблица текущих значений — `docs/backends.md`. Проверяются именно
+split-пути (`gpu-cmp` при len > 512): на коротких контекстах часть ошибок
+нормировки не видна.
 
 ## Ключевые решения (M0)
 
