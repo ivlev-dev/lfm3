@@ -142,6 +142,7 @@ struct Kernels {
     gemm_q4_b8: Kernel,
     gemm_q4_b8p: Kernel,
     gemm_i8_gz: Kernel,
+    gemm_i8_pf: Kernel,
     gemm_q6_b8: Kernel,
     gemm_q6_b8p: Kernel,
     gemm_q6: Kernel,
@@ -471,6 +472,7 @@ pub struct GpuModel {
     q6_i8_gz_on: bool,
     q4_b8p_on: bool,
     flash_on: bool,
+    i8_pf_on: bool,
     kernels: Kernels,
     rope_full: Buffer<f32>,
     rope_sliding: Buffer<f32>,
@@ -567,6 +569,7 @@ impl GpuModel {
         let q6_i8_gz_on = std::env::var("LFM_Q6I8").map(|v| v != "0").unwrap_or(true);
         let q4_b8p_on = std::env::var("LFM_B8P").map(|v| v != "0").unwrap_or(true);
         let flash_on = std::env::var("LFM_FLASH").map(|v| v != "0").unwrap_or(true);
+        let i8_pf_on = std::env::var("LFM_I8PF").map(|v| v != "0").unwrap_or(true);
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
@@ -827,6 +830,7 @@ impl GpuModel {
             gemm_q4_b8: Kernel::create(&program, "gemm_q4_k_i8_b8")?,
             gemm_q4_b8p: Kernel::create(&program, "gemm_q4_k_i8_b8p")?,
             gemm_i8_gz: Kernel::create(&program, "gemm_i8_gz")?,
+            gemm_i8_pf: Kernel::create(&program, "gemm_i8_pf")?,
             gemm_q6_b8: Kernel::create(&program, "gemm_q6_i8_b8")?,
             gemm_q6_b8p: Kernel::create(&program, "gemm_q6_i8_b8p")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
@@ -985,6 +989,7 @@ impl GpuModel {
             q6_i8_gz_on,
             q4_b8p_on,
             flash_on,
+            i8_pf_on,
             kernels,
             rope_full,
             rope_sliding,
@@ -1138,9 +1143,10 @@ impl GpuModel {
             if let Some((w8, wsc)) = self.prepacked_q4_i8.get(name) {
                 let tps = ntok.div_ceil(32);
                 let grid = rows.div_ceil(64) * tps * 512;
+                let k8 = if self.i8_pf_on { &self.kernels.gemm_i8_pf } else { &self.kernels.gemm_i8_gz };
                 unsafe {
                     self.gpu.launch(
-                        &self.kernels.gemm_i8_gz,
+                        k8,
                         grid,
                         512,
                         &[
