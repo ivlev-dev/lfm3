@@ -296,6 +296,10 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
         } else {
             k1 = kv_load2(lane, kst + ((ulong)seq * 128u + ((pos + 1u) & 127u)) * kstride + kvh * 128u);
         }
+#ifdef LFM_SG64
+        float sc0 = sub_group_reduce_add(q0 * k0.x + q1 * k0.y) * scale;
+        float sc1 = sub_group_reduce_add(q0 * k1.x + q1 * k1.y) * scale;
+#else
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -314,6 +318,7 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
         barrier(CLK_LOCAL_MEM_FENCE);
         float sc0 = sred[0] * scale;
         float sc1 = sred[64u] * scale;
+#endif
         float mn = fmax(m, fmax(sc0, sc1));
         float corr = exp(m - mn);
         float w0 = exp(sc0 - mn);
@@ -343,6 +348,9 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
         } else {
             k = kv_load2(lane, kst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
         }
+#ifdef LFM_SG64
+        float sv = sub_group_reduce_add(q0 * k.x + q1 * k.y) * scale;
+#else
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 8u) {
@@ -355,6 +363,7 @@ __kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, 
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         float sv = sred[0] * scale;
+#endif
         float mn = fmax(m, sv);
         float corr = exp(m - mn);
         float w = exp(sv - mn);
@@ -421,6 +430,10 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         } else {
             k1 = kv_load2(lane, kst + ((ulong)seq * 128u + ((pos + 1u) & 127u)) * kstride + kvh * 128u);
         }
+#ifdef LFM_SG64
+        float sc0 = sub_group_reduce_add(q0 * k0.x + q1 * k0.y) * scale;
+        float sc1 = sub_group_reduce_add(q0 * k1.x + q1 * k1.y) * scale;
+#else
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -439,6 +452,7 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         barrier(CLK_LOCAL_MEM_FENCE);
         float sc0 = sred[0] * scale;
         float sc1 = sred[64u] * scale;
+#endif
         float mn = fmax(m, fmax(sc0, sc1));
         float corr = exp(m - mn);
         float w0 = exp(sc0 - mn);
@@ -468,6 +482,9 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         } else {
             k = kv_load2(lane, kst + ((ulong)seq * 128u + (pos & 127u)) * kstride + kvh * 128u);
         }
+#ifdef LFM_SG64
+        float sv = sub_group_reduce_add(q0 * k.x + q1 * k.y) * scale;
+#else
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 8u) {
@@ -480,6 +497,7 @@ __kernel void attention_split_h_qk(__global const float *q, __global const KV_T 
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         float sv = sred[0] * scale;
+#endif
         float mn = fmax(m, sv);
         float corr = exp(m - mn);
         float w = exp(sv - mn);
@@ -559,6 +577,9 @@ __kernel void attention_b_h_rot(__global const float *q, __global const KV_T *kb
             k = kv_load2(lane, kbuf + slot * kv_heads * 128u + kvh * 128u);
             v = kv_load2(lane, vbuf + slot * kv_heads * 128u + kvh * 128u);
         }
+#ifdef LFM_SG64
+        float sv = sub_group_reduce_add(q0 * k.x + q1 * k.y) * scale;
+#else
         sred[lid] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint st = 32u; st > 0u; st >>= 1) {
@@ -568,6 +589,7 @@ __kernel void attention_b_h_rot(__global const float *q, __global const KV_T *kb
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         float sv = sred[grp * 64u] * scale;
+#endif
         float mn = fmax(m, sv);
         float corr = exp(m - mn);
         float wgt = exp(sv - mn);
@@ -654,6 +676,10 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
             k1 = kv_load2(lane, kbuf + sl1 * kv_heads * 128u + kvh * 128u);
             v1 = kv_load2(lane, vbuf + sl1 * kv_heads * 128u + kvh * 128u);
         }
+#ifdef LFM_SG64
+        float sc0 = sub_group_reduce_add(q0 * k0.x + q1 * k0.y) * scale;
+        float sc1 = sub_group_reduce_add(q0 * k1.x + q1 * k1.y) * scale;
+#else
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -672,6 +698,7 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
         barrier(CLK_LOCAL_MEM_FENCE);
         float sc0 = sred[0] * scale;
         float sc1 = sred[64u] * scale;
+#endif
         float mn = fmax(m, fmax(sc0, sc1));
         float corr = exp(m - mn);
         float w0 = exp(sc0 - mn);
@@ -693,6 +720,9 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
             k = kv_load2(lane, kbuf + sl * kv_heads * 128u + kvh * 128u);
             v = kv_load2(lane, vbuf + sl * kv_heads * 128u + kvh * 128u);
         }
+#ifdef LFM_SG64
+        float sv = sub_group_reduce_add(q0 * k.x + q1 * k.y) * scale;
+#else
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 8u) {
@@ -705,6 +735,7 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const KV
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         float sv = sred[0] * scale;
+#endif
         float mn = fmax(m, sv);
         float corr = exp(m - mn);
         float w = exp(sv - mn);

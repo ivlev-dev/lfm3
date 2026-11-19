@@ -835,6 +835,9 @@ impl GpuModel {
         if kv_f32 {
             options.push_str(" -DLFM_F32_KV");
         }
+        if subgroup == 64 {
+            options.push_str(" -DLFM_SG64");
+        }
         let program: Program = gpu.build(KERNELS, &options)?;
         let kernels = Kernels {
             embed: Kernel::create(&program, "embed_q6k")?,

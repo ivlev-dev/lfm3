@@ -667,6 +667,10 @@ __kernel void attention_h(__global const float *q, __global const KV_T *kbuf, __
         __global const KV_T *kp1 = kbuf + slot1 * kv_stride + kvh * head_dim;
         float2 k0 = kv_load2(lane, kp0);
         float2 k1 = kv_load2(lane, kp1);
+#ifdef LFM_SG64
+        float s0 = sub_group_reduce_add(q0 * k0.x + q1 * k0.y) * scale;
+        float s1 = sub_group_reduce_add(q0 * k1.x + q1 * k1.y) * scale;
+#else
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -680,11 +684,12 @@ __kernel void attention_h(__global const float *q, __global const KV_T *kbuf, __
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane == 0u) {
             sred[0] = sred[0] + sred[1] + sred[2] + sred[3] + sred[4] + sred[5] + sred[6] + sred[7];
-            sred[64] = sred[64] + sred[65] + sred[66] + sred[67] + sred[68] + sred[69] + sred[70] + sred[71];
+            sred[64u] = sred[64u] + sred[65u] + sred[66u] + sred[67u] + sred[68u] + sred[69u] + sred[70u] + sred[71u];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         float s0 = sred[0] * scale;
         float s1 = sred[64u] * scale;
+#endif
         float m_new = fmax(m, fmax(s0, s1));
         float corr = exp(m - m_new);
         float w0 = exp(s0 - m_new);
@@ -703,6 +708,9 @@ __kernel void attention_h(__global const float *q, __global const KV_T *kbuf, __
         ulong slots = (ulong)((tbl[pos >> 5] << 5) | (pos & 31u));
         __global const KV_T *kp = kbuf + slots * kv_stride + kvh * head_dim;
         float2 k = kv_load2(lane, kp);
+#ifdef LFM_SG64
+        float s = sub_group_reduce_add(q0 * k.x + q1 * k.y) * scale;
+#else
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 8u) {
@@ -715,6 +723,7 @@ __kernel void attention_h(__global const float *q, __global const KV_T *kbuf, __
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         float s = sred[0] * scale;
+#endif
         float m_new = fmax(m, s);
         float corr = exp(m - m_new);
         float w = exp(s - m_new);
@@ -761,6 +770,10 @@ __kernel void attention_split_h(__global const float *q, __global const KV_T *kb
         __global const KV_T *kp1 = kbuf + slot1 * kv_stride + kvh * head_dim;
         float2 k0 = kv_load2(lane, kp0);
         float2 k1 = kv_load2(lane, kp1);
+#ifdef LFM_SG64
+        float s0 = sub_group_reduce_add(q0 * k0.x + q1 * k0.y) * scale;
+        float s1 = sub_group_reduce_add(q0 * k1.x + q1 * k1.y) * scale;
+#else
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -774,11 +787,12 @@ __kernel void attention_split_h(__global const float *q, __global const KV_T *kb
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane == 0u) {
             sred[0] = sred[0] + sred[1] + sred[2] + sred[3] + sred[4] + sred[5] + sred[6] + sred[7];
-            sred[64] = sred[64] + sred[65] + sred[66] + sred[67] + sred[68] + sred[69] + sred[70] + sred[71];
+            sred[64u] = sred[64u] + sred[65u] + sred[66u] + sred[67u] + sred[68u] + sred[69u] + sred[70u] + sred[71u];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         float s0 = sred[0] * scale;
         float s1 = sred[64u] * scale;
+#endif
         float m_new = fmax(m, fmax(s0, s1));
         float corr = exp(m - m_new);
         float w0 = exp(s0 - m_new);
@@ -797,6 +811,9 @@ __kernel void attention_split_h(__global const float *q, __global const KV_T *kb
         ulong slots = (ulong)((tbl[pos >> 5] << 5) | (pos & 31u));
         __global const KV_T *kp = kbuf + slots * kv_stride + kvh * head_dim;
         float2 k = kv_load2(lane, kp);
+#ifdef LFM_SG64
+        float sv = sub_group_reduce_add(q0 * k.x + q1 * k.y) * scale;
+#else
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 8u) {
@@ -809,6 +826,7 @@ __kernel void attention_split_h(__global const float *q, __global const KV_T *kb
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         float sv = sred[0] * scale;
+#endif
         float m_new = fmax(m, sv);
         float corr = exp(m - m_new);
         float w = exp(sv - m_new);
