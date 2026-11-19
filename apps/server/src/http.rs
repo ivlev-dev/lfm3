@@ -83,12 +83,11 @@ pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Option<Re
             let parsed = v
                 .parse::<usize>()
                 .map_err(|_| anyhow!("bad content-length {v:?}"))?;
-            if let Some(prev) = len {
-                if prev != parsed {
+            if let Some(prev) = len
+                && prev != parsed {
                     early_error(stream, 400, "Bad Request", "conflicting content-length")?;
                     return Ok(None);
                 }
-            }
             len = Some(parsed);
         }
     }

@@ -218,6 +218,22 @@ impl InferenceBackend for PipelineModel {
         self.last().logits_row(row)
     }
 
+    fn max_sequences(&self) -> usize {
+        self.stages
+            .iter()
+            .map(|stage| stage.max_sequences())
+            .min()
+            .unwrap_or(1)
+    }
+
+    fn prefill_batch_size(&self) -> usize {
+        self.stages
+            .iter()
+            .map(|stage| stage.prefill_batch_size())
+            .min()
+            .unwrap_or(1)
+    }
+
     fn max_ctx(&self) -> usize {
         self.stages[0].max_ctx()
     }

@@ -128,11 +128,26 @@ impl TpModel {
 impl InferenceBackend for TpModel {
     fn create_sequence(&mut self) -> Result<usize> {
         let mut slots = Vec::with_capacity(self.stages.len());
+        let mut err = None;
         for stage in self.stages.iter_mut() {
-            slots.push(stage.create_sequence()?);
+            match stage.create_sequence() {
+                Ok(slot) => slots.push(slot),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
         }
-        if slots.windows(2).any(|w| w[0] != w[1]) {
-            return Err(anyhow!("tp stages allocated different slots"));
+        if err.is_none() && slots.windows(2).any(|w| w[0] != w[1]) {
+            err = Some(anyhow!("tp stages allocated different slots"));
+        }
+        if let Some(e) = err {
+            for slot in &slots {
+                for stage in self.stages.iter_mut() {
+                    let _ = stage.free_sequence(*slot);
+                }
+            }
+            return Err(e);
         }
         Ok(slots[0])
     }
@@ -204,6 +219,22 @@ impl InferenceBackend for TpModel {
             .filter(|v| !v.is_empty())
             .cloned()
             .ok_or_else(|| anyhow!("no tp logits for row {row}"))
+    }
+
+    fn max_sequences(&self) -> usize {
+        self.stages
+            .iter()
+            .map(|stage| stage.max_sequences())
+            .min()
+            .unwrap_or(1)
+    }
+
+    fn prefill_batch_size(&self) -> usize {
+        self.stages
+            .iter()
+            .map(|stage| stage.prefill_batch_size())
+            .min()
+            .unwrap_or(1)
     }
 
     fn max_ctx(&self) -> usize {

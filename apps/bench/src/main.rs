@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use lfm_app::InferenceBackend;
 use lfm_opencl::{Arg, Buffer, ClMem, Event, Gpu, Kernel, Program, Stats};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -374,7 +374,7 @@ fn main() -> Result<()> {
         } => gemv(&model, &tensor, check_rows, rgemv, &mode, onehot),
         Cmd::Sweep { model, rgemv } => sweep(&model, rgemv),
         Cmd::Dump { model, tensor } => dump(&model, &tensor),
-        Cmd::RefDebug { model, ids, out } => reference_debug(&model, &ids, out.as_ref()),
+        Cmd::RefDebug { model, ids, out } => reference_debug(&model, &ids, out.as_deref()),
         Cmd::GpuGen {
             model,
             tokenizer,
@@ -805,7 +805,7 @@ fn launch_gemv(
 }
 
 fn gemv(
-    path: &PathBuf,
+    path: &Path,
     tensor: &str,
     check_rows: usize,
     rgemv: u32,
@@ -927,7 +927,7 @@ fn gemv(
     Ok(())
 }
 
-fn sweep(path: &PathBuf, rgemv: u32) -> Result<()> {
+fn sweep(path: &Path, rgemv: u32) -> Result<()> {
     let gguf = lfm_gguf::GgufFile::open(path)?;
     let gpu = Gpu::open(0)?;
     let k = build_kernels(&gpu, rgemv)?;
@@ -1009,7 +1009,7 @@ struct StepTensor {
     bytes: u64,
 }
 
-fn step(path: &PathBuf, rgemv: u32, mode: &str, reps: usize) -> Result<()> {
+fn step(path: &Path, rgemv: u32, mode: &str, reps: usize) -> Result<()> {
     let gguf = lfm_gguf::GgufFile::open(path)?;
     let gpu = Gpu::open(0)?;
     let k = build_kernels(&gpu, rgemv)?;
@@ -1270,7 +1270,7 @@ fn step(path: &PathBuf, rgemv: u32, mode: &str, reps: usize) -> Result<()> {
     Ok(())
 }
 
-fn dump(path: &PathBuf, name: &str) -> Result<()> {
+fn dump(path: &Path, name: &str) -> Result<()> {
     let gguf = lfm_gguf::GgufFile::open(path)?;
     let t = gguf
         .tensor(name)
@@ -1333,7 +1333,7 @@ fn mixed(iters: u32) -> Result<()> {
     Ok(())
 }
 
-fn reference_ids(model: &PathBuf, ids: &[u32], max_new: usize, eos: u32) -> Result<()> {
+fn reference_ids(model: &Path, ids: &[u32], max_new: usize, eos: u32) -> Result<()> {
     let started = Instant::now();
     let reference = lfm_cpu::Lfm3Ref::load(model)?;
     println!("loaded in {:.1} s", started.elapsed().as_secs_f64());
@@ -1350,7 +1350,7 @@ fn reference_ids(model: &PathBuf, ids: &[u32], max_new: usize, eos: u32) -> Resu
     Ok(())
 }
 
-fn reference_debug(model: &PathBuf, ids: &[u32], out: Option<&PathBuf>) -> Result<()> {
+fn reference_debug(model: &Path, ids: &[u32], out: Option<&Path>) -> Result<()> {
     let reference = lfm_cpu::Lfm3Ref::load(model)?;
     let (logits, norms) = reference.forward_debug(ids)?;
     println!("hidden norms (embed + per layer + final):");
@@ -1388,8 +1388,8 @@ fn reference_debug(model: &PathBuf, ids: &[u32], out: Option<&PathBuf>) -> Resul
 }
 
 fn reference_generate(
-    model: &PathBuf,
-    tokenizer: &PathBuf,
+    model: &Path,
+    tokenizer: &Path,
     prompt: &str,
     max_new: usize,
 ) -> Result<()> {
@@ -1412,7 +1412,7 @@ fn reference_generate(
     Ok(())
 }
 
-fn reference_ppl(model: &PathBuf, tokenizer: &PathBuf, text: &str) -> Result<()> {
+fn reference_ppl(model: &Path, tokenizer: &Path, text: &str) -> Result<()> {
     let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
     let ids = tok.encode(text, false)?;
     if ids.len() < 2 {
@@ -1467,9 +1467,9 @@ fn sampling(
 }
 
 fn gpu_chat(
-    model: &PathBuf,
-    tokenizer: &PathBuf,
-    template: &PathBuf,
+    model: &Path,
+    tokenizer: &Path,
+    template: &Path,
     system: &str,
     user: &str,
     max_new: usize,
@@ -1955,9 +1955,9 @@ fn read_input_line(state: &mut TuiState) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn tui_chat(
-    model: &PathBuf,
-    tokenizer: &PathBuf,
-    template: &PathBuf,
+    model: &Path,
+    tokenizer: &Path,
+    template: &Path,
     system: &str,
     max_new: usize,
     thinking: bool,
@@ -2211,8 +2211,8 @@ fn answer(
 }
 
 fn gpu_generate(
-    model: &PathBuf,
-    tokenizer: &PathBuf,
+    model: &Path,
+    tokenizer: &Path,
     prompt: &str,
     max_new: usize,
     params: &lfm_domain::SamplingParams,
@@ -2237,7 +2237,7 @@ fn gpu_generate(
     Ok(())
 }
 
-fn gpu_mix(model: &PathBuf, tokens: usize) -> Result<()> {
+fn gpu_mix(model: &Path, tokens: usize) -> Result<()> {
     if tokens < 8 {
         return Err(anyhow!("need at least 8 tokens"));
     }
@@ -2342,7 +2342,7 @@ fn top_ids(v: &[f32], k: usize) -> Vec<u32> {
     idx
 }
 
-fn gpu_cache(model: &PathBuf, tokens: usize, reps: usize, reset: bool) -> Result<()> {
+fn gpu_cache(model: &Path, tokens: usize, reps: usize, reset: bool) -> Result<()> {
     if tokens < 64 {
         return Err(anyhow!("need at least 64 tokens"));
     }
@@ -2441,7 +2441,7 @@ fn gpu_cache(model: &PathBuf, tokens: usize, reps: usize, reset: bool) -> Result
     Ok(())
 }
 
-fn gpu_multi(model: &PathBuf, nseq: usize, tokens: usize, prompt_len: usize) -> Result<()> {
+fn gpu_multi(model: &Path, nseq: usize, tokens: usize, prompt_len: usize) -> Result<()> {
     if nseq > 8 {
         return Err(anyhow!("at most 8 sequences"));
     }
@@ -2552,7 +2552,7 @@ fn gpu_multi(model: &PathBuf, nseq: usize, tokens: usize, prompt_len: usize) -> 
     Ok(())
 }
 
-fn gpu_check(model: &PathBuf, ids: &[u32]) -> Result<()> {
+fn gpu_check(model: &Path, ids: &[u32]) -> Result<()> {
     let cpu = lfm_cpu::Lfm3Ref::load(model)?;
     let cpu_logits = cpu.logits(ids)?;
     let mut gpu = lfm_gpu::GpuModel::load(model, 2048)?;
@@ -2591,7 +2591,7 @@ fn gpu_check(model: &PathBuf, ids: &[u32]) -> Result<()> {
     Ok(())
 }
 
-fn gemb(path: &PathBuf, tensor: &str, pb: u32, rgemv: u32, threads: u32) -> Result<()> {
+fn gemb(path: &Path, tensor: &str, pb: u32, rgemv: u32, threads: u32) -> Result<()> {
     let gguf = lfm_gguf::GgufFile::open(path)?;
     let info = gguf
         .tensor(tensor)
@@ -2705,7 +2705,7 @@ fn gemb(path: &PathBuf, tensor: &str, pb: u32, rgemv: u32, threads: u32) -> Resu
     Ok(())
 }
 
-fn gpu_prefill(model: &PathBuf, tokens: usize, decode: usize) -> Result<()> {
+fn gpu_prefill(model: &Path, tokens: usize, decode: usize) -> Result<()> {
     let ctx = (tokens + decode + 64).max(1024);
     let mut gpu = lfm_gpu::GpuModel::load(model, ctx)?;
     let ids: Vec<u32> = (0..tokens)
@@ -2761,7 +2761,7 @@ fn gpu_prefill(model: &PathBuf, tokens: usize, decode: usize) -> Result<()> {
     Ok(())
 }
 
-fn gpu_trace(model: &PathBuf, ids: &[u32]) -> Result<()> {
+fn gpu_trace(model: &Path, ids: &[u32]) -> Result<()> {
     let mut gpu = lfm_gpu::GpuModel::load(model, 2048)?;
     gpu.trace = true;
     gpu.forward_batch(ids, 0, true)?;
@@ -2784,7 +2784,7 @@ fn gpu_trace(model: &PathBuf, ids: &[u32]) -> Result<()> {
     Ok(())
 }
 
-fn gpu_cmp(model: &PathBuf, ids: &[u32], batch: usize) -> Result<()> {
+fn gpu_cmp(model: &Path, ids: &[u32], batch: usize) -> Result<()> {
     let mut gpu = lfm_gpu::GpuModel::load(model, 2048)?;
     for (pos, token) in ids.iter().enumerate() {
         gpu.forward(*token, pos)?;
@@ -2891,8 +2891,8 @@ __kernel void probe(__global uint *out) {
 }
 
 fn gpu_tp(
-    model: &PathBuf,
-    tokenizer: &PathBuf,
+    model: &Path,
+    tokenizer: &Path,
     prompt: &str,
     tokens: usize,
     devices: &str,
@@ -2925,8 +2925,8 @@ fn gpu_tp(
 }
 
 fn gpu_pp(
-    model: &PathBuf,
-    tokenizer: &PathBuf,
+    model: &Path,
+    tokenizer: &Path,
     prompt: &str,
     tokens: usize,
     tiers: &str,
@@ -2976,8 +2976,8 @@ fn gpu_pp(
 }
 
 fn gpu_port(
-    model: &PathBuf,
-    tokenizer: &PathBuf,
+    model: &Path,
+    tokenizer: &Path,
     prompt: &str,
     tokens: usize,
     ctx: usize,
@@ -2991,7 +2991,7 @@ fn gpu_port(
     Ok(())
 }
 
-fn gpu_embed(model: &PathBuf, id: u32) -> Result<()> {
+fn gpu_embed(model: &Path, id: u32) -> Result<()> {
     let cpu = lfm_cpu::Lfm3Ref::load(model)?;
     let mut gpu = lfm_gpu::GpuModel::load(model, 2048)?;
     let g = gpu.debug_embed(id)?;
@@ -3595,7 +3595,7 @@ fn gemm_one(
 }
 
 fn gemm_cmp(
-    model: &PathBuf,
+    model: &Path,
     tensor: &str,
     ntok: usize,
     mode: &str,

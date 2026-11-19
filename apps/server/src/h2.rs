@@ -108,6 +108,10 @@ impl FlowControl {
         self.streams.contains_key(&stream_id)
     }
 
+    fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
     fn available(&self, stream_id: u32) -> i64 {
         let stream = self.streams.get(&stream_id).copied().unwrap_or(0);
         stream.min(self.connection).max(0)
@@ -232,6 +236,7 @@ const MAX_DEFERRED_BYTES: usize = 1 << 20;
 struct Conn {
     stream: TcpStream,
     flow: FlowControl,
+    recv_credit: u32,
     peer_gone: bool,
     deferred: std::collections::VecDeque<Frame>,
     deferred_bytes: usize,
@@ -242,6 +247,7 @@ impl Conn {
         Self {
             stream,
             flow: FlowControl::new(),
+            recv_credit: 0,
             peer_gone: false,
             deferred: std::collections::VecDeque::new(),
             deferred_bytes: 0,
@@ -493,6 +499,9 @@ impl Conn {
     }
 }
 
+const RECV_WINDOW_HALF: u32 = 32 * 1024;
+const MAX_CONCURRENT_STREAMS: usize = 8;
+
 struct Pending {
     id: u32,
     method: String,
@@ -543,6 +552,12 @@ pub fn serve(
             FRAME_HEADERS => {
                 let mut off = 0usize;
                 let mut pad = 0usize;
+                if !conn.flow.has_stream(frame.stream_id)
+                    && conn.flow.stream_count() >= MAX_CONCURRENT_STREAMS
+                {
+                    conn.send_rst(frame.stream_id, 7)?;
+                    continue;
+                }
                 conn.flow.open_stream(frame.stream_id);
                 if frame.flags & FLAG_PADDED != 0 {
                     pad = *frame
@@ -569,7 +584,7 @@ pub fn serve(
                         &mut ctx,
                     )?);
                     if end_stream {
-                        let req = pending.take().expect("request");
+                        let req = pending.take().ok_or_else(|| anyhow!("missing request"))?;
                         handle(&mut conn, engine, info, req)?;
                     }
                 } else {
@@ -592,7 +607,7 @@ pub fn serve(
                     let end_stream = pending.as_ref().map(|p| p.end_stream).unwrap_or(false);
                     pending = Some(build_request(&block, stream_id, end_stream, &mut ctx)?);
                     if end_stream {
-                        let req = pending.take().expect("request");
+                        let req = pending.take().ok_or_else(|| anyhow!("missing request"))?;
                         handle(&mut conn, engine, info, req)?;
                     }
                 }
@@ -611,11 +626,18 @@ pub fn serve(
                     req.body.extend_from_slice(&frame.payload);
                     if !frame.flow_applied && !frame.payload.is_empty() {
                         let inc = frame.payload.len() as u32;
-                        conn.window_update(0, inc)?;
-                        conn.window_update(frame.stream_id, inc)?;
+                        conn.recv_credit += inc;
+                        if conn.recv_credit >= RECV_WINDOW_HALF {
+                            let credit = conn.recv_credit;
+                            conn.recv_credit = 0;
+                            conn.window_update(0, credit)?;
+                            if conn.flow.has_stream(frame.stream_id) {
+                                conn.window_update(frame.stream_id, credit)?;
+                            }
+                        }
                     }
                     if frame.flags & FLAG_END_STREAM != 0 {
-                        let req = pending.take().expect("request");
+                        let req = pending.take().ok_or_else(|| anyhow!("missing request"))?;
                         handle(&mut conn, engine, info, req)?;
                     }
                 }
@@ -880,7 +902,9 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
                 &json!({"error": {"message": "streaming requires a single prompt"}}).to_string(),
             );
         }
-        let events = engine.submit(ChatJob::completion(prompts[0].clone(), params))?;
+        let job = ChatJob::completion(prompts[0].clone(), params);
+        let _cancel = crate::engine::CancelGuard::new(job.cancel_handle());
+        let events = engine.submit(job)?;
         let block = hpack::encode(&[
             (":status", "200".to_string()),
             ("content-type", "text/event-stream".to_string()),
@@ -925,7 +949,9 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
     for prompt in prompts {
-        let events = engine.submit(ChatJob::completion(prompt, params.clone()))?;
+        let job = ChatJob::completion(prompt, params.clone());
+        let _cancel = crate::engine::CancelGuard::new(job.cancel_handle());
+        let events = engine.submit(job)?;
         let mut text = String::new();
         let mut finish_reason = "stop";
         for event in events {

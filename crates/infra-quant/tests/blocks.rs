@@ -149,3 +149,40 @@ fn f16_conversion() {
     let bytes = half_bits(1.5).to_vec();
     assert_eq!(f16s_to_f32(&bytes), vec![1.5f32]);
 }
+
+#[test]
+fn q4_k_golden_nibble_layout() {
+    // d=1, dmin=0, все sc=1, все m=0 => значение каждого элемента равно своему нибблу.
+    // Ожидаемый порядок: группа j (0..8) из 32 значений, j = 2*qq + hi;
+    // байты группы лежат в qs[qq*32 + l], младший ниббл — j чётный, старший — j нечётный.
+    let mut block = [0u8; 144];
+    block[0..2].copy_from_slice(&half_bits(1.0));
+    block[2..4].copy_from_slice(&half_bits(0.0));
+    block[4..8].copy_from_slice(&[1, 1, 1, 1]);
+    block[8..12].copy_from_slice(&[0, 0, 0, 0]);
+    block[12..16].copy_from_slice(&[1, 1, 1, 1]);
+    for i in 0..128usize {
+        let lo = (i % 15) as u8;
+        let hi = 15 - lo;
+        block[16 + i] = lo | (hi << 4);
+    }
+    let y = dequant_q4_k(&block);
+    for j in 0..8usize {
+        let qq = j / 2;
+        let high = j % 2 == 1;
+        for l in 0..32usize {
+            let byte = block[16 + qq * 32 + l];
+            let want = if high { (byte >> 4) as f32 } else { (byte & 0x0F) as f32 };
+            assert_eq!(y[j * 32 + l], want, "j={j} l={l}");
+        }
+    }
+    let row = dequant_row_q4_k(&block, 256).unwrap();
+    assert_eq!(row, y);
+}
+
+#[test]
+fn q4_k_zero_block_is_zero() {
+    let block = q4_block(0.0, 0.0, [0u8; 12], 0xFF);
+    let y = dequant_q4_k(&block);
+    assert!(y.iter().all(|v| *v == 0.0), "zero block must stay zero");
+}

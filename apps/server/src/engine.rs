@@ -31,6 +31,13 @@ pub struct ChatJob {
     pub thinking: bool,
     pub tools: Vec<ToolDef>,
     pub raw_prompt: Option<String>,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ChatJob {
+    pub fn cancel_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
 }
 
 impl ChatJob {
@@ -46,6 +53,7 @@ impl ChatJob {
             thinking,
             tools,
             raw_prompt: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -56,7 +64,22 @@ impl ChatJob {
             thinking: false,
             tools: Vec::new(),
             raw_prompt: Some(prompt),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+}
+
+pub struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelGuard {
+    pub fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self(flag)
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -323,6 +346,7 @@ struct RequestState {
     sent: usize,
     stop_at: Option<usize>,
     next_token: Option<u32>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
     eos: u32,
 }
 
@@ -387,7 +411,7 @@ impl RequestState {
                         return TokenFlow::Cancelled;
                     }
                 }
-                SessionEvent::Finished => {}
+                SessionEvent::Finished => return TokenFlow::Stop,
             }
         }
         TokenFlow::Continue
@@ -635,6 +659,7 @@ impl Worker {
             thinking,
             tools,
             raw_prompt,
+            cancel,
         } = chat;
         let raw = raw_prompt.is_some();
         let prompt = if let Some(text) = raw_prompt {
@@ -698,6 +723,7 @@ impl Worker {
                 sent: 0,
                 stop_at: None,
                 next_token: None,
+                cancel,
                 eos,
             },
         );
@@ -736,8 +762,21 @@ impl Worker {
         }
     }
 
+    fn drop_cancelled(&mut self) {
+        let ids: Vec<JobId> = self
+            .reqs
+            .iter()
+            .filter(|(_, state)| state.cancel.load(Ordering::Relaxed))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.fail_request(id, "cancelled by client".to_string());
+        }
+    }
+
     fn step(&mut self) {
         let started = Instant::now();
+        self.drop_cancelled();
         let plan = self.sched.plan_step();
         let batch = plan.rows().len();
         match plan {
@@ -754,6 +793,10 @@ impl Worker {
             self.sched.finish(id);
             return;
         };
+        if state.cancel.load(Ordering::Relaxed) {
+            self.fail_request(id, "cancelled by client".to_string());
+            return;
+        }
         let slot = state.slot;
         let prompt = state.prompt.clone();
         let reused = match self.gpu.prefill(slot, &prompt, true) {
@@ -1019,6 +1062,7 @@ mod tests {
             sent: 0,
             stop_at: None,
             next_token: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             eos,
         }
     }

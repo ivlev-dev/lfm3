@@ -888,6 +888,11 @@ impl GpuModel {
         let kv_kind = opts.kv.clone();
         let kv_q4 = kv_kind == "q4" || kv_kind == "k4v4";
         let kv_kvarn = kv_kind == "kvarn" || kv_kind == "kvarn_k4v2";
+        if kv_kvarn {
+            eprintln!(
+                "lfm-gpu: kvarn держит полный f16-staging для неполной страницы, поэтому память под KV не уменьшается"
+            );
+        }
         if (kv_q4 || kv_kvarn) && shard.is_some() {
             return Err(anyhow!(
                 "quantized KV is not supported with tensor parallelism"

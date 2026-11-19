@@ -244,7 +244,11 @@ impl Scheduler {
                 .iter()
                 .filter(|seq| seq.phase == Phase::Prefill && seq.prompt_remaining() > 0)
                 .collect();
-            if pending.len() == 1 && self.waiting.is_empty() && pending[0].prefilled == 0 {
+            if pending.len() == 1
+                && self.waiting.is_empty()
+                && pending[0].prefilled == 0
+                && pending[0].prompt_len <= self.cfg.prefill_budget
+            {
                 return StepPlan::AtomicPrefill(pending[0].id);
             }
             if pending.is_empty() {
@@ -445,7 +449,7 @@ mod tests {
 
     #[test]
     fn single_request_admitted_then_atomic_prefill() {
-        let mut s = Scheduler::new(cfg());
+        let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 6, 128));
         let queued = s.enqueue(80, 20).unwrap();
         let ids = admit_all(&mut s, 128);
         assert_eq!(ids, vec![queued.id]);
@@ -747,10 +751,25 @@ mod tests {
 
     #[test]
     fn single_prefill_stays_atomic() {
-        let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 16, 4));
+        let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 16, 64));
         let a = s.enqueue(40, 4).unwrap();
         admit_all(&mut s, 128);
         assert_eq!(s.plan_step(), StepPlan::AtomicPrefill(a.id));
+    }
+
+    #[test]
+    fn long_single_prefill_goes_chunked() {
+        let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 16, 64));
+        let a = s.enqueue(200, 4).unwrap();
+        admit_all(&mut s, 128);
+        match s.plan_step() {
+            StepPlan::Mixed { rows, .. } => {
+                assert!(!rows.is_empty());
+                assert!(rows.len() <= 64, "chunk respects budget: {}", rows.len());
+                assert_eq!(rows[0].id, a.id);
+            }
+            other => panic!("expected chunked prefill, got {other:?}"),
+        }
     }
 
     #[test]

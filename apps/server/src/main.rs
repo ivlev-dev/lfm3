@@ -360,6 +360,7 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
     }
     let params = parsed.to_params();
     let job = ChatJob::chat(messages, params, parsed.thinking(), parsed.to_tools());
+    let _cancel = engine::CancelGuard::new(job.cancel_handle());
     let events = engine.submit(job)?;
     let name = parsed.model.as_deref().unwrap_or(model);
     let meta = CompletionMeta::new(name);
@@ -483,7 +484,9 @@ fn completions(
                 &error_body("streaming requires a single prompt"),
             );
         }
-        let events = engine.submit(ChatJob::completion(prompts[0].clone(), params))?;
+        let job = ChatJob::completion(prompts[0].clone(), params);
+        let _cancel = engine::CancelGuard::new(job.cancel_handle());
+        let events = engine.submit(job)?;
         start_sse(&mut stream)?;
         write_event(&mut stream, &meta.completion_chunk("", None))?;
         let mut finish_reason = "stop";
@@ -523,7 +526,9 @@ fn completions(
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
     for prompt in prompts {
-        let events = engine.submit(ChatJob::completion(prompt, params.clone()))?;
+        let job = ChatJob::completion(prompt, params.clone());
+        let _cancel = engine::CancelGuard::new(job.cancel_handle());
+        let events = engine.submit(job)?;
         let mut text = String::new();
         let mut finish_reason = "stop";
         for event in events {
