@@ -1,6 +1,8 @@
 use crate::MAX_SPLITS;
 use std::env;
 
+pub const MAX_PREPACK_THREADS: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub device: usize,
@@ -26,6 +28,8 @@ pub struct Options {
     pub rgemv: usize,
     pub rgemv_b: usize,
     pub gemm_force: Option<String>,
+    pub prepack_threads: usize,
+    pub program_cache: bool,
 }
 
 impl Default for Options {
@@ -54,6 +58,8 @@ impl Default for Options {
             rgemv: 4,
             rgemv_b: 5,
             gemm_force: None,
+            prepack_threads: 0,
+            program_cache: true,
         }
     }
 }
@@ -151,6 +157,12 @@ impl Options {
         {
             o.gemm_force = Some(v);
         }
+        if let Some(v) = num("LFM_PREPACK_THREADS", 0, MAX_PREPACK_THREADS) {
+            o.prepack_threads = v;
+        }
+        if let Some(v) = flag("LFM_PROGRAM_CACHE") {
+            o.program_cache = v;
+        }
         o
     }
 
@@ -197,6 +209,12 @@ impl Options {
         if !(1..=16).contains(&self.max_seqs) {
             return Err(format!("max_seqs must be in 1..=16, got {}", self.max_seqs));
         }
+        if self.prepack_threads > MAX_PREPACK_THREADS {
+            return Err(format!(
+                "prepack_threads must be 0 (auto) or in 1..={MAX_PREPACK_THREADS}, got {}",
+                self.prepack_threads
+            ));
+        }
         Ok(())
     }
 }
@@ -228,5 +246,28 @@ mod tests {
         let mut o = Options::default();
         o.splits = 0;
         assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn prepack_threads_and_program_cache_defaults() {
+        let o = Options::default();
+        assert_eq!(o.prepack_threads, 0);
+        assert!(o.program_cache);
+    }
+
+    #[test]
+    fn rejects_excessive_prepack_threads() {
+        let too_many = Options {
+            prepack_threads: MAX_PREPACK_THREADS + 1,
+            ..Options::default()
+        };
+        assert!(too_many.validate().is_err());
+        for threads in [0, 1, MAX_PREPACK_THREADS] {
+            let o = Options {
+                prepack_threads: threads,
+                ..Options::default()
+            };
+            assert!(o.validate().is_ok(), "threads={threads}");
+        }
     }
 }

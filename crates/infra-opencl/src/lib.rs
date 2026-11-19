@@ -4,15 +4,22 @@ use opencl3::context::Context;
 use opencl3::device::{CL_DEVICE_TYPE_ALL, Device, get_all_devices};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::CL_MEM_READ_WRITE;
-use opencl3::types::{CL_BLOCKING, cl_mem};
+use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_mem};
+use sha2::{Digest, Sha256};
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use opencl3::event::Event;
 pub use opencl3::kernel::Kernel;
 pub use opencl3::memory::{Buffer, ClMem};
 pub use opencl3::program::Program;
+
+pub const UPLOAD_ASYNC_MIN_BYTES: usize = 1 << 20;
+const PROGRAM_CACHE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct Caps {
@@ -138,8 +145,30 @@ impl Gpu {
     }
 
     pub fn build(&self, source: &str, options: &str) -> Result<Program> {
-        Program::create_and_build_from_source(&self.context, source, options)
-            .map_err(|e| anyhow!("build failed: {e}"))
+        self.build_with(source, options, !program_cache_disabled())
+    }
+
+    pub fn build_with(&self, source: &str, options: &str, use_cache: bool) -> Result<Program> {
+        let cached = (use_cache && self.caps.device_type == "gpu")
+            .then(|| self.program_cache_path(source, options))
+            .flatten();
+        if let Some(path) = &cached
+            && let Some(program) = load_program_binary(&self.context, path)
+        {
+            return Ok(program);
+        }
+        let program = Program::create_and_build_from_source(&self.context, source, options)
+            .map_err(|e| anyhow!("build failed: {e}"))?;
+        if let Some(path) = &cached {
+            store_program_binary(&program, path);
+        }
+        Ok(program)
+    }
+
+    fn program_cache_path(&self, source: &str, options: &str) -> Option<PathBuf> {
+        let root = program_cache_root()?;
+        let key = program_cache_key(source, options, &self.caps.name, &self.caps.driver);
+        Some(root.join(format!("{key}.bin")))
     }
 
     pub fn alloc<T>(&self, len: usize) -> Result<Buffer<T>> {
@@ -165,6 +194,34 @@ impl Gpu {
                 .context("clEnqueueWriteBuffer")?;
         }
         Ok(buf)
+    }
+
+    /// # Safety
+    /// `data` must stay alive and unmodified until the next [`Gpu::finish`] call.
+    pub unsafe fn upload_async<T: bytemuck::Pod>(&self, data: &[T]) -> Result<Buffer<T>> {
+        let mut buf = self.alloc::<T>(data.len())?;
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut buf, CL_NON_BLOCKING, 0, data, &[])
+                .context("clEnqueueWriteBuffer")?;
+        }
+        Ok(buf)
+    }
+
+    /// # Safety
+    /// `data` must stay alive and unmodified until the next [`Gpu::finish`] call.
+    pub unsafe fn upload_bytes_async(&self, data: &[u8]) -> Result<Buffer<u8>> {
+        let mut buf = self.alloc::<u8>(data.len())?;
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut buf, CL_NON_BLOCKING, 0, data, &[])
+                .context("clEnqueueWriteBuffer")?;
+        }
+        Ok(buf)
+    }
+
+    pub fn finish(&self) -> Result<()> {
+        self.queue.finish().context("clFinish")
     }
 
     pub fn download_at<T: bytemuck::Pod>(
@@ -310,6 +367,58 @@ impl Gpu {
     }
 }
 
+pub struct UploadStage<'a> {
+    gpu: &'a Gpu,
+    host: RefCell<Vec<Box<dyn Any>>>,
+}
+
+impl<'a> UploadStage<'a> {
+    pub fn new(gpu: &'a Gpu) -> Self {
+        Self {
+            gpu,
+            host: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn upload<T: bytemuck::Pod + Send + 'static>(&self, data: Vec<T>) -> Result<Buffer<T>> {
+        if std::mem::size_of_val(data.as_slice()) < UPLOAD_ASYNC_MIN_BYTES {
+            return self.gpu.upload(&data);
+        }
+        let buf = unsafe { self.gpu.upload_async(data.as_slice()) }?;
+        self.host.borrow_mut().push(Box::new(data));
+        Ok(buf)
+    }
+
+    pub fn upload_bytes(&self, data: Vec<u8>) -> Result<Buffer<u8>> {
+        if data.len() < UPLOAD_ASYNC_MIN_BYTES {
+            return self.gpu.upload_bytes(&data);
+        }
+        let buf = unsafe { self.gpu.upload_bytes_async(&data) }?;
+        self.host.borrow_mut().push(Box::new(data));
+        Ok(buf)
+    }
+
+    pub fn upload_borrowed<T: bytemuck::Pod>(&self, data: &'a [T]) -> Result<Buffer<T>> {
+        unsafe { self.gpu.upload_async(data) }
+    }
+
+    pub fn finish(&self) -> Result<()> {
+        if let Err(e) = self.gpu.finish() {
+            let keep = self.host.replace(Vec::new());
+            std::mem::forget(keep);
+            return Err(e);
+        }
+        self.host.borrow_mut().clear();
+        Ok(())
+    }
+}
+
+impl Drop for UploadStage<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
 const PROBE_SRC: &str =
     "__kernel void probe_sgs(__global uint *out) { out[0] = get_sub_group_size(); }";
 
@@ -342,4 +451,136 @@ pub fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn program_cache_disabled() -> bool {
+    match std::env::var("LFM_PROGRAM_CACHE") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn program_cache_root() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("lfm3").join("programs"))
+}
+
+pub fn program_cache_key(
+    source: &str,
+    options: &str,
+    device_name: &str,
+    driver_version: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PROGRAM_CACHE_VERSION.to_le_bytes());
+    for field in [source, options, device_name, driver_version] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hex_lower(hasher.finalize().as_slice())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn load_program_binary(context: &Context, path: &Path) -> Option<Program> {
+    let binary = std::fs::read(path).ok()?;
+    if binary.is_empty() {
+        return None;
+    }
+    Program::create_and_build_from_binary(context, &[binary.as_slice()], "").ok()
+}
+
+fn store_program_binary(program: &Program, path: &Path) {
+    let Ok(binaries) = program.get_binaries() else {
+        return;
+    };
+    let Some(binary) = binaries.first().filter(|b| !b.is_empty()) else {
+        return;
+    };
+    let Some(root) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(root).is_err() {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, binary).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = "__kernel void k(__global int *x) { x[0] = 1; }";
+    const OPTIONS: &str = "-cl-std=CL3.0 -DPB=6";
+    const DEVICE: &str = "AMD Radeon RX 6400";
+    const DRIVER: &str = "23.20.1";
+
+    #[test]
+    fn cache_key_is_deterministic() {
+        let a = program_cache_key(SOURCE, OPTIONS, DEVICE, DRIVER);
+        let b = program_cache_key(SOURCE, OPTIONS, DEVICE, DRIVER);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn cache_key_changes_with_every_input() {
+        let base = program_cache_key(SOURCE, OPTIONS, DEVICE, DRIVER);
+        assert_ne!(
+            base,
+            program_cache_key("__kernel void k() {}", OPTIONS, DEVICE, DRIVER)
+        );
+        assert_ne!(
+            base,
+            program_cache_key(SOURCE, "-cl-std=CL2.0", DEVICE, DRIVER)
+        );
+        assert_ne!(
+            base,
+            program_cache_key(SOURCE, OPTIONS, "Intel UHD", DRIVER)
+        );
+        assert_ne!(base, program_cache_key(SOURCE, OPTIONS, DEVICE, "24.1.0"));
+    }
+
+    #[test]
+    fn cache_key_has_no_field_ambiguity() {
+        let a = program_cache_key("ab", "c", DEVICE, DRIVER);
+        let b = program_cache_key("a", "bc", DEVICE, DRIVER);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cache_key_golden() {
+        assert_eq!(
+            program_cache_key(SOURCE, OPTIONS, DEVICE, DRIVER),
+            "031e352389b61fc8ef1350794a2945dc32cc776279a95f92bbe097a6b800385e"
+        );
+    }
+
+    #[test]
+    fn cache_root_falls_back_to_home() {
+        let root = program_cache_root();
+        assert!(root.is_none() || root.unwrap().ends_with("lfm3/programs"));
+    }
 }

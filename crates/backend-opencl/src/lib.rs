@@ -136,7 +136,7 @@ struct Kernels {
     attn_h: Kernel,
     attn_split_h: Kernel,
     kv_store_h: Kernel,
-    fill_h: Kernel,
+    fill_b: Kernel,
     rms_quant: Kernel,
     norm_add_quant: Kernel,
     silu_quant: Kernel,
@@ -154,8 +154,10 @@ struct Kernels {
     gemm_q4_b8p: Kernel,
     gemm_i8_gz: Kernel,
     gemm_i8_pf: Kernel,
+    gemm_i8_pf16: Kernel,
     gemm_q6_b8: Kernel,
     gemm_q6_b8p: Kernel,
+    logits_argmax_b: Kernel,
     gemm_q6: Kernel,
     gemm_q6_pp: Kernel,
     q6_b: Kernel,
@@ -418,6 +420,9 @@ struct Bufs {
     gb: Buffer<f32>,
     attnb: Buffer<f32>,
     logitsb: Buffer<f32>,
+    idsb: Buffer<u32>,
+    valsb: Buffer<f32>,
+    rowsel: Buffer<u32>,
     xqg: Buffer<i8>,
     xsg: Buffer<f32>,
     logitsg: Buffer<f32>,
@@ -499,6 +504,7 @@ pub struct GpuModel {
     subgroup: usize,
     kv_blocks: usize,
     kv_q4: bool,
+    kv4: bool,
     kv_f32: bool,
     kv_stage: usize,
     kv_ring_bits: u32,
@@ -648,7 +654,7 @@ impl GpuModel {
                             && lrows > 0
                             && q4_i8_on
                         {
-                            let (q8, sc) = prepack::prepack_q4_i8(&packed, lcols)?;
+                            let (q8, sc) = prepack::prepack_q4_i8_with_threads(&packed, lcols, opts.prepack_threads)?;
                             prepacked_q4_i8
                                 .insert(info.name.clone(), (gpu.upload(&q8)?, gpu.upload(&sc)?));
                         }
@@ -661,7 +667,7 @@ impl GpuModel {
                 GgmlType::Q6_K => {
                     if prepack_on && info.dims.len() == 2 {
                         if lcols.is_multiple_of(256) && lrows > 0 {
-                            let (q, sc) = prepack::prepack_q6_i8(data.as_ref(), lcols)?;
+                            let (q, sc) = prepack::prepack_q6_i8_with_threads(data.as_ref(), lcols, opts.prepack_threads)?;
                             prepacked_i8.insert(
                                 info.name.clone(),
                                 (gpu.upload(&q)?, gpu.upload(&sc)?, rows),
@@ -702,7 +708,7 @@ impl GpuModel {
                 GgmlType::Q4_K => Weight::Q4(gpu.upload_bytes(&data)?),
                 GgmlType::Q6_K => {
                     if prepack_on && cols.is_multiple_of(256) && rows > 0 {
-                        let (q, sc) = prepack::prepack_q6_i8(&data, cols)?;
+                        let (q, sc) = prepack::prepack_q6_i8_with_threads(&data, cols, opts.prepack_threads)?;
                         prepacked_i8.insert(
                             "lm_head_shard".to_string(),
                             (gpu.upload(&q)?, gpu.upload(&sc)?, rows),
@@ -744,7 +750,7 @@ impl GpuModel {
                     fused.extend_from_slice(&prepack::prepack_q4_k(&up_s)?);
                     let cols = up_info.dims[0] as usize;
                     if cols.is_multiple_of(256) && q4_i8_on {
-                        let (q8, sc) = prepack::prepack_q4_i8(&fused, cols)?;
+                        let (q8, sc) = prepack::prepack_q4_i8_with_threads(&fused, cols, opts.prepack_threads)?;
                         prepacked_q4_i8.insert(
                             format!("blk.{layer}.ffn_ug.weight"),
                             (gpu.upload(&q8)?, gpu.upload(&sc)?),
@@ -817,14 +823,15 @@ impl GpuModel {
                             format!("blk.{layer}.attn_qkvg.weight"),
                             gpu.upload_bytes(&fused)?,
                         );
+                    } else {
+                        let mut fused = prepack::prepack_q4_k(q_bytes)?;
+                        fused.extend_from_slice(&prepack::prepack_q4_k(k_bytes)?);
+                        fused.extend_from_slice(&prepack::prepack_q4_k(g_bytes)?);
+                        prepacked.insert(
+                            format!("blk.{layer}.attn_qkg.weight"),
+                            gpu.upload_bytes(&fused)?,
+                        );
                     }
-                    let mut fused = prepack::prepack_q4_k(q_bytes)?;
-                    fused.extend_from_slice(&prepack::prepack_q4_k(k_bytes)?);
-                    fused.extend_from_slice(&prepack::prepack_q4_k(g_bytes)?);
-                    prepacked.insert(
-                        format!("blk.{layer}.attn_qkg.weight"),
-                        gpu.upload_bytes(&fused)?,
-                    );
                 }
             }
         }
@@ -865,7 +872,7 @@ impl GpuModel {
         if kv4 {
             options.push_str(" -DLFM_KV4");
         }
-        let program: Program = gpu.build(KERNELS, &options)?;
+        let program: Program = gpu.build_with(KERNELS, &options, opts.program_cache)?;
         let kernels = Kernels {
             embed: Kernel::create(&program, "embed_q6k")?,
             rms: Kernel::create(&program, "rms_norm")?,
@@ -880,7 +887,7 @@ impl GpuModel {
             attn_h: Kernel::create(&program, "attention_h")?,
             attn_split_h: Kernel::create(&program, "attention_split_h")?,
             kv_store_h: Kernel::create(&program, "kv_store_h")?,
-            fill_h: Kernel::create(&program, "fill_zero_h")?,
+            fill_b: Kernel::create(&program, "fill_zero_b")?,
             rms_quant: Kernel::create(&program, "rms_quant")?,
             norm_add_quant: Kernel::create(&program, "norm_add_quant")?,
             silu_quant: Kernel::create(&program, "silu_quant")?,
@@ -898,8 +905,10 @@ impl GpuModel {
             gemm_q4_b8p: Kernel::create(&program, "gemm_q4_k_i8_b8p")?,
             gemm_i8_gz: Kernel::create(&program, "gemm_i8_gz")?,
             gemm_i8_pf: Kernel::create(&program, "gemm_i8_pf")?,
+            gemm_i8_pf16: Kernel::create(&program, "gemm_i8_pf16")?,
             gemm_q6_b8: Kernel::create(&program, "gemm_q6_i8_b8")?,
             gemm_q6_b8p: Kernel::create(&program, "gemm_q6_i8_b8p")?,
+            logits_argmax_b: Kernel::create(&program, "logits_argmax_b")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
@@ -998,6 +1007,9 @@ impl GpuModel {
             gb: gpu.alloc::<f32>(batch_cap * cfg.num_heads)?,
             attnb: gpu.alloc::<f32>(batch_cap * qd)?,
             logitsb: gpu.alloc::<f32>(batch_cap * vocab)?,
+            idsb: gpu.alloc::<u32>(batch_cap)?,
+            valsb: gpu.alloc::<f32>(batch_cap)?,
+            rowsel: gpu.alloc::<u32>(batch_cap)?,
             xqg: gpu.alloc::<i8>(batch_cap * h)?,
             xsg: gpu.alloc::<f32>(batch_cap * (h / GROUP))?,
             logitsg: gpu.alloc::<f32>(batch_cap * vocab)?,
@@ -1107,6 +1119,7 @@ impl GpuModel {
             subgroup,
             kv_blocks,
             kv_q4,
+            kv4,
             kv_f32,
             kv_stage,
             kv_ring_bits,
@@ -1300,7 +1313,7 @@ impl GpuModel {
             }
             return Ok(());
         }
-        if (2..=8).contains(&ntok)
+        if (2..=self.pb).contains(&ntok)
             && !force
             && let (Weight::Q4(_), Some(p)) = (weight, packed)
         {
@@ -1331,17 +1344,21 @@ impl GpuModel {
         if ntok > self.pb || force {
             if let Some((w8, wsc)) = self.prepacked_q4_i8.get(name) {
                 let tps = ntok.div_ceil(32);
-                let grid = rows.div_ceil(64) * tps * 512;
-                let k8 = if self.i8_pf_on {
+                let pf16 = self.i8_pf_on && ntok <= 16;
+                let grid = rows.div_ceil(64) * tps * if pf16 { 256 } else { 512 };
+                let k8 = if pf16 {
+                    &self.kernels.gemm_i8_pf16
+                } else if self.i8_pf_on {
                     &self.kernels.gemm_i8_pf
                 } else {
                     &self.kernels.gemm_i8_gz
                 };
+                let local = if pf16 { 256 } else { 512 };
                 unsafe {
                     self.gpu.launch(
                         k8,
                         grid,
-                        512,
+                        local,
                         &[
                             Arg::Mem(w8.get()),
                             Arg::Mem(wsc.get()),
@@ -1380,12 +1397,21 @@ impl GpuModel {
             if let Some((w8, wsc, _)) = self.prepacked_i8.get(name) {
                 if matches!(weight, Weight::Q6(_)) && self.q6_i8_gz_on && ntok > 8 {
                     let tps = ntok.div_ceil(32);
-                    let grid = rows.div_ceil(64) * tps * 512;
+                    let pf16 = self.i8_pf_on && ntok <= 16;
+                    let grid = rows.div_ceil(64) * tps * if pf16 { 256 } else { 512 };
+                    let k8 = if pf16 {
+                        &self.kernels.gemm_i8_pf16
+                    } else if self.i8_pf_on {
+                        &self.kernels.gemm_i8_pf
+                    } else {
+                        &self.kernels.gemm_i8_gz
+                    };
+                    let local = if pf16 { 256 } else { 512 };
                     unsafe {
                         self.gpu.launch(
-                            &self.kernels.gemm_i8_gz,
+                            k8,
                             grid,
-                            512,
+                            local,
                             &[
                                 Arg::Mem(w8.get()),
                                 Arg::Mem(wsc.get()),
@@ -1683,16 +1709,20 @@ impl GpuModel {
 
     fn clear_conv_slot(&mut self, slot: usize) -> Result<()> {
         let conv_len = (self.cfg.conv_cache - 1) * self.cfg.hidden_size;
-        let off = (slot * conv_len * 2) as u32;
-        let n = conv_len * 2;
+        let off = slot * conv_len * 4;
+        let n = conv_len * 4;
         for layer in self.layers.iter() {
             if let Some(conv) = &layer.conv {
                 unsafe {
                     self.gpu.launch(
-                        &self.kernels.fill_h,
-                        n,
+                        &self.kernels.fill_b,
+                        n.div_ceil(16),
                         256,
-                        &[Arg::Mem(conv.get()), Arg::U32(off), Arg::U32(n as u32)],
+                        &[
+                            Arg::Mem(conv.get()),
+                            Arg::U64(off as u64),
+                            Arg::U64(n as u64),
+                        ],
                     )?;
                 }
             }
@@ -3517,6 +3547,34 @@ impl GpuModel {
         Ok(())
     }
 
+    pub fn logits_argmax_rows(&mut self, rows: &[usize]) -> Result<Vec<(u32, f32)>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sel: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.rowsel, 1, 0, &sel, &[])?;
+            self.gpu.launch(
+                &self.kernels.logits_argmax_b,
+                sel.len() * 256,
+                256,
+                &[
+                    Arg::Mem(self.bufs.logitsb.get()),
+                    Arg::Mem(self.bufs.rowsel.get()),
+                    Arg::Mem(self.bufs.idsb.get()),
+                    Arg::Mem(self.bufs.valsb.get()),
+                    Arg::U32(sel.len() as u32),
+                    Arg::U32(self.cfg.vocab_size as u32),
+                ],
+            )?;
+        }
+        let ids = self.gpu.download(&self.bufs.idsb, sel.len())?;
+        let vals = self.gpu.download(&self.bufs.valsb, sel.len())?;
+        Ok(ids.into_iter().zip(vals).collect())
+    }
+
     pub fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
         self.gpu.download_at(
             &self.bufs.logitsb,
@@ -4840,34 +4898,36 @@ impl GpuModel {
         self.create_sequence()?;
         let h = self.cfg.hidden_size;
         let kvd = self.cfg.kv_dim();
-        let conv_len = self.max_seqs * (self.cfg.conv_cache - 1) * h * 2;
-        let kv_len = self.kv_blocks * KV_PAGE * kvd;
+        let slots = self.kv_blocks * KV_PAGE;
+        let kv_len = slots * kvd;
+        let heads = kvd / self.cfg.head_dim;
+        let kv_wide = if self.kv_f32 { 2 } else { 1 };
+        let conv_bytes = self.max_seqs * (self.cfg.conv_cache - 1) * h * 4;
         for layer in &self.layers {
             if let Some(conv) = &layer.conv {
                 unsafe {
                     self.gpu.launch(
-                        &self.kernels.fill_h,
-                        conv_len,
+                        &self.kernels.fill_b,
+                        conv_bytes.div_ceil(16),
                         256,
-                        &[Arg::Mem(conv.get()), Arg::U32(0), Arg::U32(conv_len as u32)],
+                        &[Arg::Mem(conv.get()), Arg::U64(0), Arg::U64(conv_bytes as u64)],
                     )?;
                 }
             }
             match (&layer.k, &layer.v) {
-                (Some(KvBuf::F16(k)), Some(KvBuf::F16(v))) => unsafe {
-                    self.gpu.launch(
-                        &self.kernels.fill_h,
-                        kv_len,
-                        256,
-                        &[Arg::Mem(k.get()), Arg::U32(0), Arg::U32(kv_len as u32)],
-                    )?;
-                    self.gpu.launch(
-                        &self.kernels.fill_h,
-                        kv_len,
-                        256,
-                        &[Arg::Mem(v.get()), Arg::U32(0), Arg::U32(kv_len as u32)],
-                    )?;
-                },
+                (Some(KvBuf::F16(k)), Some(KvBuf::F16(v))) => {
+                    let bytes = kv_len * kv_wide * 2;
+                    unsafe {
+                        for buf in [k.get(), v.get()] {
+                            self.gpu.launch(
+                                &self.kernels.fill_b,
+                                bytes.div_ceil(16),
+                                256,
+                                &[Arg::Mem(buf), Arg::U64(0), Arg::U64(bytes as u64)],
+                            )?;
+                        }
+                    }
+                }
                 (
                     Some(KvBuf::Q4 {
                         code: kc,
@@ -4878,28 +4938,26 @@ impl GpuModel {
                         scale: vs,
                     }),
                 ) => {
-                    let heads = self.cfg.kv_dim() / self.cfg.head_dim;
-                    let codes = (kv_len / self.cfg.head_dim) * 32;
-                    let scales = kv_len / self.cfg.head_dim;
+                    let codes = slots * heads * 64;
+                    let scales = slots * heads * 2;
                     unsafe {
                         for buf in [kc.get(), vc.get()] {
                             self.gpu.launch(
-                                &self.kernels.fill_h,
-                                codes,
-                                0,
-                                &[Arg::Mem(buf), Arg::U32(0), Arg::U32(codes as u32)],
+                                &self.kernels.fill_b,
+                                codes.div_ceil(16),
+                                256,
+                                &[Arg::Mem(buf), Arg::U64(0), Arg::U64(codes as u64)],
                             )?;
                         }
                         for buf in [kn.get(), vs.get()] {
                             self.gpu.launch(
-                                &self.kernels.fill_h,
-                                scales,
-                                0,
-                                &[Arg::Mem(buf), Arg::U32(0), Arg::U32(scales as u32)],
+                                &self.kernels.fill_b,
+                                scales.div_ceil(16),
+                                256,
+                                &[Arg::Mem(buf), Arg::U64(0), Arg::U64(scales as u64)],
                             )?;
                         }
                     }
-                    let _ = heads;
                 }
                 (
                     Some(KvBuf::Kvarn {
@@ -4914,27 +4972,29 @@ impl GpuModel {
                     }),
                     Some(KvBuf::Kvarn { staging: vst, .. }),
                 ) => {
-                    let heads = self.cfg.kv_dim() / self.cfg.head_dim;
                     let blocks = self.kv_blocks;
-                    let stage_len = self.max_seqs * self.kv_stage * self.cfg.kv_dim();
-                    let sizes = [
-                        (ks.get(), stage_len),
-                        (vst.get(), stage_len),
-                        (kcode.get(), (kv_len / self.cfg.head_dim) * 32),
-                        (vcode.get(), (kv_len / self.cfg.head_dim) * 16),
-                        (ka.get(), blocks * heads * 128),
-                        (kc.get(), blocks * heads * 32),
-                        (vb.get(), blocks * heads * 32),
-                        (vbz.get(), blocks * heads * 32),
-                        (vc.get(), blocks * heads * 128),
+                    let stage_bytes = self.max_seqs * self.kv_stage * kvd * kv_wide * 2;
+                    let code_bytes = slots * heads * 64;
+                    let vcode_bytes = slots * heads * if self.kv4 { 64 } else { 32 };
+                    let wide = |n: usize| n * kv_wide * 2;
+                    let sizes: [(ClMemRaw, usize); 9] = [
+                        (ks.get(), stage_bytes),
+                        (vst.get(), stage_bytes),
+                        (kcode.get(), code_bytes),
+                        (vcode.get(), vcode_bytes),
+                        (ka.get(), wide(blocks * heads * 128)),
+                        (kc.get(), wide(blocks * heads * 32)),
+                        (vb.get(), wide(blocks * heads * 32)),
+                        (vbz.get(), wide(blocks * heads * 32)),
+                        (vc.get(), wide(blocks * heads * 128)),
                     ];
                     unsafe {
                         for (buf, n) in sizes {
                             self.gpu.launch(
-                                &self.kernels.fill_h,
-                                n,
-                                0,
-                                &[Arg::Mem(buf), Arg::U32(0), Arg::U32(n as u32)],
+                                &self.kernels.fill_b,
+                                n.div_ceil(16),
+                                256,
+                                &[Arg::Mem(buf), Arg::U64(0), Arg::U64(n as u64)],
                             )?;
                         }
                     }

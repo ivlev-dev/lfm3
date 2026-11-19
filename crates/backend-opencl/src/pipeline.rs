@@ -132,7 +132,7 @@ impl InferenceBackend for PipelineModel {
             }
         }
         reused = reused.min(tokens.len().saturating_sub(1));
-        let pb = self.stages[0].batch_size();
+        let pb = self.stages[0].prefill_batch_size().max(1);
         let mut pos = reused;
         let mut hidden: Vec<f32> = Vec::new();
         while pos < tokens.len() {

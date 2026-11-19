@@ -615,10 +615,15 @@ __kernel void kv_store_h(__global const float *ksrc, __global const float *vsrc,
     }
 }
 
-__kernel void fill_zero_h(__global KV_T *dst, uint off, uint n) {
-    uint i = get_global_id(0);
-    if (i < n) {
-        dst[off + i] = (KV_T)0.0f;
+__kernel void fill_zero_b(__global uchar *dst, ulong off, ulong n) {
+    ulong i = (ulong)get_global_id(0) * 16;
+    if (i + 16 <= n) {
+        __global uchar *p = dst + off + i;
+        vstore16((uchar16)(0), 0, p);
+    } else if (i < n) {
+        for (ulong j = i; j < n; j++) {
+            dst[off + j] = 0;
+        }
     }
 }
 

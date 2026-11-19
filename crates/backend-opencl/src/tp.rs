@@ -13,6 +13,9 @@ pub struct TpModel {
     cfg: ModelConfig,
     row_logits: Vec<Vec<f32>>,
     last_logits: Vec<f32>,
+    attn_acc: Vec<f32>,
+    ffn_acc: Vec<f32>,
+    sync_norms: bool,
 }
 
 /// Группы подряд идущих шагов одного слота (непрерывные позиции).
@@ -31,6 +34,43 @@ pub fn group_runs(steps: &[SequenceStep]) -> Vec<(usize, usize)> {
         i = j;
     }
     runs
+}
+
+fn env_is_one(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
+
+fn reset_acc(acc: &mut Vec<f32>, len: usize) {
+    acc.clear();
+    acc.resize(len, 0.0);
+}
+
+fn add_into(dst: &mut [f32], src: &[f32]) {
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d += *s;
+    }
+}
+
+fn sync_x(stages: &mut [GpuModel]) -> Result<()> {
+    if stages.len() <= 1 {
+        return Ok(());
+    }
+    let (x, hq, hs) = stages[0].tp_norm_inputs()?;
+    for stage in stages.iter_mut().skip(1) {
+        stage.tp_set_norm_inputs(&x, &hq, &hs)?;
+    }
+    Ok(())
+}
+
+fn sync_x_b(stages: &mut [GpuModel], ntok: usize) -> Result<()> {
+    if stages.len() <= 1 {
+        return Ok(());
+    }
+    let (x, hq, hs) = stages[0].tp_norm_inputs_b(ntok)?;
+    for stage in stages.iter_mut().skip(1) {
+        stage.tp_set_norm_inputs_b(&x, &hq, &hs, ntok)?;
+    }
+    Ok(())
 }
 
 impl TpModel {
@@ -79,33 +119,14 @@ impl TpModel {
             cfg,
             row_logits: Vec::new(),
             last_logits: Vec::new(),
+            attn_acc: Vec::new(),
+            ffn_acc: Vec::new(),
+            sync_norms: env_is_one("LFM_TP_SYNC_NORMS"),
         })
     }
 
     pub fn stages(&self) -> &[GpuModel] {
         &self.stages
-    }
-
-    fn sync_x(&mut self) -> Result<()> {
-        if self.stages.len() <= 1 {
-            return Ok(());
-        }
-        let (x, hq, hs) = self.stages[0].tp_norm_inputs()?;
-        for stage in self.stages.iter_mut().skip(1) {
-            stage.tp_set_norm_inputs(&x, &hq, &hs)?;
-        }
-        Ok(())
-    }
-
-    fn sync_x_b(&mut self, ntok: usize) -> Result<()> {
-        if self.stages.len() <= 1 {
-            return Ok(());
-        }
-        let (x, hq, hs) = self.stages[0].tp_norm_inputs_b(ntok)?;
-        for stage in self.stages.iter_mut().skip(1) {
-            stage.tp_set_norm_inputs_b(&x, &hq, &hs, ntok)?;
-        }
-        Ok(())
     }
 
     fn step_token(
@@ -115,42 +136,55 @@ impl TpModel {
         pos: usize,
         want_logits: bool,
     ) -> Result<Option<Vec<f32>>> {
-        let h = self.cfg.hidden_size;
-        self.stages[0].tp_embed(token)?;
-        self.stages[0].tp_norm_attn(0)?;
-        self.sync_x()?;
-        for layer in 0..self.cfg.num_layers {
-            let attn = if self.cfg.kind(layer) == LayerKind::Conv {
-                self.stages[0].tp_conv(layer, slot, pos)?
+        let Self {
+            stages,
+            cfg,
+            attn_acc,
+            ffn_acc,
+            sync_norms,
+            ..
+        } = self;
+        let h = cfg.hidden_size;
+        stages[0].tp_embed(token)?;
+        stages[0].tp_norm_attn(0)?;
+        // Входную норму считает только rank0, поэтому hq/hs остальных стадий надо заполнить один раз.
+        sync_x(stages)?;
+        for layer in 0..cfg.num_layers {
+            if cfg.kind(layer) == LayerKind::Conv {
+                let part = stages[0].tp_conv(layer, slot, pos)?;
+                attn_acc.clear();
+                attn_acc.extend_from_slice(&part);
             } else {
-                let mut tmp = vec![0.0f32; h];
-                for stage in self.stages.iter_mut() {
+                reset_acc(attn_acc, h);
+                for stage in stages.iter_mut() {
                     let part = stage.tp_attn(layer, slot, pos)?;
-                    for (dst, src) in tmp.iter_mut().zip(part.iter()) {
-                        *dst += *src;
-                    }
+                    add_into(attn_acc, &part);
                 }
-                tmp
-            };
-            for stage in self.stages.iter_mut().rev() {
-                stage.tp_attn_norm(layer, &attn)?;
             }
-            self.sync_x()?;
-            let mut ffn = vec![0.0f32; h];
-            for stage in self.stages.iter_mut() {
+            for stage in stages.iter_mut().rev() {
+                stage.tp_attn_norm(layer, attn_acc.as_slice())?;
+            }
+            // Сумма attn/ffn одинакова на всех стадиях, веса норм реплицированы, вход x тоже
+            // одинаков, а norm_add_quant_b пересчитывает x/xq/xs локально на каждой стадии —
+            // рассылать результат норма-ядер обратно не нужно.
+            if *sync_norms {
+                sync_x(stages)?;
+            }
+            reset_acc(ffn_acc, h);
+            for stage in stages.iter_mut() {
                 let part = stage.tp_ffn_local(layer)?;
-                for (dst, src) in ffn.iter_mut().zip(part.iter()) {
-                    *dst += *src;
-                }
+                add_into(ffn_acc, &part);
             }
-            for stage in self.stages.iter_mut().rev() {
-                stage.tp_ffn_norm(layer, &ffn)?;
+            for stage in stages.iter_mut().rev() {
+                stage.tp_ffn_norm(layer, ffn_acc.as_slice())?;
             }
-            self.sync_x()?;
+            if *sync_norms {
+                sync_x(stages)?;
+            }
         }
         if want_logits {
-            let mut logits = vec![0.0f32; self.cfg.vocab_size];
-            for stage in self.stages.iter_mut() {
+            let mut logits = vec![0.0f32; cfg.vocab_size];
+            for stage in stages.iter_mut() {
                 let shard = stage
                     .tp_shard()
                     .ok_or_else(|| anyhow!("stage without tp shard"))?;
@@ -163,6 +197,7 @@ impl TpModel {
             Ok(None)
         }
     }
+
     fn prefill_chunk(
         &mut self,
         slot: usize,
@@ -170,75 +205,86 @@ impl TpModel {
         chunk: &[u32],
         need_logits: bool,
     ) -> Result<Option<Vec<f32>>> {
-        let h = self.cfg.hidden_size;
+        let Self {
+            stages,
+            cfg,
+            attn_acc,
+            ffn_acc,
+            sync_norms,
+            ..
+        } = self;
+        let h = cfg.hidden_size;
         let ntok = chunk.len();
-        let mut want_logits: Option<Vec<f32>> = None;
-        {
-            let dbg = std::env::var("LFM_TP_DEBUG").is_ok();
-            let (mut t_attn, mut t_ffn, mut t_sync, mut t_prep) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-            let t0 = Instant::now();
-            for stage in self.stages.iter_mut() {
-                stage.tp_prepare_batch(slot, pos, ntok)?;
-            }
-            t_prep += t0.elapsed().as_secs_f64();
-            self.stages[0].tp_embed_batch(chunk)?;
-            self.stages[0].tp_norm_attn_b(0, ntok)?;
-            self.sync_x_b(ntok)?;
-            for layer in 0..self.cfg.num_layers {
-                let ta = Instant::now();
-                let attn = if self.cfg.kind(layer) == LayerKind::Conv {
-                    self.stages[0].tp_conv_b(layer, slot, pos, ntok)?
-                } else {
-                    let mut acc = vec![0.0f32; ntok * h];
-                    for stage in self.stages.iter_mut() {
-                        let part = stage.tp_attn_b(layer, slot, pos, ntok)?;
-                        for (dst, src) in acc.iter_mut().zip(part.iter()) {
-                            *dst += *src;
-                        }
-                    }
-                    acc
-                };
-                t_attn += ta.elapsed().as_secs_f64();
-                let ts = Instant::now();
-                for stage in self.stages.iter_mut().rev() {
-                    stage.tp_attn_norm_b(layer, &attn, ntok)?;
+        let dbg = std::env::var("LFM_TP_DEBUG").is_ok();
+        let (mut t_attn, mut t_ffn, mut t_sync, mut t_prep) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let t0 = Instant::now();
+        for stage in stages.iter_mut() {
+            stage.tp_prepare_batch(slot, pos, ntok)?;
+        }
+        t_prep += t0.elapsed().as_secs_f64();
+        stages[0].tp_embed_batch(chunk)?;
+        stages[0].tp_norm_attn_b(0, ntok)?;
+        // Входную норму слоя 0 считает только rank0; без этой рассылки у остальных стадий
+        // останутся чужие xq/xs (softmax-норма входа), поэтому этот sync обязателен.
+        sync_x_b(stages, ntok)?;
+        for layer in 0..cfg.num_layers {
+            let ta = Instant::now();
+            if cfg.kind(layer) == LayerKind::Conv {
+                let part = stages[0].tp_conv_b(layer, slot, pos, ntok)?;
+                attn_acc.clear();
+                attn_acc.extend_from_slice(&part);
+            } else {
+                reset_acc(attn_acc, ntok * h);
+                for stage in stages.iter_mut() {
+                    let part = stage.tp_attn_b(layer, slot, pos, ntok)?;
+                    add_into(attn_acc, &part);
                 }
-                self.sync_x_b(ntok)?;
-                t_sync += ts.elapsed().as_secs_f64();
-                let tf = Instant::now();
-                let mut ffn = vec![0.0f32; ntok * h];
-                for stage in self.stages.iter_mut() {
-                    let part = stage.tp_ffn_local_b(layer, ntok)?;
-                    for (dst, src) in ffn.iter_mut().zip(part.iter()) {
-                        *dst += *src;
-                    }
-                }
-                t_ffn += tf.elapsed().as_secs_f64();
-                let ts2 = Instant::now();
-                for stage in self.stages.iter_mut().rev() {
-                    stage.tp_ffn_norm_b(layer, &ffn, ntok)?;
-                }
-                self.sync_x_b(ntok)?;
-                t_sync += ts2.elapsed().as_secs_f64();
             }
-            if need_logits {
-                let mut logits = vec![0.0f32; self.cfg.vocab_size];
-                for stage in self.stages.iter_mut() {
-                    let shard = stage
-                        .tp_shard()
-                        .ok_or_else(|| anyhow!("stage without tp shard"))?;
-                    let part = stage.tp_lmhead_last(ntok)?;
-                    let stop = (shard.vocab_start + part.len()).min(logits.len());
-                    logits[shard.vocab_start..stop]
-                        .copy_from_slice(&part[..stop - shard.vocab_start]);
-                }
-                want_logits = Some(logits);
+            t_attn += ta.elapsed().as_secs_f64();
+            let ts = Instant::now();
+            for stage in stages.iter_mut().rev() {
+                stage.tp_attn_norm_b(layer, attn_acc.as_slice(), ntok)?;
             }
-            if dbg {
-                eprintln!(
-                    "tp-debug chunk ntok={ntok}: prep {t_prep:.2}s attn {t_attn:.2}s ffn {t_ffn:.2}s norm+sync {t_sync:.2}s"
-                );
+            // host-сумма attn одинакова для всех стадий, веса post_attention_norm/ffn_norm
+            // реплицированы, x на входе одинаков -> norm_add_quant_b даёт одинаковые x/xq/xs.
+            if *sync_norms {
+                sync_x_b(stages, ntok)?;
             }
+            t_sync += ts.elapsed().as_secs_f64();
+            let tf = Instant::now();
+            reset_acc(ffn_acc, ntok * h);
+            for stage in stages.iter_mut() {
+                let part = stage.tp_ffn_local_b(layer, ntok)?;
+                add_into(ffn_acc, &part);
+            }
+            t_ffn += tf.elapsed().as_secs_f64();
+            let ts2 = Instant::now();
+            for stage in stages.iter_mut().rev() {
+                stage.tp_ffn_norm_b(layer, ffn_acc.as_slice(), ntok)?;
+            }
+            if *sync_norms {
+                sync_x_b(stages, ntok)?;
+            }
+            t_sync += ts2.elapsed().as_secs_f64();
+        }
+        let want_logits = if need_logits {
+            let mut logits = vec![0.0f32; cfg.vocab_size];
+            for stage in stages.iter_mut() {
+                let shard = stage
+                    .tp_shard()
+                    .ok_or_else(|| anyhow!("stage without tp shard"))?;
+                let part = stage.tp_lmhead_last(ntok)?;
+                let stop = (shard.vocab_start + part.len()).min(logits.len());
+                logits[shard.vocab_start..stop].copy_from_slice(&part[..stop - shard.vocab_start]);
+            }
+            Some(logits)
+        } else {
+            None
+        };
+        if dbg {
+            eprintln!(
+                "tp-debug chunk ntok={ntok}: prep {t_prep:.2}s attn {t_attn:.2}s ffn {t_ffn:.2}s norm+sync {t_sync:.2}s"
+            );
         }
         Ok(want_logits)
     }
@@ -283,7 +329,7 @@ impl InferenceBackend for TpModel {
 
     fn prefill(&mut self, slot: usize, tokens: &[u32], need_logits: bool) -> Result<usize> {
         let reused = self.prefill_begin(slot, tokens)?;
-        if std::env::var("LFM_TP_SERIAL").as_deref() == Ok("1") {
+        if env_is_one("LFM_TP_SERIAL") {
             let mut last = Vec::new();
             for (i, &token) in tokens.iter().enumerate().skip(reused) {
                 let want = need_logits && i + 1 == tokens.len();
@@ -335,7 +381,7 @@ impl InferenceBackend for TpModel {
 
     fn step(&mut self, steps: &[SequenceStep], need_logits: bool) -> Result<()> {
         self.row_logits.clear();
-        let serial = std::env::var("LFM_TP_SERIAL").as_deref() == Ok("1");
+        let serial = env_is_one("LFM_TP_SERIAL");
         let runs: Vec<(usize, usize)> = if serial {
             (0..steps.len()).map(|i| (i, i + 1)).collect()
         } else {
@@ -452,5 +498,39 @@ mod tests {
         let steps = vec![step(0, 0), step(1, 0)];
         assert_eq!(group_runs(&steps), vec![(0, 1), (1, 2)]);
         assert!(group_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn acc_reset_keeps_capacity_and_zeroes() {
+        let mut acc = vec![1.0f32; 4];
+        reset_acc(&mut acc, 2);
+        assert_eq!(acc, vec![0.0, 0.0]);
+        assert!(acc.capacity() >= 4);
+        reset_acc(&mut acc, 6);
+        assert_eq!(acc.len(), 6);
+        assert!(acc.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn add_into_sums_only_common_prefix() {
+        let mut dst = vec![1.0f32, 2.0, 3.0];
+        add_into(&mut dst, &[0.5, 0.5]);
+        assert_eq!(dst, vec![1.5, 2.5, 3.0]);
+    }
+
+    #[test]
+    fn env_flag_reads_only_exact_one() {
+        unsafe {
+            std::env::set_var("LFM_TP_TEST_FLAG", "1");
+        }
+        assert!(env_is_one("LFM_TP_TEST_FLAG"));
+        unsafe {
+            std::env::set_var("LFM_TP_TEST_FLAG", "true");
+        }
+        assert!(!env_is_one("LFM_TP_TEST_FLAG"));
+        unsafe {
+            std::env::remove_var("LFM_TP_TEST_FLAG");
+        }
+        assert!(!env_is_one("LFM_TP_TEST_FLAG"));
     }
 }

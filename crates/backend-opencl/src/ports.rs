@@ -53,12 +53,34 @@ impl InferenceBackend for GpuModel {
         self.step_mixed(&reqs, need_logits)
     }
 
+    fn step_rows(&mut self, steps: &[SequenceStep], rows: &[usize]) -> Result<()> {
+        if steps.len() == 1 && !rows.is_empty() {
+            let s = steps[0];
+            self.forward_seq(s.slot, s.token, s.pos)?;
+            self.logits_to_batch_row()?;
+            return Ok(());
+        }
+        let reqs: Vec<StepReq> = steps
+            .iter()
+            .map(|step| StepReq {
+                slot: step.slot,
+                token: step.token,
+                pos: step.pos,
+            })
+            .collect();
+        self.step_mixed_rows(&reqs, rows)
+    }
+
     fn logits(&self) -> Result<Vec<f32>> {
         GpuModel::logits(self)
     }
 
     fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
         GpuModel::logits_row(self, row)
+    }
+
+    fn argmax_rows(&mut self, rows: &[usize]) -> Result<Vec<(u32, f32)>> {
+        GpuModel::logits_argmax_rows(self, rows)
     }
 
     fn max_ctx(&self) -> usize {

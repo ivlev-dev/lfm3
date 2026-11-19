@@ -90,8 +90,12 @@ __kernel void norm_add_quant_b(__global const float *op, __global const float *p
     uint sub = lid & 3u;
     uint gbase = (lid >> 2) << 2;
     __local float red[256];
+    __local float sred[256];
     uint ng = n >> 5;
     uint iters = (ng + 63u) >> 6;
+    uint sgl = get_sub_group_local_id();
+    uint sgid = get_sub_group_id();
+    uint nsg = get_num_sub_groups();
     __global const float *opt = op + (ulong)t * n;
     __global const float *rest = res + (ulong)t * n;
     __global float *xot = x_out + (ulong)t * n;
@@ -110,6 +114,19 @@ __kernel void norm_add_quant_b(__global const float *op, __global const float *p
             s1 = o0.x * o0.x + o0.y * o0.y + o0.z * o0.z + o0.w * o0.w
                + o1.x * o1.x + o1.y * o1.y + o1.z * o1.z + o1.w * o1.w;
         }
+#ifdef LFM_SG64
+        float part = sub_group_reduce_add(s1);
+        if (sgl == 0u) {
+            sred[sgid] = part;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float ssum = 0.0f;
+        for (uint i = 0u; i < nsg; ++i) {
+            ssum += sred[i];
+        }
+        float scale = rsqrt(ssum / (float)n + 1e-5f);
+        barrier(CLK_LOCAL_MEM_FENCE);
+#else
         red[lid] = s1;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint st = 128u; st > 0u; st >>= 1) {
@@ -120,6 +137,7 @@ __kernel void norm_add_quant_b(__global const float *op, __global const float *p
         }
         float scale = rsqrt(red[0] / (float)n + 1e-5f);
         barrier(CLK_LOCAL_MEM_FENCE);
+#endif
         float4 v0 = (float4)(0.0f);
         float4 v1 = (float4)(0.0f);
         float s2 = 0.0f;
@@ -135,6 +153,19 @@ __kernel void norm_add_quant_b(__global const float *op, __global const float *p
             s2 = v0.x * v0.x + v0.y * v0.y + v0.z * v0.z + v0.w * v0.w
                + v1.x * v1.x + v1.y * v1.y + v1.z * v1.z + v1.w * v1.w;
         }
+#ifdef LFM_SG64
+        part = sub_group_reduce_add(s2);
+        if (sgl == 0u) {
+            sred[sgid] = part;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        ssum = 0.0f;
+        for (uint i = 0u; i < nsg; ++i) {
+            ssum += sred[i];
+        }
+        float scale2 = rsqrt(ssum / (float)n + 1e-5f);
+        barrier(CLK_LOCAL_MEM_FENCE);
+#else
         red[lid] = s2;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint st = 128u; st > 0u; st >>= 1) {
@@ -145,6 +176,7 @@ __kernel void norm_add_quant_b(__global const float *op, __global const float *p
         }
         float scale2 = rsqrt(red[0] / (float)n + 1e-5f);
         barrier(CLK_LOCAL_MEM_FENCE);
+#endif
         float4 w0 = (float4)(0.0f);
         float4 w1 = (float4)(0.0f);
         float amax = 0.0f;
@@ -619,12 +651,16 @@ __kernel void rms_rope_heads_b(__global float *x, __global const float *w, __glo
     uint t = gid / nheads;
     uint head = gid % nheads;
     uint lane = get_local_id(0);
-    __local float red[64];
     __global float *v = x + (ulong)t * nheads * head_dim + head * head_dim;
     float acc = 0.0f;
     for (uint i = lane; i < head_dim; i += 64u) {
         acc += v[i] * v[i];
     }
+#ifdef LFM_SG64
+    float total = sub_group_reduce_add(acc);
+    float scale = rsqrt(total / (float)head_dim + 1e-5f);
+#else
+    __local float red[64];
     red[lane] = acc;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint st = 32u; st > 0u; st >>= 1) {
@@ -634,6 +670,7 @@ __kernel void rms_rope_heads_b(__global float *x, __global const float *w, __glo
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     float scale = rsqrt(red[0] / (float)head_dim + 1e-5f);
+#endif
     for (uint i = lane; i < head_dim; i += 64u) {
         v[i] = v[i] * scale * w[i];
     }
@@ -2176,6 +2213,117 @@ __kernel void gemm_i8_pf(__global const char *wq8, __global const float *wsc, __
     }
 }
 
+__kernel void gemm_i8_pf16(__global const char *wq8, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+    uint lid = get_local_id(0);
+    uint tps = (ntok + 31u) / 32u;
+    uint gid = get_group_id(0);
+    uint row0 = (gid / tps) * 64u;
+    uint t0 = (gid % tps) * 32u;
+    if (row0 >= rows) {
+        return;
+    }
+    uint valid_rows = min(64u, rows - row0);
+    uint blocks = cols >> 8;
+    uint ngs = cols >> 5;
+    __local char xt[2 * 16 * 256];
+    __local float xsl[2 * 16 * 8];
+    uint lane = lid & 31u;
+    uint warp = lid >> 5;
+    uint whalf = warp >> 2;
+    uint tok_base = (warp & 3u) * 4u;
+    uint rloc = whalf * 32u + lane;
+    float acc[4];
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        acc[j] = 0.0f;
+    }
+    uint row = row0 + rloc;
+    bool active = rloc < valid_rows;
+    uint st_tt = lid >> 3;
+    uint st_off = (lid & 7u) * 32u;
+    uint st_token = t0 + st_tt;
+    bool stager = lid < 128u;
+    bool stok = stager && st_token < ntok;
+    char16 pa = (char16)(0);
+    char16 pc = (char16)(0);
+    float psc = 0.0f;
+    if (stok) {
+        __global const char *src = xq + (ulong)st_token * cols + st_off;
+        pa = vload16(0, src);
+        pc = vload16(0, src + 16u);
+        psc = xs[(ulong)st_token * ngs + (st_off >> 5)];
+    }
+    if (stager) {
+        vstore16(pa, 0, xt + st_tt * 256u + st_off);
+        vstore16(pc, 0, xt + st_tt * 256u + st_off + 16u);
+        xsl[st_tt * 8u + (st_off >> 5)] = psc;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint b = 0u; b < blocks; ++b) {
+        uint cur = b & 1u;
+        if (b + 1u < blocks && stager) {
+            uint nb = 1u - cur;
+            char16 a = (char16)(0);
+            char16 c = (char16)(0);
+            float sc = 0.0f;
+            if (stok) {
+                __global const char *src = xq + (ulong)st_token * cols + (ulong)(b + 1u) * 256u + st_off;
+                a = vload16(0, src);
+                c = vload16(0, src + 16u);
+                sc = xs[(ulong)st_token * ngs + (ulong)(b + 1u) * 8u + (st_off >> 5)];
+            }
+            vstore16(a, 0, xt + nb * 4096u + st_tt * 256u + st_off);
+            vstore16(c, 0, xt + nb * 4096u + st_tt * 256u + st_off + 16u);
+            xsl[nb * 128u + st_tt * 8u + (st_off >> 5)] = sc;
+        }
+        if (active) {
+            __local const char *xb = xt + cur * 4096u;
+            __local const float *sb = xsl + cur * 128u;
+            ulong gbase = (ulong)b * 8u * rows + row;
+            uint4 wa = vload4(0, (__global const uint *)(wq8 + gbase * 32ul));
+            uint4 wb = vload4(0, (__global const uint *)(wq8 + gbase * 32ul + 16u));
+            float sc = wsc[gbase];
+            #pragma unroll
+            for (uint g = 0u; g < 8u; ++g) {
+                uint4 pa = wa;
+                uint4 pb = wb;
+                float psc = sc;
+                if (g + 1u < 8u) {
+                    ulong gn = gbase + (ulong)(g + 1u) * rows;
+                    wa = vload4(0, (__global const uint *)(wq8 + gn * 32ul));
+                    wb = vload4(0, (__global const uint *)(wq8 + gn * 32ul + 16u));
+                    sc = wsc[gn];
+                }
+                #pragma unroll
+                for (uint j = 0u; j < 4u; ++j) {
+                    uint token = t0 + tok_base + j;
+                    if (token < ntok) {
+                        __local const char *xp = xb + (tok_base + j) * 256u + g * 32u;
+                        uint4 xa = vload4(0, (__local const uint *)xp);
+                        uint4 xc = vload4(0, (__local const uint *)(xp + 16u));
+                        int dl = 0;
+                        dl = lfm_dot4(pa.x, xa.x, dl); dl = lfm_dot4(pa.y, xa.y, dl);
+                        dl = lfm_dot4(pa.z, xa.z, dl); dl = lfm_dot4(pa.w, xa.w, dl);
+                        dl = lfm_dot4(pb.x, xc.x, dl); dl = lfm_dot4(pb.y, xc.y, dl);
+                        dl = lfm_dot4(pb.z, xc.z, dl); dl = lfm_dot4(pb.w, xc.w, dl);
+                        acc[j] += (float)dl * psc * sb[(tok_base + j) * 8u + g];
+                    }
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (active) {
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            uint t = tok_base + j;
+            if (t0 + t < ntok) {
+                y[(ulong)(t0 + t) * rows + row] = acc[j];
+            }
+        }
+    }
+}
+
 __kernel void gemm_q6_i8_b8p(__global const char *w, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
     uint lane = get_local_id(0);
     uint gid = get_group_id(0);
@@ -2384,5 +2532,43 @@ __kernel void gemm_q4_k_i8_lds17(__global const uchar *w, __global const char *x
                 y[(ulong)(t0 + t) * rows + row0 + rloc] = acc[j];
             }
         }
+    }
+}
+
+__kernel void logits_argmax_b(__global const float *src, __global const uint *rowids, __global uint *ids, __global float *vals, uint ntok, uint vocab) {
+    uint r = get_global_id(0) / 256u;
+    uint lid = get_local_id(0);
+    if (r >= ntok) {
+        return;
+    }
+    uint row = rowids[r];
+    __local float bv[256];
+    __local uint bi[256];
+    __global const float *p = src + (ulong)row * vocab;
+    float best = -INFINITY;
+    uint idx = 0u;
+    for (uint i = lid; i < vocab; i += 256u) {
+        float v = p[i];
+        if (v > best) {
+            best = v;
+            idx = i;
+        }
+    }
+    bv[lid] = best;
+    bi[lid] = idx;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            float v = bv[lid + s];
+            if (v > bv[lid]) {
+                bv[lid] = v;
+                bi[lid] = bi[lid + s];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0u) {
+        ids[r] = bi[0];
+        vals[r] = bv[0];
     }
 }

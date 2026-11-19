@@ -7,3 +7,4 @@ edition.workspace = true
 anyhow.workspace = true
 bytemuck.workspace = true
 opencl3.workspace = true
+sha2.workspace = true

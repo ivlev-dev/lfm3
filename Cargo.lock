@@ -1108,6 +1108,7 @@ dependencies = [
  "lfm-gguf",
  "lfm-opencl",
  "lfm-quant",
+ "rayon",
 ]
 
 [[package]]
@@ -1128,6 +1129,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "opencl3",
+ "sha2",
 ]
 
 [[package]]

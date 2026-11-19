@@ -29,8 +29,28 @@ pub trait InferenceBackend: Send {
     fn prefill_begin(&mut self, slot: usize, tokens: &[u32]) -> Result<usize>;
     fn prefill_finish(&mut self, slot: usize) -> Result<()>;
     fn step(&mut self, steps: &[SequenceStep], need_logits: bool) -> Result<()>;
+    fn step_rows(&mut self, steps: &[SequenceStep], rows: &[usize]) -> Result<()> {
+        let _ = rows;
+        self.step(steps, true)
+    }
     fn logits(&self) -> Result<Vec<f32>>;
     fn logits_row(&self, row: usize) -> Result<Vec<f32>>;
+    fn argmax_rows(&mut self, rows: &[usize]) -> Result<Vec<(u32, f32)>> {
+        let mut out = Vec::with_capacity(rows.len());
+        for &row in rows {
+            let logits = self.logits_row(row)?;
+            let mut best = 0u32;
+            let mut best_v = f32::NEG_INFINITY;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > best_v {
+                    best = i as u32;
+                    best_v = v;
+                }
+            }
+            out.push((best, best_v));
+        }
+        Ok(out)
+    }
     fn max_ctx(&self) -> usize;
     fn max_sequences(&self) -> usize {
         16

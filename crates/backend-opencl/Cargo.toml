@@ -11,3 +11,4 @@ lfm-domain.workspace = true
 lfm-gguf.workspace = true
 lfm-opencl.workspace = true
 lfm-quant.workspace = true
+rayon.workspace = true

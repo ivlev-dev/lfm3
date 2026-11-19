@@ -1,7 +1,102 @@
+use rayon::prelude::*;
+
 pub const Q4K_BLOCK: usize = 144;
 pub const Q4K_PACKED: usize = 148;
 pub const Q4K_SCALES: usize = 4;
 pub const Q4K_QUANTS: usize = 20;
+
+fn with_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+    match threads {
+        0 | 1 => f(),
+        n => match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
+            Ok(pool) => pool.install(f),
+            Err(_) => f(),
+        },
+    }
+}
+
+struct RowSink {
+    q: *mut i8,
+    scales: *mut f32,
+    rows: usize,
+}
+
+unsafe impl Send for RowSink {}
+unsafe impl Sync for RowSink {}
+
+impl RowSink {
+    fn new(q: &mut [i8], scales: &mut [f32], rows: usize) -> Self {
+        Self {
+            q: q.as_mut_ptr(),
+            scales: scales.as_mut_ptr(),
+            rows,
+        }
+    }
+
+    unsafe fn store(&self, g: usize, r: usize, quant: &[i8; 32], scale: f32) {
+        unsafe {
+            *self.scales.add(g * self.rows + r) = scale;
+            std::ptr::copy_nonoverlapping(
+                quant.as_ptr(),
+                self.q.add((g * self.rows + r) * 32),
+                quant.len(),
+            );
+        }
+    }
+}
+
+fn q4_i8_row(src: &[u8], per_row: usize, cols: usize, r: usize, sink: &RowSink) {
+    let row = &src[r * per_row..(r + 1) * per_row];
+    let mut vals = [0f32; 32];
+    let mut quant = [0i8; 32];
+    for b in 0..cols / 256 {
+        let blk = &row[b * Q4K_PACKED..(b + 1) * Q4K_PACKED];
+        let d = lfm_quant::half_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = lfm_quant::half_bits_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        for jj in 0..8usize {
+            let sc = blk[Q4K_SCALES + 2 * jj] as f32;
+            let mn = blk[Q4K_SCALES + 2 * jj + 1] as f32;
+            let qq = jj / 2;
+            let hi = jj % 2 == 1;
+            for i in 0..32usize {
+                let byte = blk[Q4K_QUANTS + qq * 32 + i];
+                let nib = if hi { byte >> 4 } else { byte & 0x0F } as f32;
+                vals[i] = d * sc * nib - dmin * mn;
+            }
+            let amax = vals.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            for i in 0..32 {
+                quant[i] = (vals[i] * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+            let g = b * 8 + jj;
+            let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            unsafe { sink.store(g, r, &quant, scale) };
+        }
+    }
+}
+
+fn q6_i8_row(
+    src: &[u8],
+    block_bytes: usize,
+    cols: usize,
+    r: usize,
+    sink: &RowSink,
+) -> anyhow::Result<()> {
+    let row = &src[r * block_bytes..(r + 1) * block_bytes];
+    let vals = lfm_quant::dequant_row_q6_k(row, cols)?;
+    let mut quant = [0i8; 32];
+    for g in 0..cols / 32 {
+        let chunk = &vals[g * 32..(g + 1) * 32];
+        let amax = chunk.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        for i in 0..32 {
+            quant[i] = (chunk[i] * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+        let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        unsafe { sink.store(g, r, &quant, scale) };
+    }
+    Ok(())
+}
 
 pub fn prepack_q4_k(src: &[u8]) -> anyhow::Result<Vec<u8>> {
     if src.is_empty() || !src.len().is_multiple_of(Q4K_BLOCK) {
@@ -29,6 +124,14 @@ pub fn prepack_q4_k(src: &[u8]) -> anyhow::Result<Vec<u8>> {
 pub const Q6K_BLOCK: usize = 210;
 
 pub fn prepack_q6_i8(src: &[u8], cols: usize) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
+    prepack_q6_i8_with_threads(src, cols, 0)
+}
+
+pub fn prepack_q6_i8_with_threads(
+    src: &[u8],
+    cols: usize,
+    threads: usize,
+) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
     if cols == 0 || !cols.is_multiple_of(256) {
         anyhow::bail!("q6 cols {cols} not a non-zero multiple of 256");
     }
@@ -43,21 +146,19 @@ pub fn prepack_q6_i8(src: &[u8], cols: usize) -> anyhow::Result<(Vec<i8>, Vec<f3
     let groups = cols / 32;
     let mut q = vec![0i8; groups * rows * 32];
     let mut scales = vec![0f32; groups * rows];
-    for r in 0..rows {
-        let row = &src[r * block_bytes..(r + 1) * block_bytes];
-        let vals = lfm_quant::dequant_row_q6_k(row, cols)?;
-        for g in 0..groups {
-            let chunk = &vals[g * 32..(g + 1) * 32];
-            let amax = chunk.iter().fold(0f32, |a, v| a.max(v.abs()));
-            let sc = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-            scales[g * rows + r] = sc;
-            let base = (g * rows + r) * 32;
-            for i in 0..32 {
-                q[base + i] = (chunk[i] * inv).round().clamp(-127.0, 127.0) as i8;
+    with_threads(threads, || {
+        let sink = RowSink::new(&mut q, &mut scales, rows);
+        if threads == 1 {
+            for r in 0..rows {
+                q6_i8_row(src, block_bytes, cols, r, &sink)?;
             }
+            Ok(())
+        } else {
+            (0..rows)
+                .into_par_iter()
+                .try_for_each(|r| q6_i8_row(src, block_bytes, cols, r, &sink))
         }
-    }
+    })?;
     Ok((q, scales))
 }
 
@@ -293,9 +394,60 @@ mod tests {
         assert!(prepack_q4_i8(&[0u8; Q4K_PACKED], 0).is_err());
         assert!(prepack_q4_i8(&[0u8; Q4K_PACKED], 512).is_err());
     }
+
+    #[test]
+    fn q4_i8_parallel_matches_sequential() {
+        let cols = 512usize;
+        let rows = 5usize;
+        let mut raw = Vec::new();
+        for r in 0..rows {
+            for b in 0..cols / 256 {
+                raw.extend_from_slice(&q4_block((r * 3 + b) as u8 * 11 + 1));
+            }
+        }
+        let packed = prepack_q4_k(&raw).unwrap();
+        let (q_ref, sc_ref) = prepack_q4_i8_with_threads(&packed, cols, 1).unwrap();
+        for threads in [0usize, 2, 3, 8] {
+            let (q, sc) = prepack_q4_i8_with_threads(&packed, cols, threads).unwrap();
+            assert_eq!(q, q_ref, "threads={threads}");
+            assert_eq!(sc, sc_ref, "threads={threads}");
+        }
+        let (q, sc) = prepack_q4_i8(&packed, cols).unwrap();
+        assert_eq!(q, q_ref);
+        assert_eq!(sc, sc_ref);
+    }
+
+    #[test]
+    fn q6_i8_parallel_matches_sequential() {
+        let cols = 512usize;
+        let rows = 4usize;
+        let mut raw = Vec::new();
+        for r in 0..rows {
+            for b in 0..cols / 256 {
+                raw.extend_from_slice(&q6_block((r * 5 + b) as u8 * 13 + 2));
+            }
+        }
+        let (q_ref, sc_ref) = prepack_q6_i8_with_threads(&raw, cols, 1).unwrap();
+        for threads in [0usize, 2, 3, 8] {
+            let (q, sc) = prepack_q6_i8_with_threads(&raw, cols, threads).unwrap();
+            assert_eq!(q, q_ref, "threads={threads}");
+            assert_eq!(sc, sc_ref, "threads={threads}");
+        }
+        let (q, sc) = prepack_q6_i8(&raw, cols).unwrap();
+        assert_eq!(q, q_ref);
+        assert_eq!(sc, sc_ref);
+    }
 }
 
 pub fn prepack_q4_i8(src: &[u8], cols: usize) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
+    prepack_q4_i8_with_threads(src, cols, 0)
+}
+
+pub fn prepack_q4_i8_with_threads(
+    src: &[u8],
+    cols: usize,
+    threads: usize,
+) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
     if cols == 0 || !cols.is_multiple_of(256) {
         anyhow::bail!("q4 cols {cols} not a non-zero multiple of 256");
     }
@@ -310,32 +462,17 @@ pub fn prepack_q4_i8(src: &[u8], cols: usize) -> anyhow::Result<(Vec<i8>, Vec<f3
     let groups = cols / 32;
     let mut q = vec![0i8; groups * rows * 32];
     let mut scales = vec![0f32; groups * rows];
-    let mut vals = [0f32; 32];
-    for r in 0..rows {
-        for b in 0..cols / 256 {
-            let blk = &src[r * per_row + b * Q4K_PACKED..r * per_row + (b + 1) * Q4K_PACKED];
-            let d = lfm_quant::half_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-            let dmin = lfm_quant::half_bits_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
-            for jj in 0..8usize {
-                let sc = blk[Q4K_SCALES + 2 * jj] as f32;
-                let mn = blk[Q4K_SCALES + 2 * jj + 1] as f32;
-                let qq = jj / 2;
-                let hi = jj % 2 == 1;
-                for i in 0..32usize {
-                    let byte = blk[Q4K_QUANTS + qq * 32 + i];
-                    let nib = if hi { byte >> 4 } else { byte & 0x0F } as f32;
-                    vals[i] = d * sc * nib - dmin * mn;
-                }
-                let amax = vals.iter().fold(0f32, |a, v| a.max(v.abs()));
-                let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-                let g = b * 8 + jj;
-                scales[g * rows + r] = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-                let base = (g * rows + r) * 32;
-                for i in 0..32 {
-                    q[base + i] = (vals[i] * inv).round().clamp(-127.0, 127.0) as i8;
-                }
+    with_threads(threads, || {
+        let sink = RowSink::new(&mut q, &mut scales, rows);
+        if threads == 1 {
+            for r in 0..rows {
+                q4_i8_row(src, per_row, cols, r, &sink);
             }
+        } else {
+            (0..rows)
+                .into_par_iter()
+                .for_each(|r| q4_i8_row(src, per_row, cols, r, &sink));
         }
-    }
+    });
     Ok((q, scales))
 }
