@@ -27,6 +27,7 @@
 | `log_requests` | `--log-requests` | `false` | access log + лог планировщика (`sched: …`) |
 | `max_body` | `--max-body` | `4194304` | максимальный размер тела запроса, байт |
 | `prefill_budget` | `--prefill-budget` | `64` | бюджет prefill-токенов на шаг, 1..=128 |
+| `h2_cancel_interval` | `--h2-cancel-interval` | `16` | как часто (в батчах ответа) HTTP/2 проверяет обрыв клиента, 1..=1024 |
 
 ## Движок (`[engine]`)
 
@@ -43,9 +44,11 @@
 | `profile` | `LFM_PROFILE` | `--profile` | `false` | тайминги ядер (`lfm-bench gpu-prefill` печатает профиль) |
 | `kv` | `LFM_KV` | `--kv` | `f16` | тип KV-кэша: `f16`, `q4`, `k4v4`, `kvarn` (=`kvarn_k4v2`, K 4 бита + V 2 бита), `kvarn_k4v4` (K 4 бита + V 4 бита, память +25 МБ, качество ближе к f16); на устройстве без fp16 `f16` хранится во float, `kvarn*` работают на float-скейлах, `q4` недоступен |
 | `prepack` | `LFM_PREPACK` | `--no-prepack` | `true` | 148-байтная раскладка Q4_K и int8-копии; `false` оставляет только decode (prefill требует prepack) |
+| `prepack_threads` | `LFM_PREPACK_THREADS` | `--prepack-threads` | `0` | потоков на CPU-prepack, 0 = авто (rayon), 1 = последовательно; 0..=256 |
+| `program_cache` | `LFM_PROGRAM_CACHE` | `--no-program-cache` | `true` | кэш скомпилированных ядер OpenCL в `$XDG_CACHE_HOME/lfm3/programs` (ключ: исходники + опции + устройство + драйвер) |
 | `fuse` | `LFM_FUSE` | `--no-fuse` | `true` | слияние `q‖k‖g` и `gate‖up` |
 | `pb` | `LFM_PB` | `--pb` | `6` | порог батчевого GEMV, 1..=12 |
-| `prefill_ntok` | `LFM_PREFILL_NTOK` | `--prefill-ntok` | `128` | размер чанка prefill, 1..=128; у `kv=kvarn` задаёт ещё и размер staging-кольца (память KV: 128 → 143 МБ, 64 → 118, 32 → 106 при ctx 8192) |
+| `prefill_ntok` | `LFM_PREFILL_NTOK` | `--prefill-ntok` | `128` | размер чанка prefill, 1..=128; у `kv=kvarn` задаёт ещё и размер staging-кольца (память KV при ctx 8192 и 8 seq: ≈65 МБ на 128, ≈59 на 64, ≈56 на 32) |
 | `max_seqs` | `LFM_SEQS` | `--max-seqs` | `8` | одновременных последовательностей, 1..=16 |
 | `cache` | `LFM_CACHE` | `--no-cache` | `true` | кэш префиксов (radix) |
 | `splits` | `LFM_SPLITS` | `--splits` | `16` | максимум сплитов внимания, 1..=16 |
@@ -71,6 +74,7 @@
 | `LFM_TIERS` | сервер | pipeline parallel, проценты слоёв: `LFM_TIERS=60/40`; поддерживает любое число стадий (24 слоя → 3×33/33/34) и батчевый prefill |
 | `RUSTICL_ENABLE` | окружение драйвера | какие GPU видит Rusticl: `iris` — только Intel, `iris,radeonsi` — Intel и AMD; PoCL CPU виден всегда отдельной платформой |
 | `LFM_SCHED_LOG` | сервер | алиас `log_requests` |
+| `LFM_TP_SYNC_NORMS` | tp.rs | `1` — вернуть синхронизацию x/hq/hs после каждой нормы (A/B, по умолчанию стадии считают нормы сами) |
 | `LFM_PLATFORM` | infra-opencl | индекс OpenCL-платформы |
 | `LFM_LAUNCH_DEBUG` | infra-opencl | печать параметров запуска ядер |
 | `LFM_CPU_W4A8` | infra-cpu | W4A8-веса на CPU |
