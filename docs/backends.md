@@ -67,9 +67,10 @@ Rusticl). Отличия включаются автоматически по `c
   `attention_split_b_fa*`, attn4/flash), не включаются: у Intel подгруппа 16,
   а `reqd_sub_group_size` Rusticl игнорирует. Остаётся `attention_b_h` /
   `attention_split_b_h`.
-- Q6-decode идёт через int8-ядро `gemm_i8_gz` по `prepacked_i8`: `gemv_q6_k_i8`
-  написан под подгруппу ≥ 32 и на 16 полосах считает неверно. Q4-decode
-  (`gemv_q4_k_i8*`) корректен.
+- Q6-decode идёт через int8-ядра по `prepacked_i8`: `gemv_q6_k_i8` написан под
+  подгруппу ≥ 32 и на 16 полосах считает неверно. Признак — `sub_group_size < 32`
+  (а не отсутствие fp16: Intel Xe с fp16 и подгруппой 16 тоже требует обхода).
+  Q4-decode (`gemv_q4_k_i8*`) корректен при любой подгруппе.
 
 Intel Gen9 не виден в OpenCL по умолчанию: нужен Rusticl с `RUSTICL_ENABLE=iris`
 (intel-compute-runtime и PoCL/Level Zero устройство не отдают).

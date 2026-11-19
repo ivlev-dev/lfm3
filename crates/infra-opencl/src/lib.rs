@@ -17,6 +17,8 @@ pub use opencl3::program::Program;
 #[derive(Debug, Clone)]
 pub struct Caps {
     pub name: String,
+    pub vendor: String,
+    pub device_type: String,
     pub version: String,
     pub driver: String,
     pub opencl_c: String,
@@ -97,6 +99,14 @@ impl Gpu {
             .collect();
         let caps = Caps {
             name: device.name().unwrap_or_default(),
+            vendor: device.vendor().unwrap_or_default(),
+            device_type: match device.dev_type().unwrap_or(0) {
+                opencl3::device::CL_DEVICE_TYPE_GPU => "gpu".to_string(),
+                opencl3::device::CL_DEVICE_TYPE_CPU => "cpu".to_string(),
+                opencl3::device::CL_DEVICE_TYPE_ACCELERATOR => "accelerator".to_string(),
+                opencl3::device::CL_DEVICE_TYPE_CUSTOM => "custom".to_string(),
+                _ => "other".to_string(),
+            },
             version: device.version().unwrap_or_default(),
             driver: device.driver_version().unwrap_or_default(),
             opencl_c: device.opencl_c_version().unwrap_or_default(),

@@ -533,6 +533,8 @@ fn main() -> Result<()> {
 fn info() -> Result<()> {
     let gpu = Gpu::open(0)?;
     println!("name: {}", gpu.caps.name);
+    println!("vendor: {}", gpu.caps.vendor);
+    println!("device_type: {}", gpu.caps.device_type);
     println!("version: {}", gpu.caps.version);
     println!("driver: {}", gpu.caps.driver);
     println!("opencl_c: {}", gpu.caps.opencl_c);

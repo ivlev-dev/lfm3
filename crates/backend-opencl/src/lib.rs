@@ -474,6 +474,7 @@ pub struct GpuModel {
     prepack_on: bool,
     q6_i8_gz_on: bool,
     q4_b8p_on: bool,
+    q6_int8_on: bool,
     flash_on: bool,
     flash2_on: bool,
     i8_pf_on: bool,
@@ -597,6 +598,7 @@ impl GpuModel {
         let q4_i8_on = opts.q4i8;
         let q6_i8_gz_on = opts.q6i8;
         let q4_b8p_on = opts.b8p;
+        let q6_int8_on = !gpu.caps.fp16 || gpu.caps.sub_group_size < 32;
         let flash_on = opts.flash;
         let flash2_on = opts.flash2;
         let i8_pf_on = opts.i8pf && gpu.caps.sub_group_size > 16;
@@ -1042,6 +1044,7 @@ impl GpuModel {
             prepack_on,
             q6_i8_gz_on,
             q4_b8p_on,
+            q6_int8_on,
             flash_on,
             flash2_on,
             i8_pf_on,
@@ -1096,9 +1099,9 @@ impl GpuModel {
         cols: usize,
     ) -> Result<()> {
         let weight = self.weight(name)?;
-        if self.kv_f32 && matches!(weight, Weight::Q6(_)) {
+        if self.q6_int8_on && matches!(weight, Weight::Q6(_)) {
             let (w8, wsc, _) = self.prepacked_i8.get(name).ok_or_else(|| {
-                anyhow!("Q6 без fp16 считает только int8-ядро, нужен prepack: {name}")
+                anyhow!("Q6 при подгруппе < 32 считает только int8-ядро, нужен prepack: {name}")
             })?;
             let k = if self.q4_b8p_on {
                 &self.kernels.gemm_q6_b8p
