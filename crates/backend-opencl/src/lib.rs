@@ -1196,6 +1196,31 @@ impl GpuModel {
             let (w8, wsc, _) = self.prepacked_i8.get(name).ok_or_else(|| {
                 anyhow!("Q6 без fp16 считает только int8-ядро, нужен prepack: {name}")
             })?;
+            if ntok <= 8 {
+                let k = if self.q4_b8p_on {
+                    &self.kernels.gemm_q6_b8p
+                } else {
+                    &self.kernels.gemm_q6_b8
+                };
+                unsafe {
+                    self.gpu.launch(
+                        k,
+                        rows.div_ceil(64) * 64,
+                        64,
+                        &[
+                            Arg::Mem(w8.get()),
+                            Arg::Mem(wsc.get()),
+                            Arg::Mem(xq.get()),
+                            Arg::Mem(xs.get()),
+                            Arg::Mem(y.get()),
+                            Arg::U32(rows as u32),
+                            Arg::U32(cols as u32),
+                            Arg::U32(ntok as u32),
+                        ],
+                    )?;
+                }
+                return Ok(());
+            }
             let tps = ntok.div_ceil(32);
             unsafe {
                 self.gpu.launch(
