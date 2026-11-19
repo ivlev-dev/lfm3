@@ -67,8 +67,9 @@
 
 | env | где | смысл |
 |---|---|---|
-| `LFM_TP` | сервер | tensor parallel, устройства через `/`: `LFM_TP=0/1` |
-| `LFM_TIERS` | сервер | pipeline parallel, проценты слоёв: `LFM_TIERS=60/40` |
+| `LFM_TP` | сервер | tensor parallel, устройства через `/`: `LFM_TP=0/1`; головы (16/4) должны делиться на число устройств — миры 1, 2, 4, 8, 16, три устройства невозможны |
+| `LFM_TIERS` | сервер | pipeline parallel, проценты слоёв: `LFM_TIERS=60/40`; поддерживает любое число стадий (24 слоя → 3×33/33/34) и батчевый prefill |
+| `RUSTICL_ENABLE` | окружение драйвера | какие GPU видит Rusticl: `iris` — только Intel, `iris,radeonsi` — Intel и AMD; PoCL CPU виден всегда отдельной платформой |
 | `LFM_SCHED_LOG` | сервер | алиас `log_requests` |
 | `LFM_PLATFORM` | infra-opencl | индекс OpenCL-платформы |
 | `LFM_LAUNCH_DEBUG` | infra-opencl | печать параметров запуска ядер |
