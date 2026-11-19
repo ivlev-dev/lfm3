@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use lfm_app::{CacheStats, InferenceBackend, SequenceStep};
@@ -12,6 +13,24 @@ pub struct TpModel {
     cfg: ModelConfig,
     row_logits: Vec<Vec<f32>>,
     last_logits: Vec<f32>,
+}
+
+/// Группы подряд идущих шагов одного слота (непрерывные позиции).
+pub fn group_runs(steps: &[SequenceStep]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0usize;
+    while i < steps.len() {
+        let mut j = i + 1;
+        while j < steps.len()
+            && steps[j].slot == steps[i].slot
+            && steps[j].pos == steps[i].pos + (j - i)
+        {
+            j += 1;
+        }
+        runs.push((i, j));
+        i = j;
+    }
+    runs
 }
 
 impl TpModel {
@@ -64,6 +83,17 @@ impl TpModel {
         let (x, hq, hs) = self.stages[0].tp_norm_inputs()?;
         for stage in self.stages.iter_mut().skip(1) {
             stage.tp_set_norm_inputs(&x, &hq, &hs)?;
+        }
+        Ok(())
+    }
+
+    fn sync_x_b(&mut self, ntok: usize) -> Result<()> {
+        if self.stages.len() <= 1 {
+            return Ok(());
+        }
+        let (x, hq, hs) = self.stages[0].tp_norm_inputs_b(ntok)?;
+        for stage in self.stages.iter_mut().skip(1) {
+            stage.tp_set_norm_inputs_b(&x, &hq, &hs, ntok)?;
         }
         Ok(())
     }
@@ -123,6 +153,85 @@ impl TpModel {
             Ok(None)
         }
     }
+    fn prefill_chunk(
+        &mut self,
+        slot: usize,
+        pos: usize,
+        chunk: &[u32],
+        need_logits: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let h = self.cfg.hidden_size;
+        let ntok = chunk.len();
+        let mut want_logits: Option<Vec<f32>> = None;
+        {
+            let dbg = std::env::var("LFM_TP_DEBUG").is_ok();
+            let (mut t_attn, mut t_ffn, mut t_sync, mut t_prep) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let t0 = Instant::now();
+            for stage in self.stages.iter_mut() {
+                stage.tp_prepare_batch(slot, pos, ntok)?;
+            }
+            t_prep += t0.elapsed().as_secs_f64();
+            self.stages[0].tp_embed_batch(chunk)?;
+            self.stages[0].tp_norm_attn_b(0, ntok)?;
+            self.sync_x_b(ntok)?;
+            for layer in 0..self.cfg.num_layers {
+                let ta = Instant::now();
+                let attn = if self.cfg.kind(layer) == LayerKind::Conv {
+                    self.stages[0].tp_conv_b(layer, slot, pos, ntok)?
+                } else {
+                    let mut acc = vec![0.0f32; ntok * h];
+                    for stage in self.stages.iter_mut() {
+                        let part = stage.tp_attn_b(layer, slot, pos, ntok)?;
+                        for (dst, src) in acc.iter_mut().zip(part.iter()) {
+                            *dst += *src;
+                        }
+                    }
+                    acc
+                };
+                t_attn += ta.elapsed().as_secs_f64();
+                let ts = Instant::now();
+                for stage in self.stages.iter_mut().rev() {
+                    stage.tp_attn_norm_b(layer, &attn, ntok)?;
+                }
+                self.sync_x_b(ntok)?;
+                t_sync += ts.elapsed().as_secs_f64();
+                let tf = Instant::now();
+                let mut ffn = vec![0.0f32; ntok * h];
+                for stage in self.stages.iter_mut() {
+                    let part = stage.tp_ffn_local_b(layer, ntok)?;
+                    for (dst, src) in ffn.iter_mut().zip(part.iter()) {
+                        *dst += *src;
+                    }
+                }
+                t_ffn += tf.elapsed().as_secs_f64();
+                let ts2 = Instant::now();
+                for stage in self.stages.iter_mut().rev() {
+                    stage.tp_ffn_norm_b(layer, &ffn, ntok)?;
+                }
+                self.sync_x_b(ntok)?;
+                t_sync += ts2.elapsed().as_secs_f64();
+            }
+            if need_logits {
+                let mut logits = vec![0.0f32; self.cfg.vocab_size];
+                for stage in self.stages.iter_mut() {
+                    let shard = stage
+                        .tp_shard()
+                        .ok_or_else(|| anyhow!("stage without tp shard"))?;
+                    let part = stage.tp_lmhead_last(ntok)?;
+                    let stop = (shard.vocab_start + part.len()).min(logits.len());
+                    logits[shard.vocab_start..stop]
+                        .copy_from_slice(&part[..stop - shard.vocab_start]);
+                }
+                want_logits = Some(logits);
+            }
+            if dbg {
+                eprintln!(
+                    "tp-debug chunk ntok={ntok}: prep {t_prep:.2}s attn {t_attn:.2}s ffn {t_ffn:.2}s norm+sync {t_sync:.2}s"
+                );
+            }
+        }
+        Ok(want_logits)
+    }
 }
 
 impl InferenceBackend for TpModel {
@@ -164,15 +273,34 @@ impl InferenceBackend for TpModel {
 
     fn prefill(&mut self, slot: usize, tokens: &[u32], need_logits: bool) -> Result<usize> {
         let reused = self.prefill_begin(slot, tokens)?;
-        let mut last = Vec::new();
-        for (i, &token) in tokens.iter().enumerate().skip(reused) {
-            let want = need_logits && i + 1 == tokens.len();
-            if let Some(logits) = self.step_token(slot, token, i, want)? {
-                last = logits;
+        if std::env::var("LFM_TP_SERIAL").as_deref() == Ok("1") {
+            let mut last = Vec::new();
+            for (i, &token) in tokens.iter().enumerate().skip(reused) {
+                let want = need_logits && i + 1 == tokens.len();
+                if let Some(logits) = self.step_token(slot, token, i, want)? {
+                    last = logits;
+                }
             }
+            self.prefill_finish(slot)?;
+            self.last_logits = last;
+            return Ok(reused);
+        }
+        let batch = self.prefill_batch_size().max(1);
+        let mut pos = reused;
+        let mut last_logits: Option<Vec<f32>> = None;
+        while pos < tokens.len() {
+            let end = (pos + batch).min(tokens.len());
+            let chunk = &tokens[pos..end];
+            let want = need_logits && end == tokens.len();
+            if let Some(logits) = self.prefill_chunk(slot, pos, chunk, want)? {
+                last_logits = Some(logits);
+            }
+            pos = end;
         }
         self.prefill_finish(slot)?;
-        self.last_logits = last;
+        if let Some(logits) = last_logits {
+            self.last_logits = logits;
+        }
         Ok(reused)
     }
 
@@ -197,13 +325,38 @@ impl InferenceBackend for TpModel {
 
     fn step(&mut self, steps: &[SequenceStep], need_logits: bool) -> Result<()> {
         self.row_logits.clear();
-        for step in steps {
-            let logits = self.step_token(step.slot, step.token, step.pos, need_logits)?;
-            if let Some(logits) = logits {
-                self.last_logits = logits.clone();
-                self.row_logits.push(logits);
+        let serial = std::env::var("LFM_TP_SERIAL").as_deref() == Ok("1");
+        let runs: Vec<(usize, usize)> = if serial {
+            (0..steps.len()).map(|i| (i, i + 1)).collect()
+        } else {
+            group_runs(steps)
+        };
+        for (i, j) in runs {
+            if j - i > 1 {
+                let chunk: Vec<u32> = steps[i..j].iter().map(|s| s.token).collect();
+                let logits =
+                    self.prefill_chunk(steps[i].slot, steps[i].pos, &chunk, need_logits)?;
+                for k in i..j {
+                    if k + 1 == j {
+                        if let Some(l) = &logits {
+                            self.last_logits = l.clone();
+                            self.row_logits.push(l.clone());
+                        } else {
+                            self.row_logits.push(Vec::new());
+                        }
+                    } else {
+                        self.row_logits.push(Vec::new());
+                    }
+                }
             } else {
-                self.row_logits.push(Vec::new());
+                let logits =
+                    self.step_token(steps[i].slot, steps[i].token, steps[i].pos, need_logits)?;
+                if let Some(l) = logits {
+                    self.last_logits = l.clone();
+                    self.row_logits.push(l);
+                } else {
+                    self.row_logits.push(Vec::new());
+                }
             }
         }
         Ok(())
@@ -256,5 +409,38 @@ impl InferenceBackend for TpModel {
             used_pages,
             hits,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(slot: usize, pos: usize) -> SequenceStep {
+        SequenceStep {
+            slot,
+            token: 1,
+            pos,
+        }
+    }
+
+    #[test]
+    fn groups_contiguous_runs_per_slot() {
+        let steps = vec![
+            step(0, 5),
+            step(0, 6),
+            step(0, 7),
+            step(1, 3),
+            step(1, 9),
+            step(0, 20),
+        ];
+        assert_eq!(group_runs(&steps), vec![(0, 3), (3, 4), (4, 5), (5, 6)]);
+    }
+
+    #[test]
+    fn groups_single_steps() {
+        let steps = vec![step(0, 0), step(1, 0)];
+        assert_eq!(group_runs(&steps), vec![(0, 1), (1, 2)]);
+        assert!(group_runs(&[]).is_empty());
     }
 }

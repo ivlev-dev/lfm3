@@ -15,8 +15,13 @@ BIN=${BIN:-./target/release/lfm-bench}
 SRV=${SRV:-./target/release/lfm-server}
 MODE=${1:-amd}
 SERVER=0
-for arg in "$@"; do
-    [ "$arg" = "--server" ] && SERVER=1
+TP=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --server) SERVER=1 ;;
+        --tp) shift; TP=${1:-} ;;
+    esac
+    shift
 done
 
 case "$MODE" in
@@ -79,6 +84,28 @@ done
 pps=$(timeout 900 "$BIN" gpu-prefill --tokens 512 --decode 16 --kv-cache kvarn 2>/dev/null \
     | awk -F'[()]' '/^decode/ { print $2 }' | awk '{ print $1 }')
 check_min "kvarn decode tok/s" "$pps" 1.0
+
+if [ -n "$TP" ]; then
+    port=8178
+    ( LFM_TP=$TP "$SRV" --addr 127.0.0.1:$port --ctx 1024 >/tmp/opencode/bench_check_tp.log 2>&1 ) &
+    srv_pid=$!
+    for _ in $(seq 1 60); do
+        curl -sf --max-time 1 http://127.0.0.1:$port/health >/dev/null 2>&1 && break
+        sleep 2
+    done
+    if curl -sf --max-time 3 http://127.0.0.1:$port/health >/dev/null 2>&1; then
+        ok "tp:$TP /health"
+        body='{"model":"lfm3","messages":[{"role":"user","content":"Count from 1 to 8, one number per line."}],"max_tokens":8,"stream":false}'
+        content=$(curl -s --max-time 600 http://127.0.0.1:$port/v1/chat/completions \
+            -H 'content-type: application/json' -d "$body" \
+            | sed -n 's/.*"content":"\([^"]*\)".*/\1/p')
+        if [ -n "$content" ]; then ok "tp:$TP chat: $content"; else bad "tp:$TP chat: пустой ответ"; fi
+    else
+        bad "tp:$TP /health"
+    fi
+    kill "$srv_pid" 2>/dev/null
+    wait "$srv_pid" 2>/dev/null
+fi
 
 if [ "$SERVER" = "1" ]; then
     port=8177

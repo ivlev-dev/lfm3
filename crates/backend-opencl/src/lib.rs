@@ -2405,6 +2405,560 @@ impl GpuModel {
         Ok(())
     }
 
+    pub fn tp_prepare_batch(&mut self, slot: usize, pos0: usize, ntok: usize) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        let kv_blocks = self.kv_blocks;
+        self.seq_ensure(slot, pos0 + ntok)?;
+        self.seq_sync(slot)?;
+        let table: Vec<u32> = self.sequence(slot)?.block_table.clone();
+        if let Some(seq) = self.seqs[slot].as_mut() {
+            seq.len = seq.len.max(pos0 + ntok);
+        }
+        let mut tbl_host = vec![0u32; self.max_seqs * kv_blocks.max(1)];
+        for (i, b) in table.iter().enumerate() {
+            tbl_host[i] = *b;
+        }
+        let pos_host: Vec<u32> = (0..ntok).map(|i| (pos0 + i) as u32).collect();
+        let seq_host = vec![slot as u32; ntok];
+        let off_host = vec![0u32; ntok];
+        let conv_off = (slot * (self.cfg.conv_cache - 1) * h) as u32;
+        let conv_host = vec![conv_off; ntok];
+        let snap_host = vec![u32::MAX; ntok];
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.pos_b, 1, 0, &pos_host, &[])?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.seq_b, 1, 0, &seq_host, &[])?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.tbl_off_b, 1, 0, &off_host, &[])?;
+            self.gpu.queue.enqueue_write_buffer(
+                &mut self.bufs.conv_off_b,
+                1,
+                0,
+                &conv_host,
+                &[],
+            )?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.snap_page, 1, 0, &snap_host, &[])?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.tbl_all, 1, 0, &tbl_host, &[])?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_embed_batch(&mut self, tokens: &[u32]) -> Result<()> {
+        if !self.has_embed {
+            return Err(anyhow!("tp shard has no embedding"));
+        }
+        let h = self.cfg.hidden_size;
+        let ntok = tokens.len();
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.tokens, 1, 0, tokens, &[])?;
+        }
+        let emb = match self.weight("token_embd.weight")? {
+            Weight::Q6(b) => b,
+            _ => return Err(anyhow!("token_embd must be Q6_K")),
+        };
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.embed_b,
+                ntok * h,
+                64,
+                &[
+                    Arg::Mem(emb.get()),
+                    Arg::Mem(self.bufs.xb.get()),
+                    Arg::Mem(self.bufs.tokens.get()),
+                    Arg::U32(ntok as u32),
+                    Arg::U32(h as u32),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_norm_attn_b(&mut self, layer: usize, ntok: usize) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        let w = self.f32_weight(&format!("blk.{layer}.attn_norm.weight"))?;
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.rms_quant_b,
+                ntok * 64,
+                64,
+                &[
+                    Arg::Mem(self.bufs.xb.get()),
+                    Arg::Mem(w.get()),
+                    Arg::Mem(self.bufs.hqx.get()),
+                    Arg::Mem(self.bufs.hsx.get()),
+                    Arg::U32(h as u32),
+                    Arg::U32(ntok as u32),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_norm_inputs_b(&self, ntok: usize) -> Result<(Vec<f32>, Vec<i8>, Vec<f32>)> {
+        let h = self.cfg.hidden_size;
+        let x = self.gpu.download(&self.bufs.xb, ntok * h)?;
+        let hq = self.gpu.download(&self.bufs.hqx, ntok * h)?;
+        let hs = self.gpu.download(&self.bufs.hsx, ntok * (h / GROUP))?;
+        Ok((x, hq, hs))
+    }
+
+    pub fn tp_set_norm_inputs_b(
+        &mut self,
+        x: &[f32],
+        hq: &[i8],
+        hs: &[f32],
+        ntok: usize,
+    ) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        if x.len() != ntok * h || hq.len() != ntok * h || hs.len() != ntok * h / GROUP {
+            return Err(anyhow!("tp batch hidden size mismatch"));
+        }
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.xb, 1, 0, x, &[])?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.hqx, 1, 0, hq, &[])?;
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.hsx, 1, 0, hs, &[])?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_conv_b(
+        &mut self,
+        layer: usize,
+        slot: usize,
+        pos0: usize,
+        ntok: usize,
+    ) -> Result<Vec<f32>> {
+        let _ = (slot, pos0);
+        let h = self.cfg.hidden_size;
+        let prefix = format!("blk.{layer}");
+        self.gemv_auto_b(
+            &format!("{prefix}.shortconv.in_proj.weight"),
+            &self.bufs.hqx,
+            &self.bufs.hsx,
+            &self.bufs.bcxb,
+            3 * h,
+            h,
+            ntok,
+            0,
+        )?;
+        let conv_w = self.f32_weight(&format!("{prefix}.shortconv.conv.weight"))?;
+        let state = self.layers[layer]
+            .conv
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing conv state"))?;
+        let snap = self.layers[layer]
+            .snap
+            .as_ref()
+            .unwrap_or(&self.bufs.snap_dummy);
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.conv_b,
+                h,
+                256,
+                &[
+                    Arg::Mem(self.bufs.bcxb.get()),
+                    Arg::Mem(conv_w.get()),
+                    Arg::Mem(state.get()),
+                    Arg::Mem(self.bufs.opb.get()),
+                    Arg::Mem(self.bufs.conv_off_b.get()),
+                    Arg::Mem(self.bufs.snap_page.get()),
+                    Arg::Mem(snap.get()),
+                    Arg::U32(h as u32),
+                    Arg::U32(self.cfg.conv_cache as u32),
+                    Arg::U32(ntok as u32),
+                    Arg::U32(((self.cfg.conv_cache - 1) * h) as u32),
+                ],
+            )?;
+            self.gpu.launch(
+                &self.kernels.quant_b,
+                ntok * (h / GROUP),
+                0,
+                &[
+                    Arg::Mem(self.bufs.opb.get()),
+                    Arg::Mem(self.bufs.hqx.get()),
+                    Arg::Mem(self.bufs.hsx.get()),
+                    Arg::U32(h as u32),
+                    Arg::U32(GROUP as u32),
+                    Arg::U32(ntok as u32),
+                ],
+            )?;
+        }
+        self.gemv_auto_b(
+            &format!("{prefix}.shortconv.out_proj.weight"),
+            &self.bufs.hqx,
+            &self.bufs.hsx,
+            &self.bufs.tmpb,
+            h,
+            h,
+            ntok,
+            0,
+        )?;
+        self.gpu.queue.finish()?;
+        self.gpu.download(&self.bufs.tmpb, ntok * h)
+    }
+
+    pub fn tp_attn_b(
+        &mut self,
+        layer: usize,
+        slot: usize,
+        pos0: usize,
+        ntok: usize,
+    ) -> Result<Vec<f32>> {
+        let _ = (slot, pos0);
+        let shard = self.tp.ok_or_else(|| anyhow!("not a tp shard"))?;
+        let prefix = format!("blk.{layer}");
+        let h = self.cfg.hidden_size;
+        let head_dim = self.cfg.head_dim;
+        let heads = shard.head_count;
+        let kv_heads = shard.kv_head_count;
+        let qd = heads * head_dim;
+        let kvg = kv_heads * head_dim;
+        let n32 = ntok as u32;
+        let fused = self
+            .prepacked
+            .contains_key(&format!("{prefix}.attn_qkvg.weight"))
+            .then(|| format!("{prefix}.attn_qkvg.weight"));
+        match fused {
+            Some(name) => self.gemv_auto4_b(
+                &name,
+                &self.bufs.hqx,
+                &self.bufs.hsx,
+                &self.bufs.qb,
+                &self.bufs.kkb,
+                &self.bufs.vvb,
+                &self.bufs.gb,
+                qd,
+                kvg,
+                kvg,
+                heads,
+                h,
+                ntok,
+            )?,
+            None => {
+                self.gemv_auto_b(
+                    &format!("{prefix}.attn_q.weight"),
+                    &self.bufs.hqx,
+                    &self.bufs.hsx,
+                    &self.bufs.qb,
+                    qd,
+                    h,
+                    ntok,
+                    0,
+                )?;
+                self.gemv_auto_b(
+                    &format!("{prefix}.attn_k.weight"),
+                    &self.bufs.hqx,
+                    &self.bufs.hsx,
+                    &self.bufs.kkb,
+                    kvg,
+                    h,
+                    ntok,
+                    0,
+                )?;
+                self.gemv_auto_b(
+                    &format!("{prefix}.attn_v.weight"),
+                    &self.bufs.hqx,
+                    &self.bufs.hsx,
+                    &self.bufs.vvb,
+                    kvg,
+                    h,
+                    ntok,
+                    0,
+                )?;
+                self.gemv_auto_b(
+                    &format!("{prefix}.attn_gate.weight"),
+                    &self.bufs.hqx,
+                    &self.bufs.hsx,
+                    &self.bufs.gb,
+                    heads,
+                    h,
+                    ntok,
+                    0,
+                )?;
+            }
+        }
+        let q_norm = self.f32_weight(&format!("{prefix}.attn_q_norm.weight"))?;
+        let k_norm = self.f32_weight(&format!("{prefix}.attn_k_norm.weight"))?;
+        let inv = if self.cfg.kind(layer) == LayerKind::SlidingAttention {
+            &self.rope_sliding
+        } else {
+            &self.rope_full
+        };
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.rms_rope_heads_b,
+                ntok * heads * 64,
+                64,
+                &[
+                    Arg::Mem(self.bufs.qb.get()),
+                    Arg::Mem(q_norm.get()),
+                    Arg::Mem(inv.get()),
+                    Arg::Mem(self.bufs.pos_b.get()),
+                    Arg::U32(head_dim as u32),
+                    Arg::U32(heads as u32),
+                    Arg::U32(n32),
+                ],
+            )?;
+            self.gpu.launch(
+                &self.kernels.rms_rope_heads_b,
+                ntok * kv_heads * 64,
+                64,
+                &[
+                    Arg::Mem(self.bufs.kkb.get()),
+                    Arg::Mem(k_norm.get()),
+                    Arg::Mem(inv.get()),
+                    Arg::Mem(self.bufs.pos_b.get()),
+                    Arg::U32(head_dim as u32),
+                    Arg::U32(kv_heads as u32),
+                    Arg::U32(n32),
+                ],
+            )?;
+        }
+        let (k_buf, v_buf) = {
+            let lb = &self.layers[layer];
+            (
+                lb.k.as_ref().ok_or_else(|| anyhow!("missing kv"))?,
+                lb.v.as_ref().ok_or_else(|| anyhow!("missing kv"))?,
+            )
+        };
+        let window = if self.cfg.kind(layer) == LayerKind::SlidingAttention {
+            self.cfg.sliding_window
+        } else {
+            0
+        };
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.kv_store_b_h,
+                ntok * kvg,
+                256,
+                &[
+                    Arg::Mem(self.bufs.kkb.get()),
+                    Arg::Mem(self.bufs.vvb.get()),
+                    Arg::Mem(k_buf.mem()),
+                    Arg::Mem(v_buf.mem()),
+                    Arg::Mem(self.bufs.tbl_all.get()),
+                    Arg::Mem(self.bufs.tbl_off_b.get()),
+                    Arg::Mem(self.bufs.pos_b.get()),
+                    Arg::U32(kvg as u32),
+                    Arg::U32(n32),
+                ],
+            )?;
+        }
+        let use2 = self.attn2
+            && !self.kv_q4
+            && head_dim == 128
+            && heads.is_multiple_of(4)
+            && self.subgroup == 64;
+        let (kernel, grid) = if use2 {
+            (&self.kernels.attn_b_h2, ntok * (heads / 4) * 256)
+        } else {
+            (&self.kernels.attn_b_h, ntok * heads * 256)
+        };
+        unsafe {
+            self.gpu.launch(
+                kernel,
+                grid,
+                256,
+                &[
+                    Arg::Mem(self.bufs.qb.get()),
+                    Arg::Mem(k_buf.mem()),
+                    Arg::Mem(v_buf.mem()),
+                    Arg::Mem(self.bufs.tbl_all.get()),
+                    Arg::Mem(self.bufs.tbl_off_b.get()),
+                    Arg::Mem(self.bufs.pos_b.get()),
+                    Arg::Mem(self.bufs.gb.get()),
+                    Arg::Mem(self.bufs.attnb.get()),
+                    Arg::U32(n32),
+                    Arg::U32(kv_heads as u32),
+                    Arg::U32(head_dim as u32),
+                    Arg::U32(heads as u32),
+                    Arg::U32(window as u32),
+                ],
+            )?;
+            self.gpu.launch(
+                &self.kernels.quant_b,
+                ntok * (qd / GROUP),
+                0,
+                &[
+                    Arg::Mem(self.bufs.attnb.get()),
+                    Arg::Mem(self.bufs.hqx.get()),
+                    Arg::Mem(self.bufs.hsx.get()),
+                    Arg::U32(qd as u32),
+                    Arg::U32(GROUP as u32),
+                    Arg::U32(n32),
+                ],
+            )?;
+        }
+        self.gemv_auto_b(
+            &format!("{prefix}.attn_output.weight"),
+            &self.bufs.hqx,
+            &self.bufs.hsx,
+            &self.bufs.tmpb,
+            h,
+            qd,
+            ntok,
+            0,
+        )?;
+        self.gpu.queue.finish()?;
+        self.gpu.download(&self.bufs.tmpb, ntok * h)
+    }
+
+    pub fn tp_attn_norm_b(&mut self, layer: usize, tmp: &[f32], ntok: usize) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.tmpb, 1, 0, tmp, &[])?;
+        }
+        let prefix = format!("blk.{layer}");
+        let post = self.f32_weight(&format!("{prefix}.post_attention_norm.weight"))?;
+        let ffn_norm = self.f32_weight(&format!("{prefix}.ffn_norm.weight"))?;
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.norm_add_quant_b,
+                ntok * 256,
+                256,
+                &[
+                    Arg::Mem(self.bufs.tmpb.get()),
+                    Arg::Mem(post.get()),
+                    Arg::Mem(self.bufs.xb.get()),
+                    Arg::Mem(ffn_norm.get()),
+                    Arg::Mem(self.bufs.xb.get()),
+                    Arg::Mem(self.bufs.hqx.get()),
+                    Arg::Mem(self.bufs.hsx.get()),
+                    Arg::U32(h as u32),
+                    Arg::U32(ntok as u32),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_ffn_local_b(&mut self, layer: usize, ntok: usize) -> Result<Vec<f32>> {
+        let shard = self.tp.ok_or_else(|| anyhow!("not a tp shard"))?;
+        let h = self.cfg.hidden_size;
+        let ffn = if shard.ffn_row_count == 0 {
+            self.ffn
+        } else {
+            shard.ffn_row_count
+        };
+        let prefix = format!("blk.{layer}");
+        self.gemv_auto_b(
+            &format!("{prefix}.ffn_ug.weight"),
+            &self.bufs.hqx,
+            &self.bufs.hsx,
+            &self.bufs.ugb,
+            2 * ffn,
+            h,
+            ntok,
+            0,
+        )?;
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.silu_quant_b,
+                ntok * (ffn / GROUP),
+                0,
+                &[
+                    Arg::Mem(self.bufs.ugb.get()),
+                    Arg::Mem(self.bufs.actqb.get()),
+                    Arg::Mem(self.bufs.actsb.get()),
+                    Arg::U32(ffn as u32),
+                    Arg::U32(ffn as u32),
+                    Arg::U32(ntok as u32),
+                ],
+            )?;
+        }
+        self.gemv_auto_b(
+            &format!("{prefix}.ffn_down.weight"),
+            &self.bufs.actqb,
+            &self.bufs.actsb,
+            &self.bufs.tmpb,
+            h,
+            ffn,
+            ntok,
+            0,
+        )?;
+        self.gpu.queue.finish()?;
+        self.gpu.download(&self.bufs.tmpb, ntok * h)
+    }
+
+    pub fn tp_ffn_norm_b(&mut self, layer: usize, tmp: &[f32], ntok: usize) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        unsafe {
+            self.gpu
+                .queue
+                .enqueue_write_buffer(&mut self.bufs.tmpb, 1, 0, tmp, &[])?;
+        }
+        let prefix = format!("blk.{layer}");
+        let post = self.f32_weight(&format!("{prefix}.post_ffw_norm.weight"))?;
+        let next_w = if layer + 1 < self.cfg.num_layers {
+            self.f32_weight(&format!("blk.{}.attn_norm.weight", layer + 1))?
+        } else if self.has_head {
+            self.f32_weight("output_norm.weight")?
+        } else {
+            self.f32_weight(&format!("{prefix}.post_ffw_norm.weight"))?
+        };
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.norm_add_quant_b,
+                ntok * 256,
+                256,
+                &[
+                    Arg::Mem(self.bufs.tmpb.get()),
+                    Arg::Mem(post.get()),
+                    Arg::Mem(self.bufs.xb.get()),
+                    Arg::Mem(next_w.get()),
+                    Arg::Mem(self.bufs.xb.get()),
+                    Arg::Mem(self.bufs.hqx.get()),
+                    Arg::Mem(self.bufs.hsx.get()),
+                    Arg::U32(h as u32),
+                    Arg::U32(ntok as u32),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn tp_lmhead_last(&mut self, ntok: usize) -> Result<Vec<f32>> {
+        let h = self.cfg.hidden_size;
+        let row = ntok - 1;
+        unsafe {
+            self.gpu.queue.enqueue_copy_buffer(
+                &self.bufs.hqx,
+                &mut self.bufs.hq,
+                row * h,
+                0,
+                h,
+                &[],
+            )?;
+            self.gpu.queue.enqueue_copy_buffer(
+                &self.bufs.hsx,
+                &mut self.bufs.hs,
+                row * (h / GROUP) * 4,
+                0,
+                (h / GROUP) * 4,
+                &[],
+            )?;
+        }
+        self.tp_lmhead_partial()
+    }
+
     pub fn tp_x(&self) -> Result<Vec<f32>> {
         self.gpu.download(&self.bufs.x, self.cfg.hidden_size)
     }

@@ -217,8 +217,10 @@ LFM_TP=0/1 lfm-server ...          # tensor parallel (головы делятс�
 LFM_TIERS=50/50 lfm-server ...     # pipeline (слои); батчевый prefill
 ```
 
-TP не умеет 3 устройства (16 голов не делятся на 3) и не батчит prefill;
-pipeline умеет и то и другое. Подробности и замеры — `docs/backends.md`.
+TP не умеет 3 устройства (16 голов не делятся на 3), но теперь батчит prefill
+(подряд идущие prompt-токены считаются чанком; `LFM_TP_SERIAL=1` — старый
+пошаговый путь). Pipeline умеет и 3 устройства, и батчевый prefill.
+Подробности и замеры — `docs/backends.md`.
 
 ### 3b. Сжатый KV (`--kv kvarn`)
 
