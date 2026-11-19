@@ -65,7 +65,6 @@ const KERNELS: &str = concat!(
 const GROUP: usize = 32;
 pub(crate) const MAX_SPLITS: usize = 16;
 const KV_PAGE: usize = PAGE;
-const KV_STAGE: usize = 4 * KV_PAGE;
 
 #[derive(Clone, Copy)]
 enum DecKv {
@@ -498,6 +497,7 @@ pub struct GpuModel {
     kv_blocks: usize,
     kv_q4: bool,
     kv_f32: bool,
+    kv_stage: usize,
     splits_cap: usize,
     cache: RadixCache,
     cache_on: bool,
@@ -919,9 +919,14 @@ impl GpuModel {
                 "kv type {kv_kind:?} требует cl_khr_fp16; без fp16 доступны kv=f16 и kv=kvarn"
             ));
         }
-        if kv_kvarn && batch_cap > KV_STAGE {
+        let kv_stage = if kv_kvarn {
+            prefill_batch.max(1).div_ceil(KV_PAGE) * KV_PAGE
+        } else {
+            KV_PAGE
+        };
+        if kv_kvarn && batch_cap > kv_stage {
             return Err(anyhow!(
-                "kvarn: батч {batch_cap} больше staging-кольца {KV_STAGE} токенов"
+                "kvarn: батч {batch_cap} больше staging-кольца {kv_stage} токенов"
             ));
         }
         if (kv_q4 || kv_kvarn) && shard.is_some() {
@@ -1011,6 +1016,7 @@ impl GpuModel {
                         kv_kvarn,
                         kv_f32,
                         opts.max_seqs,
+                        kv_stage,
                         kv_slots,
                         kv_blocks,
                         kvd,
@@ -1022,6 +1028,7 @@ impl GpuModel {
                         kv_kvarn,
                         kv_f32,
                         opts.max_seqs,
+                        kv_stage,
                         kv_slots,
                         kv_blocks,
                         kvd,
@@ -1071,6 +1078,7 @@ impl GpuModel {
             kv_blocks,
             kv_q4,
             kv_f32,
+            kv_stage,
             splits_cap,
             cache: RadixCache::new(kv_blocks),
             cache_on,
@@ -4297,7 +4305,7 @@ impl GpuModel {
                 ) => {
                     let heads = self.cfg.kv_dim() / self.cfg.head_dim;
                     let blocks = self.kv_blocks;
-                    let stage_len = self.max_seqs * KV_STAGE * self.cfg.kv_dim();
+                    let stage_len = self.max_seqs * self.kv_stage * self.cfg.kv_dim();
                     let sizes = [
                         (ks.get(), stage_len),
                         (vst.get(), stage_len),
@@ -4701,6 +4709,7 @@ fn make_kv(
     kvarn: bool,
     f32_kv: bool,
     max_seqs: usize,
+    stage: usize,
     slots: usize,
     blocks: usize,
     kvd: usize,
@@ -4708,7 +4717,7 @@ fn make_kv(
 ) -> Result<KvBuf> {
     let heads = kvd / head_dim;
     let kv_wide = if f32_kv { 2 } else { 1 };
-    let staging_slots = max_seqs * KV_STAGE;
+    let staging_slots = max_seqs * stage;
     Ok(if kvarn {
         KvBuf::Kvarn {
             staging: gpu.alloc::<u16>(staging_slots * kvd * kv_wide)?,

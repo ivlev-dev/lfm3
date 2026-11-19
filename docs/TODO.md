@@ -368,7 +368,9 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
 | Гейтация | Q6 через int8 включается по `subgroup < 32`, а не по fp16; в `Caps` добавлены vendor/device_type |
 | AMD контроль | f16: pp512 833–866, pp4096 789, pp8192 681–698, decode 63 (512)/28.8 (8192), multi 216–225; kvarn: 676/440/327, decode 50/28.4, cos 0.999205 на 601 |
 | Редукция | LDS-склад в attention kvarn и f16-decode заменён на `sub_group_reduce_add` при подгруппе 64 (`LFM_SG64`). AMD: f16 decode 8192 — 28.8 → 43.2 tok/s, kvarn decode 8192 — 28.4 → 41.5, kvarn prefill 512/4096 — 676/440 → 757/483. cos f16 0.998532, kvarn 0.998435 |
-| Вывод | decode-GEMV на iGPU упирается в перекрытие загрузки/счёт и латентность dot4; kvarn меняет память (403 → 143 МБ) на скорость prefill (−11…−52%) |
+| Сервер | одиночный decode-шаг в сервере шёл через батчевые ядра: avg_step 1150 → 256 мс; логіты переносятся в батчевый буфер для `logits_row`. На iGPU с kvarn: TTFT 2.24 с, стрим корректен, обрыв освобождает слот |
+| Память kvarn | staging-кольцо = `prefill_ntok`: 128 → 143 МБ, 64 → 118, 32 → 106 МБ при ctx 8192 (prefill −7…−11%), cos не меняется |
+| Вывод | decode-GEMV на iGPU упирается в перекрытие загрузки/счёт и латентность dot4; kvarn меняет память (403 → 106–143 МБ) на скорость prefill (−11…−48%) |
 
 ## Сессия 13 (kvarn: staging по последовательностям)
 

@@ -41,7 +41,7 @@
 | `prepack` | `LFM_PREPACK` | — | `true` | 148-байтная раскладка Q4_K и int8-копии; `false` оставляет только decode (prefill требует prepack) |
 | `fuse` | `LFM_FUSE` | — | `true` | слияние `q‖k‖g` и `gate‖up` |
 | `pb` | `LFM_PB` | `--pb` | `6` | порог батчевого GEMV, 1..=12 |
-| `prefill_ntok` | `LFM_PREFILL_NTOK` | `--prefill-ntok` | `128` | размер чанка prefill, 1..=128 |
+| `prefill_ntok` | `LFM_PREFILL_NTOK` | `--prefill-ntok` | `128` | размер чанка prefill, 1..=128; у `kv=kvarn` задаёт ещё и размер staging-кольца (память KV: 128 → 143 МБ, 64 → 118, 32 → 106 при ctx 8192) |
 | `max_seqs` | `LFM_SEQS` | `--max-seqs` | `8` | одновременных последовательностей, 1..=16 |
 | `cache` | `LFM_CACHE` | `--no-cache` | `true` | кэш префиксов (radix) |
 | `splits` | `LFM_SPLITS` | `--splits` | `16` | максимум сплитов внимания, 1..=16 |
