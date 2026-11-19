@@ -436,29 +436,6 @@ __kernel void silu_quant(__global const float *ug, __global char *xq, __global f
     }
 }
 
-__kernel void gate_quant(__global float *attn, __global const float *gate, __global char *xq, __global float *xs, uint n, uint head_dim) {
-    uint g = get_global_id(0);
-    if (g >= (n >> 5)) {
-        return;
-    }
-    uint base = g << 5;
-    uint head = base / head_dim;
-    float gv = 1.0f / (1.0f + exp(-gate[head]));
-    float vals[32];
-    float amax = 0.0f;
-    for (uint i = 0u; i < 32u; ++i) {
-        float v = attn[base + i] * gv;
-        vals[i] = v;
-        amax = fmax(amax, fabs(v));
-    }
-    float sc = amax > 0.0f ? amax / 127.0f : 0.0f;
-    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
-    xs[g] = sc;
-    for (uint i = 0u; i < 32u; ++i) {
-        xq[base + i] = (char)convert_int_rte(vals[i] * inv);
-    }
-}
-
 __kernel void norm_add_quant(__global const float *op, __global const float *post, __global const float *res, __global const float *next_w, __global float *x_out, __global char *xq, __global float *xs, uint n) {
     uint lid = get_local_id(0);
     uint sub = lid & 3u;

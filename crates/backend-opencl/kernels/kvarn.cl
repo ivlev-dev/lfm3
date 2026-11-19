@@ -830,71 +830,8 @@ static void lfm_tq_rot_inv8(float v[8], uint jlane) {
     }
 }
 
-static void lfm_kvarn_k8(__global const uchar *kcode, __global const KV_T *ka, __global const KV_T *kc,
-                         uint phys, uint tok, uint kvh, uint kv_heads, uint j, float k[8]) {
-    uint base = phys * kv_heads + kvh;
-    __global const uchar *cp = kcode + ((phys << 5 | tok) * kv_heads + kvh) * 64u + j * 4u;
-    uchar4 c = vload4(0, cp);
-    float a[8];
-    vstore8(convert_float8(kv_load8(0, ka + base * 128u + j * 8u)), 0, a);
-    float ct = (float)kc[base * 32u + tok];
-    k[0] = (float)((int)(c.s0 & 15u) - 8);
-    k[1] = (float)((int)((c.s0 >> 4) & 15u) - 8);
-    k[2] = (float)((int)(c.s1 & 15u) - 8);
-    k[3] = (float)((int)((c.s1 >> 4) & 15u) - 8);
-    k[4] = (float)((int)(c.s2 & 15u) - 8);
-    k[5] = (float)((int)((c.s2 >> 4) & 15u) - 8);
-    k[6] = (float)((int)(c.s3 & 15u) - 8);
-    k[7] = (float)((int)((c.s3 >> 4) & 15u) - 8);
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        k[i] *= a[i] * ct;
-    }
-}
-
-static void lfm_kvarn_v8(__global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz,
-                         __global const KV_T *vc, uint phys, uint tok, uint kvh, uint kv_heads, uint j, float v[8]) {
-    uint base = phys * kv_heads + kvh;
-    float sc[8];
-    vstore8(convert_float8(kv_load8(0, vc + base * 128u + j * 8u)), 0, sc);
-    float bt = (float)vb[base * 32u + tok];
-    float zero = (float)vbz[base * 32u + tok];
-#ifdef LFM_KV4
-    __global const uchar *cp = vcode + ((phys << 5 | tok) * kv_heads + kvh) * 64u + j * 4u;
-    uchar4 cv = vload4(0, cp);
-    v[0] = (float)(cv.s0 & 15u) * bt + zero;
-    v[1] = (float)((cv.s0 >> 4) & 15u) * bt + zero;
-    v[2] = (float)(cv.s1 & 15u) * bt + zero;
-    v[3] = (float)((cv.s1 >> 4) & 15u) * bt + zero;
-    v[4] = (float)(cv.s2 & 15u) * bt + zero;
-    v[5] = (float)((cv.s2 >> 4) & 15u) * bt + zero;
-    v[6] = (float)(cv.s3 & 15u) * bt + zero;
-    v[7] = (float)((cv.s3 >> 4) & 15u) * bt + zero;
-#else
-    __global const uchar *cp = vcode + ((phys << 5 | tok) * kv_heads + kvh) * 32u + j * 2u;
-    uint c = (uint)cp[0] | ((uint)cp[1] << 8);
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        v[i] = (float)((c >> (2u * i)) & 3u) * bt + zero;
-    }
-#endif
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        v[i] *= sc[i];
-    }
-}
-
-
 static void lfm_kvarn_k8_c(__global const uchar *kcode, float ct, const float a[8],
                            uint phys, uint tok, uint kvh, uint kv_heads, uint j, float k[8]) {
-#ifdef LFM_KV3
-    __global const uchar *cp = kcode + ((phys << 5 | tok) * kv_heads + kvh) * 48u + j * 3u;
-    uint w = (uint)cp[0] | ((uint)cp[1] << 8) | ((uint)cp[2] << 16);
-    #pragma unroll
-    for (uint i = 0u; i < 8u; ++i) {
-        k[i] = (float)((int)((w >> (3u * i)) & 7u) - 3);
-    }
-#else
     __global const uchar *cp = kcode + ((phys << 5 | tok) * kv_heads + kvh) * 64u + j * 4u;
     uchar4 c = vload4(0, cp);
     k[0] = (float)((int)(c.s0 & 15u) - 8);
@@ -905,7 +842,6 @@ static void lfm_kvarn_k8_c(__global const uchar *kcode, float ct, const float a[
     k[5] = (float)((int)((c.s2 >> 4) & 15u) - 8);
     k[6] = (float)((int)(c.s3 & 15u) - 8);
     k[7] = (float)((int)((c.s3 >> 4) & 15u) - 8);
-#endif
     #pragma unroll
     for (uint i = 0u; i < 8u; ++i) {
         k[i] *= a[i] * ct;
