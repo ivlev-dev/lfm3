@@ -37,7 +37,7 @@
 |---|---|---|---|---|
 | `device` | `LFM_DEVICE` | `--device` | `0` | индекс OpenCL-устройства |
 | `profile` | `LFM_PROFILE` | `--profile` | `false` | тайминги ядер (`lfm-bench gpu-prefill` печатает профиль) |
-| `kv` | `LFM_KV` | `--kv` | `f16` | тип KV-кэша: `f16`, `q4`, `k4v4`, `kvarn`, `kvarn_k4v2` |
+| `kv` | `LFM_KV` | `--kv` | `f16` | тип KV-кэша: `f16`, `q4`, `k4v4`, `kvarn`, `kvarn_k4v2`; на устройстве без fp16 `f16` хранится во float, `q4`/`kvarn` недоступны |
 | `prepack` | `LFM_PREPACK` | — | `true` | 148-байтная раскладка Q4_K и int8-копии; `false` оставляет только decode (prefill требует prepack) |
 | `fuse` | `LFM_FUSE` | — | `true` | слияние `q‖k‖g` и `gate‖up` |
 | `pb` | `LFM_PB` | `--pb` | `6` | порог батчевого GEMV, 1..=12 |
@@ -74,6 +74,20 @@
 Важно: при `LFM_TP`/`LFM_TIERS` настройки `[engine]` из файла
 не применяются — эти пути читают окружение сами (см. `docs/backends.md`).
 `lfm-bench` файл конфигурации не читает, только окружение.
+
+## Intel iGPU
+
+Встроенная Intel (Gen9/UHD 630) появляется в OpenCL только через Rusticl с
+`RUSTICL_ENABLE=iris`; без переменной устройств не будет вовсе:
+
+```bash
+RUSTICL_ENABLE=iris ./target/release/lfm-bench info
+RUSTICL_ENABLE=iris ./target/release/lfm-server --config server.toml
+```
+
+Индекс устройства — как обычно (`LFM_DEVICE`/`device`). На таком устройстве нет
+`cl_khr_fp16`: KV-кэш автоматически хранится во float, `kv = "q4"` и
+`kv = "kvarn"` возвращают ошибку при загрузке. Подробности — `docs/backends.md`.
 
 ## Пример
 

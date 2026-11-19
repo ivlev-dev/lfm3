@@ -1387,12 +1387,7 @@ fn reference_debug(model: &Path, ids: &[u32], out: Option<&Path>) -> Result<()> 
     Ok(())
 }
 
-fn reference_generate(
-    model: &Path,
-    tokenizer: &Path,
-    prompt: &str,
-    max_new: usize,
-) -> Result<()> {
+fn reference_generate(model: &Path, tokenizer: &Path, prompt: &str, max_new: usize) -> Result<()> {
     let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
     let ids = tok.encode(prompt, false)?;
     println!("prompt ids: {ids:?}");
@@ -2975,13 +2970,7 @@ fn gpu_pp(
     Ok(())
 }
 
-fn gpu_port(
-    model: &Path,
-    tokenizer: &Path,
-    prompt: &str,
-    tokens: usize,
-    ctx: usize,
-) -> Result<()> {
+fn gpu_port(model: &Path, tokenizer: &Path, prompt: &str, tokens: usize, ctx: usize) -> Result<()> {
     let mut gpu = lfm_gpu::GpuModel::load(model, ctx)?;
     let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
     let out = lfm_app::Generate::new(&mut gpu, &tok).run(prompt, tokens)?;
@@ -3594,16 +3583,13 @@ fn gemm_one(
     Ok(max_rel)
 }
 
-fn gemm_cmp(
-    model: &Path,
-    tensor: &str,
-    ntok: usize,
-    mode: &str,
-    check_rows: usize,
-) -> Result<()> {
+fn gemm_cmp(model: &Path, tensor: &str, ntok: usize, mode: &str, check_rows: usize) -> Result<()> {
     let gguf = lfm_gguf::GgufFile::open(model)?;
     let gpu = Gpu::open(0)?;
-    let program = gpu.build(LFM_KERNELS, "-cl-std=CL3.0 -DRGEMV=4 -DRGEMV_B=64 -DPB=6")?;
+    let program = gpu.build(
+        LFM_KERNELS,
+        &lfm_gpu::build_flags(&gpu, "-cl-std=CL3.0 -DRGEMV=4 -DRGEMV_B=64 -DPB=6"),
+    )?;
     if tensor != "*" {
         let info = gguf
             .tensor(tensor)
@@ -3762,7 +3748,7 @@ __kernel void f16_rate(__global const char *src, __global float *out, uint iters
 fn kernel_bin(name: &str, out: &std::path::Path) -> Result<()> {
     let gpu = Gpu::open(0)?;
     let opts = "-cl-std=CL3.0 -DRGEMV=5 -DRGEMV_B=4 -DPB=6";
-    let program = gpu.build(LFM_KERNELS, opts)?;
+    let program = gpu.build(LFM_KERNELS, &lfm_gpu::build_flags(&gpu, opts))?;
     let _k = Kernel::create(&program, name)?;
     let sizes = program.get_binary_sizes()?;
     let bins = program.get_binaries()?;

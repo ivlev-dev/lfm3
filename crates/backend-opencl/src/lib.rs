@@ -13,6 +13,15 @@ pub mod options;
 mod pipeline;
 pub mod prepack;
 pub use options::Options;
+
+/// Опции сборки программы: добавляет -DLFM_F32_KV, если устройство без cl_khr_fp16.
+pub fn build_flags(gpu: &Gpu, base: &str) -> String {
+    if gpu.caps.fp16 {
+        base.to_string()
+    } else {
+        format!("{base} -DLFM_F32_KV")
+    }
+}
 mod ports;
 mod radix;
 mod tp;
@@ -485,6 +494,7 @@ pub struct GpuModel {
     subgroup: usize,
     kv_blocks: usize,
     kv_q4: bool,
+    kv_f32: bool,
     splits_cap: usize,
     cache: RadixCache,
     cache_on: bool,
@@ -808,7 +818,11 @@ impl GpuModel {
         let wg = opts.wg;
         let wg_b = opts.wg_b;
         let subgroup = gpu.caps.sub_group_size.max(1);
-        let options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
+        let kv_f32 = !gpu.caps.fp16;
+        let mut options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
+        if kv_f32 {
+            options.push_str(" -DLFM_F32_KV");
+        }
         let program: Program = gpu.build(KERNELS, &options)?;
         let kernels = Kernels {
             embed: Kernel::create(&program, "embed_q6k")?,
@@ -881,13 +895,15 @@ impl GpuModel {
         let kv_slots = kv_blocks * KV_PAGE;
         let max_seqs = opts.max_seqs;
         let cache_on = opts.cache;
-        if !gpu.caps.fp16 {
-            return Err(anyhow!("device without fp16 is not supported"));
-        }
         let splits_cap = opts.splits;
         let kv_kind = opts.kv.clone();
         let kv_q4 = kv_kind == "q4" || kv_kind == "k4v4";
         let kv_kvarn = kv_kind == "kvarn" || kv_kind == "kvarn_k4v2";
+        if kv_f32 && (kv_q4 || kv_kvarn) {
+            return Err(anyhow!(
+                "kv type {kv_kind:?} требует cl_khr_fp16; без fp16 доступен только kv=f16 (во float)"
+            ));
+        }
         if kv_kvarn {
             eprintln!(
                 "lfm-gpu: kvarn держит полный f16-staging для неполной страницы, поэтому память под KV не уменьшается"
@@ -977,6 +993,7 @@ impl GpuModel {
                         &gpu,
                         kv_q4,
                         kv_kvarn,
+                        kv_f32,
                         kv_slots,
                         kv_blocks,
                         kvd,
@@ -986,6 +1003,7 @@ impl GpuModel {
                         &gpu,
                         kv_q4,
                         kv_kvarn,
+                        kv_f32,
                         kv_slots,
                         kv_blocks,
                         kvd,
@@ -1033,6 +1051,7 @@ impl GpuModel {
             subgroup,
             kv_blocks,
             kv_q4,
+            kv_f32,
             splits_cap,
             cache: RadixCache::new(kv_blocks),
             cache_on,
@@ -1064,6 +1083,29 @@ impl GpuModel {
         cols: usize,
     ) -> Result<()> {
         let weight = self.weight(name)?;
+        if self.kv_f32 && matches!(weight, Weight::Q6(_)) {
+            let (w8, wsc, _) = self.prepacked_i8.get(name).ok_or_else(|| {
+                anyhow!("Q6 без fp16 считает только int8-ядро, нужен prepack: {name}")
+            })?;
+            unsafe {
+                self.gpu.launch(
+                    &self.kernels.gemm_i8_gz,
+                    rows.div_ceil(64) * 512,
+                    512,
+                    &[
+                        Arg::Mem(w8.get()),
+                        Arg::Mem(wsc.get()),
+                        Arg::Mem(xq.get()),
+                        Arg::Mem(xs.get()),
+                        Arg::Mem(y.get()),
+                        Arg::U32(rows as u32),
+                        Arg::U32(cols as u32),
+                        Arg::U32(1),
+                    ],
+                )?;
+            }
+            return Ok(());
+        }
         if matches!(weight, Weight::Q4(_)) && self.prepack_on {
             let packed = self.prepacked.get(name);
             let p = packed.ok_or_else(|| anyhow!("q4 gemv needs prepacked weights: {name}"))?;
@@ -3348,7 +3390,8 @@ impl GpuModel {
                                         let use2 = self.attn2
                                             && !self.kv_q4
                                             && head_dim == 128
-                                            && heads.is_multiple_of(4);
+                                            && heads.is_multiple_of(4)
+                                            && self.subgroup == 64;
                                         let use_fa =
                                             use2 && self.flash_on && kv_heads == 4 && heads == 16;
                                         let (kernel, grid) = if use_fa {
@@ -3440,7 +3483,8 @@ impl GpuModel {
                                         let use4 = self.attn4
                                             && !self.kv_q4
                                             && heads == kv_heads * 4
-                                            && head_dim == 128;
+                                            && head_dim == 128
+                                            && self.subgroup == 64;
                                         let (kernel, grid) =
                                             if use4 && self.flash_on && self.flash2_on {
                                                 (
@@ -3931,22 +3975,28 @@ impl GpuModel {
             .and_then(|s| s.block_table.get(pos / KV_PAGE))
             .map(|b| (*b as usize) * KV_PAGE + pos % KV_PAGE)
             .unwrap_or(0);
+        let read_kv = |buf: &Buffer<u16>| -> Result<Vec<f32>> {
+            if self.kv_f32 {
+                let raw = self.gpu.download_at(buf, slot * kvd * 4, kvd * 2)?;
+                Ok(raw
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits(u32::from(c[0]) | (u32::from(c[1]) << 16)))
+                    .collect())
+            } else {
+                Ok(self
+                    .gpu
+                    .download_at(buf, slot * kvd * 2, kvd)?
+                    .iter()
+                    .map(|bits| half_to_f32(*bits))
+                    .collect())
+            }
+        };
         let k = match &self.layers[layer].k {
-            Some(KvBuf::F16(b)) => self
-                .gpu
-                .download_at(b, slot * kvd * 2, kvd)?
-                .iter()
-                .map(|bits| half_to_f32(*bits))
-                .collect(),
+            Some(KvBuf::F16(b)) => read_kv(b)?,
             _ => Vec::new(),
         };
         let v = match &self.layers[layer].v {
-            Some(KvBuf::F16(b)) => self
-                .gpu
-                .download_at(b, slot * kvd * 2, kvd)?
-                .iter()
-                .map(|bits| half_to_f32(*bits))
-                .collect(),
+            Some(KvBuf::F16(b)) => read_kv(b)?,
             _ => Vec::new(),
         };
         Ok((conv, k, v))
@@ -4498,6 +4548,7 @@ fn make_kv(
     gpu: &Gpu,
     q4: bool,
     kvarn: bool,
+    f32_kv: bool,
     slots: usize,
     blocks: usize,
     kvd: usize,
@@ -4521,6 +4572,6 @@ fn make_kv(
             scale: gpu.alloc::<u16>(slots * heads)?,
         }
     } else {
-        KvBuf::F16(gpu.alloc::<u16>(slots * kvd)?)
+        KvBuf::F16(gpu.alloc::<u16>(if f32_kv { slots * kvd * 2 } else { slots * kvd })?)
     })
 }

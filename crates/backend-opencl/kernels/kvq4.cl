@@ -59,7 +59,7 @@ static uint lfm_tq_nearest(float x, __local const float *cb) {
     return best;
 }
 
-static void lfm_tq_store_k(__global const float *src, __global uchar *code, __global half *scale,
+static void lfm_tq_store_k(__global const float *src, __global uchar *code, __global KV_T *scale,
                            __local float *buf, __local float *red, __local const float *cb, uint lane) {
     float a = src[2u * lane];
     float b = src[2u * lane + 1u];
@@ -84,11 +84,11 @@ static void lfm_tq_store_k(__global const float *src, __global uchar *code, __gl
     uint i1 = lfm_tq_nearest(buf[2u * lane + 1u], cb);
     code[lane] = (uchar)(i0 | (i1 << 4));
     if (lane == 0u) {
-        scale[0] = (half)norm;
+        scale[0] = (KV_T)norm;
     }
 }
 
-static void lfm_tq_store_v(__global const float *src, __global uchar *code, __global half *scale,
+static void lfm_tq_store_v(__global const float *src, __global uchar *code, __global KV_T *scale,
                            __local float *buf, __local float *red, uint lane) {
     float a = src[2u * lane];
     float b = src[2u * lane + 1u];
@@ -117,13 +117,13 @@ static void lfm_tq_store_v(__global const float *src, __global uchar *code, __gl
     q1 = q1 < -7 ? -7 : (q1 > 7 ? 7 : q1);
     code[lane] = (uchar)((q0 + 7) | ((q1 + 7) << 4));
     if (lane == 0u) {
-        scale[0] = (half)sc;
+        scale[0] = (KV_T)sc;
     }
 }
 
 __kernel void kv_store_q(__global const float *ksrc, __global const float *vsrc,
-                         __global uchar *kc, __global half *kn,
-                         __global uchar *vc, __global half *vs,
+                         __global uchar *kc, __global KV_T *kn,
+                         __global uchar *vc, __global KV_T *vs,
                          __global const uint *tbl, uint pos, uint kv_heads, uint head_dim) {
     uint lane = get_local_id(0);
     uint h = get_group_id(0);
@@ -145,8 +145,8 @@ __kernel void kv_store_q(__global const float *ksrc, __global const float *vsrc,
 }
 
 __kernel void kv_store_b_q(__global const float *ksrc, __global const float *vsrc,
-                           __global uchar *kc, __global half *kn,
-                           __global uchar *vc, __global half *vs,
+                           __global uchar *kc, __global KV_T *kn,
+                           __global uchar *vc, __global KV_T *vs,
                            __global const uint *tbl, __global const uint *tbl_off,
                            __global const uint *pos_b, uint kv_heads, uint head_dim, uint ntok) {
     uint lane = get_local_id(0);
@@ -172,22 +172,22 @@ __kernel void kv_store_b_q(__global const float *ksrc, __global const float *vsr
     lfm_tq_store_v(vsrc + off, vc + base * 64u, vs + base, buf, red, lane);
 }
 
-static float2 lfm_tq_load_k(__global const uchar *kc, __global const half *kn,
+static float2 lfm_tq_load_k(__global const uchar *kc, __global const KV_T *kn,
                             __local const float *cb, ulong slot, uint kvh, uint kv_heads, uint lane) {
     uint base = (uint)slot * kv_heads + kvh;
     uchar b = kc[base * 64u + lane];
-    float n = (float)vload_half(0, kn + base);
+    float n = lfm_scale((__global const ushort *)kn + base);
     float2 k;
     k.x = cb[b & 15u] * n;
     k.y = cb[b >> 4] * n;
     return k;
 }
 
-static float2 lfm_tq_load_v(__global const uchar *vc, __global const half *vs,
+static float2 lfm_tq_load_v(__global const uchar *vc, __global const KV_T *vs,
                             ulong slot, uint kvh, uint kv_heads, uint lane) {
     uint base = (uint)slot * kv_heads + kvh;
     uchar b = vc[base * 64u + lane];
-    float s = (float)vload_half(0, vs + base);
+    float s = lfm_scale((__global const ushort *)vs + base);
     float2 v;
     v.x = (float)((int)(b & 15u) - 7) * s;
     v.y = (float)((int)(b >> 4) - 7) * s;
@@ -201,8 +201,8 @@ static void lfm_tq_load_q(__global const float *q, __local float *qs, uint lane,
     lfm_tq_rot_fwd(qs, lane);
 }
 
-__kernel void attention_h_q(__global const float *q, __global const uchar *kc, __global const half *kn,
-                            __global const uchar *vc, __global const half *vs,
+__kernel void attention_h_q(__global const float *q, __global const uchar *kc, __global const KV_T *kn,
+                            __global const uchar *vc, __global const KV_T *vs,
                             __global const uint *tbl, __global const float *gate,
                             __global float *out, uint len, uint start, uint kv_heads, uint n_heads) {
     uint lane = get_local_id(0);
@@ -292,8 +292,8 @@ __kernel void attention_h_q(__global const float *q, __global const uchar *kc, _
     out[head * 128u + 2u * lane + 1u] = qs[2u * lane + 1u] * gs;
 }
 
-__kernel void attention_split_h_q(__global const float *q, __global const uchar *kc, __global const half *kn,
-                                  __global const uchar *vc, __global const half *vs,
+__kernel void attention_split_h_q(__global const float *q, __global const uchar *kc, __global const KV_T *kn,
+                                  __global const uchar *vc, __global const KV_T *vs,
                                   __global const uint *tbl, __global float *pacc, __global float *pml,
                                   uint len, uint start, uint kv_heads, uint n_heads, uint splits) {
     uint gid = get_group_id(0);
@@ -396,8 +396,8 @@ __kernel void attention_split_h_q(__global const float *q, __global const uchar 
     }
 }
 
-__kernel void attention_b_h_q(__global const float *q, __global const uchar *kc, __global const half *kn,
-                              __global const uchar *vc, __global const half *vs,
+__kernel void attention_b_h_q(__global const float *q, __global const uchar *kc, __global const KV_T *kn,
+                              __global const uchar *vc, __global const KV_T *vs,
                               __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b,
                               __global const float *gate, __global float *out,
                               uint ntok, uint kv_heads, uint n_heads, uint window) {
@@ -466,8 +466,8 @@ __kernel void attention_b_h_q(__global const float *q, __global const uchar *kc,
     o[2u * lane + 1u] = qs[grp * 128u + 2u * lane + 1u] * gs;
 }
 
-__kernel void attention_split_b_h_q(__global const float *q, __global const uchar *kc, __global const half *kn,
-                                    __global const uchar *vc, __global const half *vs,
+__kernel void attention_split_b_h_q(__global const float *q, __global const uchar *kc, __global const KV_T *kn,
+                                    __global const uchar *vc, __global const KV_T *vs,
                                     __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b,
                                     __global float *pacc, __global float *pml,
                                     uint ntok, uint kv_heads, uint n_heads, uint window, uint splits) {

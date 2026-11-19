@@ -2,7 +2,7 @@
 
 
 __kernel void kv_store_h_rot(__global const float *ksrc, __global const float *vsrc,
-                             __global half *kdst, __global half *vdst,
+                             __global KV_T *kdst, __global KV_T *vdst,
                              __global const uint *tbl, uint pos, uint kv_heads, uint head_dim) {
     uint lane = get_local_id(0);
     uint h = get_group_id(0);
@@ -14,19 +14,19 @@ __kernel void kv_store_h_rot(__global const float *ksrc, __global const float *v
     buf[2u * lane + 1u] = ksrc[src + 2u * lane + 1u];
     barrier(CLK_LOCAL_MEM_FENCE);
     lfm_tq_rot_fwd(buf, lane);
-    kdst[base + 2u * lane] = (half)buf[2u * lane];
-    kdst[base + 2u * lane + 1u] = (half)buf[2u * lane + 1u];
+    kdst[base + 2u * lane] = (KV_T)buf[2u * lane];
+    kdst[base + 2u * lane + 1u] = (KV_T)buf[2u * lane + 1u];
     barrier(CLK_LOCAL_MEM_FENCE);
     buf[2u * lane] = vsrc[src + 2u * lane];
     buf[2u * lane + 1u] = vsrc[src + 2u * lane + 1u];
     barrier(CLK_LOCAL_MEM_FENCE);
     lfm_tq_rot_fwd(buf, lane);
-    vdst[base + 2u * lane] = (half)buf[2u * lane];
-    vdst[base + 2u * lane + 1u] = (half)buf[2u * lane + 1u];
+    vdst[base + 2u * lane] = (KV_T)buf[2u * lane];
+    vdst[base + 2u * lane + 1u] = (KV_T)buf[2u * lane + 1u];
 }
 
 __kernel void kv_store_b_h_rot(__global const float *ksrc, __global const float *vsrc,
-                               __global half *kdst, __global half *vdst,
+                               __global KV_T *kdst, __global KV_T *vdst,
                                __global const uint *tbl, __global const uint *tbl_off,
                                __global const uint *pos_b, uint kv_heads, uint head_dim, uint ntok) {
     uint lane = get_local_id(0);
@@ -45,15 +45,15 @@ __kernel void kv_store_b_h_rot(__global const float *ksrc, __global const float 
     buf[2u * lane + 1u] = ksrc[src + 2u * lane + 1u];
     barrier(CLK_LOCAL_MEM_FENCE);
     lfm_tq_rot_fwd(buf, lane);
-    kdst[base + 2u * lane] = (half)buf[2u * lane];
-    kdst[base + 2u * lane + 1u] = (half)buf[2u * lane + 1u];
+    kdst[base + 2u * lane] = (KV_T)buf[2u * lane];
+    kdst[base + 2u * lane + 1u] = (KV_T)buf[2u * lane + 1u];
     barrier(CLK_LOCAL_MEM_FENCE);
     buf[2u * lane] = vsrc[src + 2u * lane];
     buf[2u * lane + 1u] = vsrc[src + 2u * lane + 1u];
     barrier(CLK_LOCAL_MEM_FENCE);
     lfm_tq_rot_fwd(buf, lane);
-    vdst[base + 2u * lane] = (half)buf[2u * lane];
-    vdst[base + 2u * lane + 1u] = (half)buf[2u * lane + 1u];
+    vdst[base + 2u * lane] = (KV_T)buf[2u * lane];
+    vdst[base + 2u * lane + 1u] = (KV_T)buf[2u * lane + 1u];
 }
 
 static void lfm_kvarn_scale(__local float *lr, __local float *lc, __local float *ir, __local float *ic,
@@ -89,9 +89,9 @@ static float lfm_kvarn_ch_var(__local const float *t, __local const float *ic, _
     return s / (float)toks;
 }
 
-__kernel void kvarn_commit(__global const half *kst, __global const half *vst,
-                           __global uchar *kcode, __global half *ka, __global half *kc,
-                           __global uchar *vcode, __global half *vb, __global half *vbz, __global half *vc,
+__kernel void kvarn_commit(__global const KV_T *kst, __global const KV_T *vst,
+                           __global uchar *kcode, __global KV_T *ka, __global KV_T *kc,
+                           __global uchar *vcode, __global KV_T *vb, __global KV_T *vbz, __global KV_T *vc,
                            __global const uint *tbl, uint tbl_off, uint page, uint kv_heads, uint head_dim) {
     uint lane = get_local_id(0);
     uint h = get_group_id(0);
@@ -146,10 +146,10 @@ __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
                 mx = fmax(mx, fabs(t[tok * 128u + c] * ic[tok] * r));
             }
             a[c] = mx / 7.0f;
-            ka[((uint)phys * kv_heads + h) * 128u + c] = (half)(a[c] * exp(lr[c]));
+            ka[((uint)phys * kv_heads + h) * 128u + c] = (KV_T)(a[c] * exp(lr[c]));
         }
         if (lane < 32u) {
-            kc[((uint)phys * kv_heads + h) * 32u + lane] = (half)exp(lc[lane]);
+            kc[((uint)phys * kv_heads + h) * 32u + lane] = (KV_T)exp(lc[lane]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint tok = 0u; tok < 32u; ++tok) {
@@ -207,11 +207,11 @@ __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
             }
             b[t2] = step;
             bz[t2] = mn;
-            vb[((uint)phys * kv_heads + h) * 32u + t2] = (half)(step * exp(lc[t2]));
-            vbz[((uint)phys * kv_heads + h) * 32u + t2] = (half)(mn * exp(lc[t2]));
+            vb[((uint)phys * kv_heads + h) * 32u + t2] = (KV_T)(step * exp(lc[t2]));
+            vbz[((uint)phys * kv_heads + h) * 32u + t2] = (KV_T)(mn * exp(lc[t2]));
         }
         for (uint c = lane; c < 128u; c += 64u) {
-            vc[((uint)phys * kv_heads + h) * 128u + c] = (half)exp(lr[c]);
+            vc[((uint)phys * kv_heads + h) * 128u + c] = (KV_T)exp(lr[c]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 32u) {
@@ -231,7 +231,7 @@ __kernel void kvarn_commit(__global const half *kst, __global const half *vst,
     }
 }
 
-static float2 lfm_kvarn_k(__global const uchar *kcode, __global const half *ka, __global const half *kc,
+static float2 lfm_kvarn_k(__global const uchar *kcode, __global const KV_T *ka, __global const KV_T *kc,
                           uint phys, uint tok, uint kvh, uint kv_heads, uint lane) {
     uint base = phys * kv_heads + kvh;
     uchar b = kcode[((phys << 5 | tok) * kv_heads + kvh) * 64u + lane];
@@ -242,8 +242,8 @@ static float2 lfm_kvarn_k(__global const uchar *kcode, __global const half *ka, 
     return k;
 }
 
-static float2 lfm_kvarn_v(__global const uchar *vcode, __global const half *vb, __global const half *vbz,
-                          __global const half *vc, uint phys, uint tok, uint kvh, uint kv_heads, uint lane) {
+static float2 lfm_kvarn_v(__global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz,
+                          __global const KV_T *vc, uint phys, uint tok, uint kvh, uint kv_heads, uint lane) {
     uint base = phys * kv_heads + kvh;
     uchar b = vcode[((phys << 5 | tok) * kv_heads + kvh) * 32u + (lane >> 1)];
     uint sh = 4u * (lane & 1u);
@@ -257,9 +257,9 @@ static float2 lfm_kvarn_v(__global const uchar *vcode, __global const half *vb, 
     return v;
 }
 
-__kernel void attention_h_qk(__global const float *q, __global const half *kst, __global const half *vst,
-                             __global const uchar *kcode, __global const half *ka, __global const half *kc,
-                             __global const uchar *vcode, __global const half *vb, __global const half *vbz, __global const half *vc,
+__kernel void attention_h_qk(__global const float *q, __global const KV_T *kst, __global const KV_T *vst,
+                             __global const uchar *kcode, __global const KV_T *ka, __global const KV_T *kc,
+                             __global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz, __global const KV_T *vc,
                              __global const uint *tbl, __global const float *gate, __global float *out,
                              uint len, uint start, uint full_end, uint kv_heads, uint n_heads) {
     uint lane = get_local_id(0);
@@ -286,8 +286,8 @@ __kernel void attention_h_qk(__global const float *q, __global const half *kst, 
             k0 = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
             k1 = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            k0 = vload_half2(lane, kst + s0 * kstride + kvh * 128u);
-            k1 = vload_half2(lane, kst + s1 * kstride + kvh * 128u);
+            k0 = kv_load2(lane, kst + s0 * kstride + kvh * 128u);
+            k1 = kv_load2(lane, kst + s1 * kstride + kvh * 128u);
         }
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
@@ -318,8 +318,8 @@ __kernel void attention_h_qk(__global const float *q, __global const half *kst, 
             v0 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
             v1 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            v0 = vload_half2(lane, vst + s0 * kstride + kvh * 128u);
-            v1 = vload_half2(lane, vst + s1 * kstride + kvh * 128u);
+            v0 = kv_load2(lane, vst + s0 * kstride + kvh * 128u);
+            v1 = kv_load2(lane, vst + s1 * kstride + kvh * 128u);
         }
         acc0 = acc0 * corr + w0 * v0.x + w1 * v1.x;
         acc1 = acc1 * corr + w0 * v0.y + w1 * v1.y;
@@ -332,7 +332,7 @@ __kernel void attention_h_qk(__global const float *q, __global const half *kst, 
         if (pos < full_end) {
             k = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            k = vload_half2(lane, kst + sp * kstride + kvh * 128u);
+            k = kv_load2(lane, kst + sp * kstride + kvh * 128u);
         }
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -354,7 +354,7 @@ __kernel void attention_h_qk(__global const float *q, __global const half *kst, 
         if (pos < full_end) {
             v = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            v = vload_half2(lane, vst + sp * kstride + kvh * 128u);
+            v = kv_load2(lane, vst + sp * kstride + kvh * 128u);
         }
         acc0 = acc0 * corr + w * v.x;
         acc1 = acc1 * corr + w * v.y;
@@ -370,9 +370,9 @@ __kernel void attention_h_qk(__global const float *q, __global const half *kst, 
     out[head * 128u + 2u * lane + 1u] = qs[2u * lane + 1u] * gs;
 }
 
-__kernel void attention_split_h_qk(__global const float *q, __global const half *kst, __global const half *vst,
-                                   __global const uchar *kcode, __global const half *ka, __global const half *kc,
-                                   __global const uchar *vcode, __global const half *vb, __global const half *vbz, __global const half *vc,
+__kernel void attention_split_h_qk(__global const float *q, __global const KV_T *kst, __global const KV_T *vst,
+                                   __global const uchar *kcode, __global const KV_T *ka, __global const KV_T *kc,
+                                   __global const uchar *vcode, __global const KV_T *vb, __global const KV_T *vbz, __global const KV_T *vc,
                                    __global const uint *tbl, __global float *pacc, __global float *pml,
                                    uint len, uint start, uint full_end, uint kv_heads, uint n_heads, uint splits) {
     uint gid = get_group_id(0);
@@ -408,8 +408,8 @@ __kernel void attention_split_h_qk(__global const float *q, __global const half 
             k0 = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
             k1 = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            k0 = vload_half2(lane, kst + s0 * kstride + kvh * 128u);
-            k1 = vload_half2(lane, kst + s1 * kstride + kvh * 128u);
+            k0 = kv_load2(lane, kst + s0 * kstride + kvh * 128u);
+            k1 = kv_load2(lane, kst + s1 * kstride + kvh * 128u);
         }
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
@@ -440,8 +440,8 @@ __kernel void attention_split_h_qk(__global const float *q, __global const half 
             v0 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
             v1 = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[(pos + 1u) >> 5], (pos + 1u) & 31u, kvh, kv_heads, lane);
         } else {
-            v0 = vload_half2(lane, vst + s0 * kstride + kvh * 128u);
-            v1 = vload_half2(lane, vst + s1 * kstride + kvh * 128u);
+            v0 = kv_load2(lane, vst + s0 * kstride + kvh * 128u);
+            v1 = kv_load2(lane, vst + s1 * kstride + kvh * 128u);
         }
         acc0 = acc0 * corr + w0 * v0.x + w1 * v1.x;
         acc1 = acc1 * corr + w0 * v0.y + w1 * v1.y;
@@ -454,7 +454,7 @@ __kernel void attention_split_h_qk(__global const float *q, __global const half 
         if (pos < full_end) {
             k = lfm_kvarn_k(kcode, ka, kc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            k = vload_half2(lane, kst + sp2 * kstride + kvh * 128u);
+            k = kv_load2(lane, kst + sp2 * kstride + kvh * 128u);
         }
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -476,7 +476,7 @@ __kernel void attention_split_h_qk(__global const float *q, __global const half 
         if (pos < full_end) {
             v = lfm_kvarn_v(vcode, vb, vbz, vc, (uint)tbl[pos >> 5], pos & 31u, kvh, kv_heads, lane);
         } else {
-            v = vload_half2(lane, vst + sp2 * kstride + kvh * 128u);
+            v = kv_load2(lane, vst + sp2 * kstride + kvh * 128u);
         }
         acc0 = acc0 * corr + w * v.x;
         acc1 = acc1 * corr + w * v.y;
@@ -496,7 +496,7 @@ __kernel void attention_split_h_qk(__global const float *q, __global const half 
     }
 }
 
-__kernel void attention_b_h_rot(__global const float *q, __global const half *kbuf, __global const half *vbuf,
+__kernel void attention_b_h_rot(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf,
                                 __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b,
                                 __global const float *gate, __global float *out,
                                 uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
@@ -530,8 +530,8 @@ __kernel void attention_b_h_rot(__global const float *q, __global const half *kb
     float scale = 0.0883883476f;
     for (uint pos = start; pos < len; ++pos) {
         ulong slot = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        __global const half *kp = kbuf + slot * kv_heads * 128u + kvh * 128u;
-        float2 k = vload_half2(lane, kp);
+        __global const KV_T *kp = kbuf + slot * kv_heads * 128u + kvh * 128u;
+        float2 k = kv_load2(lane, kp);
         sred[lid] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint st = 32u; st > 0u; st >>= 1) {
@@ -545,8 +545,8 @@ __kernel void attention_b_h_rot(__global const float *q, __global const half *kb
         float corr = exp(m - mn);
         float wgt = exp(s - mn);
         l = l * corr + wgt;
-        __global const half *vp = vbuf + slot * kv_heads * 128u + kvh * 128u;
-        float2 v = vload_half2(lane, vp);
+        __global const KV_T *vp = vbuf + slot * kv_heads * 128u + kvh * 128u;
+        float2 v = kv_load2(lane, vp);
         acc0 = acc0 * corr + wgt * v.x;
         acc1 = acc1 * corr + wgt * v.y;
         m = mn;
@@ -563,7 +563,7 @@ __kernel void attention_b_h_rot(__global const float *q, __global const half *kb
     o[2u * lane + 1u] = qs[grp * 128u + 2u * lane + 1u] * gs;
 }
 
-__kernel void attention_split_b_h_rot(__global const float *q, __global const half *kbuf, __global const half *vbuf,
+__kernel void attention_split_b_h_rot(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf,
                                       __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b,
                                       __global float *pacc, __global float *pml,
                                       uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
@@ -603,8 +603,8 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const ha
     for (; pos + 1u < p1; pos += 2u) {
         ulong s0 = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
         ulong s1 = (ulong)((tbl[toff + ((pos + 1u) >> 5)] << 5) | ((pos + 1u) & 31u));
-        float2 k0 = vload_half2(lane, kbuf + s0 * kv_heads * 128u + kvh * 128u);
-        float2 k1 = vload_half2(lane, kbuf + s1 * kv_heads * 128u + kvh * 128u);
+        float2 k0 = kv_load2(lane, kbuf + s0 * kv_heads * 128u + kvh * 128u);
+        float2 k1 = kv_load2(lane, kbuf + s1 * kv_heads * 128u + kvh * 128u);
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -628,8 +628,8 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const ha
         float w0 = exp(sc0 - mn);
         float w1 = exp(sc1 - mn);
         l = l * corr + w0 + w1;
-        float2 v0 = vload_half2(lane, vbuf + s0 * kv_heads * 128u + kvh * 128u);
-        float2 v1 = vload_half2(lane, vbuf + s1 * kv_heads * 128u + kvh * 128u);
+        float2 v0 = kv_load2(lane, vbuf + s0 * kv_heads * 128u + kvh * 128u);
+        float2 v1 = kv_load2(lane, vbuf + s1 * kv_heads * 128u + kvh * 128u);
         acc0 = acc0 * corr + w0 * v0.x + w1 * v1.x;
         acc1 = acc1 * corr + w0 * v0.y + w1 * v1.y;
         m = mn;
@@ -637,7 +637,7 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const ha
     }
     if (pos < p1) {
         ulong sp2 = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        float2 k = vload_half2(lane, kbuf + sp2 * kv_heads * 128u + kvh * 128u);
+        float2 k = kv_load2(lane, kbuf + sp2 * kv_heads * 128u + kvh * 128u);
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 8u) {
@@ -654,7 +654,7 @@ __kernel void attention_split_b_h_rot(__global const float *q, __global const ha
         float corr = exp(m - mn);
         float w = exp(sv - mn);
         l = l * corr + w;
-        float2 v = vload_half2(lane, vbuf + sp2 * kv_heads * 128u + kvh * 128u);
+        float2 v = kv_load2(lane, vbuf + sp2 * kv_heads * 128u + kvh * 128u);
         acc0 = acc0 * corr + w * v.x;
         acc1 = acc1 * corr + w * v.y;
         m = mn;

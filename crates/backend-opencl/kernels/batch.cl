@@ -24,7 +24,7 @@ __kernel void embed_q6k_b(__global const uchar *w, __global float *out, __global
     uint b = c >> 8;
     uint r = c & 255u;
     __global const uchar *blk = base + (ulong)b * 210ul;
-    float d = (float)vload_half(0, (__global const half *)(blk + 208));
+    float d = lfm_scale((__global const ushort *)(blk + 208));
     __global const uchar *ql = blk;
     __global const uchar *qh = blk + 128;
     __global const char *sc = (__global const char *)(blk + 192);
@@ -295,8 +295,8 @@ __kernel void gemv_q4_k_i8_b(__global const uchar *w, __global const char *xq, _
             for (uint r = 0u; r < RGEMV_B; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 144ul;
                 __global const uchar *scp = blk + 4;
-                float d = (float)vload_half(0, (__global const half *)blk);
-                float dmin = (float)vload_half(0, (__global const half *)(blk + 2));
+                float d = lfm_scale((__global const ushort *)blk);
+                float dmin = lfm_scale((__global const ushort *)(blk + 2));
                 uchar sl = 0u;
                 uchar ml = 0u;
                 uchar sh = 0u;
@@ -407,8 +407,8 @@ __kernel void gemv_q4_k_i8_p_b(__global const uchar *w, __global const char *xq,
             #pragma unroll
             for (uint r = 0u; r < RGEMV_B; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 148ul;
-                float d = (float)vload_half(0, (__global const half *)blk);
-                float dmin = (float)vload_half(0, (__global const half *)(blk + 2));
+                float d = lfm_scale((__global const ushort *)blk);
+                float dmin = lfm_scale((__global const ushort *)(blk + 2));
                 uchar4 sm = vload4(0, blk + 4u + 4u * (u >> 1));
                 uint4 pk = vload4(0, (__global const uint *)(blk + 20u + u * 16u));
                 char4 l0 = as_char4(pk.x & 0x0F0F0F0Fu);
@@ -523,7 +523,7 @@ __kernel void gemv_q6_k_i8_b(__global const uchar *w, __global const char *xq, _
             for (uint r = 0u; r < RGEMV_B; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 210ul;
                 __global const char *sc = (__global const char *)(blk + 192u);
-                float d = (float)vload_half(0, (__global const half *)(blk + 208u));
+                float d = lfm_scale((__global const ushort *)(blk + 208u));
                 uint so = n * 8u + lq;
                 float s0 = d * (float)sc[so + 0u];
                 float s1 = d * (float)sc[so + 2u];
@@ -686,7 +686,7 @@ __kernel void attention_combine_b(__global const float *pacc, __global const flo
     o[lane + 64u] = a1 * inv * gs;
 }
 
-__kernel void kv_store_b_h(__global const float *ksrc, __global const float *vsrc, __global half *kdst, __global half *vdst, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, uint n, uint ntok) {
+__kernel void kv_store_b_h(__global const float *ksrc, __global const float *vsrc, __global KV_T *kdst, __global KV_T *vdst, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, uint n, uint ntok) {
     uint i = get_global_id(0);
     if (i >= ntok * n) {
         return;
@@ -695,11 +695,11 @@ __kernel void kv_store_b_h(__global const float *ksrc, __global const float *vsr
     uint j = i % n;
     uint pos = pos_b[t];
     ulong slot = (ulong)((tbl[tbl_off[t] + (pos >> 5)] << 5) | (pos & 31u));
-    kdst[slot * n + j] = (half)ksrc[i];
-    vdst[slot * n + j] = (half)vsrc[i];
+    kdst[slot * n + j] = (KV_T)ksrc[i];
+    vdst[slot * n + j] = (KV_T)vsrc[i];
 }
 
-__kernel void attention_b_h(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
+__kernel void attention_b_h(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
     uint lid = get_local_id(0);
     uint lane = lid & 63u;
     uint grp = lid >> 6;
@@ -725,8 +725,8 @@ __kernel void attention_b_h(__global const float *q, __global const half *kbuf, 
     float scale = 1.0f / sqrt((float)head_dim);
     for (uint pos = start; pos < len; ++pos) {
         ulong slot = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        __global const half *kp = kbuf + slot * kv_heads * head_dim + kvh * head_dim;
-        float2 k = vload_half2(lane, kp);
+        __global const KV_T *kp = kbuf + slot * kv_heads * head_dim + kvh * head_dim;
+        float2 k = kv_load2(lane, kp);
         sred[lid] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint st = 32u; st > 0u; st >>= 1) {
@@ -740,8 +740,8 @@ __kernel void attention_b_h(__global const float *q, __global const half *kbuf, 
         float corr = exp(m - m_new);
         float wgt = exp(s - m_new);
         l = l * corr + wgt;
-        __global const half *vp = vbuf + slot * kv_heads * head_dim + kvh * head_dim;
-        float2 v = vload_half2(lane, vp);
+        __global const KV_T *vp = vbuf + slot * kv_heads * head_dim + kvh * head_dim;
+        float2 v = kv_load2(lane, vp);
         acc0 = acc0 * corr + wgt * v.x;
         acc1 = acc1 * corr + wgt * v.y;
         m = m_new;
@@ -753,7 +753,7 @@ __kernel void attention_b_h(__global const float *q, __global const half *kbuf, 
     o[2u * lane + 1u] = (acc1 / l) * gs;
 }
 
-__kernel void attention_b_fa(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
+__kernel void attention_b_fa(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
     uint lid = get_local_id(0);
     uint lane = lid & 63u;
     uint sg = lid >> 6;
@@ -797,7 +797,7 @@ __kernel void attention_b_fa(__global const float *q, __global const half *kbuf,
     vstore8(res, 0, out + ((ulong)t * n_heads + head) * head_dim + j * 8u);
 }
 
-__kernel void attention_b_h2(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
+__kernel void attention_b_h2(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global const float *gate, __global float *out, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window) {
     uint lid = get_local_id(0);
     uint lane = lid & 63u;
     uint grp = lid >> 6;
@@ -825,20 +825,20 @@ __kernel void attention_b_h2(__global const float *q, __global const half *kbuf,
     for (; pos + 1u < len; pos += 2u) {
         ulong slot0 = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
         ulong slot1 = (ulong)((tbl[toff + ((pos + 1u) >> 5)] << 5) | ((pos + 1u) & 31u));
-        __global const half *kp0 = kbuf + slot0 * kv_stride + kvh * head_dim;
-        __global const half *kp1 = kbuf + slot1 * kv_stride + kvh * head_dim;
-        float2 k0 = vload_half2(lane, kp0);
-        float2 k1 = vload_half2(lane, kp1);
+        __global const KV_T *kp0 = kbuf + slot0 * kv_stride + kvh * head_dim;
+        __global const KV_T *kp1 = kbuf + slot1 * kv_stride + kvh * head_dim;
+        float2 k0 = kv_load2(lane, kp0);
+        float2 k1 = kv_load2(lane, kp1);
         float r0 = sub_group_reduce_add(q0 * k0.x + q1 * k0.y);
         float r1 = sub_group_reduce_add(q0 * k1.x + q1 * k1.y);
-        __global const half *vp0 = vbuf + slot0 * kv_stride + kvh * head_dim;
-        __global const half *vp1 = vbuf + slot1 * kv_stride + kvh * head_dim;
+        __global const KV_T *vp0 = vbuf + slot0 * kv_stride + kvh * head_dim;
+        __global const KV_T *vp1 = vbuf + slot1 * kv_stride + kvh * head_dim;
         float s0 = r0 * scale;
         float m_new = fmax(m, s0);
         float corr = exp(m - m_new);
         float wgt = exp(s0 - m_new);
         l = l * corr + wgt;
-        float2 v0 = vload_half2(lane, vp0);
+        float2 v0 = kv_load2(lane, vp0);
         acc0 = acc0 * corr + wgt * v0.x;
         acc1 = acc1 * corr + wgt * v0.y;
         m = m_new;
@@ -847,23 +847,23 @@ __kernel void attention_b_h2(__global const float *q, __global const half *kbuf,
         corr = exp(m - m_new);
         wgt = exp(s1 - m_new);
         l = l * corr + wgt;
-        float2 v1 = vload_half2(lane, vp1);
+        float2 v1 = kv_load2(lane, vp1);
         acc0 = acc0 * corr + wgt * v1.x;
         acc1 = acc1 * corr + wgt * v1.y;
         m = m_new;
     }
     if (pos < len) {
         ulong slots = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        __global const half *kp = kbuf + slots * kv_stride + kvh * head_dim;
-        float2 k = vload_half2(lane, kp);
+        __global const KV_T *kp = kbuf + slots * kv_stride + kvh * head_dim;
+        float2 k = kv_load2(lane, kp);
         float rv = sub_group_reduce_add(q0 * k.x + q1 * k.y);
         float sv = rv * scale;
         float m_new = fmax(m, sv);
         float corr = exp(m - m_new);
         float wgt = exp(sv - m_new);
         l = l * corr + wgt;
-        __global const half *vp = vbuf + slots * kv_stride + kvh * head_dim;
-        float2 v = vload_half2(lane, vp);
+        __global const KV_T *vp = vbuf + slots * kv_stride + kvh * head_dim;
+        float2 v = kv_load2(lane, vp);
         acc0 = acc0 * corr + wgt * v.x;
         acc1 = acc1 * corr + wgt * v.y;
         m = m_new;
@@ -874,7 +874,7 @@ __kernel void attention_b_h2(__global const float *q, __global const half *kbuf,
     o[2u * lane + 1u] = (acc1 / l) * gs;
 }
 
-__kernel void attention_split_b_h(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
+__kernel void attention_split_b_h(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);
     uint per_tok = n_heads * splits;
@@ -907,10 +907,10 @@ __kernel void attention_split_b_h(__global const float *q, __global const half *
     for (; pos + 1u < p1; pos += 2u) {
         ulong slot0 = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
         ulong slot1 = (ulong)((tbl[toff + ((pos + 1u) >> 5)] << 5) | ((pos + 1u) & 31u));
-        __global const half *kp0 = kbuf + slot0 * kv_stride + kvh * head_dim;
-        __global const half *kp1 = kbuf + slot1 * kv_stride + kvh * head_dim;
-        float2 k0 = vload_half2(lane, kp0);
-        float2 k1 = vload_half2(lane, kp1);
+        __global const KV_T *kp0 = kbuf + slot0 * kv_stride + kvh * head_dim;
+        __global const KV_T *kp1 = kbuf + slot1 * kv_stride + kvh * head_dim;
+        float2 k0 = kv_load2(lane, kp0);
+        float2 k1 = kv_load2(lane, kp1);
         sred[lane] = q0 * k0.x + q1 * k0.y;
         sred[64u + lane] = q0 * k1.x + q1 * k1.y;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -934,10 +934,10 @@ __kernel void attention_split_b_h(__global const float *q, __global const half *
         float w0 = exp(s0 - m_new);
         float w1 = exp(s1 - m_new);
         l = l * corr + w0 + w1;
-        __global const half *vp0 = vbuf + slot0 * kv_stride + kvh * head_dim;
-        __global const half *vp1 = vbuf + slot1 * kv_stride + kvh * head_dim;
-        float2 v0 = vload_half2(lane, vp0);
-        float2 v1 = vload_half2(lane, vp1);
+        __global const KV_T *vp0 = vbuf + slot0 * kv_stride + kvh * head_dim;
+        __global const KV_T *vp1 = vbuf + slot1 * kv_stride + kvh * head_dim;
+        float2 v0 = kv_load2(lane, vp0);
+        float2 v1 = kv_load2(lane, vp1);
         acc0 = acc0 * corr + w0 * v0.x + w1 * v1.x;
         acc1 = acc1 * corr + w0 * v0.y + w1 * v1.y;
         m = m_new;
@@ -945,8 +945,8 @@ __kernel void attention_split_b_h(__global const float *q, __global const half *
     }
     if (pos < p1) {
         ulong slots = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        __global const half *kp = kbuf + slots * kv_stride + kvh * head_dim;
-        float2 k = vload_half2(lane, kp);
+        __global const KV_T *kp = kbuf + slots * kv_stride + kvh * head_dim;
+        float2 k = kv_load2(lane, kp);
         sred[lane] = q0 * k.x + q1 * k.y;
         barrier(CLK_LOCAL_MEM_FENCE);
         if (lane < 8u) {
@@ -963,8 +963,8 @@ __kernel void attention_split_b_h(__global const float *q, __global const half *
         float corr = exp(m - m_new);
         float w = exp(sv - m_new);
         l = l * corr + w;
-        __global const half *vp = vbuf + slots * kv_stride + kvh * head_dim;
-        float2 v = vload_half2(lane, vp);
+        __global const KV_T *vp = vbuf + slots * kv_stride + kvh * head_dim;
+        float2 v = kv_load2(lane, vp);
         acc0 = acc0 * corr + w * v.x;
         acc1 = acc1 * corr + w * v.y;
         m = m_new;
@@ -1043,8 +1043,8 @@ __kernel void gemv_q4_k_i8_4p_b(__global const uchar *w, __global const char *xq
             #pragma unroll
             for (uint r = 0u; r < RGEMV4P; ++r) {
                 __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 148ul;
-                float d = (float)vload_half(0, (__global const half *)blk);
-                float dmin = (float)vload_half(0, (__global const half *)(blk + 2));
+                float d = lfm_scale((__global const ushort *)blk);
+                float dmin = lfm_scale((__global const ushort *)(blk + 2));
                 uchar4 sm = vload4(0, blk + 4u + 4u * (u >> 1));
                 uint4 pk = vload4(0, (__global const uint *)(blk + 20u + u * 16u));
                 char4 l0 = as_char4(pk.x & 0x0F0F0F0Fu);
@@ -1152,7 +1152,7 @@ __kernel void gemm_q6_k_i8(__global const uchar *w, __global const char *xq, __g
                 for (uint r = 0u; r < 2u; ++r) {
                     __global const uchar *blk = base_w + (ulong)r * row_stride + (ulong)b * 210ul;
                     __global const char *sc = (__global const char *)(blk + 192u);
-                    float d = (float)vload_half(0, (__global const half *)(blk + 208u));
+                    float d = lfm_scale((__global const ushort *)(blk + 208u));
                     uint so = n * 8u + lq;
                     s0[r] = d * (float)sc[so + 0u];
                     s1[r] = d * (float)sc[so + 2u];
@@ -1312,7 +1312,7 @@ __kernel void gemm_q6_i8_pp(__global const char *w, __global const float *wsc, _
     }
 }
 
-__kernel void attention_split_b_fa(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
+__kernel void attention_split_b_fa(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);
     uint per_tok = kv_heads * splits;
@@ -1394,7 +1394,7 @@ __kernel void attention_split_b_fa(__global const float *q, __global const half 
     }
 }
 
-__kernel void attention_split_b_fa2(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
+__kernel void attention_split_b_fa2(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);
     uint per_tok = kv_heads * splits;
@@ -1453,8 +1453,8 @@ __kernel void attention_split_b_fa2(__global const float *q, __global const half
         #pragma unroll
         for (uint u = 0u; u < 4u; ++u) {
             ulong slot = (ulong)((tbl[toff + ((pos + u) >> 5)] << 5) | ((pos + u) & 31u));
-            half16 kh = vload16(0, kbuf + slot * kv_stride + koff);
-            vv[u] = convert_float16(vload16(0, vbuf + slot * kv_stride + koff));
+            KV_V16 kh = kv_load16(0, kbuf + slot * kv_stride + koff);
+            vv[u] = convert_float16(kv_load16(0, vbuf + slot * kv_stride + koff));
             float d = 0.0f;
             #pragma unroll
             for (uint i = 0u; i < 16u; ++i) {
@@ -1489,8 +1489,8 @@ __kernel void attention_split_b_fa2(__global const float *q, __global const half
     }
     for (; pos < p1; ++pos) {
         ulong slot = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        half16 kh = vload16(0, kbuf + slot * kv_stride + koff);
-        float16 vv = convert_float16(vload16(0, vbuf + slot * kv_stride + koff));
+        KV_V16 kh = kv_load16(0, kbuf + slot * kv_stride + koff);
+        float16 vv = convert_float16(kv_load16(0, vbuf + slot * kv_stride + koff));
         float d = 0.0f;
         #pragma unroll
         for (uint i = 0u; i < 16u; ++i) {
@@ -1520,7 +1520,7 @@ __kernel void attention_split_b_fa2(__global const float *q, __global const half
     }
 }
 
-__kernel void attention_split_b_h4_p4(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
+__kernel void attention_split_b_h4_p4(__global const float *q, __global const KV_T *kbuf, __global const KV_T *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);
     uint per_tok = kv_heads * splits;
@@ -1565,8 +1565,8 @@ __kernel void attention_split_b_h4_p4(__global const float *q, __global const ha
         #pragma unroll
         for (uint u = 0u; u < 4u; ++u) {
             ulong slot = (ulong)((tbl[toff + ((pos + u) >> 5)] << 5) | ((pos + u) & 31u));
-            k[u] = vload_half2(lane, kbuf + slot * kv_stride + kvh * head_dim);
-            v[u] = vload_half2(lane, vbuf + slot * kv_stride + kvh * head_dim);
+            k[u] = kv_load2(lane, kbuf + slot * kv_stride + kvh * head_dim);
+            v[u] = kv_load2(lane, vbuf + slot * kv_stride + kvh * head_dim);
         }
         #pragma unroll
         for (uint g = 0u; g < 4u; ++g) {
@@ -1616,7 +1616,7 @@ __kernel void attention_split_b_h4_p4(__global const float *q, __global const ha
     }
     for (; pos < p1; ++pos) {
         ulong slot = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
-        float2 k = vload_half2(lane, kbuf + slot * kv_stride + kvh * head_dim);
+        float2 k = kv_load2(lane, kbuf + slot * kv_stride + kvh * head_dim);
         #pragma unroll
         for (uint g = 0u; g < 4u; ++g) {
             sred[g * 64u + lane] = q0[g] * k.x + q1[g] * k.y;
@@ -1641,7 +1641,7 @@ __kernel void attention_split_b_h4_p4(__global const float *q, __global const ha
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
-        float2 v = vload_half2(lane, vbuf + slot * kv_stride + kvh * head_dim);
+        float2 v = kv_load2(lane, vbuf + slot * kv_stride + kvh * head_dim);
         #pragma unroll
         for (uint g = 0u; g < 4u; ++g) {
             float sv = sred[g * 64u] * scale;
@@ -1715,8 +1715,8 @@ __kernel void gemm_q4_k_i8_b8(__global const uchar *w, __global const char *xq, 
         barrier(CLK_LOCAL_MEM_FENCE);
         if (row < rows) {
             __local const uchar *srow = ws + lane * 16u;
-            float d = (float)vload_half(0, (__local const half *)(wh + lane * 4u));
-            float dmin = (float)vload_half(0, (__local const half *)(wh + lane * 4u + 2u));
+            float d = lfm_scale_local(wh + lane * 4u);
+            float dmin = lfm_scale_local(wh + lane * 4u + 2u);
             #pragma unroll
             for (uint q = 0u; q < 4u; ++q) {
                 uint4 pa = vload4(0, (__global const uint *)(base + (ulong)b * 148ul + 20ul + q * 32u));
@@ -1844,8 +1844,8 @@ __kernel void gemm_q4_k_i8_b8p(__global const uchar *w, __global const char *xq,
             __local const uchar *srow = ws + cur * 1024u + lane * 16u;
             __local const char *xb = xt + cur * 2048u;
             __local const int *sm = xsum + cur * 64u;
-            float d = (float)vload_half(0, (__local const half *)(wh + cur * 256u + lane * 4u));
-            float dmin = (float)vload_half(0, (__local const half *)(wh + cur * 256u + lane * 4u + 2u));
+            float d = lfm_scale_local(wh + cur * 256u + lane * 4u);
+            float dmin = lfm_scale_local(wh + cur * 256u + lane * 4u + 2u);
             #pragma unroll
             for (uint q = 0u; q < 4u; ++q) {
                 uint4 wa = vload4(0, (__global const uint *)(base + (ulong)b * 148ul + 20ul + q * 32u));
@@ -2338,8 +2338,8 @@ __kernel void gemm_q4_k_i8_lds17(__global const uchar *w, __global const char *x
         barrier(CLK_LOCAL_MEM_FENCE);
         if (rloc < valid_rows) {
             __local const uchar *srow = ws + rloc * 16u;
-            float d = (float)vload_half(0, (__local const half *)(wh + rloc * 4u));
-            float dmin = (float)vload_half(0, (__local const half *)(wh + rloc * 4u + 2u));
+            float d = lfm_scale_local(wh + rloc * 4u);
+            float dmin = lfm_scale_local(wh + rloc * 4u + 2u);
             #pragma unroll
             for (uint q = 0u; q < 4u; ++q) {
                 uint4 pa = vload4(0, wq + ((2u * q) * 64u + rloc) * 4u);

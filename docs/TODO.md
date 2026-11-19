@@ -1,9 +1,13 @@
 # TODO — продолжить с пустой сессии
 
-Актуальное состояние (конец сессии 10): `main` = `origin/main`, дерево чистое,
+Актуальное состояние (конец сессии 12): `main` = `origin/main`, дерево чистое,
 `cargo build --release --workspace` без предупреждений, `cargo test --workspace`
 зелёный. Ядра не оптимизируем: результат зафиксирован в `benchmarks/machine.md` и
-`benchmarks/llama-cpp.md`. Итоги последней сессии — раздел «Сессия 10» ниже.
+`benchmarks/llama-cpp.md`. Итоги последней сессии — раздел «Сессия 12» ниже.
+
+Дополнительно с сессии 12: работает второй бэкенд-путь без fp16 (Intel UHD 630
+через Rusticl, `RUSTICL_ENABLE=iris`) — KV во float, 64-полосные ядра и
+`gemv_q6_k_i8` заменены, см. `docs/backends.md`.
 
 Разделы «Сессия 1…9» — исторические логи: в них упоминаются удалённые пути
 (`LFM_KV=f32`, ядро `lds11`) и старые цифры, актуальными они не являются.
@@ -352,6 +356,22 @@ curl -sN --http2-prior-knowledge -X POST http://127.0.0.1:8000/v1/chat/completio
   запусков, профиль prefill 8192, обновлённые приоритеты.
 - Код движка не изменился: SoA-раскладка и decode-фьюжн реализованы, замерены и
   полностью откачены (рабочее дерево чистое).
+
+## Сессия 12 (порт OpenCL на устройство без fp16: Intel UHD 630)
+
+| Блок | Итог |
+|---|---|
+| Запуск iGPU | Rusticl отдаёт Intel Gen9 только с `RUSTICL_ENABLE=iris`; `lfm-bench info`: OpenCL 3.1, 3 CU, WG 1024, подгруппа 16, `fp16: false`, `integer_dot: true` |
+| KV во float | `KV_T`/`KV_V16` в `common.cl`, `-DLFM_F32_KV` включается по `caps.fp16`; `lfm_h2f` (битовая конверсия f16→f32), `lfm_scale`/`lfm_scale_local` для заголовков блоков; буфер KV на f32-устройстве вдвое больше по `u16`; `kv=q4`/`kvarn` отвергаются при загрузке |
+| Ядра | `attention_b_h2`/`attention_b_fa`/`attention_split_b_fa*` и attn4 только при `subgroup == 64`; Q6-decode на f32-устройстве идёт через `gemm_i8_gz` (у `gemv_q6_k_i8` неверный результат при подгруппе 16) |
+| Отладка | найден баг каста: `(ushort *)blk + 208` давал смещение в элементах — исправлено на `(ushort *)(blk + 208)`, embed cos 1.000000 |
+| Точность | `gpu-check` cos 0.998703, top-4 совпадает с CPU; `gpu-trace` все 24 слоя ≥ 0.987; `gemm-cmp` lds17 1.65e-5, q6b8 1.31e-2 |
+| Скорость | Intel: prefill 128 — 10.9 tok/s, decode — 1.9 tok/s, `gpu-multi` 2×6 — 3.5 tok/s; AMD не регрессировал (cos 0.998427, prefill 871, decode 82) |
+| Тесты | `cargo test --workspace` зелёный, сборка без предупреждений |
+| Документация | `docs/config.md` (Intel iGPU), `docs/backends.md` (что меняется без fp16), `benchmarks/machine.md` (цифры и потолки) |
+
+Проверено и откачено: ручной `LFM_F32_KV=1` на AMD — GPU hang (context lost,
+hard recovery), поэтому режим включается только по `caps.fp16`.
 
 ## Сессия 11 (аудит: исправление остатка)
 
