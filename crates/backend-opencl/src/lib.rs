@@ -821,9 +821,13 @@ impl GpuModel {
             opts.rgemv
         };
         let rgemv_b = opts.rgemv_b;
-        let wg = opts.wg;
-        let wg_b = opts.wg_b;
         let subgroup = gpu.caps.sub_group_size.max(1);
+        let wg = if subgroup <= 16 {
+            opts.wg.max(512)
+        } else {
+            opts.wg
+        };
+        let wg_b = opts.wg_b;
         let kv_f32 = !gpu.caps.fp16;
         let mut options = format!("-cl-std=CL3.0 -DRGEMV={rgemv} -DRGEMV_B={rgemv_b} -DPB={pb}");
         if kv_f32 {
@@ -1125,11 +1129,16 @@ impl GpuModel {
             let p = packed.ok_or_else(|| anyhow!("q4 gemv needs prepacked weights: {name}"))?;
             let per_wg = (self.wg / self.subgroup).max(1) * self.rgemv;
             let grid = rows.div_ceil(per_wg) * self.wg;
+            let local = if self.subgroup <= 16 {
+                self.wg
+            } else {
+                self.wg_b
+            };
             unsafe {
                 self.gpu.launch(
                     &self.kernels.q4pk,
                     grid,
-                    self.wg_b,
+                    local,
                     &[
                         Arg::Mem(p.get()),
                         Arg::Mem(xq.get()),

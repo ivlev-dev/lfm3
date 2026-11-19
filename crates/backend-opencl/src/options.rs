@@ -140,7 +140,7 @@ impl Options {
         if let Some(v) = num("LFM_WG_B", 64, 512) {
             o.wg_b = v / 64 * 64;
         }
-        if let Some(v) = num("LFM_RGEMV", 1, 8) {
+        if let Some(v) = num("LFM_RGEMV", 1, 32) {
             o.rgemv = v;
         }
         if let Some(v) = num("LFM_RGEMV_B", 1, 8) {
