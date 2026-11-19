@@ -1394,6 +1394,132 @@ __kernel void attention_split_b_fa(__global const float *q, __global const half 
     }
 }
 
+__kernel void attention_split_b_fa2(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
+    uint gid = get_group_id(0);
+    uint lane = get_local_id(0);
+    uint per_tok = kv_heads * splits;
+    uint tgroup = gid / per_tok;
+    uint rem = gid % per_tok;
+    uint kvh = rem / splits;
+    uint sp = rem % splits;
+    uint s = lane >> 5;
+    uint hh = (lane >> 3) & 3u;
+    uint j = lane & 7u;
+    uint t = tgroup * 2u + s;
+    bool active = t < ntok;
+    uint t0 = tgroup * 2u;
+    uint gstart = 0xFFFFFFFFu;
+    uint gend = 0u;
+    #pragma unroll
+    for (uint v = 0u; v < 2u; ++v) {
+        uint tt = t0 + v;
+        if (tt < ntok) {
+            uint ln = pos_b[tt] + 1u;
+            uint st = (window > 0u && ln > window) ? ln - window : 0u;
+            gstart = min(gstart, st);
+            gend = max(gend, ln);
+        }
+    }
+    if (gend <= gstart) {
+        gend = gstart + 1u;
+    }
+    uint len = 0u;
+    uint start = 0u;
+    if (active) {
+        len = pos_b[t] + 1u;
+        start = (window > 0u && len > window) ? len - window : 0u;
+    }
+    uint span = gend - gstart;
+    uint chunk = (span + splits - 1u) / splits;
+    uint p0 = gstart + sp * chunk;
+    uint p1 = min(p0 + chunk, gend);
+    uint toff = tbl_off[t0];
+    uint head = kvh * 4u + hh;
+    __global const float *qp = q + ((ulong)(t0 + s) * n_heads + head) * head_dim + j * 16u;
+    float16 qv = (float16)(0.0f);
+    if (active) {
+        qv = vload16(0, qp);
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float16 acc = (float16)(0.0f);
+    float scale = 1.0f / sqrt((float)head_dim);
+    uint kv_stride = kv_heads * head_dim;
+    uint koff = kvh * head_dim + j * 16u;
+    uint pos = p0;
+    for (; pos + 3u < p1; pos += 4u) {
+        float sv[4];
+        float16 vv[4];
+        #pragma unroll
+        for (uint u = 0u; u < 4u; ++u) {
+            ulong slot = (ulong)((tbl[toff + ((pos + u) >> 5)] << 5) | ((pos + u) & 31u));
+            half16 kh = vload16(0, kbuf + slot * kv_stride + koff);
+            vv[u] = convert_float16(vload16(0, vbuf + slot * kv_stride + koff));
+            float d = 0.0f;
+            #pragma unroll
+            for (uint i = 0u; i < 16u; ++i) {
+                d = fma(qv[i], (float)kh[i], d);
+            }
+            d += sub_group_shuffle_xor(d, 4u);
+            d += sub_group_shuffle_xor(d, 2u);
+            d += sub_group_shuffle_xor(d, 1u);
+            sv[u] = d * scale;
+        }
+        float mn = m;
+        #pragma unroll
+        for (uint u = 0u; u < 4u; ++u) {
+            uint pp = pos + u;
+            if (active && pp >= start && pp < len) {
+                mn = fmax(mn, sv[u]);
+            }
+        }
+        float corr = exp(m - mn);
+        l *= corr;
+        acc *= corr;
+        #pragma unroll
+        for (uint u = 0u; u < 4u; ++u) {
+            uint pp = pos + u;
+            if (active && pp >= start && pp < len) {
+                float w = exp(sv[u] - mn);
+                l += w;
+                acc = fma(w, vv[u], acc);
+            }
+        }
+        m = mn;
+    }
+    for (; pos < p1; ++pos) {
+        ulong slot = (ulong)((tbl[toff + (pos >> 5)] << 5) | (pos & 31u));
+        half16 kh = vload16(0, kbuf + slot * kv_stride + koff);
+        float16 vv = convert_float16(vload16(0, vbuf + slot * kv_stride + koff));
+        float d = 0.0f;
+        #pragma unroll
+        for (uint i = 0u; i < 16u; ++i) {
+            d = fma(qv[i], (float)kh[i], d);
+        }
+        d += sub_group_shuffle_xor(d, 4u);
+        d += sub_group_shuffle_xor(d, 2u);
+        d += sub_group_shuffle_xor(d, 1u);
+        if (active && pos >= start && pos < len) {
+            float sv = d * scale;
+            float mn = fmax(m, sv);
+            float corr = exp(m - mn);
+            float w = exp(sv - mn);
+            l = l * corr + w;
+            acc = fma(w, vv, acc * corr);
+            m = mn;
+        }
+    }
+    if (active) {
+        ulong pbase = ((ulong)t * n_heads + head) * splits + sp;
+        __global float *pa = pacc + pbase * head_dim;
+        vstore16(acc, 0, pa + j * 16u);
+        if (j == 0u) {
+            pml[pbase * 2u] = m;
+            pml[pbase * 2u + 1u] = l;
+        }
+    }
+}
+
 __kernel void attention_split_b_h4_p4(__global const float *q, __global const half *kbuf, __global const half *vbuf, __global const uint *tbl, __global const uint *tbl_off, __global const uint *pos_b, __global float *pacc, __global float *pml, uint ntok, uint kv_heads, uint head_dim, uint n_heads, uint window, uint splits) {
     uint gid = get_group_id(0);
     uint lane = get_local_id(0);

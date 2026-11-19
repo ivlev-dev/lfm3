@@ -171,6 +171,7 @@ struct Kernels {
     attn_split_b_h: Kernel,
     attn_split_b_h4_p4: Kernel,
     attn_split_b_fa: Kernel,
+    attn_split_b_fa2: Kernel,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -472,6 +473,7 @@ pub struct GpuModel {
     q6_i8_gz_on: bool,
     q4_b8p_on: bool,
     flash_on: bool,
+    flash2_on: bool,
     i8_pf_on: bool,
     kernels: Kernels,
     rope_full: Buffer<f32>,
@@ -569,6 +571,7 @@ impl GpuModel {
         let q6_i8_gz_on = std::env::var("LFM_Q6I8").map(|v| v != "0").unwrap_or(true);
         let q4_b8p_on = std::env::var("LFM_B8P").map(|v| v != "0").unwrap_or(true);
         let flash_on = std::env::var("LFM_FLASH").map(|v| v != "0").unwrap_or(true);
+        let flash2_on = std::env::var("LFM_FLASH2").map(|v| v != "0").unwrap_or(true);
         let i8_pf_on = std::env::var("LFM_I8PF").map(|v| v != "0").unwrap_or(true);
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
@@ -859,6 +862,7 @@ impl GpuModel {
             attn_split_b_h: Kernel::create(&program, "attention_split_b_h")?,
             attn_split_b_h4_p4: Kernel::create(&program, "attention_split_b_h4_p4")?,
             attn_split_b_fa: Kernel::create(&program, "attention_split_b_fa")?,
+            attn_split_b_fa2: Kernel::create(&program, "attention_split_b_fa2")?,
         };
         let h = cfg.hidden_size;
         let qd = cfg.q_dim();
@@ -989,6 +993,7 @@ impl GpuModel {
             q6_i8_gz_on,
             q4_b8p_on,
             flash_on,
+            flash2_on,
             i8_pf_on,
             kernels,
             rope_full,
@@ -3310,7 +3315,12 @@ impl GpuModel {
                                         && !self.kv_q4
                                         && heads == kv_heads * 4
                                         && head_dim == 128;
-                                    let (kernel, grid) = if use4 && self.flash_on {
+                                    let (kernel, grid) = if use4 && self.flash_on && self.flash2_on {
+                                        (
+                                            &self.kernels.attn_split_b_fa2,
+                                            ntok.div_ceil(2) * kv_heads * splits * 64,
+                                        )
+                                    } else if use4 && self.flash_on {
                                         (
                                             &self.kernels.attn_split_b_fa,
                                             ntok * kv_heads * splits * 64,
