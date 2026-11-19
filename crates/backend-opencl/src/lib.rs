@@ -140,8 +140,10 @@ struct Kernels {
     q4x4p_b: Kernel,
     gemm_q4_lds17: Kernel,
     gemm_q4_b8: Kernel,
+    gemm_q4_b8p: Kernel,
     gemm_i8_gz: Kernel,
     gemm_q6_b8: Kernel,
+    gemm_q6_b8p: Kernel,
     gemm_q6: Kernel,
     gemm_q6_pp: Kernel,
     q6_b: Kernel,
@@ -465,6 +467,7 @@ pub struct GpuModel {
     prepacked: HashMap<String, Buffer<u8>>,
     prepack_on: bool,
     q6_i8_gz_on: bool,
+    q4_b8p_on: bool,
     kernels: Kernels,
     rope_full: Buffer<f32>,
     rope_sliding: Buffer<f32>,
@@ -559,6 +562,7 @@ impl GpuModel {
         let fuse_on = std::env::var("LFM_FUSE").map(|v| v != "0").unwrap_or(true);
         let q4_i8_on = std::env::var("LFM_Q4I8").map(|v| v != "0").unwrap_or(true);
         let q6_i8_gz_on = std::env::var("LFM_Q6I8").map(|v| v != "0").unwrap_or(true);
+        let q4_b8p_on = std::env::var("LFM_B8P").map(|v| v != "0").unwrap_or(true);
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
@@ -817,8 +821,10 @@ impl GpuModel {
             q4x4p_b: Kernel::create(&program, "gemv_q4_k_i8_4p_b")?,
             gemm_q4_lds17: Kernel::create(&program, "gemm_q4_k_i8_lds17")?,
             gemm_q4_b8: Kernel::create(&program, "gemm_q4_k_i8_b8")?,
+            gemm_q4_b8p: Kernel::create(&program, "gemm_q4_k_i8_b8p")?,
             gemm_i8_gz: Kernel::create(&program, "gemm_i8_gz")?,
             gemm_q6_b8: Kernel::create(&program, "gemm_q6_i8_b8")?,
+            gemm_q6_b8p: Kernel::create(&program, "gemm_q6_i8_b8p")?,
             gemm_q6: Kernel::create(&program, "gemm_q6_k_i8")?,
             gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
@@ -971,6 +977,7 @@ impl GpuModel {
             prepacked,
             prepack_on,
             q6_i8_gz_on,
+            q4_b8p_on,
             kernels,
             rope_full,
             rope_sliding,
@@ -1100,9 +1107,10 @@ impl GpuModel {
         if (2..=8).contains(&ntok) && !force {
             if let (Weight::Q4(_), Some(p)) = (weight, packed) {
                 let grid = rows.div_ceil(64) * 64;
+                let k = if self.q4_b8p_on { &self.kernels.gemm_q4_b8p } else { &self.kernels.gemm_q4_b8 };
                 unsafe {
                     self.gpu.launch(
-                        &self.kernels.gemm_q4_b8,
+                        k,
                         grid,
                         64,
                         &[
@@ -1188,9 +1196,10 @@ impl GpuModel {
                 }
                 if matches!(weight, Weight::Q6(_)) {
                     if (5..=8).contains(&ntok) {
+                        let k = if self.q4_b8p_on { &self.kernels.gemm_q6_b8p } else { &self.kernels.gemm_q6_b8 };
                         unsafe {
                             self.gpu.launch(
-                                &self.kernels.gemm_q6_b8,
+                                k,
                                 rows.div_ceil(64) * 64,
                                 64,
                                 &[
