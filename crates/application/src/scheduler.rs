@@ -13,6 +13,10 @@ pub struct SchedulerConfig {
     pub max_active: usize,
     pub max_batch: usize,
     pub prefill_budget: usize,
+    /// Сколько decode-строк можно отдать за шаг (по умолчанию = max_batch).
+    pub max_decode: usize,
+    /// Предел всех строк за шаг (decode + prefill); usize::MAX — без предела.
+    pub max_rows: usize,
 }
 
 impl SchedulerConfig {
@@ -23,6 +27,8 @@ impl SchedulerConfig {
             max_active: max_active.clamp(1, 16),
             max_batch,
             prefill_budget: prefill_budget.max(1),
+            max_decode: max_batch,
+            max_rows: usize::MAX,
         }
     }
 }
@@ -270,7 +276,7 @@ impl Scheduler {
             if seq.phase != Phase::Decode {
                 continue;
             }
-            if rows.len() >= self.cfg.max_batch {
+            if rows.len() >= self.cfg.max_decode {
                 break;
             }
             rows.push(StepRow {
@@ -281,7 +287,10 @@ impl Scheduler {
             need_logits = true;
         }
 
-        let mut budget = self.cfg.prefill_budget;
+        let mut budget = self
+            .cfg
+            .prefill_budget
+            .min(self.cfg.max_rows.saturating_sub(rows.len()));
         let prefs: Vec<&ActiveSeq> = order
             .iter()
             .map(|&i| &self.active[i])

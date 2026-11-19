@@ -579,15 +579,12 @@ impl Worker {
     ) -> Result<Self> {
         let mut gpu = backend(&cfg.model, cfg.ctx)?;
         let _ = gpu.free_sequence(0);
-        let max_batch = cfg.pb.clamp(1, 12);
+        let batch_cap = gpu.prefill_batch_size().max(1);
         let max_active = cfg.max_seqs.clamp(1, 16).min(gpu.max_sequences());
         let prefill_budget = cfg.prefill_budget.clamp(1, 128);
-        let sched = Scheduler::new(SchedulerConfig::new(
-            gpu.max_ctx(),
-            max_active,
-            max_batch,
-            prefill_budget,
-        ));
+        let mut scfg = SchedulerConfig::new(gpu.max_ctx(), max_active, batch_cap, prefill_budget);
+        scfg.max_decode = max_active.min(batch_cap);
+        let sched = Scheduler::new(scfg);
         let tok = tokenizer(&cfg.tokenizer)?;
         let chat = ChatTemplate::from_file(&cfg.template)?;
         let worker = Self {

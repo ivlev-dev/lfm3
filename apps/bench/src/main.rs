@@ -2443,8 +2443,8 @@ fn gpu_cache(model: &Path, tokens: usize, reps: usize, reset: bool) -> Result<()
 }
 
 fn gpu_multi(model: &Path, nseq: usize, tokens: usize, prompt_len: usize) -> Result<()> {
-    if nseq > 8 {
-        return Err(anyhow!("at most 8 sequences"));
+    if nseq > 16 {
+        return Err(anyhow!("at most 16 sequences"));
     }
     let prompts: Vec<Vec<u32>> = (0..nseq)
         .map(|i| {
