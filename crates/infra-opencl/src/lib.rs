@@ -236,7 +236,12 @@ impl Gpu {
             }
         }
         if std::env::var("LFM_LAUNCH_DEBUG").is_ok() {
-            eprintln!("launch {}", kernel.function_name().unwrap_or_default());
+            eprintln!(
+                "launch {} global={} local={}",
+                kernel.function_name().unwrap_or_default(),
+                global,
+                local
+            );
         }
         let event = unsafe { exec.enqueue_nd_range(&self.queue) }.map_err(|e| {
             anyhow!(

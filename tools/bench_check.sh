@@ -87,7 +87,12 @@ check_min "kvarn decode tok/s" "$pps" 1.0
 
 if [ -n "$TP" ]; then
     port=8178
-    ( LFM_TP=$TP "$SRV" --addr 127.0.0.1:$port --ctx 1024 >/tmp/opencode/bench_check_tp.log 2>&1 ) &
+    tp_devices=$(awk -F/ '{ print NF }' <<<"$TP")
+    tp_env="LFM_TP=$TP"
+    if [ "$tp_devices" -ge 3 ] && [ "$MODE" != "igpu" ] && [ "$MODE" != "igpu-full" ]; then
+        tp_env="RUSTICL_ENABLE=iris,radeonsi LFM_TP=$TP"
+    fi
+    ( env $tp_env "$SRV" --addr 127.0.0.1:$port --ctx 1024 >/tmp/opencode/bench_check_tp.log 2>&1 ) &
     srv_pid=$!
     for _ in $(seq 1 60); do
         curl -sf --max-time 1 http://127.0.0.1:$port/health >/dev/null 2>&1 && break

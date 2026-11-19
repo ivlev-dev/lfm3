@@ -206,6 +206,13 @@ pub struct TpShard {
     pub embed: bool,
 }
 
+fn uneven(rank: usize, world: usize, total: usize) -> (usize, usize) {
+    let per = total / world;
+    let rem = total % world;
+    let start = rank * per + rank.min(rem);
+    (start, per + usize::from(rank < rem))
+}
+
 impl TpShard {
     pub fn attention(
         rank: usize,
@@ -214,18 +221,20 @@ impl TpShard {
         kv_heads: usize,
         head_dim: usize,
     ) -> Self {
-        let qd = heads * head_dim;
-        let per = qd / world;
-        debug_assert!(per.is_multiple_of(256));
+        let ratio = heads / kv_heads;
+        let kv_per = kv_heads / world;
+        let kv_rem = kv_heads % world;
+        let kv_count = kv_per + usize::from(rank < kv_rem);
+        let kv_start = rank * kv_per + rank.min(kv_rem);
         Self {
             rank,
             world,
-            head_start: rank * heads / world,
-            head_count: heads / world,
-            kv_head_start: rank * kv_heads / world,
-            kv_head_count: kv_heads / world,
-            out_col_start: rank * per / head_dim,
-            out_col_count: per / head_dim,
+            head_start: kv_start * ratio,
+            head_count: kv_count * ratio,
+            kv_head_start: kv_start,
+            kv_head_count: kv_count,
+            out_col_start: kv_start * ratio,
+            out_col_count: kv_count * ratio,
             ffn_row_start: 0,
             ffn_row_count: 0,
             ffn_col_start: 0,
@@ -246,14 +255,14 @@ impl TpShard {
         vocab: usize,
     ) -> Self {
         let mut shard = Self::attention(rank, world, heads, kv_heads, head_dim);
-        let per = ffn / world;
-        shard.ffn_row_start = rank * per;
-        shard.ffn_row_count = per;
-        shard.ffn_col_start = rank * per;
-        shard.ffn_col_count = per;
-        let vper = vocab / world;
-        shard.vocab_start = rank * vper;
-        shard.vocab_count = vper;
+        let (ffn_start, ffn_count) = uneven(rank, world, ffn);
+        shard.ffn_row_start = ffn_start;
+        shard.ffn_row_count = ffn_count;
+        shard.ffn_col_start = ffn_start;
+        shard.ffn_col_count = ffn_count;
+        let (vocab_start, vocab_count) = uneven(rank, world, vocab);
+        shard.vocab_start = vocab_start;
+        shard.vocab_count = vocab_count;
         shard
     }
 }
@@ -295,17 +304,12 @@ fn shard_slice(
                 shard.ffn_col_start / 256,
                 (shard.ffn_col_start + shard.ffn_col_count) / 256,
             )),
-            "attn_output.weight" => {
-                if cols != shard.world * (cols / shard.world) {
-                    return None;
-                }
-                Some(ShardSlice::Blocks(
-                    0,
-                    rows,
-                    shard.out_col_start * head_dim / 256,
-                    (shard.out_col_start + shard.out_col_count) * head_dim / 256,
-                ))
-            }
+            "attn_output.weight" => Some(ShardSlice::Blocks(
+                0,
+                rows,
+                shard.out_col_start * head_dim / 256,
+                (shard.out_col_start + shard.out_col_count) * head_dim / 256,
+            )),
             _ => Some(ShardSlice::Rows(0, usize::MAX)),
         };
     }
@@ -2032,7 +2036,7 @@ impl GpuModel {
                             unsafe {
                                 self.gpu.launch(
                                     &self.kernels.kv_store_h,
-                                    kvd,
+                                    kvd.div_ceil(256) * 256,
                                     256,
                                     &[
                                         Arg::Mem(self.bufs.kk.get()),
@@ -2745,7 +2749,7 @@ impl GpuModel {
         unsafe {
             self.gpu.launch(
                 &self.kernels.kv_store_b_h,
-                ntok * kvg,
+                (ntok * kvg).div_ceil(256) * 256,
                 256,
                 &[
                     Arg::Mem(self.bufs.kkb.get()),
@@ -3154,7 +3158,7 @@ impl GpuModel {
         unsafe {
             self.gpu.launch(
                 self.kv_store_kernel(),
-                kvd,
+                kvd.div_ceil(256) * 256,
                 256,
                 &[
                     Arg::Mem(self.bufs.kk.get()),
@@ -5189,6 +5193,34 @@ impl GpuModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uneven_shard_for_three_devices() {
+        let shards: Vec<TpShard> = (0..3)
+            .map(|r| TpShard::full(r, 3, 16, 4, 128, 7680, 128000))
+            .collect();
+        let heads: Vec<usize> = shards.iter().map(|s| s.head_count).collect();
+        let kv: Vec<usize> = shards.iter().map(|s| s.kv_head_count).collect();
+        assert_eq!(heads, vec![8, 4, 4]);
+        assert_eq!(kv, vec![2, 1, 1]);
+        assert_eq!(shards[1].head_start, 8);
+        assert_eq!(shards[2].head_start, 12);
+        assert_eq!(shards[2].kv_head_start, 3);
+        let rows: Vec<usize> = shards.iter().map(|s| s.ffn_row_count).collect();
+        assert_eq!(rows, vec![2560, 2560, 2560]);
+        let vocab: Vec<usize> = shards.iter().map(|s| s.vocab_count).collect();
+        assert_eq!(vocab.iter().sum::<usize>(), 128000);
+        assert_eq!(vocab, vec![42667, 42667, 42666]);
+    }
+
+    #[test]
+    fn even_shard_matches_old_layout() {
+        let a = TpShard::full(1, 2, 16, 4, 128, 7680, 128000);
+        assert_eq!((a.head_start, a.head_count), (8, 8));
+        assert_eq!((a.kv_head_start, a.kv_head_count), (2, 2));
+        assert_eq!((a.ffn_row_start, a.ffn_row_count), (3840, 3840));
+        assert_eq!((a.vocab_start, a.vocab_count), (64000, 64000));
+    }
 
     #[test]
     fn chunk_ranges_covers_all() {

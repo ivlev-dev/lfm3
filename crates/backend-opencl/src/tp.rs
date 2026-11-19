@@ -42,8 +42,19 @@ impl TpModel {
         let file = GgufFile::open(path)?;
         let cfg = ModelConfig::from_metadata(&file).map_err(|e| anyhow!("config: {e}"))?;
         let kv_heads = *cfg.kv_heads.iter().max().unwrap_or(&0);
-        if cfg.num_heads % world != 0 || kv_heads % world != 0 {
-            return Err(anyhow!("heads not divisible by tp world"));
+        if kv_heads == 0 || cfg.num_heads % kv_heads != 0 {
+            return Err(anyhow!("num_heads must be a multiple of kv_heads"));
+        }
+        if world > kv_heads {
+            return Err(anyhow!(
+                "tp world {world} exceeds kv heads {kv_heads}: some stage would have no heads"
+            ));
+        }
+        if cfg.ffn_size % world != 0 || (cfg.ffn_size / world) % 256 != 0 {
+            return Err(anyhow!(
+                "ffn {} cannot be split into {world} column shards (need multiple of 256)",
+                cfg.ffn_size
+            ));
         }
         let mut stages = Vec::with_capacity(world);
         for (rank, &device) in devices.iter().enumerate() {
