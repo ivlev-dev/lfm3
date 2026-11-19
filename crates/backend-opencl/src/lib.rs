@@ -899,9 +899,9 @@ impl GpuModel {
         let kv_kind = opts.kv.clone();
         let kv_q4 = kv_kind == "q4" || kv_kind == "k4v4";
         let kv_kvarn = kv_kind == "kvarn" || kv_kind == "kvarn_k4v2";
-        if kv_f32 && (kv_q4 || kv_kvarn) {
+        if kv_f32 && kv_q4 {
             return Err(anyhow!(
-                "kv type {kv_kind:?} требует cl_khr_fp16; без fp16 доступен только kv=f16 (во float)"
+                "kv type {kv_kind:?} требует cl_khr_fp16; без fp16 доступны kv=f16 и kv=kvarn"
             ));
         }
         if kv_kvarn {
@@ -1178,6 +1178,31 @@ impl GpuModel {
             list.split(',')
                 .any(|pat| !pat.is_empty() && name.contains(pat))
         });
+        if self.kv_f32 && matches!(weight, Weight::Q6(_)) {
+            let (w8, wsc, _) = self
+                .prepacked_i8
+                .get(name)
+                .ok_or_else(|| anyhow!("Q6 без fp16 считает только int8-ядро, нужен prepack: {name}"))?;
+            let tps = ntok.div_ceil(32);
+            unsafe {
+                self.gpu.launch(
+                    &self.kernels.gemm_i8_gz,
+                    rows.div_ceil(64) * tps * 512,
+                    512,
+                    &[
+                        Arg::Mem(w8.get()),
+                        Arg::Mem(wsc.get()),
+                        Arg::Mem(xq.get()),
+                        Arg::Mem(xs.get()),
+                        Arg::Mem(y.get()),
+                        Arg::U32(rows as u32),
+                        Arg::U32(cols as u32),
+                        Arg::U32(ntok as u32),
+                    ],
+                )?;
+            }
+            return Ok(());
+        }
         if (2..=8).contains(&ntok)
             && !force
             && let (Weight::Q4(_), Some(p)) = (weight, packed)
@@ -4555,16 +4580,17 @@ fn make_kv(
     head_dim: usize,
 ) -> Result<KvBuf> {
     let heads = kvd / head_dim;
+    let kv_wide = if f32_kv { 2 } else { 1 };
     Ok(if kvarn {
         KvBuf::Kvarn {
-            staging: gpu.alloc::<u16>(slots * kvd)?,
+            staging: gpu.alloc::<u16>(slots * kvd * kv_wide)?,
             kcode: gpu.alloc::<u8>(slots * heads * 64)?,
-            ka: gpu.alloc::<u16>(blocks * heads * 128)?,
-            kc: gpu.alloc::<u16>(blocks * heads * 32)?,
+            ka: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,
+            kc: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
             vcode: gpu.alloc::<u8>(slots * heads * 32)?,
-            vb: gpu.alloc::<u16>(blocks * heads * 32)?,
-            vbz: gpu.alloc::<u16>(blocks * heads * 32)?,
-            vc: gpu.alloc::<u16>(blocks * heads * 128)?,
+            vb: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
+            vbz: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
+            vc: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,
         }
     } else if q4 {
         KvBuf::Q4 {

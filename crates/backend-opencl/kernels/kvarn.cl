@@ -1,4 +1,6 @@
+#ifndef LFM_F32_KV
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
 
 
 __kernel void kv_store_h_rot(__global const float *ksrc, __global const float *vsrc,
