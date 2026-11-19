@@ -63,7 +63,6 @@ impl TpModel {
                 world,
                 cfg.num_heads,
                 kv_heads,
-                cfg.head_dim,
                 cfg.ffn_size,
                 cfg.vocab_size,
             );

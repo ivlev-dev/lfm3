@@ -214,13 +214,7 @@ fn uneven(rank: usize, world: usize, total: usize) -> (usize, usize) {
 }
 
 impl TpShard {
-    pub fn attention(
-        rank: usize,
-        world: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-    ) -> Self {
+    pub fn attention(rank: usize, world: usize, heads: usize, kv_heads: usize) -> Self {
         let ratio = heads / kv_heads;
         let kv_per = kv_heads / world;
         let kv_rem = kv_heads % world;
@@ -250,11 +244,10 @@ impl TpShard {
         world: usize,
         heads: usize,
         kv_heads: usize,
-        head_dim: usize,
         ffn: usize,
         vocab: usize,
     ) -> Self {
-        let mut shard = Self::attention(rank, world, heads, kv_heads, head_dim);
+        let mut shard = Self::attention(rank, world, heads, kv_heads);
         let (ffn_start, ffn_count) = uneven(rank, world, ffn);
         shard.ffn_row_start = ffn_start;
         shard.ffn_row_count = ffn_count;
@@ -272,13 +265,7 @@ enum ShardSlice {
     Blocks(usize, usize, usize, usize),
 }
 
-fn shard_slice(
-    name: &str,
-    rows: usize,
-    cols: usize,
-    head_dim: usize,
-    shard: &TpShard,
-) -> Option<ShardSlice> {
+fn shard_slice(name: &str, rows: usize, head_dim: usize, shard: &TpShard) -> Option<ShardSlice> {
     if let Some(rest) = name.strip_prefix("blk.") {
         let (_, field) = rest.split_once('.')?;
         return match field {
@@ -638,7 +625,7 @@ impl GpuModel {
             let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
             let (lrows, lcols);
             let data: std::borrow::Cow<[u8]> = if let Some(shard) = shard {
-                match shard_slice(&info.name, rows, cols, cfg.head_dim, &shard) {
+                match shard_slice(&info.name, rows, cfg.head_dim, &shard) {
                     None => continue,
                     Some(spec) => {
                         let (lr, lc) = local_dims(&spec, rows, cols);
@@ -743,7 +730,7 @@ impl GpuModel {
                     if let Some(shard) = shard {
                         let cols = info.dims[0] as usize;
                         let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
-                        let spec = shard_slice(&info.name, rows, cols, cfg.head_dim, &shard)
+                        let spec = shard_slice(&info.name, rows, cfg.head_dim, &shard)
                             .ok_or_else(|| anyhow!("missing ffn shard spec"))?;
                         slice_shard(bytes, info.ggml_type, cols, &spec)
                     } else {
@@ -5197,7 +5184,7 @@ mod tests {
     #[test]
     fn uneven_shard_for_three_devices() {
         let shards: Vec<TpShard> = (0..3)
-            .map(|r| TpShard::full(r, 3, 16, 4, 128, 7680, 128000))
+            .map(|r| TpShard::full(r, 3, 16, 4, 7680, 128000))
             .collect();
         let heads: Vec<usize> = shards.iter().map(|s| s.head_count).collect();
         let kv: Vec<usize> = shards.iter().map(|s| s.kv_head_count).collect();
@@ -5215,7 +5202,7 @@ mod tests {
 
     #[test]
     fn even_shard_matches_old_layout() {
-        let a = TpShard::full(1, 2, 16, 4, 128, 7680, 128000);
+        let a = TpShard::full(1, 2, 16, 4, 7680, 128000);
         assert_eq!((a.head_start, a.head_count), (8, 8));
         assert_eq!((a.kv_head_start, a.kv_head_count), (2, 2));
         assert_eq!((a.ffn_row_start, a.ffn_row_count), (3840, 3840));
