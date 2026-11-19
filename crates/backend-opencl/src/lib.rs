@@ -3381,7 +3381,7 @@ impl GpuModel {
 
     pub fn kernel_stats(&self) -> Vec<(String, u64)> {
         let dev = self.gpu.device.id();
-        let list: [(&str, &Kernel); 18] = [
+        let list: [(&str, &Kernel); 23] = [
             ("q4", &self.kernels.q4),
             ("q4p_b", &self.kernels.q4p_b),
             ("q4x4p_b", &self.kernels.q4x4p_b),
@@ -3400,6 +3400,11 @@ impl GpuModel {
             ("silu_quant_b", &self.kernels.silu_quant_b),
             ("conv_b", &self.kernels.conv_b),
             ("kv_store_h", &self.kernels.kv_store_h),
+            ("gemm_i8_gz", &self.kernels.gemm_i8_gz),
+            ("gemm_i8_pf", &self.kernels.gemm_i8_pf),
+            ("gemm_q4_b8p", &self.kernels.gemm_q4_b8p),
+            ("gemm_q6_b8p", &self.kernels.gemm_q6_b8p),
+            ("gemm_q4_lds17", &self.kernels.gemm_q4_lds17),
         ];
         list.iter()
             .map(|(n, k)| (n.to_string(), k.get_private_mem_size(dev).unwrap_or(0)))
