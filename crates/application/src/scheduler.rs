@@ -118,10 +118,7 @@ pub struct StepRow {
 pub enum StepPlan {
     Idle,
     AtomicPrefill(JobId),
-    Mixed {
-        rows: Vec<StepRow>,
-        need_logits: bool,
-    },
+    Mixed { rows: Vec<StepRow> },
 }
 
 impl StepPlan {
@@ -131,7 +128,7 @@ impl StepPlan {
 
     pub fn rows(&self) -> &[StepRow] {
         match self {
-            StepPlan::Mixed { rows, .. } => rows,
+            StepPlan::Mixed { rows } => rows,
             _ => &[],
         }
     }
@@ -270,7 +267,6 @@ impl Scheduler {
         };
         self.cursor = if n == 0 { 0 } else { (self.cursor + 1) % n };
         let mut rows: Vec<StepRow> = Vec::with_capacity(self.cfg.max_batch);
-        let mut need_logits = false;
         for &i in &order {
             let seq = &self.active[i];
             if seq.phase != Phase::Decode {
@@ -284,7 +280,6 @@ impl Scheduler {
                 pos: seq.position(),
                 token: StepToken::Decode,
             });
-            need_logits = true;
         }
 
         let mut budget = self
@@ -323,16 +318,10 @@ impl Scheduler {
                 progress = true;
             }
         }
-        for (i, seq) in prefs.iter().enumerate() {
-            if taken[i] > 0 && taken[i] == seq.prompt_remaining() {
-                need_logits = true;
-            }
-        }
-
         if rows.is_empty() {
             StepPlan::Idle
         } else {
-            StepPlan::Mixed { rows, need_logits }
+            StepPlan::Mixed { rows }
         }
     }
 
@@ -552,10 +541,6 @@ mod tests {
                 token: StepToken::Prompt(11)
             } if id == b.id
         ));
-        match plan {
-            StepPlan::Mixed { need_logits, .. } => assert!(need_logits),
-            other => panic!("expected mixed plan, got {other:?}"),
-        }
     }
 
     #[test]
@@ -575,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_completion_requests_logits() {
+    fn prefill_completion_lands_on_last_prompt_row() {
         let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 6, 12));
         let a = s.enqueue(10, 5).unwrap();
         let b = s.enqueue(100, 5).unwrap();
@@ -588,10 +573,7 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert!(matches!(rows[1].token, StepToken::Prompt(97)));
         assert!(matches!(rows[3].token, StepToken::Prompt(99)));
-        match plan {
-            StepPlan::Mixed { need_logits, .. } => assert!(need_logits),
-            other => panic!("expected mixed plan, got {other:?}"),
-        }
+        assert!(matches!(rows[3].token, StepToken::Prompt(index) if index + 1 == 100));
     }
 
     #[test]
@@ -605,10 +587,7 @@ mod tests {
         let rows = plan.rows();
         assert_eq!(rows.len(), 12);
         assert!(matches!(rows[0].token, StepToken::Prompt(10)));
-        match plan {
-            StepPlan::Mixed { need_logits, .. } => assert!(!need_logits),
-            other => panic!("expected mixed plan, got {other:?}"),
-        }
+        assert!(matches!(rows[11].token, StepToken::Prompt(index) if index + 1 < 100));
     }
 
     #[test]
@@ -626,10 +605,6 @@ mod tests {
         let plan = s.plan_step();
         assert_eq!(plan.rows().len(), 4);
         assert!(plan.rows().iter().all(|row| row.token == StepToken::Decode));
-        match plan {
-            StepPlan::Mixed { need_logits, .. } => assert!(need_logits),
-            other => panic!("expected mixed plan, got {other:?}"),
-        }
     }
 
     #[test]

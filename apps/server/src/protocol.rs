@@ -2,9 +2,60 @@ use anyhow::{Result, anyhow};
 use lfm_domain::{Message, Role, SamplingParams, ToolCall, ToolDef};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::EngineMetricsSnapshot;
+
+pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+pub const DEFAULT_TOP_K: usize = 40;
+pub const DEFAULT_TOP_P: f32 = 0.95;
+pub const DEFAULT_MAX_TOKENS: usize = 256;
+
+fn default_params() -> SamplingParams {
+    SamplingParams {
+        temperature: DEFAULT_TEMPERATURE,
+        top_k: DEFAULT_TOP_K,
+        top_p: DEFAULT_TOP_P,
+        max_tokens: DEFAULT_MAX_TOKENS,
+        ..SamplingParams::default()
+    }
+}
+
+struct RequestParams<'a> {
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    max_tokens: Option<usize>,
+    stop: Option<&'a Stop>,
+    seed: Option<u64>,
+}
+
+fn build_params(req: RequestParams<'_>) -> SamplingParams {
+    let mut params = default_params();
+    if let Some(v) = req.temperature {
+        params.temperature = v;
+    }
+    if let Some(v) = req.top_k {
+        params.top_k = v;
+    }
+    if let Some(v) = req.top_p {
+        params.top_p = v;
+    }
+    if let Some(v) = req.seed {
+        params.seed = v;
+    }
+    if let Some(v) = req.max_tokens {
+        params.max_tokens = v.max(1);
+    }
+    if let Some(stop) = req.stop {
+        params.stop = match stop {
+            Stop::One(s) => vec![s.clone()],
+            Stop::Many(v) => v.clone(),
+        };
+    }
+    params
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -124,23 +175,14 @@ impl ChatRequest {
     }
 
     pub fn to_params(&self) -> SamplingParams {
-        let mut params = SamplingParams {
-            temperature: self.temperature.unwrap_or(0.7),
-            top_k: self.top_k.unwrap_or(40),
-            top_p: self.top_p.unwrap_or(0.95),
-            ..SamplingParams::default()
-        };
-        if let Some(stop) = &self.stop {
-            match stop {
-                Stop::One(s) => params.stop = vec![s.clone()],
-                Stop::Many(v) => params.stop = v.clone(),
-            }
-        }
-        if let Some(seed) = self.seed {
-            params.seed = seed;
-        }
-        params.max_tokens = self.max_tokens.unwrap_or(256).max(1);
-        params
+        build_params(RequestParams {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            max_tokens: self.max_tokens,
+            stop: self.stop.as_ref(),
+            seed: self.seed,
+        })
     }
 
     pub fn thinking(&self) -> bool {
@@ -248,23 +290,14 @@ impl CompletionRequest {
     }
 
     pub fn to_params(&self) -> SamplingParams {
-        let mut params = SamplingParams {
-            temperature: self.temperature.unwrap_or(0.7),
-            top_k: self.top_k.unwrap_or(40),
-            top_p: self.top_p.unwrap_or(0.95),
-            ..SamplingParams::default()
-        };
-        if let Some(stop) = &self.stop {
-            match stop {
-                Stop::One(s) => params.stop = vec![s.clone()],
-                Stop::Many(v) => params.stop = v.clone(),
-            }
-        }
-        if let Some(seed) = self.seed {
-            params.seed = seed;
-        }
-        params.max_tokens = self.max_tokens.unwrap_or(256).max(1);
-        params
+        build_params(RequestParams {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            max_tokens: self.max_tokens,
+            stop: self.stop.as_ref(),
+            seed: self.seed,
+        })
     }
 }
 
@@ -296,28 +329,26 @@ impl CompletionMeta {
         }
     }
 
-    pub fn chunk(&self, delta: Value, finish: Option<&str>) -> String {
-        json!({
-            "id": self.id,
-            "object": "chat.completion.chunk",
-            "created": self.created,
-            "model": self.model,
-            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }]
-        })
-        .to_string()
-    }
-
-    pub fn tool_chunk(&self, index: usize, tc: &ToolCall) -> String {
-        let delta = json!({ "tool_calls": [{
-            "index": index,
-            "id": tc.id.clone().unwrap_or_else(|| format!("call_{index}")),
-            "type": "function",
-            "function": {
-                "name": tc.name,
-                "arguments": tool_arguments_text(&tc.arguments)
-            }
-        }]});
-        self.chunk(delta, None)
+    pub fn write_chunk<D: Serialize>(
+        &self,
+        out: &mut Vec<u8>,
+        delta: D,
+        finish: Option<&str>,
+    ) -> serde_json::Result<()> {
+        serde_json::to_writer(
+            out,
+            &ChatChunk {
+                id: &self.id,
+                object: "chat.completion.chunk",
+                created: self.created,
+                model: &self.model,
+                choices: [ChatChoice {
+                    index: 0,
+                    delta,
+                    finish_reason: finish,
+                }],
+            },
+        )
     }
 
     pub fn message_response(
@@ -365,15 +396,27 @@ impl CompletionMeta {
         .to_string()
     }
 
-    pub fn completion_chunk(&self, text: &str, finish: Option<&str>) -> String {
-        json!({
-            "id": self.id,
-            "object": "text_completion",
-            "created": self.created,
-            "model": self.model,
-            "choices": [{ "index": 0, "text": text, "logprobs": Value::Null, "finish_reason": finish }]
-        })
-        .to_string()
+    pub fn write_completion_chunk(
+        &self,
+        out: &mut Vec<u8>,
+        text: &str,
+        finish: Option<&str>,
+    ) -> serde_json::Result<()> {
+        serde_json::to_writer(
+            out,
+            &CompletionChunk {
+                id: &self.id,
+                object: "text_completion",
+                created: self.created,
+                model: &self.model,
+                choices: [CompletionChoice {
+                    index: 0,
+                    text,
+                    logprobs: None,
+                    finish_reason: finish,
+                }],
+            },
+        )
     }
 
     pub fn completion_response(
@@ -403,6 +446,126 @@ impl CompletionMeta {
         })
         .to_string()
     }
+}
+
+#[derive(Serialize)]
+struct ChatChunk<'a, D> {
+    id: &'a str,
+    object: &'static str,
+    created: u64,
+    model: &'a str,
+    choices: [ChatChoice<'a, D>; 1],
+}
+
+#[derive(Serialize)]
+struct ChatChoice<'a, D> {
+    index: u32,
+    delta: D,
+    finish_reason: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct CompletionChunk<'a> {
+    id: &'a str,
+    object: &'static str,
+    created: u64,
+    model: &'a str,
+    choices: [CompletionChoice<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct CompletionChoice<'a> {
+    index: u32,
+    text: &'a str,
+    logprobs: Option<()>,
+    finish_reason: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum Delta<'a> {
+    Content {
+        content: &'a str,
+    },
+    Reasoning {
+        reasoning_content: &'a str,
+    },
+    ToolCalls {
+        tool_calls: [ToolCallDelta<'a>; 1],
+    },
+    Opening {
+        role: &'static str,
+        content: &'a str,
+    },
+    Empty {},
+}
+
+impl<'a> Delta<'a> {
+    pub fn content(text: &'a str) -> Self {
+        Self::Content { content: text }
+    }
+
+    pub fn reasoning(text: &'a str) -> Self {
+        Self::Reasoning {
+            reasoning_content: text,
+        }
+    }
+
+    pub fn opening(role: &'static str) -> Self {
+        Self::Opening { role, content: "" }
+    }
+
+    pub fn empty() -> Self {
+        Self::Empty {}
+    }
+
+    pub fn tool_call(index: usize, call: &'a ToolCall) -> Self {
+        Self::ToolCalls {
+            tool_calls: [ToolCallDelta {
+                index,
+                id: match &call.id {
+                    Some(id) => Cow::Borrowed(id),
+                    None => Cow::Owned(format!("call_{index}")),
+                },
+                kind: "function",
+                function: ToolFunctionDelta {
+                    name: &call.name,
+                    arguments: tool_arguments_text(&call.arguments),
+                },
+            }],
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ToolCallDelta<'a> {
+    index: usize,
+    id: Cow<'a, str>,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ToolFunctionDelta<'a>,
+}
+
+#[derive(Serialize)]
+pub struct ToolFunctionDelta<'a> {
+    name: &'a str,
+    arguments: String,
+}
+
+pub fn push_sse<F>(out: &mut Vec<u8>, encode: F) -> Result<()>
+where
+    F: FnOnce(&mut Vec<u8>) -> serde_json::Result<()>,
+{
+    out.extend_from_slice(b"data: ");
+    encode(out)?;
+    out.extend_from_slice(b"\n\n");
+    Ok(())
+}
+
+pub fn push_sse_data(out: &mut Vec<u8>, data: &[u8]) {
+    out.extend_from_slice(b"data: ");
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\n\n");
 }
 
 pub fn models_json(model: &str, created: u64) -> String {
@@ -495,6 +658,29 @@ mod tests {
     }
 
     #[test]
+    fn sampling_defaults_match_protocol_contract() {
+        assert_eq!(DEFAULT_TEMPERATURE, 0.7);
+        assert_eq!(DEFAULT_TOP_K, 40);
+        assert_eq!(DEFAULT_TOP_P, 0.95);
+        assert_eq!(DEFAULT_MAX_TOKENS, 256);
+        let chat = parse(r#"{"messages":[]}"#).to_params();
+        assert_eq!(chat.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(chat.top_k, DEFAULT_TOP_K);
+        assert_eq!(chat.top_p, DEFAULT_TOP_P);
+        assert_eq!(chat.max_tokens, DEFAULT_MAX_TOKENS);
+        let completion = parse_completion(r#"{"prompt":"x"}"#).to_params();
+        assert_eq!(completion.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(completion.top_k, DEFAULT_TOP_K);
+        assert_eq!(completion.top_p, DEFAULT_TOP_P);
+        assert_eq!(completion.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(completion.min_p, SamplingParams::default().min_p);
+        assert_eq!(
+            completion.repeat_penalty,
+            SamplingParams::default().repeat_penalty
+        );
+    }
+
+    #[test]
     fn thinking_from_kwargs() {
         let req = parse(r#"{"messages":[],"chat_template_kwargs":{"enable_thinking":true}}"#);
         assert!(req.thinking());
@@ -511,11 +697,30 @@ mod tests {
     #[test]
     fn chunk_and_response_shapes() {
         let meta = CompletionMeta::new("lfm3");
-        let chunk = meta.chunk(json!({"content":"hi"}), None);
-        let v: Value = serde_json::from_str(&chunk).unwrap();
+        let mut buf = Vec::new();
+        meta.write_chunk(&mut buf, Delta::content("hi"), None)
+            .unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["object"], "chat.completion.chunk");
         assert_eq!(v["choices"][0]["delta"]["content"], "hi");
         assert!(v["choices"][0]["finish_reason"].is_null());
+
+        buf.clear();
+        meta.write_chunk(&mut buf, Delta::opening("assistant"), None)
+            .unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["delta"]["content"], "");
+
+        buf.clear();
+        meta.write_chunk(&mut buf, Delta::empty(), Some("stop"))
+            .unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            v["choices"][0]["delta"].as_object().map(|m| m.len()),
+            Some(0)
+        );
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
 
         let resp = meta.message_response("hello", None, &[], "stop", 3, 2);
         let v: Value = serde_json::from_str(&resp).unwrap();
@@ -672,13 +877,19 @@ mod tests {
             name: "weather".into(),
             arguments: json!({"city": "Paris"}),
         };
-        let chunk = meta.tool_chunk(2, &tc);
-        let v: Value = serde_json::from_str(&chunk).unwrap();
+        let mut buf = Vec::new();
+        meta.write_chunk(&mut buf, Delta::tool_call(2, &tc), None)
+            .unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["choices"][0]["delta"]["tool_calls"][0]["index"], 2);
         assert_eq!(v["choices"][0]["delta"]["tool_calls"][0]["id"], "call_2");
         assert_eq!(
             v["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
             "weather"
+        );
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
         );
     }
 
@@ -717,9 +928,11 @@ mod tests {
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
         assert_eq!(v["usage"]["total_tokens"], 5);
 
-        let chunk = meta.completion_chunk("hi", None);
-        let v: Value = serde_json::from_str(&chunk).unwrap();
+        let mut buf = Vec::new();
+        meta.write_completion_chunk(&mut buf, "hi", None).unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["choices"][0]["text"], "hi");
+        assert!(v["choices"][0]["logprobs"].is_null());
         assert!(v["choices"][0]["finish_reason"].is_null());
     }
 

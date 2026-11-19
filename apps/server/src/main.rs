@@ -10,15 +10,53 @@ mod ws;
 use anyhow::Result;
 use clap::Parser;
 use engine::{ChatJob, Engine, Event, ServeConfig};
-use http::{Request, end_sse, read_request, start_sse, write_event, write_json};
-use protocol::{ChatRequest, CompletionMeta, CompletionRequest, metrics_json, models_json};
+use http::{Request, SseWriter, read_request, write_json};
+use protocol::{ChatRequest, CompletionMeta, CompletionRequest, Delta, metrics_json, models_json};
 use serde_json::json;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
+
+const MAX_BATCH_EVENTS: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_body: usize,
+    pub h2_cancel_interval: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pump {
+    Continue,
+    Stop,
+}
+
+pub(crate) fn pump_events(
+    events: &Receiver<Event>,
+    mut apply: impl FnMut(&[Event]) -> Result<Pump>,
+) -> Result<()> {
+    let mut batch: Vec<Event> = Vec::with_capacity(MAX_BATCH_EVENTS);
+    loop {
+        batch.clear();
+        match events.recv() {
+            Ok(event) => batch.push(event),
+            Err(_) => return Ok(()),
+        }
+        while batch.len() < MAX_BATCH_EVENTS {
+            match events.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(_) => break,
+            }
+        }
+        if apply(&batch)? == Pump::Stop {
+            return Ok(());
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "lfm-server", about = "OpenAI-совместимый сервер LFM3 (OpenCL)")]
@@ -47,6 +85,11 @@ struct Cli {
     max_body: Option<usize>,
     #[arg(long, help = "бюджет prefill-токенов на шаг, 1..=128 [64]")]
     prefill_budget: Option<usize>,
+    #[arg(
+        long,
+        help = "проверять обрыв клиента на h2 каждые N батчей, 1..=1024 [16]"
+    )]
+    h2_cancel_interval: Option<usize>,
     #[arg(long, help = "индекс OpenCL-устройства [0]")]
     device: Option<usize>,
     #[arg(
@@ -70,6 +113,10 @@ struct Cli {
     no_fuse: bool,
     #[arg(long, help = "отключить prepack (148-байтная раскладка и int8-копии)")]
     no_prepack: bool,
+    #[arg(long, help = "потоков на prepack, 0 = авто, 1 = последовательно [0]")]
+    prepack_threads: Option<usize>,
+    #[arg(long, help = "отключить кэш скомпилированных ядер OpenCL")]
+    no_program_cache: bool,
     #[arg(long, help = "отключить пары позиций в коротком внимании")]
     no_attn2: bool,
     #[arg(long, help = "отключить GQA-шеринг K/V (4 головы на группу)")]
@@ -128,6 +175,12 @@ fn apply_engine_cli(opts: &mut lfm_gpu::Options, cli: &Cli) {
     }
     if cli.no_prepack {
         opts.prepack = false;
+    }
+    if let Some(v) = cli.prepack_threads {
+        opts.prepack_threads = v;
+    }
+    if cli.no_program_cache {
+        opts.program_cache = false;
     }
     if cli.no_attn2 {
         opts.attn2 = false;
@@ -199,6 +252,7 @@ fn main() -> Result<()> {
         log_requests: cli.log_requests.then_some(true),
         max_body: cli.max_body,
         prefill_budget: cli.prefill_budget,
+        h2_cancel_interval: cli.h2_cancel_interval,
     };
     let cfg = config::resolve(&file, &overrides, engine_opts)?;
     let backend_name = backend_name();
@@ -273,6 +327,10 @@ fn main() -> Result<()> {
         flag.store(false, Ordering::SeqCst);
     });
     let active = Arc::new(AtomicUsize::new(0));
+    let limits = Limits {
+        max_body: cfg.max_body,
+        h2_cancel_interval: cfg.h2_cancel_interval,
+    };
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -286,7 +344,7 @@ fn main() -> Result<()> {
                         let guard = ActiveGuard(active);
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                handle(stream, &engine, &info, cfg.max_body)
+                                handle(stream, &engine, &info, limits)
                             }));
                         match outcome {
                             Ok(Ok(())) => {}
@@ -380,21 +438,17 @@ fn route(method: &str, path: &str) -> Route {
     }
 }
 
-fn handle(
-    mut stream: TcpStream,
-    engine: &Engine,
-    info: &ServerInfo,
-    max_body: usize,
-) -> Result<()> {
+fn handle(mut stream: TcpStream, engine: &Engine, info: &ServerInfo, limits: Limits) -> Result<()> {
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut peek = [0u8; 24];
     let seen = stream.peek(&mut peek).unwrap_or(0);
     if seen > 0 && h2::is_preface(&peek[..seen]) && seen < peek.len() {
-        return h2::serve(stream, engine, info, max_body);
+        return h2::serve(stream, engine, info, limits);
     }
     let started = Instant::now();
-    let request = match read_request(&mut stream, max_body)? {
+    let request = match read_request(&mut stream, limits.max_body)? {
         Some(request) => request,
         None => return Ok(()),
     };
@@ -446,57 +500,53 @@ fn chat(mut stream: TcpStream, engine: &Engine, model: &str, request: &Request) 
     let name = parsed.model.as_deref().unwrap_or(model);
     let meta = CompletionMeta::new(name);
     if parsed.stream {
-        start_sse(&mut stream)?;
-        write_event(
-            &mut stream,
-            &meta.chunk(json!({ "role": "assistant", "content": "" }), None),
-        )?;
+        let mut out = SseWriter::start(&mut stream)?;
+        out.json(|b| meta.write_chunk(b, Delta::opening("assistant"), None))?;
+        out.flush()?;
         let mut tool_index = 0usize;
         let mut finish_reason = "stop";
         let mut finished = false;
-        for event in events {
-            match event {
-                Event::Delta(text) => {
-                    write_event(&mut stream, &meta.chunk(json!({ "content": text }), None))?;
-                }
-                Event::Thinking(text) => {
-                    write_event(
-                        &mut stream,
-                        &meta.chunk(json!({ "reasoning_content": text }), None),
-                    )?;
-                }
-                Event::ToolCall(tc) => {
-                    write_event(&mut stream, &meta.tool_chunk(tool_index, &tc))?;
-                    tool_index += 1;
-                }
-                Event::Final {
-                    finish_reason: reason,
-                    ..
-                } => {
-                    finish_reason = reason;
-                    finished = true;
-                }
-                Event::Error(e) => {
-                    eprintln!("engine error: {e}");
-                    write_event(
-                        &mut stream,
-                        &meta.chunk(json!({ "content": "\n[error] generation failed" }), None),
-                    )?;
-                    finish_reason = "error";
+        pump_events(&events, |batch| {
+            for event in batch {
+                match event {
+                    Event::Delta(text) => {
+                        out.json(|b| meta.write_chunk(b, Delta::content(text), None))?;
+                    }
+                    Event::Thinking(text) => {
+                        out.json(|b| meta.write_chunk(b, Delta::reasoning(text), None))?;
+                    }
+                    Event::ToolCall(tc) => {
+                        out.json(|b| meta.write_chunk(b, Delta::tool_call(tool_index, tc), None))?;
+                        tool_index += 1;
+                    }
+                    Event::Final {
+                        finish_reason: reason,
+                        ..
+                    } => {
+                        finish_reason = reason;
+                        finished = true;
+                    }
+                    Event::Error(e) => {
+                        eprintln!("engine error: {e}");
+                        out.json(|b| {
+                            meta.write_chunk(b, Delta::content("\n[error] generation failed"), None)
+                        })?;
+                        finish_reason = "error";
+                    }
                 }
             }
-        }
+            out.flush()?;
+            Ok(Pump::Continue)
+        })?;
         if !finished {
-            write_event(
-                &mut stream,
-                &json!({"error": {"message": "generation interrupted", "type": "server_error"}})
-                    .to_string(),
-            )?;
-            return end_sse(&mut stream);
+            out.data(
+                br#"{"error": {"message": "generation interrupted", "type": "server_error"}}"#,
+            );
+            return out.end();
         }
-        write_event(&mut stream, &meta.chunk(json!({}), Some(finish_reason)))?;
-        write_event(&mut stream, "[DONE]")?;
-        return end_sse(&mut stream);
+        out.json(|b| meta.write_chunk(b, Delta::empty(), Some(finish_reason)))?;
+        out.data(b"[DONE]");
+        return out.end();
     }
     let mut text = String::new();
     let mut thinking: Option<String> = None;
@@ -568,40 +618,43 @@ fn completions(
         let job = ChatJob::completion(prompts[0].clone(), params);
         let _cancel = engine::CancelGuard::new(job.cancel_handle());
         let events = engine.submit(job)?;
-        start_sse(&mut stream)?;
-        write_event(&mut stream, &meta.completion_chunk("", None))?;
+        let mut out = SseWriter::start(&mut stream)?;
+        out.json(|b| meta.write_completion_chunk(b, "", None))?;
+        out.flush()?;
         let mut finish_reason = "stop";
         let mut finished = false;
-        for event in events {
-            match event {
-                Event::Delta(text) => {
-                    write_event(&mut stream, &meta.completion_chunk(&text, None))?;
+        pump_events(&events, |batch| {
+            for event in batch {
+                match event {
+                    Event::Delta(text) => {
+                        out.json(|b| meta.write_completion_chunk(b, text, None))?;
+                    }
+                    Event::Final {
+                        finish_reason: reason,
+                        ..
+                    } => {
+                        finish_reason = reason;
+                        finished = true;
+                    }
+                    Event::Error(e) => {
+                        eprintln!("engine error: {e}");
+                        finish_reason = "error";
+                    }
+                    Event::Thinking(_) | Event::ToolCall(_) => {}
                 }
-                Event::Final {
-                    finish_reason: reason,
-                    ..
-                } => {
-                    finish_reason = reason;
-                    finished = true;
-                }
-                Event::Error(e) => {
-                    eprintln!("engine error: {e}");
-                    finish_reason = "error";
-                }
-                Event::Thinking(_) | Event::ToolCall(_) => {}
             }
-        }
+            out.flush()?;
+            Ok(Pump::Continue)
+        })?;
         if !finished {
-            write_event(
-                &mut stream,
-                &json!({"error": {"message": "generation interrupted", "type": "server_error"}})
-                    .to_string(),
-            )?;
-            return end_sse(&mut stream);
+            out.data(
+                br#"{"error": {"message": "generation interrupted", "type": "server_error"}}"#,
+            );
+            return out.end();
         }
-        write_event(&mut stream, &meta.completion_chunk("", Some(finish_reason)))?;
-        write_event(&mut stream, "[DONE]")?;
-        return end_sse(&mut stream);
+        out.json(|b| meta.write_completion_chunk(b, "", Some(finish_reason)))?;
+        out.data(b"[DONE]");
+        return out.end();
     }
     let mut choices = Vec::with_capacity(prompts.len());
     let mut prompt_tokens = 0usize;
@@ -690,51 +743,38 @@ fn ws_session(mut stream: TcpStream, engine: &Engine, request: &Request) -> Resu
             }
         };
         let params = parsed.to_params();
-        let events = engine.submit(ChatJob::chat(
-            messages,
-            params,
-            parsed.thinking(),
-            parsed.to_tools(),
-        ))?;
-        for event in events {
-            match event {
-                Event::Delta(text) => {
-                    conn.send_text(&json!({ "type": "delta", "content": text }).to_string())?;
-                }
-                Event::Thinking(text) => {
-                    conn.send_text(&json!({ "type": "thinking", "content": text }).to_string())?;
-                }
-                Event::ToolCall(tc) => {
-                    conn.send_text(
-                        &json!({
-                            "type": "tool_call",
-                            "id": tc.id,
-                            "name": tc.name,
-                            "arguments": tc.arguments
-                        })
-                        .to_string(),
-                    )?;
-                }
-                Event::Final {
-                    finish_reason,
-                    prompt_tokens,
-                    completion_tokens,
-                    ..
-                } => {
-                    conn.send_text(
-                        &json!({
-                            "type": "done",
-                            "finish_reason": finish_reason,
-                            "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens }
-                        })
-                        .to_string(),
-                    )?;
-                }
-                Event::Error(e) => {
-                    conn.send_text(&json!({ "type": "error", "message": e }).to_string())?;
-                }
+        let job = ChatJob::chat(messages, params, parsed.thinking(), parsed.to_tools());
+        let _cancel = engine::CancelGuard::new(job.cancel_handle());
+        let events = engine.submit(job)?;
+        pump_events(&events, |batch| {
+            for event in batch {
+                let message = match event {
+                    Event::Delta(content) => ws::OutMessage::Delta { content },
+                    Event::Thinking(content) => ws::OutMessage::Thinking { content },
+                    Event::ToolCall(tc) => ws::OutMessage::ToolCall {
+                        id: tc.id.as_deref(),
+                        name: &tc.name,
+                        arguments: &tc.arguments,
+                    },
+                    Event::Final {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                        ..
+                    } => ws::OutMessage::Done {
+                        finish_reason: *finish_reason,
+                        usage: ws::Usage {
+                            prompt_tokens: *prompt_tokens,
+                            completion_tokens: *completion_tokens,
+                        },
+                    },
+                    Event::Error(message) => ws::OutMessage::Error { message },
+                };
+                conn.queue_json(&message)?;
             }
-        }
+            conn.flush()?;
+            Ok(Pump::Continue)
+        })?;
     }
     Ok(())
 }

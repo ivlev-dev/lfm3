@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use serde::Serialize;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -100,39 +101,102 @@ pub fn handshake(stream: &mut TcpStream, client_key: &str) -> Result<()> {
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 
+#[derive(Serialize)]
+#[serde(tag = "type")]
+pub enum OutMessage<'a> {
+    #[serde(rename = "delta")]
+    Delta { content: &'a str },
+    #[serde(rename = "thinking")]
+    Thinking { content: &'a str },
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        id: Option<&'a str>,
+        name: &'a str,
+        arguments: &'a serde_json::Value,
+    },
+    #[serde(rename = "done")]
+    Done {
+        finish_reason: &'a str,
+        usage: Usage,
+    },
+    #[serde(rename = "error")]
+    Error { message: &'a str },
+}
+
+#[derive(Serialize, Clone, Copy)]
+pub struct Usage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+}
+
+fn push_frame(out: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+    out.push(0x80 | opcode);
+    let len = payload.len();
+    if len < 126 {
+        out.push(len as u8);
+    } else if len <= 65535 {
+        out.push(126);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        out.push(127);
+        out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+}
+
 pub struct WsConn {
     stream: TcpStream,
+    out: Vec<u8>,
+    scratch: Vec<u8>,
 }
 
 impl WsConn {
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            out: Vec::with_capacity(2048),
+            scratch: Vec::with_capacity(512),
+        }
     }
 
     pub fn send_text(&mut self, text: &str) -> Result<()> {
-        self.send_frame(0x1, text.as_bytes())
+        self.queue_text(text);
+        self.flush()
     }
 
     pub fn send_close(&mut self) -> Result<()> {
-        self.send_frame(0x8, &[])
+        self.queue_frame(0x8, &[]);
+        self.flush()
     }
 
-    fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
-        let mut head = Vec::with_capacity(10);
-        head.push(0x80 | opcode);
-        let len = payload.len();
-        if len < 126 {
-            head.push(len as u8);
-        } else if len <= 65535 {
-            head.push(126);
-            head.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            head.push(127);
-            head.extend_from_slice(&(len as u64).to_be_bytes());
+    pub fn queue_text(&mut self, text: &str) {
+        self.queue_frame(0x1, text.as_bytes());
+    }
+
+    pub fn queue_json(&mut self, value: &impl Serialize) -> Result<()> {
+        self.scratch.clear();
+        serde_json::to_writer(&mut self.scratch, value)?;
+        let Self { out, scratch, .. } = self;
+        push_frame(out, 0x1, scratch);
+        Ok(())
+    }
+
+    fn queue_frame(&mut self, opcode: u8, payload: &[u8]) {
+        let Self { out, .. } = self;
+        push_frame(out, opcode, payload);
+    }
+
+    #[cfg(test)]
+    pub fn pending_bytes(&self) -> usize {
+        self.out.len()
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        if !self.out.is_empty() {
+            self.stream.write_all(&self.out)?;
+            self.stream.flush()?;
+            self.out.clear();
         }
-        self.stream.write_all(&head)?;
-        self.stream.write_all(payload)?;
-        self.stream.flush()?;
         Ok(())
     }
 
@@ -206,7 +270,8 @@ impl WsConn {
                     return Ok(None);
                 }
                 0x9 => {
-                    self.send_frame(0xA, &payload)?;
+                    self.queue_frame(0xA, &payload);
+                    self.flush()?;
                     continue;
                 }
                 0xA => continue,
@@ -312,5 +377,77 @@ mod tests {
         let mut conn = WsConn::new(stream);
         assert_eq!(conn.read_message().unwrap().as_deref(), Some("hello"));
         client.join().unwrap();
+    }
+
+    #[test]
+    fn queued_frames_are_flushed_as_one_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).unwrap();
+            raw
+        });
+        let (stream, _) = listener.accept().unwrap();
+        {
+            let mut conn = WsConn::new(stream);
+            conn.queue_json(&OutMessage::Delta { content: "a" })
+                .unwrap();
+            conn.queue_json(&OutMessage::Delta { content: "b" })
+                .unwrap();
+            assert!(conn.pending_bytes() > 0);
+            conn.flush().unwrap();
+            assert_eq!(conn.pending_bytes(), 0);
+            conn.send_close().unwrap();
+        }
+        let raw = client.join().unwrap();
+        let frames = decode_frames(&raw);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].0, 0x1);
+        assert_eq!(frames[1].0, 0x1);
+        assert_eq!(frames[2].0, 0x8);
+        let first: serde_json::Value = serde_json::from_slice(&frames[0].1).unwrap();
+        assert_eq!(first["type"], "delta");
+        assert_eq!(first["content"], "a");
+        let second: serde_json::Value = serde_json::from_slice(&frames[1].1).unwrap();
+        assert_eq!(second["content"], "b");
+    }
+
+    #[test]
+    fn done_message_serializes_usage() {
+        let bytes = serde_json::to_vec(&OutMessage::Done {
+            finish_reason: "stop",
+            usage: Usage {
+                prompt_tokens: 3,
+                completion_tokens: 5,
+            },
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["type"], "done");
+        assert_eq!(value["finish_reason"], "stop");
+        assert_eq!(value["usage"]["prompt_tokens"], 3);
+        assert_eq!(value["usage"]["completion_tokens"], 5);
+    }
+
+    fn decode_frames(raw: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 2 <= raw.len() {
+            let opcode = raw[i] & 0x0f;
+            let mut len = (raw[i + 1] & 0x7f) as usize;
+            let mut off = i + 2;
+            if len == 126 {
+                len = u16::from_be_bytes([raw[off], raw[off + 1]]) as usize;
+                off += 2;
+            } else if len == 127 {
+                len = u64::from_be_bytes(raw[off..off + 8].try_into().unwrap()) as usize;
+                off += 8;
+            }
+            out.push((opcode, raw[off..off + len].to_vec()));
+            i = off + len;
+        }
+        out
     }
 }

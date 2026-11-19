@@ -119,6 +119,12 @@ pub struct EngineMetrics {
     waiting: AtomicU32,
     steps: AtomicU64,
     avg_step_us: AtomicU64,
+    avg_gpu_us: AtomicU64,
+    avg_logits_us: AtomicU64,
+    avg_sample_us: AtomicU64,
+    avg_detok_us: AtomicU64,
+    rows_total: AtomicU64,
+    rows_logits: AtomicU64,
     kv_used_pages: AtomicU64,
     kv_free_pages: AtomicU64,
     kv_cached_pages: AtomicU64,
@@ -133,11 +139,28 @@ pub struct MetricsUpdate {
     pub waiting: u32,
     pub steps: u64,
     pub avg_step_us: u64,
+    pub avg_gpu_us: u64,
+    pub avg_logits_us: u64,
+    pub avg_sample_us: u64,
+    pub avg_detok_us: u64,
+    pub rows_total: u64,
+    pub rows_logits: u64,
     pub kv_used_pages: u64,
     pub kv_free_pages: u64,
     pub kv_cached_pages: u64,
     pub cache_hits: u64,
     pub reused_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
+pub struct EngineStageMetrics {
+    pub avg_gpu_us: u64,
+    pub avg_logits_us: u64,
+    pub avg_sample_us: u64,
+    pub avg_detok_us: u64,
+    pub rows_total: u64,
+    pub rows_logits: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -173,6 +196,12 @@ impl EngineMetrics {
             waiting: AtomicU32::new(0),
             steps: AtomicU64::new(0),
             avg_step_us: AtomicU64::new(0),
+            avg_gpu_us: AtomicU64::new(0),
+            avg_logits_us: AtomicU64::new(0),
+            avg_sample_us: AtomicU64::new(0),
+            avg_detok_us: AtomicU64::new(0),
+            rows_total: AtomicU64::new(0),
+            rows_logits: AtomicU64::new(0),
             kv_used_pages: AtomicU64::new(0),
             kv_free_pages: AtomicU64::new(0),
             kv_cached_pages: AtomicU64::new(0),
@@ -188,6 +217,16 @@ impl EngineMetrics {
         self.steps.store(update.steps, Ordering::Relaxed);
         self.avg_step_us
             .store(update.avg_step_us, Ordering::Relaxed);
+        self.avg_gpu_us.store(update.avg_gpu_us, Ordering::Relaxed);
+        self.avg_logits_us
+            .store(update.avg_logits_us, Ordering::Relaxed);
+        self.avg_sample_us
+            .store(update.avg_sample_us, Ordering::Relaxed);
+        self.avg_detok_us
+            .store(update.avg_detok_us, Ordering::Relaxed);
+        self.rows_total.store(update.rows_total, Ordering::Relaxed);
+        self.rows_logits
+            .store(update.rows_logits, Ordering::Relaxed);
         self.kv_used_pages
             .store(update.kv_used_pages, Ordering::Relaxed);
         self.kv_free_pages
@@ -212,6 +251,18 @@ impl EngineMetrics {
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             reused_tokens: self.reused_tokens.load(Ordering::Relaxed),
             uptime_s: self.started.elapsed().as_secs_f64(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn stage_snapshot(&self) -> EngineStageMetrics {
+        EngineStageMetrics {
+            avg_gpu_us: self.avg_gpu_us.load(Ordering::Relaxed),
+            avg_logits_us: self.avg_logits_us.load(Ordering::Relaxed),
+            avg_sample_us: self.avg_sample_us.load(Ordering::Relaxed),
+            avg_detok_us: self.avg_detok_us.load(Ordering::Relaxed),
+            rows_total: self.rows_total.load(Ordering::Relaxed),
+            rows_logits: self.rows_logits.load(Ordering::Relaxed),
         }
     }
 }
@@ -308,6 +359,11 @@ impl Engine {
     pub fn metrics(&self) -> EngineMetricsSnapshot {
         self.metrics.snapshot()
     }
+
+    #[allow(dead_code)]
+    pub fn stage_metrics(&self) -> EngineStageMetrics {
+        self.metrics.stage_snapshot()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +395,6 @@ struct RequestState {
     hold: usize,
     max_new: usize,
     tokens: Vec<u32>,
-    printed: String,
     content: String,
     thinking: String,
     sent: usize,
@@ -352,7 +407,7 @@ struct RequestState {
 impl RequestState {
     fn push_text(&mut self, text: &str) -> TokenFlow {
         self.content.push_str(text);
-        if let Some(pos) = first_stop(&self.content, &self.stops) {
+        if let Some(pos) = self.find_stop(text.len()) {
             self.stop_at = Some(pos);
             return TokenFlow::Stop;
         }
@@ -371,13 +426,23 @@ impl RequestState {
         TokenFlow::Continue
     }
 
+    fn find_stop(&self, appended: usize) -> Option<usize> {
+        if self.stops.is_empty() {
+            return None;
+        }
+        let start = stop_scan_start(self.content.len(), appended, self.hold);
+        let mut start = start;
+        while start > 0 && !self.content.is_char_boundary(start) {
+            start -= 1;
+        }
+        first_stop(&self.content[start..], &self.stops).map(|pos| start + pos)
+    }
+
     fn process_token(&mut self, tok: &dyn TokenizerPort, token: u32) -> TokenFlow {
         self.tokens.push(token);
-        let Ok(text) = tok.decode(&self.tokens, true) else {
+        let Some(delta) = decode_delta(tok, &self.tokens) else {
             return TokenFlow::Continue;
         };
-        let (delta, printed) = next_delta(&text, &self.printed);
-        self.printed = printed;
         if delta.is_empty() {
             return TokenFlow::Continue;
         }
@@ -452,6 +517,24 @@ struct Metrics {
     batch_max: usize,
     active_max: usize,
     reused_tokens: usize,
+    gpu_us: u128,
+    gpu_calls: u64,
+    logits_us: u128,
+    logits_calls: u64,
+    sample_us: u128,
+    samples: u64,
+    detok_us: u128,
+    detoks: u64,
+    rows_total: usize,
+    rows_logits: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Gpu,
+    Logits,
+    Sample,
+    Detok,
 }
 
 impl Metrics {
@@ -463,6 +546,16 @@ impl Metrics {
             batch_max: 0,
             active_max: 0,
             reused_tokens: 0,
+            gpu_us: 0,
+            gpu_calls: 0,
+            logits_us: 0,
+            logits_calls: 0,
+            sample_us: 0,
+            samples: 0,
+            detok_us: 0,
+            detoks: 0,
+            rows_total: 0,
+            rows_logits: 0,
         }
     }
 
@@ -471,6 +564,33 @@ impl Metrics {
         self.step_us += elapsed.as_micros();
         self.batch_max = self.batch_max.max(batch);
         self.active_max = self.active_max.max(active);
+    }
+
+    fn stage(&mut self, stage: Stage, elapsed: Duration) {
+        let us = elapsed.as_micros();
+        match stage {
+            Stage::Gpu => {
+                self.gpu_us += us;
+                self.gpu_calls += 1;
+            }
+            Stage::Logits => {
+                self.logits_us += us;
+                self.logits_calls += 1;
+            }
+            Stage::Sample => {
+                self.sample_us += us;
+                self.samples += 1;
+            }
+            Stage::Detok => {
+                self.detok_us += us;
+                self.detoks += 1;
+            }
+        }
+    }
+
+    fn rows(&mut self, total: usize, logits: usize) {
+        self.rows_total += total;
+        self.rows_logits += logits;
     }
 
     fn reuse(&mut self, tokens: usize) {
@@ -497,6 +617,12 @@ impl Metrics {
             waiting: saturating_u32(sched.waiting_len()),
             steps: self.steps,
             avg_step_us: self.avg_step_us(),
+            avg_gpu_us: average_us(self.gpu_us, self.gpu_calls),
+            avg_logits_us: average_us(self.logits_us, self.logits_calls),
+            avg_sample_us: average_us(self.sample_us, self.samples),
+            avg_detok_us: average_us(self.detok_us, self.detoks),
+            rows_total: saturating_u64(self.rows_total),
+            rows_logits: saturating_u64(self.rows_logits),
             kv_used_pages: saturating_u64(used_pages),
             kv_free_pages: saturating_u64(gpu.free_pages()),
             kv_cached_pages: saturating_u64(cached_pages),
@@ -553,8 +679,44 @@ fn next_delta(text: &str, printed: &str) -> (String, String) {
     (stable[common..].to_string(), stable.to_string())
 }
 
+const DETOK_CONTEXT: usize = 32;
+const STOP_SCAN_MARGIN: usize = 4;
+
+/// Декодируется окно из последних `DETOK_CONTEXT` токенов и предыдущее окно
+/// без последнего токена: прирост считается по разнице, поэтому стоимость
+/// токена не зависит от длины ответа. Общая для обоих окон граница (например,
+/// разорванный UTF-8 символ) даёт одинаковый U+FFFD-префикс и не мешает.
+fn decode_delta(tok: &dyn TokenizerPort, tokens: &[u32]) -> Option<String> {
+    let end = tokens.len();
+    if end == 0 {
+        return Some(String::new());
+    }
+    let start = (end - 1).saturating_sub(DETOK_CONTEXT);
+    let prev = tok.decode(&tokens[start..end - 1], true).ok()?;
+    let cur = tok.decode(&tokens[start..end], true).ok()?;
+    let (delta, _) = next_delta(&cur, stable_text(&prev));
+    Some(delta)
+}
+
+/// Начало окна поиска стоп-строк: новый фрагмент плюс запас на самую длинную
+/// стоп-строку, которая могла начаться раньше и закончиться в нём.
+fn stop_scan_start(len: usize, appended: usize, max_stop_len: usize) -> usize {
+    len.saturating_sub(
+        appended
+            .saturating_add(max_stop_len)
+            .saturating_add(STOP_SCAN_MARGIN),
+    )
+}
+
 fn saturating_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn average_us(total: u128, count: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    u64::try_from(total / u128::from(count)).unwrap_or(u64::MAX)
 }
 
 struct Worker {
@@ -693,9 +855,7 @@ impl Worker {
             session = Some(chat_session);
         }
         let mut sampler = Sampler::new(params.clone());
-        for &token in &prompt {
-            sampler.push(token);
-        }
+        push_prompt_window(&mut sampler, &prompt, params.repeat_penalty_window);
         let hold = params.stop.iter().map(|stop| stop.len()).max().unwrap_or(0);
         let eos = self.tok.eos_id();
         self.reqs.insert(
@@ -713,7 +873,6 @@ impl Worker {
                 hold,
                 max_new: enqueued.max_new,
                 tokens: Vec::new(),
-                printed: String::new(),
                 content: String::new(),
                 thinking: String::new(),
                 sent: 0,
@@ -778,7 +937,7 @@ impl Worker {
         match plan {
             StepPlan::Idle => return,
             StepPlan::AtomicPrefill(id) => self.atomic_prefill(id),
-            StepPlan::Mixed { rows, need_logits } => self.mixed_step(&rows, need_logits),
+            StepPlan::Mixed { rows } => self.mixed_step(&rows),
         }
         self.metrics
             .record(started.elapsed(), batch, self.sched.active_len());
@@ -795,15 +954,19 @@ impl Worker {
         }
         let slot = state.slot;
         let prompt = state.prompt.clone();
-        let reused = match self.gpu.prefill(slot, &prompt, true) {
+        let gpu_started = Instant::now();
+        let prefill = self.gpu.prefill(slot, &prompt, true);
+        self.metrics.stage(Stage::Gpu, gpu_started.elapsed());
+        let reused = match prefill {
             Ok(reused) => reused,
             Err(e) => {
                 self.fail_request(id, format!("{e}"));
                 return;
             }
         };
+        self.metrics.rows(prompt.len(), 1);
         self.metrics.reuse(reused);
-        let logits = match self.gpu.logits() {
+        let logits = match self.logits_full() {
             Ok(logits) => logits,
             Err(e) => {
                 self.fail_request(id, format!("{e}"));
@@ -814,7 +977,7 @@ impl Worker {
         self.accept_token(id, logits);
     }
 
-    fn mixed_step(&mut self, rows: &[StepRow], _need_logits: bool) {
+    fn mixed_step(&mut self, rows: &[StepRow]) {
         let max_batch = self
             .sched
             .config()
@@ -829,36 +992,37 @@ impl Worker {
     }
 
     fn mixed_slice(&mut self, rows: &[StepRow]) -> bool {
-        let need_logits = rows.iter().any(|row| match row.token {
-            StepToken::Decode => true,
-            StepToken::Prompt(index) => self
-                .reqs
-                .get(&row.id)
-                .map(|state| index + 1 >= state.prompt.len())
-                .unwrap_or(false),
-        });
         let mut reqs: Vec<SequenceStep> = Vec::with_capacity(rows.len());
+        let mut rows_needed: Vec<usize> = Vec::with_capacity(rows.len());
         let mut failure: Option<(JobId, String)> = None;
-        for row in rows {
+        for (row_index, row) in rows.iter().enumerate() {
             let Some(state) = self.reqs.get(&row.id) else {
                 failure = Some((row.id, "scheduler lost sequence".to_string()));
                 break;
             };
             let token = match row.token {
                 StepToken::Prompt(index) => match state.prompt.get(index) {
-                    Some(token) => *token,
+                    Some(token) => {
+                        if index + 1 >= state.prompt.len() {
+                            rows_needed.push(row_index);
+                        }
+                        *token
+                    }
                     None => {
                         failure = Some((row.id, "prompt index out of range".to_string()));
                         break;
                     }
                 },
-                StepToken::Decode => match state.next_token {
-                    Some(token) => token,
-                    None => {
-                        failure = Some((row.id, "missing pending token".to_string()));
-                        break;
+                StepToken::Decode => {
+                    rows_needed.push(row_index);
+                    match state.next_token {
+                        Some(token) => token,
+                        None => {
+                            failure = Some((row.id, "missing pending token".to_string()));
+                            break;
+                        }
                     }
-                },
+                }
             };
             reqs.push(SequenceStep {
                 slot: state.slot,
@@ -870,7 +1034,14 @@ impl Worker {
             self.fail_request(id, reason);
             return false;
         }
-        if let Err(e) = self.gpu.step(&reqs, need_logits) {
+        let gpu_started = Instant::now();
+        let stepped = if rows_needed.is_empty() {
+            self.gpu.step(&reqs, false)
+        } else {
+            self.gpu.step_rows(&reqs, &rows_needed)
+        };
+        self.metrics.stage(Stage::Gpu, gpu_started.elapsed());
+        if let Err(e) = stepped {
             let mut ids: Vec<JobId> = rows.iter().map(|row| row.id).collect();
             ids.sort();
             ids.dedup();
@@ -879,7 +1050,9 @@ impl Worker {
             }
             return false;
         }
+        self.metrics.rows(reqs.len(), rows_needed.len());
         for (row_index, row) in rows.iter().enumerate() {
+            let wanted = rows_needed.binary_search(&row_index).is_ok();
             match row.token {
                 StepToken::Prompt(_) => {
                     self.sched.advance_prefill(row.id, 1);
@@ -891,11 +1064,11 @@ impl Worker {
                     if !done {
                         continue;
                     }
-                    if !need_logits {
+                    if !wanted {
                         self.fail_request(row.id, "prefill completion without logits".to_string());
                         continue;
                     }
-                    let logits = match self.gpu.logits_row(row_index) {
+                    let logits = match self.logits_at(row_index) {
                         Ok(logits) => logits,
                         Err(e) => {
                             self.fail_request(row.id, format!("{e}"));
@@ -913,7 +1086,10 @@ impl Worker {
                     self.accept_token(row.id, logits);
                 }
                 StepToken::Decode => {
-                    let logits = match self.gpu.logits_row(row_index) {
+                    if !wanted {
+                        continue;
+                    }
+                    let logits = match self.logits_at(row_index) {
                         Ok(logits) => logits,
                         Err(e) => {
                             self.fail_request(row.id, format!("{e}"));
@@ -927,14 +1103,32 @@ impl Worker {
         true
     }
 
+    fn logits_at(&mut self, row: usize) -> Result<Vec<f32>> {
+        let started = Instant::now();
+        let logits = self.gpu.logits_row(row);
+        self.metrics.stage(Stage::Logits, started.elapsed());
+        logits
+    }
+
+    fn logits_full(&mut self) -> Result<Vec<f32>> {
+        let started = Instant::now();
+        let logits = self.gpu.logits();
+        self.metrics.stage(Stage::Logits, started.elapsed());
+        logits
+    }
+
     fn accept_token(&mut self, id: JobId, mut logits: Vec<f32>) {
         let tok = &self.tok;
         let Some(state) = self.reqs.get_mut(&id) else {
             return;
         };
+        let sample_started = Instant::now();
         let token = state.sampler.sample(&mut logits);
+        self.metrics.stage(Stage::Sample, sample_started.elapsed());
         state.sampler.push(token);
+        let detok_started = Instant::now();
         let flow = state.process_token(tok.as_ref(), token);
+        self.metrics.stage(Stage::Detok, detok_started.elapsed());
         let commit = state.commit_token(token, flow);
         self.sched.record_token(id);
         match commit {
@@ -1017,6 +1211,14 @@ impl Worker {
     }
 }
 
+fn push_prompt_window(sampler: &mut Sampler, prompt: &[u32], window: usize) {
+    let keep = window.max(1);
+    let skip = prompt.len().saturating_sub(keep);
+    for &token in &prompt[skip..] {
+        sampler.push(token);
+    }
+}
+
 fn first_stop(content: &str, stops: &[String]) -> Option<usize> {
     let mut best: Option<usize> = None;
     for stop in stops {
@@ -1038,8 +1240,12 @@ mod tests {
     use super::*;
 
     fn test_state(max_new: usize, eos: u32) -> RequestState {
-        let (tx, _rx) = channel();
-        RequestState {
+        test_state_with_rx(max_new, eos).0
+    }
+
+    fn test_state_with_rx(max_new: usize, eos: u32) -> (RequestState, Receiver<Event>) {
+        let (tx, rx) = channel();
+        let state = RequestState {
             slot: 0,
             prompt: vec![1, 2, 3],
             sampler: Sampler::new(SamplingParams::default()),
@@ -1052,7 +1258,6 @@ mod tests {
             hold: 0,
             max_new,
             tokens: Vec::new(),
-            printed: String::new(),
             content: String::new(),
             thinking: String::new(),
             sent: 0,
@@ -1060,6 +1265,48 @@ mod tests {
             next_token: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             eos,
+        };
+        (state, rx)
+    }
+
+    fn raw_state(stops: Vec<String>) -> (RequestState, Receiver<Event>) {
+        let (mut state, rx) = test_state_with_rx(64, u32::MAX);
+        state.raw = true;
+        state.session = None;
+        state.hold = stops.iter().map(|stop| stop.len()).max().unwrap_or(0);
+        state.stops = stops;
+        (state, rx)
+    }
+
+    fn deltas(rx: &Receiver<Event>) -> String {
+        let mut out = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Delta(text) = event {
+                out.push_str(&text);
+            }
+        }
+        out
+    }
+
+    /// Байтовый ByteLevel-подобный токенизатор: id — байт, декодер режет
+    /// неполные UTF-8 последовательности в U+FFFD.
+    struct ByteTokenizer;
+
+    impl TokenizerPort for ByteTokenizer {
+        fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<u32>> {
+            Ok(text.bytes().map(u32::from).collect())
+        }
+
+        fn decode(&self, ids: &[u32], _skip_special_tokens: bool) -> Result<String> {
+            let bytes: Vec<u8> = ids
+                .iter()
+                .map(|&id| u8::try_from(id).unwrap_or(b'?'))
+                .collect();
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        fn eos_id(&self) -> u32 {
+            u32::MAX
         }
     }
 
@@ -1141,6 +1388,7 @@ mod tests {
         assert_eq!(snapshot.cache_hits, 0);
         assert_eq!(snapshot.reused_tokens, 0);
         assert!(snapshot.uptime_s >= 0.0);
+        assert_eq!(metrics.stage_snapshot(), EngineStageMetrics::default());
     }
 
     #[test]
@@ -1152,6 +1400,12 @@ mod tests {
             waiting: 2,
             steps: 11,
             avg_step_us: 2500,
+            avg_gpu_us: 1700,
+            avg_logits_us: 90,
+            avg_sample_us: 12,
+            avg_detok_us: 7,
+            rows_total: 64,
+            rows_logits: 5,
             kv_used_pages: 7,
             kv_free_pages: 9,
             kv_cached_pages: 4,
@@ -1169,6 +1423,32 @@ mod tests {
         assert_eq!(snapshot.kv_cached_pages, 4);
         assert_eq!(snapshot.cache_hits, 12);
         assert_eq!(snapshot.reused_tokens, 128);
+        let stages = metrics.stage_snapshot();
+        assert_eq!(stages.avg_gpu_us, 1700);
+        assert_eq!(stages.avg_logits_us, 90);
+        assert_eq!(stages.avg_sample_us, 12);
+        assert_eq!(stages.avg_detok_us, 7);
+        assert_eq!(stages.rows_total, 64);
+        assert_eq!(stages.rows_logits, 5);
+    }
+
+    #[test]
+    fn stage_averages_are_per_call() {
+        let mut metrics = Metrics::new(false);
+        metrics.stage(Stage::Gpu, Duration::from_micros(900));
+        metrics.stage(Stage::Gpu, Duration::from_micros(300));
+        metrics.stage(Stage::Logits, Duration::from_micros(40));
+        metrics.stage(Stage::Sample, Duration::from_micros(10));
+        metrics.stage(Stage::Detok, Duration::from_micros(2));
+        metrics.stage(Stage::Detok, Duration::from_micros(6));
+        metrics.rows(8, 3);
+        metrics.rows(4, 1);
+        assert_eq!(average_us(metrics.gpu_us, metrics.gpu_calls), 600);
+        assert_eq!(average_us(metrics.logits_us, metrics.logits_calls), 40);
+        assert_eq!(average_us(metrics.sample_us, metrics.samples), 10);
+        assert_eq!(average_us(metrics.detok_us, metrics.detoks), 4);
+        assert_eq!(metrics.rows_total, 12);
+        assert_eq!(metrics.rows_logits, 4);
     }
 
     #[test]
@@ -1182,6 +1462,12 @@ mod tests {
             waiting: 0,
             steps: 1,
             avg_step_us: 1000,
+            avg_gpu_us: 800,
+            avg_logits_us: 30,
+            avg_sample_us: 5,
+            avg_detok_us: 3,
+            rows_total: 16,
+            rows_logits: 2,
             kv_used_pages: 2,
             kv_free_pages: 30,
             kv_cached_pages: 1,
@@ -1196,6 +1482,7 @@ mod tests {
         assert_eq!(snapshot.kv_free_pages, 30);
         assert_eq!(snapshot.kv_cached_pages, 1);
         assert_eq!(snapshot.reused_tokens, 32);
+        assert_eq!(reader.stage_snapshot().rows_logits, 2);
     }
 
     #[test]
@@ -1251,5 +1538,137 @@ mod tests {
         let (d, printed) = next_delta("ab", "abcd");
         assert!(d.is_empty());
         assert_eq!(printed, "ab");
+    }
+
+    #[test]
+    fn incremental_detok_matches_full_decode() {
+        let tok = ByteTokenizer;
+        let text = "Привет, мир! 42 — тест";
+        let ids = tok.encode(text, false).unwrap();
+        let mut printed = String::new();
+        let mut out = String::new();
+        for end in 1..=ids.len() {
+            let delta = decode_delta(&tok, &ids[..end]).expect("delta");
+            let full = tok.decode(&ids[..end], true).unwrap();
+            let (expected, next) = next_delta(&full, &printed);
+            assert_eq!(delta, expected, "token {end}");
+            printed = next;
+            out.push_str(&delta);
+        }
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn incremental_detok_is_constant_window() {
+        let tok = ByteTokenizer;
+        let ids: Vec<u32> = std::iter::repeat_n(b'a', DETOK_CONTEXT * 4)
+            .map(u32::from)
+            .collect();
+        let delta = decode_delta(&tok, &ids).expect("delta");
+        assert_eq!(delta.len(), 1);
+        assert_eq!(decode_delta(&tok, &[]), Some(String::new()));
+    }
+
+    #[test]
+    fn process_token_streams_raw_text() {
+        let tok = ByteTokenizer;
+        let (mut state, rx) = test_state_with_rx(64, u32::MAX);
+        state.raw = true;
+        state.session = None;
+        for id in tok.encode("Привет, мир", false).unwrap() {
+            assert_eq!(state.process_token(&tok, id), TokenFlow::Continue);
+        }
+        assert_eq!(deltas(&rx), "Привет, мир");
+        assert_eq!(state.content, "Привет, мир");
+        assert_eq!(state.sent, state.content.len());
+    }
+
+    #[test]
+    fn push_text_holds_back_longest_stop_prefix() {
+        let (mut state, rx) = test_state_with_rx(64, u32::MAX);
+        state.stops = vec!["END".to_string()];
+        state.hold = 3;
+        assert_eq!(state.push_text("hello EN"), TokenFlow::Continue);
+        assert_eq!(deltas(&rx), "hello");
+        assert_eq!(state.push_text("D"), TokenFlow::Stop);
+        assert_eq!(state.stop_at, Some(6));
+        assert_eq!(deltas(&rx), "");
+        assert_eq!(state.sent, 5);
+    }
+
+    #[test]
+    fn stop_window_finds_stop_across_chunk_boundary() {
+        let (mut state, _rx) = raw_state(vec!["<END>".to_string()]);
+        assert_eq!(state.push_text("abc<EN"), TokenFlow::Continue);
+        assert_eq!(state.push_text("D>tail"), TokenFlow::Stop);
+        assert_eq!(state.stop_at, Some(3));
+        assert_eq!(state.content, "abc<END>tail");
+    }
+
+    #[test]
+    fn stop_window_matches_full_scan() {
+        let stops = vec!["END".to_string(), "long-stop".to_string()];
+        let prefix = "z".repeat(50);
+        let scenarios: [&[&str]; 3] = [
+            &["aaa", "EN", "D"],
+            &[prefix.as_str(), "EN", "D"],
+            &[prefix.as_str(), "long", "-st", "op"],
+        ];
+        for chunks in scenarios {
+            let mut content = String::new();
+            let mut stopped = false;
+            for chunk in chunks {
+                content.push_str(chunk);
+                let expected = first_stop(&content, &stops);
+                let start = stop_scan_start(content.len(), chunk.len(), 9);
+                let mut start = start;
+                while start > 0 && !content.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let scanned = first_stop(&content[start..], &stops).map(|pos| start + pos);
+                assert_eq!(scanned, expected, "chunk {chunk}");
+                if expected.is_some() {
+                    stopped = true;
+                    break;
+                }
+            }
+            assert!(stopped, "scenario never stopped");
+        }
+    }
+
+    #[test]
+    fn stop_scan_start_keeps_margin() {
+        assert_eq!(stop_scan_start(100, 4, 6), 100 - 4 - 6 - STOP_SCAN_MARGIN);
+        assert_eq!(stop_scan_start(3, 10, 6), 0);
+        assert_eq!(stop_scan_start(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn prompt_window_push_matches_full_push() {
+        let params = SamplingParams {
+            repeat_penalty: 2.0,
+            repeat_penalty_window: 4,
+            ..SamplingParams::default()
+        };
+        let prompt: Vec<u32> = (0..100).collect();
+        let mut full = Sampler::new(params.clone());
+        for &token in &prompt {
+            full.push(token);
+        }
+        let mut windowed = Sampler::new(params.clone());
+        push_prompt_window(&mut windowed, &prompt, params.repeat_penalty_window);
+        let mut tail = Sampler::new(params.clone());
+        for &token in &prompt[96..] {
+            tail.push(token);
+        }
+        let logits: Vec<f32> = (0..128).map(|i| i as f32 * 0.01).collect();
+        let mut a = logits.clone();
+        let mut b = logits.clone();
+        let mut c = logits.clone();
+        let token = full.sample(&mut a);
+        assert_eq!(token, windowed.sample(&mut b));
+        assert_eq!(token, tail.sample(&mut c));
+        assert_eq!(a, b);
+        assert_eq!(a, c);
     }
 }

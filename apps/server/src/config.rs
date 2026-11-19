@@ -3,6 +3,8 @@ use lfm_gpu::Options;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+pub const DEFAULT_H2_CANCEL_INTERVAL: usize = 16;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
@@ -17,7 +19,15 @@ pub struct FileConfig {
     pub max_body: Option<usize>,
     pub prefill_budget: Option<usize>,
     #[serde(default)]
+    pub server: ServerFile,
+    #[serde(default)]
     pub engine: EngineFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerFile {
+    pub h2_cancel_interval: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -27,6 +37,8 @@ pub struct EngineFile {
     pub profile: Option<bool>,
     pub kv: Option<String>,
     pub prepack: Option<bool>,
+    pub prepack_threads: Option<usize>,
+    pub program_cache: Option<bool>,
     pub fuse: Option<bool>,
     pub pb: Option<usize>,
     pub prefill_ntok: Option<usize>,
@@ -69,6 +81,12 @@ impl FileConfig {
         }
         if let Some(v) = e.prepack {
             o.prepack = v;
+        }
+        if let Some(v) = e.prepack_threads {
+            o.prepack_threads = v;
+        }
+        if let Some(v) = e.program_cache {
+            o.program_cache = v;
         }
         if let Some(v) = e.fuse {
             o.fuse = v;
@@ -143,6 +161,7 @@ pub struct Resolved {
     pub log_requests: bool,
     pub max_body: usize,
     pub prefill_budget: usize,
+    pub h2_cancel_interval: usize,
     pub engine: Options,
 }
 
@@ -157,6 +176,7 @@ pub struct Overrides {
     pub log_requests: Option<bool>,
     pub max_body: Option<usize>,
     pub prefill_budget: Option<usize>,
+    pub h2_cancel_interval: Option<usize>,
 }
 
 pub fn resolve(file: &FileConfig, cli: &Overrides, engine: Options) -> Result<Resolved> {
@@ -198,12 +218,21 @@ pub fn resolve(file: &FileConfig, cli: &Overrides, engine: Options) -> Result<Re
         .or(file.prefill_budget)
         .unwrap_or(64)
         .clamp(1, 128);
+    let h2_cancel_interval = cli
+        .h2_cancel_interval
+        .or(file.server.h2_cancel_interval)
+        .unwrap_or(DEFAULT_H2_CANCEL_INTERVAL);
     if ctx == 0 || !ctx.is_multiple_of(32) {
         return Err(anyhow!("ctx must be a positive multiple of 32, got {ctx}"));
     }
     if max_body < 1024 {
         return Err(anyhow!(
             "max_body must be at least 1024 bytes, got {max_body}"
+        ));
+    }
+    if !(1..=1024).contains(&h2_cancel_interval) {
+        return Err(anyhow!(
+            "h2_cancel_interval must be in 1..=1024, got {h2_cancel_interval}"
         ));
     }
     engine
@@ -220,6 +249,7 @@ pub fn resolve(file: &FileConfig, cli: &Overrides, engine: Options) -> Result<Re
         log_requests,
         max_body,
         prefill_budget,
+        h2_cancel_interval,
         engine,
     })
 }
@@ -244,11 +274,18 @@ pub fn dump(cfg: &Resolved, backend: &str) -> String {
     out.push_str(&format!(
         "# backend = \"{backend}\" (для справки, не читается)\n"
     ));
+    out.push_str("\n[server]\n");
+    out.push_str(&format!(
+        "h2_cancel_interval = {}\n",
+        cfg.h2_cancel_interval
+    ));
     out.push_str("\n[engine]\n");
     out.push_str(&format!("device = {}\n", e.device));
     out.push_str(&format!("profile = {}\n", e.profile));
     out.push_str(&format!("kv = \"{}\"\n", e.kv));
     out.push_str(&format!("prepack = {}\n", e.prepack));
+    out.push_str(&format!("prepack_threads = {}\n", e.prepack_threads));
+    out.push_str(&format!("program_cache = {}\n", e.program_cache));
     out.push_str(&format!("fuse = {}\n", e.fuse));
     out.push_str(&format!("pb = {}\n", e.pb));
     out.push_str(&format!("prefill_ntok = {}\n", e.prefill_ntok));
@@ -327,6 +364,7 @@ wg = 128
             log_requests: Some(true),
             max_body: None,
             prefill_budget: None,
+            h2_cancel_interval: None,
         };
         let r = resolve(&cfg, &cli, Options::default()).unwrap();
         assert_eq!(r.addr, "127.0.0.1:1");
@@ -350,7 +388,67 @@ wg = 128
             log_requests: None,
             max_body: None,
             prefill_budget: None,
+            h2_cancel_interval: None,
         };
         assert!(resolve(&cfg, &cli, Options::default()).is_err());
+    }
+
+    #[test]
+    fn server_section_sets_h2_cancel_interval() {
+        let cfg: FileConfig = toml::from_str("[server]\nh2_cancel_interval = 4\n").unwrap();
+        assert_eq!(cfg.server.h2_cancel_interval, Some(4));
+        let cli = Overrides {
+            model: None,
+            tokenizer: None,
+            template: None,
+            addr: None,
+            ctx: None,
+            system: None,
+            name: None,
+            log_requests: None,
+            max_body: None,
+            prefill_budget: None,
+            h2_cancel_interval: None,
+        };
+        let r = resolve(&cfg, &cli, Options::default()).unwrap();
+        assert_eq!(r.h2_cancel_interval, 4);
+        let dump = dump(&r, "opencl");
+        assert!(
+            dump.contains("[server]\nh2_cancel_interval = 4\n"),
+            "{dump}"
+        );
+        let round_trip: FileConfig = toml::from_str(&dump).unwrap();
+        assert_eq!(round_trip.server.h2_cancel_interval, Some(4));
+    }
+
+    #[test]
+    fn h2_cancel_interval_defaults_and_cli_priority() {
+        let cfg = empty();
+        let mut cli = Overrides {
+            model: None,
+            tokenizer: None,
+            template: None,
+            addr: None,
+            ctx: None,
+            system: None,
+            name: None,
+            log_requests: None,
+            max_body: None,
+            prefill_budget: None,
+            h2_cancel_interval: None,
+        };
+        let r = resolve(&cfg, &cli, Options::default()).unwrap();
+        assert_eq!(r.h2_cancel_interval, DEFAULT_H2_CANCEL_INTERVAL);
+        cli.h2_cancel_interval = Some(8);
+        let r = resolve(&cfg, &cli, Options::default()).unwrap();
+        assert_eq!(r.h2_cancel_interval, 8);
+        cli.h2_cancel_interval = Some(0);
+        assert!(resolve(&cfg, &cli, Options::default()).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_server_keys() {
+        let parsed: Result<FileConfig, _> = toml::from_str("[server]\nnope = 1\n");
+        assert!(parsed.is_err());
     }
 }

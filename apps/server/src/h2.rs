@@ -1,10 +1,14 @@
 use crate::engine::{ChatJob, Engine, Event};
 use crate::hpack::{self, HpackCtx};
-use crate::protocol::{ChatRequest, CompletionMeta, CompletionRequest, metrics_json, models_json};
+use crate::protocol::{
+    ChatRequest, CompletionMeta, CompletionRequest, Delta, metrics_json, models_json, push_sse,
+    push_sse_data,
+};
+use crate::{Limits, Pump, pump_events};
 use anyhow::{Result, anyhow};
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -232,6 +236,7 @@ struct Frame {
 
 const MAX_DEFERRED_FRAMES: usize = 64;
 const MAX_DEFERRED_BYTES: usize = 1 << 20;
+const MAX_POLL_FRAMES: usize = 64;
 
 struct Conn {
     stream: TcpStream,
@@ -240,6 +245,9 @@ struct Conn {
     peer_gone: bool,
     deferred: std::collections::VecDeque<Frame>,
     deferred_bytes: usize,
+    inbuf: Vec<u8>,
+    out: Vec<u8>,
+    cancel_interval: usize,
 }
 
 impl Conn {
@@ -251,6 +259,9 @@ impl Conn {
             peer_gone: false,
             deferred: std::collections::VecDeque::new(),
             deferred_bytes: 0,
+            inbuf: Vec::with_capacity(16 * 1024),
+            out: Vec::with_capacity(16 * 1024 + 9),
+            cancel_interval: crate::config::DEFAULT_H2_CANCEL_INTERVAL,
         }
     }
 
@@ -263,23 +274,129 @@ impl Conn {
         Ok(())
     }
 
-    fn read_frame(&mut self) -> Result<Frame> {
-        let mut head = [0u8; 9];
-        self.stream.read_exact(&mut head)?;
+    fn read_into_buf(&mut self) -> std::io::Result<usize> {
+        let mut tmp = [0u8; 16 * 1024];
+        let n = self.stream.read(&mut tmp)?;
+        if n > 0 {
+            self.inbuf.extend_from_slice(&tmp[..n]);
+        }
+        Ok(n)
+    }
+
+    fn take_frame(&mut self) -> Result<Option<Frame>> {
+        if self.inbuf.len() < 9 {
+            return Ok(None);
+        }
+        let head = &self.inbuf[..9];
         let len = ((head[0] as usize) << 16) | ((head[1] as usize) << 8) | head[2] as usize;
         if len > 1 << 20 {
             return Err(anyhow!("http/2 frame too large: {len}"));
         }
-        let mut payload = vec![0u8; len];
-        self.stream.read_exact(&mut payload)?;
+        if self.inbuf.len() < 9 + len {
+            return Ok(None);
+        }
+        let typ = head[3];
+        let flags = head[4];
         let stream_id = u32::from_be_bytes([head[5] & 0x7f, head[6], head[7], head[8]]);
-        Ok(Frame {
-            typ: head[3],
-            flags: head[4],
+        let payload = self.inbuf[9..9 + len].to_vec();
+        self.inbuf.drain(..9 + len);
+        Ok(Some(Frame {
+            typ,
+            flags,
             stream_id,
             payload,
             flow_applied: false,
-        })
+        }))
+    }
+
+    fn read_frame(&mut self) -> Result<Frame> {
+        loop {
+            if let Some(frame) = self.take_frame()? {
+                return Ok(frame);
+            }
+            if self.read_into_buf()? == 0 {
+                return Err(anyhow!("http/2 connection closed"));
+            }
+        }
+    }
+
+    fn poll_peer(&mut self, stream_id: u32) -> Result<SendState> {
+        self.stream.set_nonblocking(true)?;
+        let state = self.poll_peer_frames(stream_id);
+        self.stream.set_nonblocking(false)?;
+        state
+    }
+
+    fn poll_peer_frames(&mut self, stream_id: u32) -> Result<SendState> {
+        let mut budget = MAX_POLL_FRAMES;
+        loop {
+            while let Some(frame) = self.take_frame()? {
+                if let Some(state) = self.dispatch_peer_frame(frame, stream_id)? {
+                    return Ok(state);
+                }
+                budget -= 1;
+                if budget == 0 {
+                    return Ok(SendState::Open);
+                }
+            }
+            match self.read_into_buf() {
+                Ok(0) => {
+                    self.peer_gone = true;
+                    return Ok(SendState::GoneAway);
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(SendState::Open),
+                Err(e) if e.kind() == ErrorKind::ConnectionReset => {
+                    self.peer_gone = true;
+                    return Ok(SendState::GoneAway);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    fn dispatch_peer_frame(&mut self, frame: Frame, stream_id: u32) -> Result<Option<SendState>> {
+        match frame.typ {
+            FRAME_SETTINGS => {
+                if frame.flags & FLAG_ACK == 0 {
+                    self.apply_settings(&frame.payload)?;
+                }
+            }
+            FRAME_PING => {
+                if frame.flags & FLAG_ACK == 0 && frame.payload.len() == 8 {
+                    self.ping_ack(&frame.payload)?;
+                }
+            }
+            FRAME_WINDOW_UPDATE => self.apply_window_update(&frame)?,
+            FRAME_RST => {
+                self.flow.close_stream(frame.stream_id);
+                if frame.stream_id == stream_id {
+                    return Ok(Some(SendState::Reset));
+                }
+            }
+            FRAME_GOAWAY => {
+                self.peer_gone = true;
+                return Ok(Some(SendState::GoneAway));
+            }
+            FRAME_HEADERS | FRAME_CONTINUATION => {
+                self.flow.open_stream(frame.stream_id);
+                self.defer(frame)?;
+            }
+            FRAME_DATA => {
+                let len = frame.payload.len() as u32;
+                if len > 0 {
+                    self.window_update(0, len)?;
+                    if self.flow.has_stream(frame.stream_id) {
+                        self.window_update(frame.stream_id, len)?;
+                    }
+                }
+                let mut frame = frame;
+                frame.flow_applied = true;
+                self.defer(frame)?;
+            }
+            _ => {}
+        }
+        Ok(None)
     }
 
     fn defer(&mut self, frame: Frame) -> Result<()> {
@@ -312,9 +429,12 @@ impl Conn {
         head[3] = typ;
         head[4] = flags;
         head[5..9].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-        self.stream.write_all(&head)?;
-        self.stream.write_all(payload)?;
-        self.stream.flush()?;
+        let Self { stream, out, .. } = self;
+        out.clear();
+        out.extend_from_slice(&head);
+        out.extend_from_slice(payload);
+        stream.write_all(out)?;
+        stream.flush()?;
         Ok(())
     }
 
@@ -452,45 +572,9 @@ impl Conn {
             if !self.flow.has_stream(stream_id) {
                 return Ok(SendState::Reset);
             }
-            let mut frame = self.read_frame()?;
-            match frame.typ {
-                FRAME_SETTINGS => {
-                    if frame.flags & FLAG_ACK == 0 {
-                        self.apply_settings(&frame.payload)?;
-                    }
-                }
-                FRAME_PING => {
-                    if frame.flags & FLAG_ACK == 0 && frame.payload.len() == 8 {
-                        self.ping_ack(&frame.payload)?;
-                    }
-                }
-                FRAME_WINDOW_UPDATE => self.apply_window_update(&frame)?,
-                FRAME_RST => {
-                    self.flow.close_stream(frame.stream_id);
-                    if frame.stream_id == stream_id {
-                        return Ok(SendState::Reset);
-                    }
-                }
-                FRAME_GOAWAY => {
-                    self.peer_gone = true;
-                    return Ok(SendState::GoneAway);
-                }
-                FRAME_HEADERS | FRAME_CONTINUATION => {
-                    self.flow.open_stream(frame.stream_id);
-                    self.defer(frame)?;
-                }
-                FRAME_DATA => {
-                    let len = frame.payload.len() as u32;
-                    if len > 0 {
-                        self.window_update(0, len)?;
-                        if self.flow.has_stream(frame.stream_id) {
-                            self.window_update(frame.stream_id, len)?;
-                        }
-                    }
-                    frame.flow_applied = true;
-                    self.defer(frame)?;
-                }
-                _ => {}
+            let frame = self.read_frame()?;
+            if let Some(state) = self.dispatch_peer_frame(frame, stream_id)? {
+                return Ok(state);
             }
             if self.flow.available(stream_id) > 0 {
                 return Ok(SendState::Open);
@@ -514,9 +598,11 @@ pub fn serve(
     stream: TcpStream,
     engine: &Engine,
     info: &crate::ServerInfo,
-    max_body: usize,
+    limits: Limits,
 ) -> Result<()> {
+    let max_body = limits.max_body;
     let mut conn = Conn::new(stream);
+    conn.cancel_interval = limits.h2_cancel_interval;
     conn.read_preface()?;
     conn.send_settings()?;
     let mut ctx = HpackCtx::new();
@@ -762,12 +848,9 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
         }
     };
     let params = parsed.to_params();
-    let events = engine.submit(ChatJob::chat(
-        messages,
-        params,
-        parsed.thinking(),
-        parsed.to_tools(),
-    ))?;
+    let job = ChatJob::chat(messages, params, parsed.thinking(), parsed.to_tools());
+    let _cancel = crate::engine::CancelGuard::new(job.cancel_handle());
+    let events = engine.submit(job)?;
     let name = parsed.model.as_deref().unwrap_or(model);
     let meta = CompletionMeta::new(name);
     if parsed.stream {
@@ -779,45 +862,64 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
         conn.send_headers(req.id, &block, false)?;
         let mut tool_index = 0usize;
         let mut finish_reason = "stop";
-        for event in events {
-            let payload = match event {
-                Event::Delta(text) => {
-                    format!("data: {}\n\n", meta.chunk(json!({"content": text}), None))
+        let mut completed = false;
+        let mut rounds = 0usize;
+        let mut batch: Vec<u8> = Vec::with_capacity(8192);
+        pump_events(&events, |events| {
+            batch.clear();
+            for event in events {
+                match event {
+                    Event::Delta(text) => push_sse(&mut batch, |b| {
+                        meta.write_chunk(b, Delta::content(text), None)
+                    })?,
+                    Event::Thinking(text) => push_sse(&mut batch, |b| {
+                        meta.write_chunk(b, Delta::reasoning(text), None)
+                    })?,
+                    Event::ToolCall(tc) => {
+                        push_sse(&mut batch, |b| {
+                            meta.write_chunk(b, Delta::tool_call(tool_index, tc), None)
+                        })?;
+                        tool_index += 1;
+                    }
+                    Event::Final {
+                        finish_reason: reason,
+                        ..
+                    } => {
+                        finish_reason = reason;
+                        completed = true;
+                    }
+                    Event::Error(e) => {
+                        let text = format!("\n[error] {e}");
+                        push_sse(&mut batch, |b| {
+                            meta.write_chunk(b, Delta::content(&text), None)
+                        })?;
+                    }
                 }
-                Event::Thinking(text) => format!(
-                    "data: {}\n\n",
-                    meta.chunk(json!({"reasoning_content": text}), None)
-                ),
-                Event::ToolCall(tc) => {
-                    let payload = format!("data: {}\n\n", meta.tool_chunk(tool_index, &tc));
-                    tool_index += 1;
-                    payload
-                }
-                Event::Final {
-                    finish_reason: reason,
-                    ..
-                } => {
-                    finish_reason = reason;
-                    continue;
-                }
-                Event::Error(e) => format!(
-                    "data: {}\n\n",
-                    meta.chunk(json!({"content": format!("\n[error] {e}")}), None)
-                ),
-            };
-            conn.send_data(req.id, payload.as_bytes(), false)?;
-            if conn.peer_gone {
-                return Ok(());
             }
-            if !conn.flow.has_stream(req.id) {
-                return Ok(());
+            if batch.is_empty() {
+                return Ok(Pump::Continue);
             }
+            if conn.send_data(req.id, &batch, false)? != SendState::Open {
+                return Ok(Pump::Stop);
+            }
+            rounds += 1;
+            if rounds >= conn.cancel_interval {
+                rounds = 0;
+                if conn.poll_peer(req.id)? != SendState::Open {
+                    return Ok(Pump::Stop);
+                }
+            }
+            Ok(Pump::Continue)
+        })?;
+        if !completed {
+            return Ok(());
         }
-        let finish = format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            meta.chunk(json!({}), Some(finish_reason))
-        );
-        conn.send_data(req.id, finish.as_bytes(), true)?;
+        let mut tail = Vec::with_capacity(256);
+        push_sse(&mut tail, |b| {
+            meta.write_chunk(b, Delta::empty(), Some(finish_reason))
+        })?;
+        push_sse_data(&mut tail, b"[DONE]");
+        conn.send_data(req.id, &tail, true)?;
         return Ok(());
     }
     let mut text = String::new();
@@ -911,38 +1013,57 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
             ("cache-control", "no-cache".to_string()),
         ]);
         conn.send_headers(req.id, &block, false)?;
-        let first = format!("data: {}\n\n", meta.completion_chunk("", None));
-        conn.send_data(req.id, first.as_bytes(), false)?;
+        let mut batch: Vec<u8> = Vec::with_capacity(8192);
+        push_sse(&mut batch, |b| meta.write_completion_chunk(b, "", None))?;
+        conn.send_data(req.id, &batch, false)?;
         let mut finish_reason = "stop";
-        for event in events {
-            let payload = match event {
-                Event::Delta(text) => format!("data: {}\n\n", meta.completion_chunk(&text, None)),
-                Event::Final {
-                    finish_reason: reason,
-                    ..
-                } => {
-                    finish_reason = reason;
-                    continue;
+        let mut completed = false;
+        let mut rounds = 0usize;
+        pump_events(&events, |events| {
+            batch.clear();
+            for event in events {
+                match event {
+                    Event::Delta(text) => {
+                        push_sse(&mut batch, |b| meta.write_completion_chunk(b, text, None))?;
+                    }
+                    Event::Final {
+                        finish_reason: reason,
+                        ..
+                    } => {
+                        finish_reason = reason;
+                        completed = true;
+                    }
+                    Event::Error(e) => {
+                        let text = format!("\n[error] {e}");
+                        push_sse(&mut batch, |b| meta.write_completion_chunk(b, &text, None))?;
+                    }
+                    Event::Thinking(_) | Event::ToolCall(_) => {}
                 }
-                Event::Error(e) => format!(
-                    "data: {}\n\n",
-                    meta.completion_chunk(&format!("\n[error] {e}"), None)
-                ),
-                Event::Thinking(_) | Event::ToolCall(_) => continue,
-            };
-            conn.send_data(req.id, payload.as_bytes(), false)?;
-            if conn.peer_gone {
-                return Ok(());
             }
-            if !conn.flow.has_stream(req.id) {
-                return Ok(());
+            if batch.is_empty() {
+                return Ok(Pump::Continue);
             }
+            if conn.send_data(req.id, &batch, false)? != SendState::Open {
+                return Ok(Pump::Stop);
+            }
+            rounds += 1;
+            if rounds >= conn.cancel_interval {
+                rounds = 0;
+                if conn.poll_peer(req.id)? != SendState::Open {
+                    return Ok(Pump::Stop);
+                }
+            }
+            Ok(Pump::Continue)
+        })?;
+        if !completed {
+            return Ok(());
         }
-        let finish = format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            meta.completion_chunk("", Some(finish_reason))
-        );
-        conn.send_data(req.id, finish.as_bytes(), true)?;
+        let mut tail = Vec::with_capacity(256);
+        push_sse(&mut tail, |b| {
+            meta.write_completion_chunk(b, "", Some(finish_reason))
+        })?;
+        push_sse_data(&mut tail, b"[DONE]");
+        conn.send_data(req.id, &tail, true)?;
         return Ok(());
     }
     let mut choices = Vec::with_capacity(prompts.len());
@@ -1322,6 +1443,76 @@ mod tests {
         conn.flow.open_stream(1);
         drop(client);
         assert!(conn.send_data(1, b"hello", false).is_err());
+    }
+
+    #[test]
+    fn read_frame_reassembles_partial_reads() {
+        let (mut conn, client) = pair();
+        let sender = std::thread::spawn(move || {
+            let mut stream = client;
+            let mut head = [0u8; 9];
+            head[2] = 8;
+            head[3] = FRAME_PING;
+            head[5..9].copy_from_slice(&0u32.to_be_bytes());
+            stream.write_all(&head).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            stream.write_all(b"lfm-ping").unwrap();
+            stream.flush().unwrap();
+        });
+        let frame = conn.read_frame().unwrap();
+        assert_eq!(frame.typ, FRAME_PING);
+        assert_eq!(frame.payload, b"lfm-ping");
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn poll_peer_detects_rst_stream_without_window_exhaustion() {
+        let (mut conn, mut client) = pair();
+        conn.flow.open_stream(1);
+        assert_eq!(conn.poll_peer(1).unwrap(), SendState::Open);
+        send_frame(&mut client, FRAME_RST, 0, 1, &ERR_PROTOCOL.to_be_bytes());
+        let state = wait_for_poll(&mut conn, 1);
+        assert_eq!(state, SendState::Reset);
+        assert!(!conn.flow.has_stream(1));
+    }
+
+    #[test]
+    fn poll_peer_detects_closed_client() {
+        let (mut conn, client) = pair();
+        conn.flow.open_stream(1);
+        drop(client);
+        assert_eq!(wait_for_poll(&mut conn, 1), SendState::GoneAway);
+        assert!(conn.peer_gone);
+    }
+
+    #[test]
+    fn poll_peer_defers_pipelined_headers() {
+        let (mut conn, mut client) = pair();
+        conn.flow.open_stream(1);
+        send_frame(&mut client, FRAME_HEADERS, FLAG_END_HEADERS, 3, b"\x82");
+        for _ in 0..200 {
+            conn.poll_peer(1).unwrap();
+            if !conn.deferred.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(conn.flow.stream_count(), 2);
+        let frame = conn.next_frame().unwrap();
+        assert_eq!(frame.typ, FRAME_HEADERS);
+        assert_eq!(frame.stream_id, 3);
+    }
+
+    fn wait_for_poll(conn: &mut Conn, stream_id: u32) -> SendState {
+        for _ in 0..200 {
+            let state = conn.poll_peer(stream_id).unwrap();
+            if state != SendState::Open {
+                return state;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        SendState::Open
     }
 
     #[test]
