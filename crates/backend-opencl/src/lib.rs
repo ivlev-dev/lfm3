@@ -815,7 +815,11 @@ impl GpuModel {
         let prefill_batch = opts.prefill_ntok;
         let batch_cap = pb.max(prefill_batch);
         let gemm_force = opts.gemm_force.clone();
-        let rgemv = opts.rgemv;
+        let rgemv = if gpu.caps.sub_group_size <= 16 {
+            opts.rgemv.max(8)
+        } else {
+            opts.rgemv
+        };
         let rgemv_b = opts.rgemv_b;
         let wg = opts.wg;
         let wg_b = opts.wg_b;
@@ -1092,11 +1096,16 @@ impl GpuModel {
             let (w8, wsc, _) = self.prepacked_i8.get(name).ok_or_else(|| {
                 anyhow!("Q6 без fp16 считает только int8-ядро, нужен prepack: {name}")
             })?;
+            let k = if self.q4_b8p_on {
+                &self.kernels.gemm_q6_b8p
+            } else {
+                &self.kernels.gemm_q6_b8
+            };
             unsafe {
                 self.gpu.launch(
-                    &self.kernels.gemm_i8_gz,
-                    rows.div_ceil(64) * 512,
-                    512,
+                    k,
+                    rows.div_ceil(64) * 64,
+                    64,
                     &[
                         Arg::Mem(w8.get()),
                         Arg::Mem(wsc.get()),

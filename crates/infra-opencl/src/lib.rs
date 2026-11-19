@@ -236,8 +236,9 @@ impl Gpu {
         })?;
         if self.profile {
             let name = kernel.function_name().unwrap_or_default();
+            let started = Instant::now();
             event.wait()?;
-            let us = Self::elapsed(&event)?.as_secs_f64() * 1e6;
+            let us = started.elapsed().as_secs_f64() * 1e6;
             let mut map = self.kernel_times.borrow_mut();
             let e = map.entry(name).or_insert((0, 0.0));
             e.0 += 1;
