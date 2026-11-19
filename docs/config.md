@@ -50,7 +50,7 @@
 | `flash` | `LFM_FLASH` | — | `true` | flash-внимание: 4 головы × 16 полос |
 | `flash2` | `LFM_FLASH2` | — | `true` | два токена на волну в split-внимании |
 | `b8p` | `LFM_B8P` | — | `true` | префетч x в b8-ядрах decode |
-| `i8pf` | `LFM_I8PF` | — | `true` | префетч весов группы в int8-GEMM |
+| `i8pf` | `LFM_I8PF` | — | `true` | префетч весов группы в int8-GEMM; на устройстве с подгруппой ≤16 выключается (не хватает регистров) |
 | `q4i8` | `LFM_Q4I8` | — | `true` | int8-перепаковка Q4_K для prefill |
 | `q6i8` | `LFM_Q6I8` | — | `true` | Q6-prefill на int8-ядре |
 | `wg` | `LFM_WG` | — | `256` | размер рабочей группы decode-GEMV (кратен 64) |

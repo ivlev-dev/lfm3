@@ -599,7 +599,7 @@ impl GpuModel {
         let q4_b8p_on = opts.b8p;
         let flash_on = opts.flash;
         let flash2_on = opts.flash2;
-        let i8_pf_on = opts.i8pf;
+        let i8_pf_on = opts.i8pf && gpu.caps.sub_group_size > 16;
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
@@ -1222,9 +1222,14 @@ impl GpuModel {
                 return Ok(());
             }
             let tps = ntok.div_ceil(32);
+            let k = if self.i8_pf_on {
+                &self.kernels.gemm_i8_pf
+            } else {
+                &self.kernels.gemm_i8_gz
+            };
             unsafe {
                 self.gpu.launch(
-                    &self.kernels.gemm_i8_gz,
+                    k,
                     rows.div_ceil(64) * tps * 512,
                     512,
                     &[
