@@ -2536,33 +2536,39 @@ __kernel void gemm_q4_k_i8_lds17(__global const uchar *w, __global const char *x
 }
 
 __kernel void logits_argmax_b(__global const float *src, __global const uint *rowids, __global uint *ids, __global float *vals, uint ntok, uint vocab) {
-    uint r = get_global_id(0) / 256u;
+    uint r = get_group_id(0);
     uint lid = get_local_id(0);
+    uint lsz = get_local_size(0);
     if (r >= ntok) {
         return;
     }
     uint row = rowids[r];
-    __local float bv[256];
-    __local uint bi[256];
+    __local float bv[1024];
+    __local uint bi[1024];
     __global const float *p = src + (ulong)row * vocab;
+    uint nv = vocab >> 2;
     float best = -INFINITY;
     uint idx = 0u;
-    for (uint i = lid; i < vocab; i += 256u) {
+    for (uint i = lid; i < nv; i += lsz) {
+        float4 v = vload4(0, p + i * 4u);
+        if (v.x > best) { best = v.x; idx = i * 4u; }
+        if (v.y > best) { best = v.y; idx = i * 4u + 1u; }
+        if (v.z > best) { best = v.z; idx = i * 4u + 2u; }
+        if (v.w > best) { best = v.w; idx = i * 4u + 3u; }
+    }
+    for (uint i = nv * 4u + lid; i < vocab; i += lsz) {
         float v = p[i];
-        if (v > best) {
-            best = v;
-            idx = i;
-        }
+        if (v > best) { best = v; idx = i; }
     }
     bv[lid] = best;
     bi[lid] = idx;
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (uint s = 128u; s > 0u; s >>= 1) {
-        if (lid < s) {
-            float v = bv[lid + s];
+    for (uint st = lsz >> 1; st > 0u; st >>= 1) {
+        if (lid < st) {
+            float v = bv[lid + st];
             if (v > bv[lid]) {
                 bv[lid] = v;
-                bi[lid] = bi[lid + s];
+                bi[lid] = bi[lid + st];
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);

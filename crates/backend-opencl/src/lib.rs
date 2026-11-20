@@ -654,7 +654,11 @@ impl GpuModel {
                             && lrows > 0
                             && q4_i8_on
                         {
-                            let (q8, sc) = prepack::prepack_q4_i8_with_threads(&packed, lcols, opts.prepack_threads)?;
+                            let (q8, sc) = prepack::prepack_q4_i8_with_threads(
+                                &packed,
+                                lcols,
+                                opts.prepack_threads,
+                            )?;
                             prepacked_q4_i8
                                 .insert(info.name.clone(), (gpu.upload(&q8)?, gpu.upload(&sc)?));
                         }
@@ -667,7 +671,11 @@ impl GpuModel {
                 GgmlType::Q6_K => {
                     if prepack_on && info.dims.len() == 2 {
                         if lcols.is_multiple_of(256) && lrows > 0 {
-                            let (q, sc) = prepack::prepack_q6_i8_with_threads(data.as_ref(), lcols, opts.prepack_threads)?;
+                            let (q, sc) = prepack::prepack_q6_i8_with_threads(
+                                data.as_ref(),
+                                lcols,
+                                opts.prepack_threads,
+                            )?;
                             prepacked_i8.insert(
                                 info.name.clone(),
                                 (gpu.upload(&q)?, gpu.upload(&sc)?, rows),
@@ -708,7 +716,8 @@ impl GpuModel {
                 GgmlType::Q4_K => Weight::Q4(gpu.upload_bytes(&data)?),
                 GgmlType::Q6_K => {
                     if prepack_on && cols.is_multiple_of(256) && rows > 0 {
-                        let (q, sc) = prepack::prepack_q6_i8_with_threads(&data, cols, opts.prepack_threads)?;
+                        let (q, sc) =
+                            prepack::prepack_q6_i8_with_threads(&data, cols, opts.prepack_threads)?;
                         prepacked_i8.insert(
                             "lm_head_shard".to_string(),
                             (gpu.upload(&q)?, gpu.upload(&sc)?, rows),
@@ -750,7 +759,11 @@ impl GpuModel {
                     fused.extend_from_slice(&prepack::prepack_q4_k(&up_s)?);
                     let cols = up_info.dims[0] as usize;
                     if cols.is_multiple_of(256) && q4_i8_on {
-                        let (q8, sc) = prepack::prepack_q4_i8_with_threads(&fused, cols, opts.prepack_threads)?;
+                        let (q8, sc) = prepack::prepack_q4_i8_with_threads(
+                            &fused,
+                            cols,
+                            opts.prepack_threads,
+                        )?;
                         prepacked_q4_i8.insert(
                             format!("blk.{layer}.ffn_ug.weight"),
                             (gpu.upload(&q8)?, gpu.upload(&sc)?),
@@ -2427,24 +2440,101 @@ impl GpuModel {
     }
 
     pub fn tp_prepare_batch(&mut self, slot: usize, pos0: usize, ntok: usize) -> Result<()> {
-        let h = self.cfg.hidden_size;
+        let rows: Vec<(usize, usize)> = (0..ntok).map(|i| (slot, pos0 + i)).collect();
+        self.tp_prepare_rows(&rows)
+    }
+
+    pub fn tp_prepare_rows(&mut self, rows: &[(usize, usize)]) -> Result<()> {
+        if rows.is_empty() {
+            return Err(anyhow!("empty tp batch"));
+        }
+        if rows.len() > self.batch_cap {
+            return Err(anyhow!(
+                "tp batch of {} exceeds prefetch batch {}",
+                rows.len(),
+                self.batch_cap
+            ));
+        }
+        let mut last_pos: Vec<Option<usize>> = vec![None; self.max_seqs];
+        for &(slot, pos) in rows {
+            if pos >= self.max_ctx {
+                return Err(anyhow!(
+                    "context overflow: pos {pos} >= max_ctx {}",
+                    self.max_ctx
+                ));
+            }
+            if self.seqs.get(slot).map(|s| s.is_none()).unwrap_or(true) {
+                return Err(anyhow!("sequence slot {slot} is empty"));
+            }
+            if let Some(prev) = last_pos[slot]
+                && pos != prev + 1
+            {
+                return Err(anyhow!(
+                    "tp batch: slot {slot} positions {prev} -> {pos} are not contiguous"
+                ));
+            }
+            last_pos[slot] = Some(pos);
+        }
         let kv_blocks = self.kv_blocks;
-        self.seq_ensure(slot, pos0 + ntok)?;
-        self.seq_sync(slot)?;
-        let table: Vec<u32> = self.sequence(slot)?.block_table.clone();
-        if let Some(seq) = self.seqs[slot].as_mut() {
-            seq.len = seq.len.max(pos0 + ntok);
-        }
+        let mut slots: Vec<usize> = rows.iter().map(|&(slot, _)| slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
         let mut tbl_host = vec![0u32; self.max_seqs * kv_blocks.max(1)];
-        for (i, b) in table.iter().enumerate() {
-            tbl_host[i] = *b;
+        for &slot in &slots {
+            let end = rows
+                .iter()
+                .filter(|&&(s, _)| s == slot)
+                .map(|&(_, p)| p + 1)
+                .max()
+                .unwrap_or(1);
+            self.seq_ensure(slot, end)?;
+            self.seq_sync(slot)?;
+            let seq = self.sequence(slot)?;
+            let base = slot * kv_blocks;
+            for (i, block) in seq.block_table.iter().enumerate() {
+                tbl_host[base + i] = *block;
+            }
+            if let Some(seq) = self.seqs[slot].as_mut() {
+                seq.len = seq.len.max(end);
+            }
         }
-        let pos_host: Vec<u32> = (0..ntok).map(|i| (pos0 + i) as u32).collect();
-        let seq_host = vec![slot as u32; ntok];
-        let off_host = vec![0u32; ntok];
-        let conv_off = (slot * (self.cfg.conv_cache - 1) * h) as u32;
-        let conv_host = vec![conv_off; ntok];
-        let snap_host = vec![u32::MAX; ntok];
+        let conv_len = (self.cfg.conv_cache - 1) * self.cfg.hidden_size;
+        let pos_host: Vec<u32> = rows.iter().map(|&(_, pos)| pos as u32).collect();
+        let seq_host: Vec<u32> = rows.iter().map(|&(slot, _)| slot as u32).collect();
+        let tbl_off_host: Vec<u32> = rows
+            .iter()
+            .map(|&(slot, _)| (slot * kv_blocks) as u32)
+            .collect();
+        let conv_off_host: Vec<u32> = rows
+            .iter()
+            .map(|&(slot, _)| (slot * conv_len) as u32)
+            .collect();
+        let snap_host: Vec<u32> = if self.cache_on && self.layers.iter().any(|l| l.snap.is_some()) {
+            rows.iter()
+                .map(|&(slot, pos)| {
+                    if (pos + 1) % KV_PAGE != 0 {
+                        return u32::MAX;
+                    }
+                    let pending = self
+                        .seqs
+                        .get(slot)
+                        .and_then(|s| s.as_ref())
+                        .and_then(|s| s.pending.as_ref())
+                        .is_some();
+                    if !pending {
+                        return u32::MAX;
+                    }
+                    self.seqs
+                        .get(slot)
+                        .and_then(|s| s.as_ref())
+                        .and_then(|s| s.block_table.get(pos / KV_PAGE))
+                        .copied()
+                        .unwrap_or(u32::MAX)
+                })
+                .collect()
+        } else {
+            vec![u32::MAX; rows.len()]
+        };
         unsafe {
             self.gpu
                 .queue
@@ -2452,14 +2542,18 @@ impl GpuModel {
             self.gpu
                 .queue
                 .enqueue_write_buffer(&mut self.bufs.seq_b, 1, 0, &seq_host, &[])?;
-            self.gpu
-                .queue
-                .enqueue_write_buffer(&mut self.bufs.tbl_off_b, 1, 0, &off_host, &[])?;
+            self.gpu.queue.enqueue_write_buffer(
+                &mut self.bufs.tbl_off_b,
+                1,
+                0,
+                &tbl_off_host,
+                &[],
+            )?;
             self.gpu.queue.enqueue_write_buffer(
                 &mut self.bufs.conv_off_b,
                 1,
                 0,
-                &conv_host,
+                &conv_off_host,
                 &[],
             )?;
             self.gpu
@@ -2980,6 +3074,57 @@ impl GpuModel {
         self.tp_lmhead_partial()
     }
 
+    pub fn tp_lmhead_rows(&mut self, ntok: usize, rows: &[usize]) -> Result<Vec<f32>> {
+        let shard = self.tp.ok_or_else(|| anyhow!("not a tp shard"))?;
+        let h = self.cfg.hidden_size;
+        let ngs = h / GROUP;
+        if ntok == 0 || ntok > self.batch_cap {
+            return Err(anyhow!(
+                "tp lm_head batch {ntok} outside 1..={}",
+                self.batch_cap
+            ));
+        }
+        if let Some(&row) = rows.iter().find(|&&row| row >= ntok) {
+            return Err(anyhow!("logits row {row} outside batch of {ntok}"));
+        }
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (i, &row) in rows.iter().enumerate() {
+            unsafe {
+                self.gpu.queue.enqueue_copy_buffer(
+                    &self.bufs.hqx,
+                    &mut self.bufs.xqg,
+                    row * h,
+                    i * h,
+                    h,
+                    &[],
+                )?;
+                self.gpu.queue.enqueue_copy_buffer(
+                    &self.bufs.hsx,
+                    &mut self.bufs.xsg,
+                    row * ngs * 4,
+                    i * ngs * 4,
+                    ngs * 4,
+                    &[],
+                )?;
+            }
+        }
+        self.gemv_auto_b(
+            "lm_head_shard",
+            &self.bufs.xqg,
+            &self.bufs.xsg,
+            &self.bufs.logitsg,
+            shard.vocab_count,
+            h,
+            rows.len(),
+            0,
+        )?;
+        self.gpu.queue.finish()?;
+        self.gpu
+            .download(&self.bufs.logitsg, rows.len() * shard.vocab_count)
+    }
+
     pub fn tp_x(&self) -> Result<Vec<f32>> {
         self.gpu.download(&self.bufs.x, self.cfg.hidden_size)
     }
@@ -3369,6 +3514,10 @@ impl GpuModel {
         self.prefill_batch
     }
 
+    pub fn batch_cap(&self) -> usize {
+        self.batch_cap
+    }
+
     pub fn max_sequences(&self) -> usize {
         self.max_seqs
     }
@@ -3556,10 +3705,11 @@ impl GpuModel {
             self.gpu
                 .queue
                 .enqueue_write_buffer(&mut self.bufs.rowsel, 1, 0, &sel, &[])?;
+            let local = self.gpu.caps.max_work_group_size.clamp(64, 1024);
             self.gpu.launch(
                 &self.kernels.logits_argmax_b,
-                sel.len() * 256,
-                256,
+                sel.len() * local,
+                local,
                 &[
                     Arg::Mem(self.bufs.logitsb.get()),
                     Arg::Mem(self.bufs.rowsel.get()),
@@ -4910,7 +5060,11 @@ impl GpuModel {
                         &self.kernels.fill_b,
                         conv_bytes.div_ceil(16),
                         256,
-                        &[Arg::Mem(conv.get()), Arg::U64(0), Arg::U64(conv_bytes as u64)],
+                        &[
+                            Arg::Mem(conv.get()),
+                            Arg::U64(0),
+                            Arg::U64(conv_bytes as u64),
+                        ],
                     )?;
                 }
             }

@@ -16,6 +16,56 @@ pub struct TpModel {
     attn_acc: Vec<f32>,
     ffn_acc: Vec<f32>,
     sync_norms: bool,
+    batch_dec: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TpBatch {
+    Prefill(usize, usize),
+    Decode(Vec<usize>),
+}
+
+pub(crate) fn plan_batches(
+    steps: &[SequenceStep],
+    cap: usize,
+    serial: bool,
+    batch_dec: bool,
+) -> Vec<TpBatch> {
+    let runs: Vec<(usize, usize)> = if serial {
+        (0..steps.len()).map(|i| (i, i + 1)).collect()
+    } else {
+        group_runs(steps)
+    };
+    let batch_dec = batch_dec && !serial;
+    let cap = cap.max(1);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < runs.len() {
+        let (a, b) = runs[i];
+        if b - a > 1 {
+            out.push(TpBatch::Prefill(a, b));
+            i += 1;
+            continue;
+        }
+        if !batch_dec {
+            out.push(TpBatch::Decode(vec![a]));
+            i += 1;
+            continue;
+        }
+        let mut grp = vec![a];
+        let mut j = i + 1;
+        while j < runs.len() && runs[j].1 - runs[j].0 == 1 && grp.len() < cap {
+            let s = runs[j].0;
+            if grp.iter().any(|&k| steps[k].slot == steps[s].slot) {
+                break;
+            }
+            grp.push(s);
+            j += 1;
+        }
+        out.push(TpBatch::Decode(grp));
+        i = j;
+    }
+    out
 }
 
 /// Группы подряд идущих шагов одного слота (непрерывные позиции).
@@ -38,6 +88,16 @@ pub fn group_runs(steps: &[SequenceStep]) -> Vec<(usize, usize)> {
 
 fn env_is_one(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
+}
+
+fn env_flag_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
 }
 
 fn reset_acc(acc: &mut Vec<f32>, len: usize) {
@@ -122,6 +182,7 @@ impl TpModel {
             attn_acc: Vec::new(),
             ffn_acc: Vec::new(),
             sync_norms: env_is_one("LFM_TP_SYNC_NORMS"),
+            batch_dec: env_flag_on("LFM_TP_BATCH_DEC"),
         })
     }
 
@@ -198,13 +259,7 @@ impl TpModel {
         }
     }
 
-    fn prefill_chunk(
-        &mut self,
-        slot: usize,
-        pos: usize,
-        chunk: &[u32],
-        need_logits: bool,
-    ) -> Result<Option<Vec<f32>>> {
+    fn layers_batch(&mut self, ntok: usize) -> Result<()> {
         let Self {
             stages,
             cfg,
@@ -214,29 +269,18 @@ impl TpModel {
             ..
         } = self;
         let h = cfg.hidden_size;
-        let ntok = chunk.len();
         let dbg = std::env::var("LFM_TP_DEBUG").is_ok();
-        let (mut t_attn, mut t_ffn, mut t_sync, mut t_prep) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        let t0 = Instant::now();
-        for stage in stages.iter_mut() {
-            stage.tp_prepare_batch(slot, pos, ntok)?;
-        }
-        t_prep += t0.elapsed().as_secs_f64();
-        stages[0].tp_embed_batch(chunk)?;
-        stages[0].tp_norm_attn_b(0, ntok)?;
-        // Входную норму слоя 0 считает только rank0; без этой рассылки у остальных стадий
-        // останутся чужие xq/xs (softmax-норма входа), поэтому этот sync обязателен.
-        sync_x_b(stages, ntok)?;
+        let (mut t_attn, mut t_ffn, mut t_sync) = (0.0f64, 0.0f64, 0.0f64);
         for layer in 0..cfg.num_layers {
             let ta = Instant::now();
             if cfg.kind(layer) == LayerKind::Conv {
-                let part = stages[0].tp_conv_b(layer, slot, pos, ntok)?;
+                let part = stages[0].tp_conv_b(layer, 0, 0, ntok)?;
                 attn_acc.clear();
                 attn_acc.extend_from_slice(&part);
             } else {
                 reset_acc(attn_acc, ntok * h);
                 for stage in stages.iter_mut() {
-                    let part = stage.tp_attn_b(layer, slot, pos, ntok)?;
+                    let part = stage.tp_attn_b(layer, 0, 0, ntok)?;
                     add_into(attn_acc, &part);
                 }
             }
@@ -245,8 +289,6 @@ impl TpModel {
             for stage in stages.iter_mut().rev() {
                 stage.tp_attn_norm_b(layer, attn_acc.as_slice(), ntok)?;
             }
-            // host-сумма attn одинакова для всех стадий, веса post_attention_norm/ffn_norm
-            // реплицированы, x на входе одинаков -> norm_add_quant_b даёт одинаковые x/xq/xs.
             if *sync_norms {
                 sync_x_b(stages, ntok)?;
             }
@@ -267,26 +309,153 @@ impl TpModel {
             }
             t_sync += ts2.elapsed().as_secs_f64();
         }
-        let want_logits = if need_logits {
-            let mut logits = vec![0.0f32; cfg.vocab_size];
-            for stage in stages.iter_mut() {
-                let shard = stage
-                    .tp_shard()
-                    .ok_or_else(|| anyhow!("stage without tp shard"))?;
-                let part = stage.tp_lmhead_last(ntok)?;
-                let stop = (shard.vocab_start + part.len()).min(logits.len());
-                logits[shard.vocab_start..stop].copy_from_slice(&part[..stop - shard.vocab_start]);
-            }
-            Some(logits)
-        } else {
-            None
-        };
         if dbg {
             eprintln!(
-                "tp-debug chunk ntok={ntok}: prep {t_prep:.2}s attn {t_attn:.2}s ffn {t_ffn:.2}s norm+sync {t_sync:.2}s"
+                "tp-debug batch ntok={ntok}: attn {t_attn:.2}s ffn {t_ffn:.2}s norm+sync {t_sync:.2}s"
             );
         }
-        Ok(want_logits)
+        Ok(())
+    }
+
+    fn gather_last(&mut self, ntok: usize) -> Result<Vec<f32>> {
+        let vocab = self.cfg.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        for stage in self.stages.iter_mut() {
+            let shard = stage
+                .tp_shard()
+                .ok_or_else(|| anyhow!("stage without tp shard"))?;
+            let part = stage.tp_lmhead_last(ntok)?;
+            let stop = (shard.vocab_start + part.len()).min(vocab);
+            logits[shard.vocab_start..stop].copy_from_slice(&part[..stop - shard.vocab_start]);
+        }
+        Ok(logits)
+    }
+
+    fn gather_logits(&mut self, ntok: usize, rows: &[usize]) -> Result<Vec<Vec<f32>>> {
+        let vocab = self.cfg.vocab_size;
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(rows.len());
+        for stage in self.stages.iter_mut() {
+            let shard = stage
+                .tp_shard()
+                .ok_or_else(|| anyhow!("stage without tp shard"))?;
+            let part = stage.tp_lmhead_rows(ntok, rows)?;
+            if part.len() != rows.len() * shard.vocab_count {
+                return Err(anyhow!(
+                    "lm_head shard returned {} values for {} rows",
+                    part.len(),
+                    rows.len()
+                ));
+            }
+            if out.is_empty() {
+                out.resize_with(rows.len(), || vec![0.0f32; vocab]);
+            }
+            for (i, dst) in out.iter_mut().enumerate() {
+                let seg = &part[i * shard.vocab_count..(i + 1) * shard.vocab_count];
+                let stop = (shard.vocab_start + seg.len()).min(vocab);
+                dst[shard.vocab_start..stop].copy_from_slice(&seg[..stop - shard.vocab_start]);
+            }
+        }
+        Ok(out)
+    }
+
+    fn prefill_chunk(
+        &mut self,
+        slot: usize,
+        pos: usize,
+        chunk: &[u32],
+        need_logits: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let ntok = chunk.len();
+        for stage in self.stages.iter_mut() {
+            stage.tp_prepare_batch(slot, pos, ntok)?;
+        }
+        self.stages[0].tp_embed_batch(chunk)?;
+        self.stages[0].tp_norm_attn_b(0, ntok)?;
+        sync_x_b(&mut self.stages, ntok)?;
+        self.layers_batch(ntok)?;
+        if need_logits {
+            Ok(Some(self.gather_last(ntok)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn decode_batch(
+        &mut self,
+        steps: &[SequenceStep],
+        idxs: &[usize],
+        want: &[bool],
+    ) -> Result<()> {
+        let ntok = idxs.len();
+        let rows: Vec<(usize, usize)> = idxs
+            .iter()
+            .map(|&i| (steps[i].slot, steps[i].pos))
+            .collect();
+        for stage in self.stages.iter_mut() {
+            stage.tp_prepare_rows(&rows)?;
+        }
+        let tokens: Vec<u32> = idxs.iter().map(|&i| steps[i].token).collect();
+        self.stages[0].tp_embed_batch(&tokens)?;
+        self.stages[0].tp_norm_attn_b(0, ntok)?;
+        sync_x_b(&mut self.stages, ntok)?;
+        self.layers_batch(ntok)?;
+        let sel: Vec<usize> = (0..ntok).filter(|&r| want[idxs[r]]).collect();
+        if sel.is_empty() {
+            return Ok(());
+        }
+        let logits = self.gather_logits(ntok, &sel)?;
+        for (&row, l) in sel.iter().zip(logits) {
+            self.last_logits = l.clone();
+            self.row_logits[idxs[row]] = l;
+        }
+        Ok(())
+    }
+
+    fn run_steps(&mut self, steps: &[SequenceStep], want: &[bool]) -> Result<()> {
+        self.row_logits.clear();
+        self.row_logits.resize(steps.len(), Vec::new());
+        let cap = self
+            .stages
+            .iter()
+            .map(|stage| stage.batch_cap())
+            .min()
+            .unwrap_or(1)
+            .max(1);
+        let plan = plan_batches(steps, cap, env_is_one("LFM_TP_SERIAL"), self.batch_dec);
+        for batch in plan {
+            match batch {
+                TpBatch::Prefill(a, b) => {
+                    let mut pos = a;
+                    while pos < b {
+                        let end = (pos + cap).min(b);
+                        let chunk: Vec<u32> = steps[pos..end].iter().map(|s| s.token).collect();
+                        let logits = self.prefill_chunk(
+                            steps[a].slot,
+                            steps[pos].pos,
+                            &chunk,
+                            want[end - 1],
+                        )?;
+                        if let Some(l) = logits {
+                            self.last_logits = l.clone();
+                            self.row_logits[end - 1] = l;
+                        }
+                        pos = end;
+                    }
+                }
+                TpBatch::Decode(idxs) if idxs.len() > 1 => {
+                    self.decode_batch(steps, &idxs, want)?;
+                }
+                TpBatch::Decode(idxs) => {
+                    let i = idxs[0];
+                    let s = steps[i];
+                    if let Some(l) = self.step_token(s.slot, s.token, s.pos, want[i])? {
+                        self.last_logits = l.clone();
+                        self.row_logits[i] = l;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -380,42 +549,19 @@ impl InferenceBackend for TpModel {
     }
 
     fn step(&mut self, steps: &[SequenceStep], need_logits: bool) -> Result<()> {
-        self.row_logits.clear();
-        let serial = env_is_one("LFM_TP_SERIAL");
-        let runs: Vec<(usize, usize)> = if serial {
-            (0..steps.len()).map(|i| (i, i + 1)).collect()
-        } else {
-            group_runs(steps)
-        };
-        for (i, j) in runs {
-            if j - i > 1 {
-                let chunk: Vec<u32> = steps[i..j].iter().map(|s| s.token).collect();
-                let logits =
-                    self.prefill_chunk(steps[i].slot, steps[i].pos, &chunk, need_logits)?;
-                for k in i..j {
-                    if k + 1 == j {
-                        if let Some(l) = &logits {
-                            self.last_logits = l.clone();
-                            self.row_logits.push(l.clone());
-                        } else {
-                            self.row_logits.push(Vec::new());
-                        }
-                    } else {
-                        self.row_logits.push(Vec::new());
-                    }
-                }
-            } else {
-                let logits =
-                    self.step_token(steps[i].slot, steps[i].token, steps[i].pos, need_logits)?;
-                if let Some(l) = logits {
-                    self.last_logits = l.clone();
-                    self.row_logits.push(l);
-                } else {
-                    self.row_logits.push(Vec::new());
-                }
-            }
+        let want = vec![need_logits; steps.len()];
+        self.run_steps(steps, &want)
+    }
+
+    fn step_rows(&mut self, steps: &[SequenceStep], rows: &[usize]) -> Result<()> {
+        let mut want = vec![false; steps.len()];
+        for &row in rows {
+            let slot = want
+                .get_mut(row)
+                .ok_or_else(|| anyhow!("logits row {row} outside batch of {}", steps.len()))?;
+            *slot = true;
         }
-        Ok(())
+        self.run_steps(steps, &want)
     }
 
     fn logits(&self) -> Result<Vec<f32>> {
@@ -498,6 +644,111 @@ mod tests {
         let steps = vec![step(0, 0), step(1, 0)];
         assert_eq!(group_runs(&steps), vec![(0, 1), (1, 2)]);
         assert!(group_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn plan_batches_decode_merges_slots() {
+        let steps = vec![step(0, 5), step(1, 3), step(2, 9), step(3, 0)];
+        let plan = plan_batches(&steps, 8, false, true);
+        assert_eq!(plan, vec![TpBatch::Decode(vec![0, 1, 2, 3])]);
+    }
+
+    #[test]
+    fn plan_batches_decode_never_repeats_slot() {
+        let steps = vec![step(0, 5), step(1, 3), step(0, 6), step(2, 0)];
+        let plan = plan_batches(&steps, 8, false, true);
+        assert_eq!(
+            plan,
+            vec![TpBatch::Decode(vec![0, 1]), TpBatch::Decode(vec![2, 3]),]
+        );
+    }
+
+    #[test]
+    fn plan_batches_decode_respects_cap() {
+        let steps = vec![step(0, 0), step(1, 0), step(2, 0), step(3, 0), step(4, 0)];
+        let plan = plan_batches(&steps, 2, false, true);
+        assert_eq!(
+            plan,
+            vec![
+                TpBatch::Decode(vec![0, 1]),
+                TpBatch::Decode(vec![2, 3]),
+                TpBatch::Decode(vec![4]),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_batches_keeps_prefill_runs_separate() {
+        let steps = vec![
+            step(0, 0),
+            step(0, 1),
+            step(0, 2),
+            step(1, 7),
+            step(1, 8),
+            step(2, 4),
+        ];
+        let plan = plan_batches(&steps, 8, false, true);
+        assert_eq!(
+            plan,
+            vec![
+                TpBatch::Prefill(0, 3),
+                TpBatch::Prefill(3, 5),
+                TpBatch::Decode(vec![5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_batches_disabled_is_one_row_per_batch() {
+        let steps = vec![step(0, 5), step(1, 3), step(0, 6)];
+        let plan = plan_batches(&steps, 8, false, false);
+        assert_eq!(
+            plan,
+            vec![
+                TpBatch::Decode(vec![0]),
+                TpBatch::Decode(vec![1]),
+                TpBatch::Decode(vec![2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_batches_serial_splits_runs() {
+        let steps = vec![step(0, 0), step(0, 1), step(1, 2)];
+        let plan = plan_batches(&steps, 8, true, true);
+        assert_eq!(
+            plan,
+            vec![
+                TpBatch::Decode(vec![0]),
+                TpBatch::Decode(vec![1]),
+                TpBatch::Decode(vec![2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_batches_empty() {
+        assert!(plan_batches(&[], 8, false, true).is_empty());
+    }
+
+    #[test]
+    fn env_flag_default_on_honours_off_values() {
+        unsafe {
+            std::env::set_var("LFM_TP_BATCH_DEC_TEST", "0");
+        }
+        assert!(!env_flag_on("LFM_TP_BATCH_DEC_TEST"));
+        unsafe {
+            std::env::set_var("LFM_TP_BATCH_DEC_TEST", "off");
+        }
+        assert!(!env_flag_on("LFM_TP_BATCH_DEC_TEST"));
+        unsafe {
+            std::env::set_var("LFM_TP_BATCH_DEC_TEST", "1");
+        }
+        assert!(env_flag_on("LFM_TP_BATCH_DEC_TEST"));
+        unsafe {
+            std::env::remove_var("LFM_TP_BATCH_DEC_TEST");
+        }
+        assert!(env_flag_on("LFM_TP_BATCH_DEC_TEST"));
     }
 
     #[test]

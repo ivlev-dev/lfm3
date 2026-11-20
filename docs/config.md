@@ -74,6 +74,7 @@
 | `LFM_TIERS` | сервер | pipeline parallel, проценты слоёв: `LFM_TIERS=60/40`; поддерживает любое число стадий (24 слоя → 3×33/33/34) и батчевый prefill |
 | `RUSTICL_ENABLE` | окружение драйвера | какие GPU видит Rusticl: `iris` — только Intel, `iris,radeonsi` — Intel и AMD; PoCL CPU виден всегда отдельной платформой |
 | `LFM_SCHED_LOG` | сервер | алиас `log_requests` |
+| `LFM_TP_BATCH_DEC` | tp.rs | `0` — построчный decode в TP (по умолчанию строки разных слотов считаются одним батчем) |
 | `LFM_TP_SYNC_NORMS` | tp.rs | `1` — вернуть синхронизацию x/hq/hs после каждой нормы (A/B, по умолчанию стадии считают нормы сами) |
 | `LFM_ARGMAX` | сервер | `0` — отключить GPU-argmax для greedy (A/B; по умолчанию включён) |
 | `LFM_PLATFORM` | infra-opencl | индекс OpenCL-платформы |
