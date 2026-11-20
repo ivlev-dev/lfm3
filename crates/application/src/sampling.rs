@@ -55,6 +55,12 @@ impl Sampler {
         ((self.next_u64() >> 40) as f32) / ((1u32 << 24) as f32)
     }
 
+    pub fn is_greedy(&self) -> bool {
+        self.params.temperature <= 0.0
+            && self.params.top_k <= 1
+            && self.params.repeat_penalty == 1.0
+    }
+
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
         if logits.is_empty() {
             return 0;

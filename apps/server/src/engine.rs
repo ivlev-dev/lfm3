@@ -650,6 +650,17 @@ impl Metrics {
     }
 }
 
+fn argmax_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LFM_ARGMAX").map(|v| v != "0").unwrap_or(true))
+}
+
+fn greedy_token(ids: &[(usize, u32)], row: usize) -> Option<u32> {
+    ids.iter()
+        .find(|(index, _)| *index == row)
+        .map(|(_, token)| *token)
+}
+
 fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -1051,6 +1062,29 @@ impl Worker {
             return false;
         }
         self.metrics.rows(reqs.len(), rows_needed.len());
+        let mut greedy: Vec<(usize, u32)> = Vec::new();
+        if argmax_enabled() && !rows_needed.is_empty() {
+            let wanted: Vec<usize> = rows_needed
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    rows.get(index)
+                        .and_then(|row| self.reqs.get(&row.id))
+                        .map(|state| state.sampler.is_greedy())
+                        .unwrap_or(false)
+                })
+                .collect();
+            if !wanted.is_empty() {
+                let started = Instant::now();
+                if let Ok(ids) = self.gpu.argmax_rows(&wanted) {
+                    greedy = wanted
+                        .into_iter()
+                        .zip(ids.into_iter().map(|(id, _)| id))
+                        .collect();
+                }
+                self.metrics.stage(Stage::Logits, started.elapsed());
+            }
+        }
         for (row_index, row) in rows.iter().enumerate() {
             let wanted = rows_needed.binary_search(&row_index).is_ok();
             match row.token {
@@ -1068,6 +1102,19 @@ impl Worker {
                         self.fail_request(row.id, "prefill completion without logits".to_string());
                         continue;
                     }
+                    let slot = match self.reqs.get(&row.id).map(|state| state.slot) {
+                        Some(slot) => slot,
+                        None => continue,
+                    };
+                    if let Some(token) = greedy_token(&greedy, row_index) {
+                        if let Err(e) = self.gpu.prefill_finish(slot) {
+                            self.fail_request(row.id, format!("{e}"));
+                            continue;
+                        }
+                        self.sched.complete_prefill(row.id);
+                        self.accept_sampled(row.id, token);
+                        continue;
+                    }
                     let logits = match self.logits_at(row_index) {
                         Ok(logits) => logits,
                         Err(e) => {
@@ -1075,10 +1122,7 @@ impl Worker {
                             continue;
                         }
                     };
-                    let slot = self.reqs.get(&row.id).map(|state| state.slot);
-                    if let Some(slot) = slot
-                        && let Err(e) = self.gpu.prefill_finish(slot)
-                    {
+                    if let Err(e) = self.gpu.prefill_finish(slot) {
                         self.fail_request(row.id, format!("{e}"));
                         continue;
                     }
@@ -1087,6 +1131,10 @@ impl Worker {
                 }
                 StepToken::Decode => {
                     if !wanted {
+                        continue;
+                    }
+                    if let Some(token) = greedy_token(&greedy, row_index) {
+                        self.accept_sampled(row.id, token);
                         continue;
                     }
                     let logits = match self.logits_at(row_index) {
@@ -1118,13 +1166,20 @@ impl Worker {
     }
 
     fn accept_token(&mut self, id: JobId, mut logits: Vec<f32>) {
+        let sample_started = Instant::now();
+        let Some(state) = self.reqs.get_mut(&id) else {
+            return;
+        };
+        let token = state.sampler.sample(&mut logits);
+        self.metrics.stage(Stage::Sample, sample_started.elapsed());
+        self.accept_sampled(id, token);
+    }
+
+    fn accept_sampled(&mut self, id: JobId, token: u32) {
         let tok = &self.tok;
         let Some(state) = self.reqs.get_mut(&id) else {
             return;
         };
-        let sample_started = Instant::now();
-        let token = state.sampler.sample(&mut logits);
-        self.metrics.stage(Stage::Sample, sample_started.elapsed());
         state.sampler.push(token);
         let detok_started = Instant::now();
         let flow = state.process_token(tok.as_ref(), token);

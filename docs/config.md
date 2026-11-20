@@ -75,6 +75,7 @@
 | `RUSTICL_ENABLE` | окружение драйвера | какие GPU видит Rusticl: `iris` — только Intel, `iris,radeonsi` — Intel и AMD; PoCL CPU виден всегда отдельной платформой |
 | `LFM_SCHED_LOG` | сервер | алиас `log_requests` |
 | `LFM_TP_SYNC_NORMS` | tp.rs | `1` — вернуть синхронизацию x/hq/hs после каждой нормы (A/B, по умолчанию стадии считают нормы сами) |
+| `LFM_ARGMAX` | сервер | `0` — отключить GPU-argmax для greedy (A/B; по умолчанию включён) |
 | `LFM_PLATFORM` | infra-opencl | индекс OpenCL-платформы |
 | `LFM_LAUNCH_DEBUG` | infra-opencl | печать параметров запуска ядер |
 | `LFM_CPU_W4A8` | infra-cpu | W4A8-веса на CPU |
