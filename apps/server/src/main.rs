@@ -85,6 +85,8 @@ struct Cli {
     max_body: Option<usize>,
     #[arg(long, help = "бюджет prefill-токенов на шаг, 1..=128 [64]")]
     prefill_budget: Option<usize>,
+    #[arg(long, help = "сколько prefill-токенов подмешивать в шаг с decode, 0..=64 [8]")]
+    prefill_in_decode: Option<usize>,
     #[arg(
         long,
         help = "проверять обрыв клиента на h2 каждые N батчей, 1..=1024 [16]"
@@ -257,6 +259,7 @@ fn main() -> Result<()> {
         log_requests: cli.log_requests.then_some(true),
         max_body: cli.max_body,
         prefill_budget: cli.prefill_budget,
+        prefill_in_decode: cli.prefill_in_decode,
         h2_cancel_interval: cli.h2_cancel_interval,
     };
     let cfg = config::resolve(&file, &overrides, engine_opts)?;
@@ -306,6 +309,7 @@ fn main() -> Result<()> {
             log_requests: cfg.log_requests,
             max_seqs: cfg.engine.max_seqs,
             prefill_budget: cfg.prefill_budget,
+            prefill_in_decode: cfg.prefill_in_decode,
         },
         backend,
         tokenizer,

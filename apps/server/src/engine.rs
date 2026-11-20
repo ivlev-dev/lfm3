@@ -22,6 +22,7 @@ pub struct ServeConfig {
     pub log_requests: bool,
     pub max_seqs: usize,
     pub prefill_budget: usize,
+    pub prefill_in_decode: usize,
 }
 
 pub struct ChatJob {
@@ -756,6 +757,7 @@ impl Worker {
         let prefill_budget = cfg.prefill_budget.clamp(1, 128);
         let mut scfg = SchedulerConfig::new(gpu.max_ctx(), max_active, batch_cap, prefill_budget);
         scfg.max_decode = max_active.min(batch_cap);
+        scfg.prefill_in_decode = cfg.prefill_in_decode.min(batch_cap);
         let sched = Scheduler::new(scfg);
         let tok = tokenizer(&cfg.tokenizer)?;
         let chat = ChatTemplate::from_file(&cfg.template)?;

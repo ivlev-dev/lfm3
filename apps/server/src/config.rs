@@ -18,6 +18,7 @@ pub struct FileConfig {
     pub log_requests: Option<bool>,
     pub max_body: Option<usize>,
     pub prefill_budget: Option<usize>,
+    pub prefill_in_decode: Option<usize>,
     #[serde(default)]
     pub server: ServerFile,
     #[serde(default)]
@@ -165,6 +166,7 @@ pub struct Resolved {
     pub log_requests: bool,
     pub max_body: usize,
     pub prefill_budget: usize,
+    pub prefill_in_decode: usize,
     pub h2_cancel_interval: usize,
     pub engine: Options,
 }
@@ -180,6 +182,7 @@ pub struct Overrides {
     pub log_requests: Option<bool>,
     pub max_body: Option<usize>,
     pub prefill_budget: Option<usize>,
+    pub prefill_in_decode: Option<usize>,
     pub h2_cancel_interval: Option<usize>,
 }
 
@@ -222,6 +225,10 @@ pub fn resolve(file: &FileConfig, cli: &Overrides, engine: Options) -> Result<Re
         .or(file.prefill_budget)
         .unwrap_or(64)
         .clamp(1, 128);
+    let prefill_in_decode = cli
+        .prefill_in_decode
+        .or(file.prefill_in_decode)
+        .unwrap_or(8);
     let h2_cancel_interval = cli
         .h2_cancel_interval
         .or(file.server.h2_cancel_interval)
@@ -232,6 +239,11 @@ pub fn resolve(file: &FileConfig, cli: &Overrides, engine: Options) -> Result<Re
     if max_body < 1024 {
         return Err(anyhow!(
             "max_body must be at least 1024 bytes, got {max_body}"
+        ));
+    }
+    if prefill_in_decode > 64 {
+        return Err(anyhow!(
+            "prefill_in_decode must be in 0..=64, got {prefill_in_decode}"
         ));
     }
     if !(1..=1024).contains(&h2_cancel_interval) {
@@ -253,6 +265,7 @@ pub fn resolve(file: &FileConfig, cli: &Overrides, engine: Options) -> Result<Re
         log_requests,
         max_body,
         prefill_budget,
+        prefill_in_decode,
         h2_cancel_interval,
         engine,
     })
@@ -275,6 +288,10 @@ pub fn dump(cfg: &Resolved, backend: &str) -> String {
     out.push_str(&format!("log_requests = {}\n", cfg.log_requests));
     out.push_str(&format!("max_body = {}\n", cfg.max_body));
     out.push_str(&format!("prefill_budget = {}\n", cfg.prefill_budget));
+    out.push_str(&format!(
+        "prefill_in_decode = {}\n",
+        cfg.prefill_in_decode
+    ));
     out.push_str(&format!(
         "# backend = \"{backend}\" (для справки, не читается)\n"
     ));
@@ -369,6 +386,7 @@ wg = 128
             log_requests: Some(true),
             max_body: None,
             prefill_budget: None,
+            prefill_in_decode: None,
             h2_cancel_interval: None,
         };
         let r = resolve(&cfg, &cli, Options::default()).unwrap();
@@ -393,6 +411,7 @@ wg = 128
             log_requests: None,
             max_body: None,
             prefill_budget: None,
+            prefill_in_decode: None,
             h2_cancel_interval: None,
         };
         assert!(resolve(&cfg, &cli, Options::default()).is_err());
@@ -413,6 +432,7 @@ wg = 128
             log_requests: None,
             max_body: None,
             prefill_budget: None,
+            prefill_in_decode: None,
             h2_cancel_interval: None,
         };
         let r = resolve(&cfg, &cli, Options::default()).unwrap();
@@ -440,6 +460,7 @@ wg = 128
             log_requests: None,
             max_body: None,
             prefill_budget: None,
+            prefill_in_decode: None,
             h2_cancel_interval: None,
         };
         let r = resolve(&cfg, &cli, Options::default()).unwrap();

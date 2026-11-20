@@ -13,6 +13,8 @@ pub struct SchedulerConfig {
     pub max_active: usize,
     pub max_batch: usize,
     pub prefill_budget: usize,
+    /// Сколько prefill-токенов подмешивать в шаг, где уже есть decode.
+    pub prefill_in_decode: usize,
     /// Сколько decode-строк можно отдать за шаг (по умолчанию = max_batch).
     pub max_decode: usize,
     /// Предел всех строк за шаг (decode + prefill); usize::MAX — без предела.
@@ -27,6 +29,7 @@ impl SchedulerConfig {
             max_active: max_active.clamp(1, 16),
             max_batch,
             prefill_budget: prefill_budget.max(1),
+            prefill_in_decode: prefill_budget.max(1),
             max_decode: max_batch,
             max_rows: usize::MAX,
         }
@@ -282,10 +285,12 @@ impl Scheduler {
             });
         }
 
-        let mut budget = self
-            .cfg
-            .prefill_budget
-            .min(self.cfg.max_rows.saturating_sub(rows.len()));
+        let cap = if has_decode {
+            self.cfg.prefill_in_decode
+        } else {
+            self.cfg.prefill_budget
+        };
+        let mut budget = cap.min(self.cfg.max_rows.saturating_sub(rows.len()));
         let prefs: Vec<&ActiveSeq> = order
             .iter()
             .map(|&i| &self.active[i])
@@ -680,6 +685,27 @@ mod tests {
         assert_eq!(seq.used_pages(), 1);
         assert_eq!(seq.future_pages(), 2);
         assert_eq!(s.available_for_new(3), 1);
+    }
+
+    #[test]
+    fn prefill_in_decode_caps_prompt_rows_in_mixed_step() {
+        let mut cfg = cfg();
+        cfg.prefill_budget = 32;
+        cfg.prefill_in_decode = 2;
+        let mut s = Scheduler::new(cfg);
+        let a = s.enqueue(80, 20).unwrap();
+        let b = s.enqueue(40, 10).unwrap();
+        admit_all(&mut s, 128);
+        make_decode(&mut s, a.id);
+        let plan = s.plan_step();
+        let rows = plan.rows();
+        let prompts = rows
+            .iter()
+            .filter(|r| matches!(r.token, StepToken::Prompt(_)))
+            .count();
+        assert_eq!(prompts, 2);
+        assert!(rows.iter().any(|r| r.id == a.id));
+        assert!(rows.iter().any(|r| r.id == b.id));
     }
 
     #[test]
