@@ -1467,6 +1467,87 @@ fn sampling(
     }
 }
 
+fn open_backend(model: &Path, ctx: usize) -> Result<Box<dyn lfm_app::InferenceBackend>> {
+    if let Ok(raw) = std::env::var("LFM_TP")
+        && !raw.trim().is_empty()
+    {
+        let mut devices = Vec::new();
+        for part in raw.split('/') {
+            devices.push(
+                part.trim()
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("bad LFM_TP {raw:?}"))?,
+            );
+        }
+        return Ok(Box::new(lfm_gpu::TpModel::load(model, ctx, &devices)?));
+    }
+    if let Ok(raw) = std::env::var("LFM_TIERS")
+        && !raw.trim().is_empty()
+    {
+        let mut tiers = Vec::new();
+        for part in raw.split('/') {
+            let percent = part
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| anyhow!("bad LFM_TIERS {raw:?}"))?;
+            tiers.push((tiers.len(), percent));
+        }
+        if tiers.iter().map(|(_, p)| *p).sum::<usize>() != 100 {
+            return Err(anyhow!("LFM_TIERS percentages must sum to 100"));
+        }
+        return Ok(Box::new(lfm_gpu::PipelineModel::load_tiers(
+            model, ctx, &tiers,
+        )?));
+    }
+    Ok(Box::new(lfm_gpu::GpuModel::load_with(
+        model,
+        ctx,
+        &lfm_gpu::Options::from_env(),
+    )?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_backend(
+    backend: &mut dyn lfm_app::InferenceBackend,
+    tok: &lfm_tokenizer::LfmTokenizer,
+    ids: &[u32],
+    params: &lfm_domain::SamplingParams,
+    max_new: usize,
+    cancel: &AtomicBool,
+    mut on_token: impl FnMut(u32),
+) -> Result<()> {
+    let slot = backend.create_sequence()?;
+    let result = (|| -> Result<()> {
+        let mut sampler = lfm_app::Sampler::new(params.clone());
+        for &t in ids {
+            sampler.push(t);
+        }
+        backend.prefill(slot, ids, true)?;
+        let mut logits = backend.logits()?;
+        let mut pos = ids.len();
+        for step in 0..max_new {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let token = sampler.sample(&mut logits);
+            if token == tok.eos_id() {
+                break;
+            }
+            sampler.push(token);
+            on_token(token);
+            if step + 1 == max_new {
+                break;
+            }
+            backend.step(&[lfm_app::SequenceStep { slot, token, pos }], true)?;
+            logits = backend.logits_row(0)?;
+            pos += 1;
+        }
+        Ok(())
+    })();
+    let freed = backend.free_sequence(slot);
+    result.and(freed)
+}
+
 fn gpu_chat(
     model: &Path,
     tokenizer: &Path,
@@ -1487,12 +1568,12 @@ fn gpu_chat(
             model, tokenizer, template, system, max_new, thinking, params, ctx,
         );
     }
-    let mut gpu = lfm_gpu::GpuModel::load(model, ctx)?;
+    let mut gpu = open_backend(model, ctx)?;
     let mut history = vec![lfm_domain::Message::system(system)];
     if !interactive {
         history.push(lfm_domain::Message::user(user));
         return answer(
-            &mut gpu,
+            &mut *gpu,
             &tok,
             &chat,
             &mut history,
@@ -1529,7 +1610,7 @@ fn gpu_chat(
         print!("assistant> ");
         std::io::stdout().flush()?;
         if let Err(e) = answer(
-            &mut gpu,
+            &mut *gpu,
             &tok,
             &chat,
             &mut history,
@@ -1967,7 +2048,7 @@ fn tui_chat(
 ) -> Result<()> {
     let tok = lfm_tokenizer::LfmTokenizer::from_file(tokenizer)?;
     let chat = lfm_chat::ChatTemplate::from_file(template)?;
-    let mut gpu = lfm_gpu::GpuModel::load(model, ctx)?;
+    let mut gpu = open_backend(model, ctx)?;
     let name = model
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1990,7 +2071,7 @@ fn tui_chat(
     print!("\x1b[?1049h\x1b[2J");
     let _ = std::io::stdout().flush();
     let result = tui_loop(
-        &mut gpu, &tok, &chat, system, max_new, thinking, params, &mut state,
+        &mut *gpu, &tok, &chat, system, max_new, thinking, params, &mut state,
     );
     print!("\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
@@ -2000,7 +2081,7 @@ fn tui_chat(
 
 #[allow(clippy::too_many_arguments)]
 fn tui_loop(
-    gpu: &mut lfm_gpu::GpuModel,
+    gpu: &mut dyn lfm_app::InferenceBackend,
     tok: &lfm_tokenizer::LfmTokenizer,
     chat: &lfm_chat::ChatTemplate,
     system: &str,
@@ -2071,7 +2152,7 @@ fn tui_loop(
         let res = {
             let prompt_tokens = ids.len();
             let _ = prompt_tokens;
-            gpu.generate_stream_cancel(&ids, params, max_new, tok.eos_id(), &cancel, |next| {
+            stream_backend(gpu, tok, &ids, params, max_new, &cancel, |next| {
                 if poll_interrupt(&mut state.pending) {
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -2145,7 +2226,7 @@ fn tui_loop(
 }
 
 fn answer(
-    gpu: &mut lfm_gpu::GpuModel,
+    gpu: &mut dyn lfm_app::InferenceBackend,
     tok: &lfm_tokenizer::LfmTokenizer,
     chat: &lfm_chat::ChatTemplate,
     history: &mut Vec<lfm_domain::Message>,
@@ -2171,7 +2252,8 @@ fn answer(
     let started = Instant::now();
     let mut generated = Vec::new();
     let mut printed = String::new();
-    gpu.generate_stream(&ids, params, max_new, tok.eos_id(), |next| {
+    let cancel = AtomicBool::new(false);
+    stream_backend(gpu, tok, &ids, params, max_new, &cancel, |next| {
         generated.push(next);
         let Ok(text) = tok.decode(&generated, true) else {
             return;
