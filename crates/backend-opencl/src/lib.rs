@@ -516,6 +516,8 @@ pub struct GpuModel {
     max_seqs: usize,
     seqs: Vec<Option<Sequence>>,
     logits_off: Option<usize>,
+    logit_rows: usize,
+    logits_map: Vec<usize>,
     pub trace: bool,
     pub traced: Vec<Vec<f32>>,
 }
@@ -525,6 +527,7 @@ fn pick_logits_rows(
     logits_rows: Option<&[usize]>,
     logits_row: Option<usize>,
     ntok: usize,
+    cap: usize,
 ) -> Result<Option<Vec<usize>>> {
     if !need_logits {
         return Ok(None);
@@ -543,6 +546,12 @@ fn pick_logits_rows(
         && last >= ntok
     {
         return Err(anyhow!("logits row {last} outside batch of {ntok}"));
+    }
+    if sel.len() > cap {
+        return Err(anyhow!(
+            "logits selection of {} rows exceeds capacity {cap}",
+            sel.len()
+        ));
     }
     Ok(Some(sel))
 }
@@ -856,6 +865,7 @@ impl GpuModel {
         let pb = opts.pb;
         let prefill_batch = opts.prefill_ntok;
         let batch_cap = pb.max(prefill_batch);
+        let logit_rows = (opts.max_seqs + 2).min(batch_cap);
         let gemm_force = opts.gemm_force.clone();
         let rgemv = if gpu.caps.sub_group_size <= 16 {
             opts.rgemv.max(16)
@@ -1019,13 +1029,13 @@ impl GpuModel {
             vvb: gpu.alloc::<f32>(batch_cap * kvd)?,
             gb: gpu.alloc::<f32>(batch_cap * cfg.num_heads)?,
             attnb: gpu.alloc::<f32>(batch_cap * qd)?,
-            logitsb: gpu.alloc::<f32>(batch_cap * vocab)?,
+            logitsb: gpu.alloc::<f32>(logit_rows * vocab)?,
             idsb: gpu.alloc::<u32>(batch_cap)?,
             valsb: gpu.alloc::<f32>(batch_cap)?,
             rowsel: gpu.alloc::<u32>(batch_cap)?,
-            xqg: gpu.alloc::<i8>(batch_cap * h)?,
-            xsg: gpu.alloc::<f32>(batch_cap * (h / GROUP))?,
-            logitsg: gpu.alloc::<f32>(batch_cap * vocab)?,
+            xqg: gpu.alloc::<i8>(logit_rows * h)?,
+            xsg: gpu.alloc::<f32>(logit_rows * (h / GROUP))?,
+            logitsg: gpu.alloc::<f32>(logit_rows * vocab)?,
             pos_b: gpu.alloc::<u32>(batch_cap)?,
             seq_b: gpu.alloc::<u32>(batch_cap)?,
             tbl_off_b: gpu.alloc::<u32>(batch_cap)?,
@@ -1144,6 +1154,8 @@ impl GpuModel {
             max_seqs,
             seqs: (0..max_seqs).map(|_| None).collect(),
             logits_off: None,
+            logit_rows,
+            logits_map: Vec::new(),
             trace: false,
             traced: Vec::new(),
         };
@@ -1850,6 +1862,7 @@ impl GpuModel {
         }
         let (tbl_mem, conv_off) = self.seq_launch_params(slot, pos + 1)?;
         self.logits_off = None;
+        self.logits_map.clear();
         let h = self.cfg.hidden_size;
         let qd = self.cfg.q_dim();
         let kvd = self.cfg.kv_dim();
@@ -3693,6 +3706,7 @@ impl GpuModel {
             )?;
         }
         self.logits_off = Some(0);
+        self.logits_map.clear();
         Ok(())
     }
 
@@ -3700,7 +3714,18 @@ impl GpuModel {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let sel: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
+        let mut sel: Vec<u32> = Vec::with_capacity(rows.len());
+        for &r in rows {
+            let pos = if self.logits_map.is_empty() {
+                r
+            } else {
+                self.logits_map
+                    .iter()
+                    .position(|&m| m == r)
+                    .ok_or_else(|| anyhow!("logits row {r} was not computed"))?
+            };
+            sel.push(pos as u32);
+        }
         unsafe {
             self.gpu
                 .queue
@@ -3726,9 +3751,17 @@ impl GpuModel {
     }
 
     pub fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
+        let pos = if self.logits_map.is_empty() {
+            row
+        } else {
+            self.logits_map
+                .iter()
+                .position(|&r| r == row)
+                .ok_or_else(|| anyhow!("logits row {row} was not computed"))?
+        };
         self.gpu.download_at(
             &self.bufs.logitsb,
-            row * self.cfg.vocab_size * 4,
+            pos * self.cfg.vocab_size * 4,
             self.cfg.vocab_size,
         )
     }
@@ -4642,9 +4675,21 @@ impl GpuModel {
             }
         }
         if need_logits && self.has_head {
-            let sel = pick_logits_rows(need_logits, logits_rows, logits_row, ntok)?
+            let sel = pick_logits_rows(
+                need_logits,
+                logits_rows,
+                logits_row,
+                ntok,
+                self.logit_rows,
+            )?
                 .ok_or_else(|| anyhow!("missing logits selection"))?;
             if sel.is_empty() {
+                if ntok > self.logit_rows {
+                    return Err(anyhow!(
+                        "logits for {ntok} rows exceed capacity {}",
+                        self.logit_rows
+                    ));
+                }
                 self.gemv_auto_b(
                     "token_embd.weight",
                     &self.bufs.hqx,
@@ -4656,6 +4701,7 @@ impl GpuModel {
                     0,
                 )?;
                 self.logits_off = None;
+                self.logits_map.clear();
             } else {
                 let k = sel.len();
                 let ngs = h / GROUP;
@@ -4690,23 +4736,20 @@ impl GpuModel {
                     0,
                 )?;
                 let row_bytes = self.cfg.vocab_size * 4;
-                for (i, &r) in sel.iter().enumerate() {
+                for i in 0..k {
                     unsafe {
                         self.gpu.queue.enqueue_copy_buffer(
                             &self.bufs.logitsg,
                             &mut self.bufs.logitsb,
                             i * row_bytes,
-                            r * row_bytes,
+                            i * row_bytes,
                             row_bytes,
                             &[],
                         )?;
                     }
                 }
-                self.logits_off = if k == 1 {
-                    Some(sel[0] * self.cfg.vocab_size)
-                } else {
-                    None
-                };
+                self.logits_map.clone_from(&sel);
+                self.logits_off = (k == 1).then_some(0);
             }
         } else {
             self.logits_off = None;
@@ -5489,16 +5532,16 @@ mod tests {
     #[test]
     fn logits_rows_all_when_unspecified() {
         assert_eq!(
-            pick_logits_rows(true, None, None, 6).unwrap(),
+            pick_logits_rows(true, None, None, 6, 8).unwrap(),
             Some(Vec::new())
         );
-        assert_eq!(pick_logits_rows(false, None, Some(2), 6).unwrap(), None);
+        assert_eq!(pick_logits_rows(false, None, Some(2), 6, 8).unwrap(), None);
     }
 
     #[test]
     fn logits_rows_single_row_from_forward_mixed() {
         assert_eq!(
-            pick_logits_rows(true, None, Some(4), 6).unwrap(),
+            pick_logits_rows(true, None, Some(4), 6, 8).unwrap(),
             Some(vec![4])
         );
     }
@@ -5506,16 +5549,16 @@ mod tests {
     #[test]
     fn logits_rows_are_sorted_and_deduplicated() {
         assert_eq!(
-            pick_logits_rows(true, Some(&[5, 1, 5, 3]), None, 6).unwrap(),
+            pick_logits_rows(true, Some(&[5, 1, 5, 3]), None, 6, 8).unwrap(),
             Some(vec![1, 3, 5])
         );
     }
 
     #[test]
     fn logits_rows_reject_out_of_range() {
-        assert!(pick_logits_rows(true, Some(&[0, 6]), None, 6).is_err());
-        assert!(pick_logits_rows(true, None, Some(9), 6).is_err());
-        assert!(pick_logits_rows(true, Some(&[]), None, 6).is_err());
+        assert!(pick_logits_rows(true, Some(&[0, 6]), None, 6, 8).is_err());
+        assert!(pick_logits_rows(true, None, Some(9), 6, 8).is_err());
+        assert!(pick_logits_rows(true, Some(&[]), None, 6, 8).is_err());
     }
 }
 
