@@ -12,8 +12,8 @@ members = [
     "crates/infra-chat",
     "crates/infra-cpu",
     "crates/lfm",
-    "tools/bench",
     "apps/lfm",
+    "tools/bench",
 ]
 
 [workspace.package]

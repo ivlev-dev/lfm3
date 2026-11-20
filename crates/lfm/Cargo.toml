@@ -8,7 +8,6 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-ctrlc.workspace = true
 lfm-app = { path = "../application" }
 lfm-domain = { path = "../domain" }
 lfm-gpu = { path = "../backend-opencl" }

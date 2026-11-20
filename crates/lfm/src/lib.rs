@@ -2,7 +2,6 @@ pub mod chat;
 pub mod config;
 pub mod generate;
 pub mod runtime;
-pub mod serve;
 
 pub use chat::{Chat, ChatEvent, Reply, load_tools};
 pub use config::{

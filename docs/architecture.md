@@ -9,7 +9,7 @@
 ```
 apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
     │
-    ├── crates/lfm (библиотека): Config, Runtime, Chat, Generate, serve
+    ├── crates/lfm (библиотека): Config, Runtime, Chat, Generate
     │        │
     │        ├── infra-*: gguf, quant, cpu, opencl, hf, tokenizer, chat
     │        │        │
@@ -44,7 +44,7 @@ apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
   декодов нет, иначе `step_mixed`: по 1 токену на декод + prefill-чанки в бюджете
   `prefill_budget` (конфиг) или `LFM_PREFILL_BUDGET`), проверка контекста, отмена, позиции декода. Без I/O и GPU —
   покрыт юнит-тестами.
-- Сервер (`crates/lfm/src/serve`) работает только через порты: движок не знает
+- Сервер (`apps/lfm/src/serve`) работает только через порты: движок не знает
   про OpenCL и HTTP; транспорт (HTTP/1.1, h2c, WS, SSE) — отдельные модули.
 - Библиотека `lfm`: `Config` (TOML), `Runtime` (выбор бэкенда и устройств),
   `Chat` (история, reasoning, tools, стриминг), `generate_stream` со счётчиками.
@@ -130,13 +130,13 @@ apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
 - `lfm-app::Generate` — greedy prompt→ids/text с гарантированным освобождением слота.
   Адаптеры: `GpuModel` (backend-opencl) и `LfmTokenizer` (infra-tokenizer); фейки в
   `crates/application/tests/generate.rs`, смоук через `lfm-bench gpu-port`.
-- Серверный движок (`crates/lfm/src/serve/engine.rs`) работает только через порты:
+- Серверный движок (`apps/lfm/src/serve/engine.rs`) работает только через порты:
   `Engine::spawn` принимает `BackendLoader`/`TokenizerLoader`, метрики KV/кэша идут
   через `InferenceBackend::cache_stats/free_pages/max_ctx`. Конкретные реализации
-  подставляет `crates/lfm/src/serve/mod.rs` (composition root).
+  подставляет `apps/lfm/src/serve/mod.rs` (composition root).
 
 ### Планировщик
-- Реализован (`crates/application/src/scheduler.rs` + `crates/lfm/src/serve/engine.rs`):
+- Реализован (`crates/application/src/scheduler.rs` + `apps/lfm/src/serve/engine.rs`):
   один поток-движок, `step_mixed` на все активные декоды, chunked prefill в бюджете,
   admission по свободным страницам, отмена по разрыву соединения, метрики шага.
 - Радикс префикс-кэш: хэш-цепочка блоков по 32 токена, общие страницы KV с
@@ -151,7 +151,7 @@ apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
   такой же запрос переиспользует 160 токенов, текст ответа совпадает.
 
 ### Транспорт и телеметрия
-- `lfm serve` (`crates/lfm/src/serve`): HTTP/1.1 и HTTP/2 h2c (свой HPACK + flow control отправки, чтение
+- `lfm serve` (`apps/lfm/src/serve`): HTTP/1.1 и HTTP/2 h2c (свой HPACK + flow control отправки, чтение
   SETTINGS/PING/WINDOW_UPDATE во время ожидания окна), SSE, WebSocket.
 - Pipelined HEADERS/DATA, пришедшие во время ожидания окна, буферизуются в соединении
   (до 64 кадров / 1 МиБ) и обрабатываются главным циклом после отправки; окна
@@ -159,11 +159,9 @@ apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
 - `GET /metrics`: атомарный снимок из потока-движка (`active/waiting`, `steps`,
   `avg_step_ms`, KV-страницы, `cache_hits`, `reused_tokens`, `uptime_s`), без
   блокировки генерации; один и тот же JSON по HTTP/1.1 и h2.
-- `apps/lfm` (`lfm chat`): локальный TUI без сервера — общий рендер/ввод/история,
-  стриминг через `lfm::Chat`, статус с TTFT и prefill/decode tok/s; `--once` —
-  один запрос для скриптов.
-- Исторический HTTP-клиент (`apps/tui`, не входит в workspace) оставлен в дереве
-  как справка; продуктовый чат работает in-process.
+- `lfm chat` (`apps/lfm/src/tui.rs`): локальный TUI без сервера — рендер/ввод/
+  история, стриминг через `lfm::Chat`, статус с TTFT и prefill/decode tok/s;
+  `--once` — один запрос для скриптов.
 
 ### Устройства
 - TP для decode (all-reduce через host staging — P2P в rusticl нет), PP для 3-tier.

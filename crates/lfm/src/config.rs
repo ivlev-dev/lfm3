@@ -223,6 +223,23 @@ impl Config {
         Ok(toml::to_string_pretty(self)?)
     }
 
+    pub fn example_toml() -> String {
+        let mut cfg = Self::default();
+        cfg.backend.mode = BackendMode::Pipeline;
+        cfg.backend.devices = vec![0, 1];
+        cfg.backend.tiers = vec![96, 4];
+        cfg.backend.kv = "kvarn".to_string();
+        cfg.backend.ctx = 32768;
+        let body = cfg.to_toml().unwrap_or_default();
+        format!(
+            "# lfm.toml — конфигурация LFM3\n\
+             # backend.devices: индексы OpenCL-устройств (0=GPU, 1=iGPU при RUSTICL_ENABLE=iris,radeonsi)\n\
+             # backend.mode: single | pipeline | tp; tiers — проценты слоёв для pipeline\n\
+             # backend.kv: f16 | q4 | kvarn | kvarn_k4v4 | k4v4\n\
+             # Приоритет: CLI > этот файл > значения по умолчанию\n\n{body}"
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.backend.kind != "opencl" {
             bail!(

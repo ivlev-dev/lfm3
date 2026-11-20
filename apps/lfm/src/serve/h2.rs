@@ -261,7 +261,7 @@ impl Conn {
             deferred_bytes: 0,
             inbuf: Vec::with_capacity(16 * 1024),
             out: Vec::with_capacity(16 * 1024 + 9),
-            cancel_interval: crate::config::DEFAULT_H2_CANCEL_INTERVAL,
+            cancel_interval: lfm::config::DEFAULT_H2_CANCEL_INTERVAL,
         }
     }
 

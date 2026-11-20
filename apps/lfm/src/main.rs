@@ -1,3 +1,4 @@
+mod serve;
 mod tui;
 
 use std::io::{IsTerminal, Read};
@@ -271,7 +272,7 @@ fn serve(mut cfg: Config, args: ServeArgs) -> Result<()> {
         cfg.server.log_requests = true;
     }
     cfg.validate()?;
-    lfm::serve::run(&cfg)
+    serve::run(&cfg)
 }
 
 fn print_config(cfg: Config) -> Result<()> {

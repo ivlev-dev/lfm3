@@ -15,7 +15,7 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::BackendMode;
+use lfm::BackendMode;
 use crate::serve::engine::{ChatJob, Engine, Event, ServeConfig};
 use crate::serve::http::{Request, SseWriter, read_request, write_json};
 use crate::serve::protocol::{ChatRequest, CompletionMeta, CompletionRequest, Delta, metrics_json, models_json};
@@ -57,7 +57,7 @@ pub(crate) fn pump_events(
     }
 }
 
-pub fn run(cfg: &crate::Config) -> Result<()> {
+pub fn run(cfg: &lfm::Config) -> Result<()> {
     cfg.validate()?;
     let opts = cfg.backend.to_options();
     let mode = cfg.backend.mode;

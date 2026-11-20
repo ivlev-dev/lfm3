@@ -1030,7 +1030,6 @@ name = "lfm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ctrlc",
  "lfm-app",
  "lfm-chat",
  "lfm-domain",
@@ -1088,8 +1087,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ctrlc",
  "lfm",
+ "lfm-app",
+ "lfm-chat",
  "lfm-domain",
+ "lfm-gpu",
+ "lfm-tokenizer",
+ "serde",
+ "serde_json",
  "toml",
 ]
 
