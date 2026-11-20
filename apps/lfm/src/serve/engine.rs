@@ -289,10 +289,7 @@ impl Engine {
         backend: BackendLoader,
         tokenizer: TokenizerLoader,
     ) -> Result<Self> {
-        let log_requests = cfg.log_requests
-            || std::env::var("LFM_SCHED_LOG")
-                .map(|v| v != "0")
-                .unwrap_or(false);
+        let log_requests = cfg.log_requests;
         let (job_tx, job_rx) = channel::<Job>();
         let (ready_tx, ready_rx) = channel::<Result<()>>();
         let metrics = Arc::new(EngineMetrics::new(cfg.ctx));
@@ -452,6 +449,11 @@ impl RequestState {
     }
 
     fn process_token(&mut self, tok: &dyn TokenizerPort, token: u32) -> TokenFlow {
+        // EOS — служебный терминальный токен: он не является выданным текстом
+        // и не входит в completion_tokens (семантика usage в OpenAI API).
+        if token == self.eos {
+            return TokenFlow::Continue;
+        }
         self.tokens.push(token);
         let Some(delta) = decode_delta(tok, &self.tokens) else {
             return TokenFlow::Continue;
@@ -661,15 +663,6 @@ impl Metrics {
             self.reused_tokens
         );
     }
-}
-
-fn argmax_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("LFM_ARGMAX")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
 }
 
 fn greedy_token(ids: &[(usize, u32)], row: usize) -> Option<u32> {
@@ -1086,7 +1079,7 @@ impl Worker {
         }
         self.metrics.rows(reqs.len(), rows_needed.len());
         let mut greedy: Vec<(usize, u32)> = Vec::new();
-        if argmax_enabled() && !rows_needed.is_empty() {
+        if !rows_needed.is_empty() {
             let wanted: Vec<usize> = rows_needed
                 .iter()
                 .copied()
@@ -1367,8 +1360,21 @@ mod tests {
     }
 
     /// Байтовый ByteLevel-подобный токенизатор: id — байт, декодер режет
-    /// неполные UTF-8 последовательности в U+FFFD.
-    struct ByteTokenizer;
+    /// неполные UTF-8 последовательности в U+FFFD. `eos` в декодированный
+    /// текст не попадает, как при `skip_special_tokens = true`.
+    struct ByteTokenizer {
+        eos: u32,
+    }
+
+    impl ByteTokenizer {
+        const fn new() -> Self {
+            Self { eos: u32::MAX }
+        }
+
+        const fn with_eos(eos: u32) -> Self {
+            Self { eos }
+        }
+    }
 
     impl TokenizerPort for ByteTokenizer {
         fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<u32>> {
@@ -1378,13 +1384,14 @@ mod tests {
         fn decode(&self, ids: &[u32], _skip_special_tokens: bool) -> Result<String> {
             let bytes: Vec<u8> = ids
                 .iter()
+                .filter(|&&id| id != self.eos)
                 .map(|&id| u8::try_from(id).unwrap_or(b'?'))
                 .collect();
             Ok(String::from_utf8_lossy(&bytes).into_owned())
         }
 
         fn eos_id(&self) -> u32 {
-            u32::MAX
+            self.eos
         }
     }
 
@@ -1620,7 +1627,7 @@ mod tests {
 
     #[test]
     fn incremental_detok_matches_full_decode() {
-        let tok = ByteTokenizer;
+        let tok = ByteTokenizer::new();
         let text = "Привет, мир! 42 — тест";
         let ids = tok.encode(text, false).unwrap();
         let mut printed = String::new();
@@ -1638,7 +1645,7 @@ mod tests {
 
     #[test]
     fn incremental_detok_is_constant_window() {
-        let tok = ByteTokenizer;
+        let tok = ByteTokenizer::new();
         let ids: Vec<u32> = std::iter::repeat_n(b'a', DETOK_CONTEXT * 4)
             .map(u32::from)
             .collect();
@@ -1649,7 +1656,7 @@ mod tests {
 
     #[test]
     fn process_token_streams_raw_text() {
-        let tok = ByteTokenizer;
+        let tok = ByteTokenizer::new();
         let (mut state, rx) = test_state_with_rx(64, u32::MAX);
         state.raw = true;
         state.session = None;
@@ -1659,6 +1666,22 @@ mod tests {
         assert_eq!(deltas(&rx), "Привет, мир");
         assert_eq!(state.content, "Привет, мир");
         assert_eq!(state.sent, state.content.len());
+    }
+
+    #[test]
+    fn process_token_skips_eos_and_keeps_counter() {
+        let eos = u32::from(b'!');
+        let tok = ByteTokenizer::with_eos(eos);
+        let (mut state, rx) = test_state_with_rx(64, eos);
+        state.raw = true;
+        state.session = None;
+        let a = u32::from(b'a');
+        assert_eq!(state.process_token(&tok, a), TokenFlow::Continue);
+        assert_eq!(state.process_token(&tok, eos), TokenFlow::Continue);
+        assert_eq!(state.tokens, vec![a], "EOS не должен попадать в счётчик");
+        assert_eq!(deltas(&rx), "a");
+        assert_eq!(state.commit_token(eos, TokenFlow::Continue), Commit::Eos);
+        assert_eq!(state.finish, "stop");
     }
 
     #[test]
@@ -1748,5 +1771,454 @@ mod tests {
         assert_eq!(token, tail.sample(&mut c));
         assert_eq!(a, b);
         assert_eq!(a, c);
+    }
+
+    // --- Сквозные тесты жизненного цикла Worker на фейковом бэкенде ---
+
+    use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::Sender;
+
+    const TEST_EOS: u32 = 0;
+    const TEST_CTX: usize = 4096;
+    const TEST_SLOTS: usize = 4;
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[derive(Default)]
+    struct FakeStats {
+        /// Токены, которые «генерирует» бэкенд; после исчерпания отдаётся EOS.
+        script: Vec<u32>,
+        cursor: usize,
+        active: BTreeSet<usize>,
+        created: usize,
+        freed: usize,
+        step_calls: usize,
+        cancel_after_steps: Option<usize>,
+        cancel: Option<Arc<AtomicBool>>,
+        fail_step_calls: usize,
+        fail_prefill_calls: usize,
+    }
+
+    struct FakeBackend {
+        stats: Arc<Mutex<FakeStats>>,
+    }
+
+    impl FakeBackend {
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeStats> {
+            self.stats.lock().expect("fake backend state")
+        }
+
+        fn next_logits(&self) -> Vec<f32> {
+            let mut logits = vec![-10.0f32; 256];
+            let token = {
+                let mut stats = self.lock();
+                let mut token = TEST_EOS;
+                if let Some(&next) = stats.script.get(stats.cursor) {
+                    token = next;
+                    stats.cursor += 1;
+                }
+                token
+            };
+            let index = token as usize;
+            assert!(index < logits.len(), "script token {token} out of logits");
+            logits[index] = 10.0;
+            logits
+        }
+    }
+
+    impl InferenceBackend for FakeBackend {
+        fn create_sequence(&mut self) -> Result<usize> {
+            let mut stats = self.lock();
+            let slot = (0..TEST_SLOTS)
+                .find(|slot| !stats.active.contains(slot))
+                .ok_or_else(|| anyhow!("no free slots"))?;
+            stats.active.insert(slot);
+            stats.created += 1;
+            Ok(slot)
+        }
+
+        fn free_sequence(&mut self, slot: usize) -> Result<()> {
+            let mut stats = self.lock();
+            assert!(stats.active.remove(&slot), "double free of slot {slot}");
+            stats.freed += 1;
+            Ok(())
+        }
+
+        fn prefill(&mut self, _slot: usize, _tokens: &[u32], _need_logits: bool) -> Result<usize> {
+            let mut stats = self.lock();
+            if stats.fail_prefill_calls > 0 {
+                stats.fail_prefill_calls -= 1;
+                return Err(anyhow!("prefill exploded"));
+            }
+            Ok(0)
+        }
+
+        fn prefill_begin(&mut self, _slot: usize, _tokens: &[u32]) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn prefill_finish(&mut self, _slot: usize) -> Result<()> {
+            Ok(())
+        }
+
+        fn step(&mut self, _steps: &[SequenceStep], _need_logits: bool) -> Result<()> {
+            let mut stats = self.lock();
+            stats.step_calls += 1;
+            if stats.fail_step_calls > 0 {
+                stats.fail_step_calls -= 1;
+                return Err(anyhow!("step exploded"));
+            }
+            let trigger = stats
+                .cancel_after_steps
+                .is_some_and(|limit| stats.step_calls >= limit);
+            let cancel = if trigger {
+                stats.cancel_after_steps = None;
+                stats.cancel.clone()
+            } else {
+                None
+            };
+            drop(stats);
+            if let Some(flag) = cancel {
+                flag.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn logits(&self) -> Result<Vec<f32>> {
+            Ok(self.next_logits())
+        }
+
+        fn logits_row(&self, _row: usize) -> Result<Vec<f32>> {
+            Ok(self.next_logits())
+        }
+
+        fn max_ctx(&self) -> usize {
+            TEST_CTX
+        }
+
+        fn max_sequences(&self) -> usize {
+            TEST_SLOTS
+        }
+
+        fn prefill_batch_size(&self) -> usize {
+            8
+        }
+
+        fn free_pages(&self) -> usize {
+            1024
+        }
+
+        fn cache_stats(&self) -> CacheStats {
+            CacheStats::default()
+        }
+    }
+
+    fn fake_backend(script: &str) -> (FakeBackend, Arc<Mutex<FakeStats>>) {
+        let stats = Arc::new(Mutex::new(FakeStats {
+            script: script.bytes().map(u32::from).collect(),
+            ..FakeStats::default()
+        }));
+        (
+            FakeBackend {
+                stats: Arc::clone(&stats),
+            },
+            stats,
+        )
+    }
+
+    fn greedy(max_tokens: usize) -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            max_tokens,
+            ..SamplingParams::default()
+        }
+    }
+
+    fn test_worker(backend: FakeBackend) -> Worker {
+        Worker {
+            gpu: Box::new(backend),
+            tok: Box::new(ByteTokenizer::with_eos(TEST_EOS)),
+            chat: ChatTemplate::from_str("chat", "{{ messages[0].content }}")
+                .expect("test template"),
+            system: String::new(),
+            sched: Scheduler::new(SchedulerConfig::new(TEST_CTX, TEST_SLOTS, 8, 8)),
+            reqs: HashMap::new(),
+            metrics: Metrics::new(false),
+            shared: Arc::new(EngineMetrics::new(TEST_CTX)),
+        }
+    }
+
+    /// Гоняет настоящий `Worker::run` в отдельном потоке и возвращает воркер
+    /// после остановки, чтобы проверить состояние планировщика и слотов.
+    struct Harness {
+        tx: Sender<Job>,
+        join: std::thread::JoinHandle<Worker>,
+    }
+
+    impl Harness {
+        fn start(backend: FakeBackend) -> Self {
+            let (tx, rx) = channel::<Job>();
+            let join = std::thread::spawn(move || {
+                let mut worker = test_worker(backend);
+                worker.run(rx);
+                worker
+            });
+            Self { tx, join }
+        }
+
+        fn submit(&self, chat: ChatJob) -> Receiver<Event> {
+            let (tx, rx) = channel();
+            self.tx.send(Job { chat, tx }).expect("engine channel");
+            rx
+        }
+
+        fn shutdown(self) -> Worker {
+            drop(self.tx);
+            self.join.join().expect("engine thread")
+        }
+    }
+
+    fn drain_until_terminal(rx: &Receiver<Event>) -> Vec<Event> {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let mut events = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(event) => {
+                    let terminal = matches!(event, Event::Final { .. } | Event::Error(_));
+                    events.push(event);
+                    if terminal {
+                        return events;
+                    }
+                }
+                Err(e) => panic!("engine did not finish: {e}"),
+            }
+        }
+    }
+
+    fn streamed_text(events: &[Event]) -> String {
+        let mut text = String::new();
+        for event in events {
+            if let Event::Delta(delta) = event {
+                text.push_str(delta);
+            }
+        }
+        text
+    }
+
+    fn expect_final(events: &[Event]) -> &Event {
+        match events.last() {
+            Some(event @ Event::Final { .. }) => event,
+            Some(Event::Error(message)) => panic!("expected final event, got error: {message}"),
+            _ => panic!("expected terminal final event"),
+        }
+    }
+
+    fn expect_error(events: &[Event]) -> &str {
+        match events.last() {
+            Some(Event::Error(message)) => message,
+            Some(event) => panic!("expected error event, got {event:?}"),
+            None => panic!("expected error event, got none"),
+        }
+    }
+
+    #[test]
+    fn cancel_guard_sets_flag_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = CancelGuard::new(Arc::clone(&flag));
+            assert!(!flag.load(Ordering::Relaxed));
+        }
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn worker_success_path_streams_text_and_releases_slot() {
+        let (backend, stats) = fake_backend("hi");
+        let harness = Harness::start(backend);
+        let events = drain_until_terminal(
+            &harness.submit(ChatJob::completion("prompt".to_string(), greedy(8))),
+        );
+
+        assert_eq!(streamed_text(&events), "hi");
+        let Event::Final {
+            text,
+            finish_reason,
+            prompt_tokens,
+            completion_tokens,
+            ..
+        } = expect_final(&events)
+        else {
+            panic!("expected final event");
+        };
+        assert_eq!(text, "hi");
+        assert_eq!(*finish_reason, "stop");
+        assert_eq!(*prompt_tokens, "prompt".len());
+        // EOS — служебный токен и в completion_tokens не входит: "h", "i".
+        assert_eq!(*completion_tokens, 2);
+
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.created, 1);
+        assert_eq!(stats.freed, 1);
+        assert!(stats.active.is_empty());
+    }
+
+    #[test]
+    fn cancelled_request_reports_error_and_frees_slot_for_next_request() {
+        let (backend, stats) = fake_backend(&"x".repeat(64));
+        let job = ChatJob::completion("prompt".to_string(), greedy(64));
+        let flag = job.cancel_handle();
+        {
+            let mut state = stats.lock().unwrap();
+            state.cancel_after_steps = Some(2);
+            state.cancel = Some(Arc::clone(&flag));
+        }
+        let harness = Harness::start(backend);
+
+        let events = drain_until_terminal(&harness.submit(job));
+        assert_eq!(expect_error(&events), "cancelled by client");
+        assert!(flag.load(Ordering::Relaxed));
+
+        let events = drain_until_terminal(
+            &harness.submit(ChatJob::completion("again".to_string(), greedy(1))),
+        );
+        let Event::Final { finish_reason, .. } = expect_final(&events) else {
+            panic!("expected final event");
+        };
+        assert_eq!(*finish_reason, "length");
+
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.created, 2);
+        assert_eq!(stats.freed, 2);
+        assert!(stats.active.is_empty());
+    }
+
+    #[test]
+    fn max_tokens_exhaustion_reports_length_and_releases_slot() {
+        let (backend, stats) = fake_backend(&"x".repeat(32));
+        let harness = Harness::start(backend);
+        let events = drain_until_terminal(
+            &harness.submit(ChatJob::completion("prompt".to_string(), greedy(5))),
+        );
+
+        assert_eq!(streamed_text(&events), "xxxxx");
+        let Event::Final {
+            text,
+            finish_reason,
+            completion_tokens,
+            ..
+        } = expect_final(&events)
+        else {
+            panic!("expected final event");
+        };
+        assert_eq!(text, "xxxxx");
+        assert_eq!(*finish_reason, "length");
+        assert_eq!(*completion_tokens, 5);
+
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.freed, 1);
+        assert!(stats.active.is_empty());
+    }
+
+    #[test]
+    fn backend_step_error_reports_error_and_worker_accepts_next_request() {
+        let (backend, stats) = fake_backend(&"x".repeat(32));
+        stats.lock().unwrap().fail_step_calls = 1;
+        let harness = Harness::start(backend);
+
+        let events = drain_until_terminal(
+            &harness.submit(ChatJob::completion("prompt".to_string(), greedy(16))),
+        );
+        assert_eq!(expect_error(&events), "step exploded");
+
+        let events = drain_until_terminal(
+            &harness.submit(ChatJob::completion("again".to_string(), greedy(1))),
+        );
+        let Event::Final { finish_reason, .. } = expect_final(&events) else {
+            panic!("expected final event");
+        };
+        assert_eq!(*finish_reason, "length");
+
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.created, 2);
+        assert_eq!(stats.freed, 2);
+        assert!(stats.active.is_empty());
+    }
+
+    #[test]
+    fn backend_prefill_error_reports_error_and_worker_accepts_next_request() {
+        let (backend, stats) = fake_backend(&"x".repeat(32));
+        stats.lock().unwrap().fail_prefill_calls = 1;
+        let harness = Harness::start(backend);
+
+        let events = drain_until_terminal(
+            &harness.submit(ChatJob::completion("prompt".to_string(), greedy(16))),
+        );
+        assert_eq!(expect_error(&events), "prefill exploded");
+
+        let events = drain_until_terminal(
+            &harness.submit(ChatJob::completion("again".to_string(), greedy(1))),
+        );
+        let Event::Final { finish_reason, .. } = expect_final(&events) else {
+            panic!("expected final event");
+        };
+        assert_eq!(*finish_reason, "length");
+
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.created, 2);
+        assert_eq!(stats.freed, 2);
+        assert!(stats.active.is_empty());
+    }
+
+    #[test]
+    fn tool_call_output_finishes_with_tool_calls_reason() {
+        let script =
+            "<tool_call><function=weather><parameter=city>Oslo</parameter></function></tool_call>";
+        let (backend, stats) = fake_backend(script);
+        let harness = Harness::start(backend);
+        let chat = ChatJob::chat(vec![Message::user("ping")], greedy(128), false, Vec::new());
+        let events = drain_until_terminal(&harness.submit(chat));
+
+        let tool_events = events
+            .iter()
+            .filter(|event| matches!(event, Event::ToolCall(_)))
+            .count();
+        assert_eq!(tool_events, 1);
+        let Event::Final {
+            text,
+            tool_calls,
+            finish_reason,
+            ..
+        } = expect_final(&events)
+        else {
+            panic!("expected final event");
+        };
+        assert_eq!(text, "");
+        assert_eq!(*finish_reason, "tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "weather");
+        assert_eq!(tool_calls[0].arguments["city"], "Oslo");
+
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.freed, 1);
+        assert!(stats.active.is_empty());
     }
 }

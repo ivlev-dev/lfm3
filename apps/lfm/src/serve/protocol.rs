@@ -661,6 +661,25 @@ mod tests {
         );
     }
 
+    /// OpenAI-клиенты присылают поля, которых сервер не поддерживает
+    /// (например, `logit_bias`, `logprobs`, penalties): запрос обязан
+    /// приниматься, а лишние поля — молча игнорироваться, без 400.
+    #[test]
+    fn ignores_unknown_openai_fields() {
+        let req = parse(
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"50256":-100},"logprobs":true,"top_logprobs":5}"#,
+        );
+        assert_eq!(req.to_messages().unwrap()[0].content.as_deref(), Some("hi"));
+        let p = req.to_params();
+        assert_eq!(p.temperature, DEFAULT_TEMPERATURE);
+
+        let req = parse_completion(
+            r#"{"prompt":"hi","logit_bias":{"50256":-100},"logprobs":true,"unknown_field":1}"#,
+        );
+        assert_eq!(req.to_prompts().unwrap(), vec!["hi".to_string()]);
+        assert_eq!(req.to_params().max_tokens, DEFAULT_MAX_TOKENS);
+    }
+
     #[test]
     fn parses_content_parts() {
         let req = parse(
