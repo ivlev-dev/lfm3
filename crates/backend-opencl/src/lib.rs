@@ -3818,6 +3818,22 @@ impl GpuModel {
         self.forward_impl(reqs, need_logits, None, None, None, Some(hidden))
     }
 
+    pub fn step_mixed_input_rows(
+        &mut self,
+        reqs: &[StepReq],
+        hidden: &[f32],
+        logits_rows: &[usize],
+    ) -> Result<()> {
+        self.forward_impl(
+            reqs,
+            !logits_rows.is_empty(),
+            None,
+            Some(logits_rows),
+            None,
+            Some(hidden),
+        )
+    }
+
     pub fn forward_batch_hidden(
         &mut self,
         slot: usize,

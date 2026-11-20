@@ -250,11 +250,7 @@ impl Scheduler {
                 .iter()
                 .filter(|seq| seq.phase == Phase::Prefill && seq.prompt_remaining() > 0)
                 .collect();
-            if pending.len() == 1
-                && self.waiting.is_empty()
-                && pending[0].prefilled == 0
-                && pending[0].prompt_len <= self.cfg.prefill_budget
-            {
+            if pending.len() == 1 && self.waiting.is_empty() && pending[0].prefilled == 0 {
                 return StepPlan::AtomicPrefill(pending[0].id);
             }
             if pending.is_empty() {
@@ -768,15 +764,24 @@ mod tests {
     }
 
     #[test]
-    fn long_single_prefill_goes_chunked() {
+    fn long_single_prefill_is_atomic() {
         let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 16, 64));
         let a = s.enqueue(200, 4).unwrap();
+        admit_all(&mut s, 128);
+        assert_eq!(s.plan_step(), StepPlan::AtomicPrefill(a.id));
+    }
+
+    #[test]
+    fn long_prefill_with_company_goes_chunked() {
+        let mut s = Scheduler::new(SchedulerConfig::new(4096, 8, 16, 64));
+        let a = s.enqueue(200, 4).unwrap();
+        let b = s.enqueue(40, 4).unwrap();
         admit_all(&mut s, 128);
         match s.plan_step() {
             StepPlan::Mixed { rows, .. } => {
                 assert!(!rows.is_empty());
                 assert!(rows.len() <= 64, "chunk respects budget: {}", rows.len());
-                assert_eq!(rows[0].id, a.id);
+                assert!(rows.iter().all(|r| r.id == a.id || r.id == b.id));
             }
             other => panic!("expected chunked prefill, got {other:?}"),
         }

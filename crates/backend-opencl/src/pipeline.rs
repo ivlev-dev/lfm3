@@ -81,13 +81,119 @@ impl PipelineModel {
         let n = self.stages.len();
         for (i, stage) in self.stages.iter_mut().enumerate().skip(1) {
             let last = i + 1 == n;
-            stage.step_mixed_input(steps, &hidden, need_logits && last)?;
+            if last && need_logits {
+                let row = steps.len() - 1;
+                stage.step_mixed_input_rows(steps, &hidden, &[row])?;
+            } else {
+                stage.step_mixed_input(steps, &hidden, false)?;
+            }
             if !last {
                 hidden = stage.stage_hidden_batch(steps.len())?;
             }
         }
         Ok(())
     }
+    fn prefill_pipelined(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        need_logits: bool,
+        chunks: &[(usize, usize)],
+    ) -> Result<()> {
+        let n = self.stages.len();
+        let stages = std::mem::take(&mut self.stages);
+        let mut slots: Vec<Option<GpuModel>> = stages.into_iter().map(Some).collect();
+        let mut senders: Vec<Option<std::sync::mpsc::SyncSender<Vec<f32>>>> =
+            (0..n).map(|_| None).collect();
+        let mut receivers: Vec<Option<std::sync::mpsc::Receiver<Vec<f32>>>> =
+            (0..n).map(|_| None).collect();
+        for i in 1..n {
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            senders[i] = Some(tx);
+            receivers[i] = Some(rx);
+        }
+        let mut errors: Vec<Option<anyhow::Error>> = (0..n).map(|_| None).collect();
+        let mut results: Vec<Option<GpuModel>> = (0..n).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut stage = slots[i].take().expect("stage");
+                let rx = receivers[i].take();
+                let tx = if i + 1 < n { senders[i + 1].take() } else { None };
+                let handle = scope.spawn(move || -> (GpuModel, Result<()>) {
+                    let mut result = Ok(());
+                    let dbg = std::env::var("LFM_PIPE_DEBUG").is_ok();
+                    for (ci, &(pos, end)) in chunks.iter().enumerate() {
+                        let t0 = std::time::Instant::now();
+                        let last_chunk = ci + 1 == chunks.len();
+                        let len = end - pos;
+                        let input = if i == 0 {
+                            None
+                        } else {
+                            match rx.as_ref().map(|r| r.recv()) {
+                                Some(Ok(h)) => Some(h),
+                                _ => break,
+                            }
+                        };
+                        let step = if i == 0 {
+                            stage.forward_batch_seq(slot, &tokens[pos..end], pos, false)
+                        } else {
+                            stage.forward_batch_hidden(
+                                slot,
+                                input.as_deref().unwrap_or(&[]),
+                                pos,
+                                need_logits && i + 1 == n && last_chunk,
+                            )
+                        };
+                        if dbg {
+                            eprintln!(
+                                "stage {i} chunk {ci} pos {pos}..{end} = {:.3}s",
+                                t0.elapsed().as_secs_f64()
+                            );
+                        }
+                        if let Err(e) = step {
+                            result = Err(e);
+                            break;
+                        }
+                        if let Some(tx) = &tx {
+                            match stage.stage_hidden_batch(len) {
+                                Ok(h) => {
+                                    if tx.send(h).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    result = Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    (stage, result)
+                });
+                handles.push(handle);
+            }
+            for (i, handle) in handles.into_iter().enumerate() {
+                match handle.join() {
+                    Ok((stage, result)) => {
+                        results[i] = Some(stage);
+                        if let Err(e) = result {
+                            errors[i] = Some(e);
+                        }
+                    }
+                    Err(_) => {
+                        errors[i] = Some(anyhow!("pipeline stage {i} panicked"));
+                    }
+                }
+            }
+        });
+        self.stages = results.into_iter().map(|s| s.expect("stage")).collect();
+        for e in errors.into_iter().flatten() {
+            return Err(e);
+        }
+        Ok(())
+    }
+
 }
 
 impl InferenceBackend for PipelineModel {
@@ -133,37 +239,26 @@ impl InferenceBackend for PipelineModel {
         }
         reused = reused.min(tokens.len().saturating_sub(1));
         let pb = self.stages[0].prefill_batch_size().max(1);
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
         let mut pos = reused;
-        let mut hidden: Vec<f32> = Vec::new();
         while pos < tokens.len() {
             let end = (pos + pb).min(tokens.len());
-            let last_chunk = end == tokens.len();
-            let n = self.stages.len();
-            self.stages[0].forward_batch_seq(
-                slot,
-                &tokens[pos..end],
-                pos,
-                need_logits && n == 1 && last_chunk,
-            )?;
-            if n > 1 {
-                hidden = self.stages[0].stage_hidden_batch(end - pos)?;
-            }
-            for (i, stage) in self.stages.iter_mut().enumerate().skip(1) {
-                let last = i + 1 == n;
-                stage.forward_batch_hidden(
-                    slot,
-                    &hidden,
-                    pos,
-                    need_logits && last && last_chunk,
-                )?;
-                if !last {
-                    hidden = stage.stage_hidden_batch(end - pos)?;
-                }
-            }
+            chunks.push((pos, end));
             pos = end;
-            if last_chunk {
-                break;
+        }
+        let n = self.stages.len();
+        if n == 1 {
+            for &(pos, end) in &chunks {
+                let last_chunk = end == tokens.len();
+                self.stages[0].forward_batch_seq(
+                    slot,
+                    &tokens[pos..end],
+                    pos,
+                    need_logits && last_chunk,
+                )?;
             }
+        } else {
+            self.prefill_pipelined(slot, tokens, need_logits, &chunks)?;
         }
         for stage in self.stages.iter_mut() {
             stage.prefill_finish(slot)?;
