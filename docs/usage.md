@@ -28,8 +28,8 @@ echo "..." | lfm chat --once -            # промпт из stdin
 серым блоком `thinking ›`.
 
 Флаги сэмплинга: `--temperature`, `--top-k`, `--top-p`, `--min-p`,
-`--repeat-penalty`, `--seed`. Режим рассуждений — `--thinking`
-(рассуждения идут отдельным потоком и в TUI показываются как `[thinking]`).
+`--repeat-penalty`, `--seed`. Режим рассуждений — `--thinking` (рассуждения идут
+отдельным потоком: в TUI — блок `thinking ›`, в `--once` — в stderr без метки).
 
 Инструменты (tool calling) включаются JSON-файлом:
 
@@ -39,7 +39,8 @@ lfm chat --tools examples/tools.json
 
 Формат — массив OpenAI tool-объектов (`name`, `description`, `parameters`);
 допускается и обёртка `{"tools": [...]}`. Модель вызывает инструмент в
-формате шаблона, приложение показывает `[tool_call] name {...}`.
+формате шаблона; вызов показывается как `⚙ name args` в TUI и как
+`[tool] name args` в `--once`.
 
 ## Сервер
 
@@ -58,9 +59,12 @@ OpenAI-совместимые эндпоинты:
 | GET | `/metrics` | active/waiting, avg_step_ms, стадии, KV-страницы |
 | GET | `/ws` | WebSocket-стриминг |
 
-`temperature: 0` включает greedy-путь (argmax на GPU). `tools` в запросе
-поддерживаются как в OpenAI API. `stream: true` отдаёт SSE; клиент может
-оборвать соединение — сервер отменит генерацию.
+`temperature: 0` при `repeat_penalty = 1.0` включает greedy-путь (argmax на GPU);
+при `repeat_penalty ≠ 1.0` штраф применяется на CPU, и GPU-argmax не
+используется. `tools` в запросе поддерживаются как в OpenAI API, но
+`tool_choice` понимается только как `"none"` (выбор конкретной функции не
+поддержан). `stream: true` отдаёт SSE; клиент может оборвать соединение —
+сервер отменит генерацию.
 
 Метрики включают `avg_gpu_us`, `avg_logits_us`, `avg_sample_us`,
 `avg_detok_us`, `rows_total`, `rows_logits` — по ним видно, что lm_head
@@ -73,7 +77,7 @@ OpenAI-совместимые эндпоинты:
 `docs/config.md`.
 
 ```bash
-lfm config init            # пример: GPU+iGPU, kvarn, ctx 32768
+lfm config init            # пример: single, devices=[0], kv=f16, ctx 4096
 lfm config print           # эффективный конфиг
 ```
 
@@ -92,14 +96,14 @@ lfm serve --devices 0,1 --mode tp
 
 На текущей машине OpenCL-устройство одно: `0` — интегрированный AMD Radeon
 Vega 8 (8 CU, подгруппа 64, fp16, память общая с CPU). Дискретной карты и Intel
-iGPU в системе нет; `RUSTICL_ENABLE` для Vega 8 не нужен. CPU через PoCL виден
-как отдельное устройство, но годится только для диагностики.
-`pipeline` требует минимум двух устройств; `single` допускает ровно одно, а
-`tp` — от двух до четырёх (только `kv = "f16"`). Нарушение — ошибка валидации
-конфига, а не тихое вырождение режима.
+iGPU в системе нет; `RUSTICL_ENABLE` для Vega 8 не нужен. PoCL не установлен
+(в `/etc/OpenCL/vendors` только rusticl), поэтому второго OpenCL-устройства нет
+и `pipeline`/`tp` здесь недоступны. Правила режимов — `docs/config.md`, раздел
+«Режимы устройств».
 
-Ориентиры по производительности: актуальные замеры — `benchmarks/machine.md`
-(Машина 2, Vega 8). Числа для RX 6400/iGPU в старых разделах — история.
+Ориентиры по производительности: замеры — `benchmarks/machine.md` (раздел
+«Машина 2: Vega 8» заполняется — чисел для Vega 8 пока нет). Числа для
+RX 6400/iGPU в старых разделах — история.
 
 ## KV-кэш
 
@@ -148,6 +152,6 @@ println!("{} tok/s", reply.stats.decode_tok_s());
 - Не хватает памяти (у Vega 8 она общая с CPU, UMA) — `kv = "kvarn"`,
   `kv_pool` меньше, `q4i8_ffn_only = true`, `cache = false` (без снапшотов conv).
 - Медленный decode в `pipeline` с CPU-стадией — уменьшите её долю (`tiers`);
-  на текущей машине второе устройство только диагностическое.
+  на текущей машине второго устройства нет, `pipeline` здесь не запускается.
 - Долгий первый запуск — компиляция ядер; кэш в
   `$XDG_CACHE_HOME/lfm3/programs` ускоряет повторные старты.

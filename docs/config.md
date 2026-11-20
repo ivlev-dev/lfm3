@@ -28,7 +28,7 @@ lfm chat --ctx 32768 --kv kvarn # оверрайды только для это�
 | `devices` | `--devices 0,1` | `[0]` | индексы OpenCL-устройств |
 | `mode` | `--mode` | `single` | `single`, `pipeline`, `tp` |
 | `tiers` | `--tiers 96/4` | `[]` (поровну) | проценты слоёв для `pipeline`, сумма 100 |
-| `kv` | `--kv` | `f16` | `f16`, `q4`, `k4v4`, `kvarn` (=`kvarn_k4v2`), `kvarn_k4v4` |
+| `kv` | `--kv` | `f16` | `f16`, `q4` (алиас `k4v4` — тот же формат), `kvarn` (=`kvarn_k4v2`), `kvarn_k4v4` (отдельный формат: V 4 бита) |
 | `ctx` | `--ctx` | `4096` | контекст одной последовательности, кратен 32 |
 | `kv_pool` | — | `1` | во сколько раз пул KV больше `ctx`, 1..=16 |
 | `max_seqs` | `--max-seqs` | `8` | одновременных последовательностей, 1..=32 |
@@ -51,8 +51,10 @@ lfm chat --ctx 32768 --kv kvarn # оверрайды только для это�
 | `gemm_force` | — | — | принудительный GEMM по подстроке имени (диагностика) |
 | `profile` | — | `false` | тайминги ядер |
 
-Прочерк в колонке CLI означает «только TOML»: `kv_pool` и `q4i8_ffn_only`
-не имеют флагов командной строки.
+Прочерк в колонке CLI означает «только TOML»: флагов нет у большинства ключей
+(например, `kv_pool`, `prefill_ntok`, `pb`, `splits`, `cache`, `fuse`,
+`q4i8_ffn_only`, `profile`); CLI-флаги есть только там, где они указаны в
+колонке.
 
 На AMD (подгруппа 64) Q4 decode-GEMV с prepack запускается с local size =
 `wg_b`, а `wg` задаёт шаг сетки. Q6 и lm_head идут общим GEMV-путём, где `wg`
@@ -64,11 +66,11 @@ lfm chat --ctx 32768 --kv kvarn # оверрайды только для это�
 |---|---|---|---|
 | `system` | `--system` | `You are a helpful assistant.` | системный промпт |
 | `max_tokens` | `--max-tokens` | `0` | максимум новых токенов; `0` — до EOS или заполнения контекста |
-| `temperature` | `--temperature` | `0.7` | температура (0 = greedy) |
+| `temperature` | `--temperature` | `0.7` | температура (0 = greedy при `repeat_penalty = 1.0`) |
 | `top_k` | `--top-k` | `40` | top-k |
 | `top_p` | `--top-p` | `0.95` | top-p |
 | `min_p` | `--min-p` | `0.0` | min-p |
-| `repeat_penalty` | `--repeat-penalty` | `1.0` | штраф за повторы (`1.0` = выключен); greedy-путь включается при `temperature = 0` |
+| `repeat_penalty` | `--repeat-penalty` | `1.0` | штраф за повторы (`1.0` = выключен); greedy-путь включается только при `temperature = 0` **и** `repeat_penalty = 1.0` |
 | `seed` | `--seed` | `0` | 0 — фиксированное зерно по умолчанию |
 | `thinking` | `--thinking` | `false` | режим рассуждений |
 | `tools` | `--tools` | — | JSON с определениями инструментов (OpenAI tools) |

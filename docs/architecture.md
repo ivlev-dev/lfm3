@@ -2,22 +2,24 @@
 
 ## Принцип
 
-Зависимости направлены внутрь: `apps → infra-* → application → domain`.
-`domain` не знает про I/O, OpenCL, GGUF и HTTP; инфраструктура реализует порты,
-объявленные во `application` (или в `domain`, если правило чисто доменное).
+Зависимости направлены внутрь. `domain` — нижний слой, над ним `application`
+(порты и use-cases). Инфраструктура делится на две группы: `infra-gguf`,
+`infra-cpu` и `infra-chat` зависят только от `domain` (+ `gguf`/`quant`), а
+`backend-opencl` и `infra-tokenizer` реализуют порты и поэтому зависят ещё и от
+`application`. `domain` не знает про I/O, OpenCL, GGUF и HTTP.
 
 ```
 apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
     │
     ├── crates/lfm (библиотека): Config, Runtime, Chat, Generate
-    │        │
-    │        ├── infra-*: gguf, quant, cpu, opencl, hf, tokenizer, chat
-    │        │        │
-    │        │        └── application: порты + use-cases (сессия, движок, планировщик)
-    │        │                │
-    │        │                └── domain: конфиг модели, KV-блоки, radix, сэмплинг
-    │        │
-    ├── tools/bench (`lfm-bench`): диагностический стенд (не входит в поставку)
+    │        ├── backend-opencl → application (порты) + domain
+    │        │                    + infra-gguf/quant/opencl
+    │        ├── infra-tokenizer → application (TokenizerPort)
+    │        ├── infra-chat → domain
+    │        └── infra-gguf, infra-cpu → domain (+ gguf/quant);
+    │            infra-opencl, infra-hf, infra-quant — без зависимостей на lfm-*
+
+tools/bench (`lfm-bench`) — отдельный пакет, диагностический стенд, не входит в поставку
 ```
 
 Конфигурация (TOML + CLI, приоритет и все ключи) — `docs/config.md`.
@@ -56,7 +58,7 @@ apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
 | `infra-gguf` | mmap-парсер GGUF v2/v3, метаданные, срезы тензоров |
 | `infra-quant` | эталонная деквантизация Q4_K/Q6_K/Q8_0, dot для валидации |
 | `infra-cpu` | CPU-эталон forward (f32) с KV/conv-состоянием; oracle для ядер |
-| `infra-opencl` | устройства, контекст, очереди без profiling, буферы, диспатч |
+| `infra-opencl` | устройства, контекст, буферы, диспатч; профилирующая очередь — только для диагностики |
 | `infra-hf` | клиент HF: кэш, докачка Range, ETag, sha256 |
 | `infra-tokenizer` | BPE из tokenizer.json |
 | `infra-chat` | рендер chat_template.jinja (minijinja), thinking/tools |
@@ -65,22 +67,30 @@ apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
 
 ### Память весов
 - Формат GGUF остаётся нативным: 4.5/6.5 бит на вес, 0% накладных на трафик.
-- Раскладка при загрузке (prepack) может переставлять байты внутри блока, но не
-  добавляет байтов: decode упирается в ПСП.
-- Три тира: VRAM → RAM (pinned/mmap) → SSD (mmap + префетч), политика residency.
+- Раскладка при загрузке (prepack) может переставлять байты внутри блока; для
+  Q4_K блок растёт со 144 до 148 байт (+4 байта: пары скейл/мин распакованы в
+  байты рядом с заголовком), raw-копия при этом не хранится. Decode упирается в
+  ПСП.
+- План (не реализовано): три тира памяти — VRAM → RAM (pinned/mmap) → SSD
+  (mmap + префетч) с политикой residency.
 
 ### Ядра (W4A8)
 - Активации квантуются в int8 по группам 32 (один раз на стадию слоя).
 - Веса распаковываются в `char4` на лету, `dot(char4,char4)` — 4 MAC/инструкцию.
-- Subgroup (wave64) reduce, без LDS-барьеров; multi-row `RGEMV` и адаптивный размер.
+- Редукции по подгруппе: при фактической подгруппе 64 (`LFM_SG64`) —
+  `sub_group_reduce_add`, без LDS-барьеров; для подгрупп меньше 64 остаётся
+  LDS-склад (fallback). Multi-row `RGEMV` и адаптивный размер.
 - Fusion на загрузке: ffn up+gate в один буфер (`ffn_ug`), один GEMV на слой.
 - Слитые ядра: `rms_quant`, `norm_add_quant`, `silu_quant`, `rms_rope_qk`,
-  gate внутри `attention`, общий `kv_store2`. Тяжёлые поэлементные ядра
-  (`norm_add_quant`, `quantize_q8`) работают по 4 потока на группу из 32 и
-  векторизованы `float4`/`char4` — иначе упираются в латентность при 64 потоках.
-- Профилирующая очередь запрещена в рантайме (+80 мкс/диспатч).
-- Не полагаться на `sub_group_reduce_add` в rusticl: размер подгруппы может
-  отличаться от пробы (наблюдали 32 вместо 64) — редукции делать через LDS.
+  gate внутри `attention`, KV-store по формату KV — `kv_store_h`,
+  `kv_store_b_h`, `kv_store_q`, `kv_store_b_q`, `kv_store_h_rot`,
+  `kv_store_b_h_rot`. Тяжёлые поэлементные ядра (`norm_add_quant`,
+  `quantize_q8`) работают по 4 потока на группу из 32 и векторизованы
+  `float4`/`char4` — иначе упираются в латентность при 64 потоках.
+- Профилирующая очередь по умолчанию выключена (+80 мкс/диспатч); включается
+  `backend.profile = true` — только для диагностики.
+- Размер подгруппы брать из фактического запуска, а не из пробы rusticl
+  (наблюдали 32 вместо 64): от него зависит выбор `LFM_SG64`-редукции.
 - Скейлы квантованного блока привязаны к строке: при multi-row GEMV читать их
   для каждой строки, а не один раз на блок.
 - Состояние shortconv и KV обязаны обнуляться при загрузке модели: буферы
@@ -124,8 +134,9 @@ apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
   `(l_cache-1)×hidden` на последовательность.
 - Split-K реализован: при ctx > 512 позиции делятся на чанки по 512 (до 16),
   каждый чанк считает свой partial-софтмакс, отдельное ядро собирает результат.
-  Дальше: тайловый prefill-attention (K/V блоками в LDS), KV int8/int4.
-- План по KV: int8/int4, K — per-group scale + Hadamard-ротация, V — per-token.
+  Дальше: тайловый prefill-attention (K/V блоками в LDS). KV int8/int4 проверены
+  и откачены (на 4096 decode −11%, см. `docs/plan.md`, «Проверено и откачено»);
+  возвращаться только под 16k+ и с более дешёвым форматом (fp8 native).
 
 ### Порты и use-cases
 - `lfm-app::ports`: `InferenceBackend` (`create/free sequence`, `prefill`, `step`,
@@ -168,9 +179,12 @@ apps/lfm (бинарь `lfm`: chat + serve)          композиция, UX
   `--once` — один запрос для скриптов.
 
 ### Устройства
-- TP для decode (all-reduce через host staging — P2P в rusticl нет), PP для 3-tier.
-- CPU через PoCL как обычное OpenCL-устройство; абстракция `DeviceSet`.
-- NPU (Hexagon v68) — отдельный порт `NpuBackend`, без влияния на ядро.
+- TP для decode: all-reduce через host staging (P2P в rusticl нет); PP по слоям —
+  `PipelineModel`.
+- Устройство выбирается индексом OpenCL; CPU через PoCL подключался как обычное
+  OpenCL-устройство, но в текущей системе PoCL не установлен.
+- План (не реализовано): абстракция `DeviceSet`, отдельный порт `NpuBackend`
+  (Hexagon v68) без влияния на ядро.
 
 ## Тестовая стратегия
 

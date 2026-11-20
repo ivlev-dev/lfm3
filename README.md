@@ -10,9 +10,7 @@
   `kvarn` / `kvarn_k4v4`.
 - **Устройства**: `single`, `pipeline` (слои по устройствам, конвейер по
   чанкам) и `tp` (тензорный параллелизм). На текущей машине OpenCL-устройство
-  одно — Vega 8, поэтому рабочий режим `single`; `pipeline` требует второго
-  устройства, `tp` — от двух до четырёх (только `kv = "f16"`). Неверная
-  комбинация режима и устройств — ошибка валидации.
+  одно — Vega 8, поэтому рабочий режим `single`.
 - **Сервинг**: continuous batching, paged KV, radix prefix cache, пул KV
   (`kv_pool`), адресные логиты, GPU-argmax для greedy.
 - **Чат**: streaming, reasoning (`thinking`), tool calling, TTFT и счётчики
@@ -57,7 +55,7 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -
 ## Конфигурация
 
 ```bash
-./target/release/lfm config init       # создать lfm.toml с примером (GPU+iGPU)
+./target/release/lfm config init       # создать lfm.toml (single, devices=[0], kv=f16)
 ./target/release/lfm config print      # эффективный конфиг в TOML
 ./target/release/lfm --config my.toml chat
 ```
@@ -66,8 +64,9 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -
 Полное описание ключей — `docs/config.md`.
 
 `lfm config init` создаёт безопасный пример для одного устройства (Vega 8):
-`devices = [0]`, `mode = "single"`. Раскладка для двух устройств (GPU + iGPU)
-описана ниже и в комментариях-подсказках внутри сгенерированного файла.
+`devices = [0]`, `mode = "single"`, `kv = "f16"`, `ctx = 4096`. Раскладка для
+двух устройств (GPU + iGPU) приведена ниже и в комментариях-подсказках внутри
+сгенерированного файла.
 
 Пример: GPU + iGPU (машина с двумя устройствами), сжатый KV, контекст 32k:
 
@@ -98,18 +97,19 @@ ctx = 32000
 | tp | `mode = "tp"`, `devices = [0,1]` | два одинаковых быстрых GPU; только `kv = "f16"` |
 
 `single` допускает ровно одно устройство, `pipeline` — минимум два, `tp` — от
-двух до четырёх. Неверная комбинация — ошибка валидации.
+двух до четырёх и только с `kv = "f16"`. Комбинацию проверяет `Config::validate`
+при загрузке; канонический текст правил — `docs/config.md`, раздел «Режимы
+устройств».
 
 На текущей машине OpenCL-устройство одно: индекс `0` — интегрированный
 **AMD Radeon Vega 8** (Raven/Picasso, 8 CU, подгруппа 64, fp16; память общая с
 CPU, UMA). Дискретной карты и Intel iGPU в системе нет, `RUSTICL_ENABLE` для
-Vega 8 не нужен. CPU через PoCL виден как отдельное OpenCL-устройство, но
-годится только для диагностики: `pipeline`/`tp` с ним медленнее.
+Vega 8 не нужен. PoCL не установлен (в `/etc/OpenCL/vendors` только rusticl),
+поэтому второго OpenCL-устройства нет и `pipeline`/`tp` на этой машине
+недоступны — рабочий режим только `single`.
 
-`pipeline` требует как минимум двух устройств; `single` — ровно одно; `tp` —
-от двух до четырёх и делит головы/FFN между устройствами. Нарушение этих
-правил (`Config::validate`) — ошибка загрузки конфига. Замеры, ограничения и
-выбор раскладки — `docs/backends.md`; актуальные числа — `benchmarks/machine.md`.
+Замеры, ограничения и выбор раскладки — `docs/backends.md`; числа для Vega 8 —
+`benchmarks/machine.md` (раздел Vega 8 заполняется).
 
 ## Библиотека
 
