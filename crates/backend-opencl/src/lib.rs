@@ -261,6 +261,72 @@ impl TpShard {
         shard.vocab_count = vocab_count;
         shard
     }
+
+    pub fn full_weighted(
+        rank: usize,
+        world: usize,
+        heads: usize,
+        kv_heads: usize,
+        ffn: usize,
+        vocab: usize,
+        weights: &[u32],
+    ) -> Self {
+        let mut shard = Self::attention(rank, world, heads, kv_heads);
+        let kv = split_units(kv_heads, 1, weights, 1);
+        let ratio = heads / kv_heads;
+        let kv_start = kv[..rank].iter().sum::<usize>();
+        let kv_count = kv[rank];
+        shard.kv_head_start = kv_start;
+        shard.kv_head_count = kv_count;
+        shard.head_start = kv_start * ratio;
+        shard.head_count = kv_count * ratio;
+        shard.out_col_start = kv_start * ratio;
+        shard.out_col_count = kv_count * ratio;
+        let ffn_parts = split_units(ffn, 256, weights, 1);
+        let ffn_start = ffn_parts[..rank].iter().sum::<usize>();
+        shard.ffn_row_start = ffn_start;
+        shard.ffn_row_count = ffn_parts[rank];
+        shard.ffn_col_start = ffn_start;
+        shard.ffn_col_count = ffn_parts[rank];
+        let vocab_parts = split_units(vocab, 1, weights, 1);
+        shard.vocab_start = vocab_parts[..rank].iter().sum::<usize>();
+        shard.vocab_count = vocab_parts[rank];
+        shard
+    }
+}
+
+fn split_units(total: usize, align: usize, weights: &[u32], min_units: usize) -> Vec<usize> {
+    let units = total / align;
+    let sum: u64 = weights.iter().map(|w| *w as u64).sum();
+    if weights.is_empty() || sum == 0 || units == 0 {
+        return vec![0; weights.len()];
+    }
+    let mut alloc: Vec<usize> = weights
+        .iter()
+        .map(|w| (units as u64 * *w as u64 / sum) as usize)
+        .collect();
+    for a in &mut alloc {
+        *a = (*a).max(min_units);
+    }
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse((units as u64 * weights[i] as u64) % sum));
+    let mut diff = units as isize - alloc.iter().sum::<usize>() as isize;
+    let mut k = 0usize;
+    while diff != 0 {
+        let i = order[k % order.len()];
+        if diff > 0 {
+            alloc[i] += 1;
+            diff -= 1;
+        } else if alloc[i] > min_units {
+            alloc[i] -= 1;
+            diff += 1;
+        }
+        k += 1;
+        if k > order.len() * units.max(1) {
+            break;
+        }
+    }
+    alloc.iter().map(|u| u * align).collect()
 }
 
 enum ShardSlice {
@@ -5484,6 +5550,24 @@ mod tests {
         let vocab: Vec<usize> = shards.iter().map(|s| s.vocab_count).collect();
         assert_eq!(vocab.iter().sum::<usize>(), 128000);
         assert_eq!(vocab, vec![42667, 42667, 42666]);
+    }
+
+    #[test]
+    fn weighted_shard_gives_gpu_more_work() {
+        let shards: Vec<TpShard> = (0..2)
+            .map(|r| TpShard::full_weighted(r, 2, 16, 4, 7680, 128000, &[65, 35]))
+            .collect();
+        assert_eq!(shards[0].kv_head_count, 3);
+        assert_eq!(shards[1].kv_head_count, 1);
+        assert_eq!(shards[0].head_count, 12);
+        assert_eq!(shards[1].head_count, 4);
+        assert_eq!(shards[1].head_start, 12);
+        assert_eq!(shards[0].ffn_row_count, 5120);
+        assert_eq!(shards[1].ffn_row_count, 2560);
+        assert_eq!(shards[1].ffn_row_start, 5120);
+        assert_eq!(shards[0].vocab_count, 83200);
+        assert_eq!(shards[1].vocab_count, 44800);
+        assert_eq!(shards[1].vocab_start, 83200);
     }
 
     #[test]

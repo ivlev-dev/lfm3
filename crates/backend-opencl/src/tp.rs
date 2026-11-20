@@ -133,6 +133,29 @@ fn sync_x_b(stages: &mut [GpuModel], ntok: usize) -> Result<()> {
     Ok(())
 }
 
+fn tp_weights(world: usize) -> Result<Option<Vec<u32>>> {
+    let Ok(raw) = std::env::var("LFM_TP_WEIGHTS") else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    for part in raw.split('/') {
+        out.push(
+            part.trim()
+                .parse::<u32>()
+                .map_err(|_| anyhow!("bad LFM_TP_WEIGHTS {raw:?}: need N0/N1/..."))?,
+        );
+    }
+    if out.len() != world || out.iter().all(|&w| w == 0) {
+        return Err(anyhow!(
+            "LFM_TP_WEIGHTS {raw:?} does not match {world} devices"
+        ));
+    }
+    Ok(Some(out))
+}
+
 impl TpModel {
     pub fn load(path: &Path, max_ctx: usize, devices: &[usize]) -> Result<Self> {
         let world = devices.len();
@@ -150,7 +173,22 @@ impl TpModel {
                 "tp world {world} exceeds kv heads {kv_heads}: some stage would have no heads"
             ));
         }
-        if cfg.ffn_size % world != 0 || (cfg.ffn_size / world) % 256 != 0 {
+        let mut weights = tp_weights(world)?;
+        if weights.is_none() && world == 2 {
+            let kinds: Vec<String> = devices
+                .iter()
+                .map(|&d| {
+                    lfm_opencl::Gpu::open(d)
+                        .map(|g| g.caps.device_type)
+                        .unwrap_or_default()
+                })
+                .collect();
+            if kinds[0] == "gpu" && kinds[1] == "cpu" {
+                weights = Some(vec![75, 25]);
+            }
+        }
+        if weights.is_none() && (cfg.ffn_size % world != 0 || (cfg.ffn_size / world) % 256 != 0)
+        {
             return Err(anyhow!(
                 "ffn {} cannot be split into {world} column shards (need multiple of 256)",
                 cfg.ffn_size
@@ -158,14 +196,25 @@ impl TpModel {
         }
         let mut stages = Vec::with_capacity(world);
         for (rank, &device) in devices.iter().enumerate() {
-            let shard = TpShard::full(
-                rank,
-                world,
-                cfg.num_heads,
-                kv_heads,
-                cfg.ffn_size,
-                cfg.vocab_size,
-            );
+            let shard = match &weights {
+                Some(w) => TpShard::full_weighted(
+                    rank,
+                    world,
+                    cfg.num_heads,
+                    kv_heads,
+                    cfg.ffn_size,
+                    cfg.vocab_size,
+                    w,
+                ),
+                None => TpShard::full(
+                    rank,
+                    world,
+                    cfg.num_heads,
+                    kv_heads,
+                    cfg.ffn_size,
+                    cfg.vocab_size,
+                ),
+            };
             stages.push(GpuModel::load_stage(
                 path,
                 max_ctx,
