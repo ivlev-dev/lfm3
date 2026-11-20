@@ -8,6 +8,7 @@ type ClMemRaw = *mut c_void;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub mod options;
 mod pipeline;
@@ -65,6 +66,15 @@ const KERNELS: &str = concat!(
 const GROUP: usize = 32;
 pub(crate) const MAX_SPLITS: usize = 16;
 const KV_PAGE: usize = PAGE;
+/// Целевое время работы GPU между синхронизациями на prefill.
+///
+/// amdgpu по умолчанию сбрасывает контекст (`ring gfx timeout`), если пакет
+/// команд на ring идёт дольше `lockup_timeout` (2 с). Один prefill-чанк — это
+/// десятки слоёв, отправленных одним пакетом, и на длинном контексте он
+/// запросто перекрывает этот порог. Поэтому `forward_impl` группирует слои
+/// чанка так, чтобы замеренное время группы не превышало `PREFILL_FENCE`
+/// (пятикратный запас к вотчдогу), и между группами ждёт `finish()`.
+const PREFILL_FENCE: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy)]
 enum DecKv {
@@ -4123,6 +4133,19 @@ impl GpuModel {
                 )?;
             }
         }
+        // Prefill держит GPU без синхронизации весь чанк, а amdgpu сбрасывает
+        // контекст, если пакет команд на ring gfx не укладывается в
+        // `lockup_timeout` (2 с). Простое «прошло 400 мс с прошлого `finish`»
+        // здесь не работает: enqueue асинхронный, хост успевает отправить все
+        // слои чанка за единицы миллисекунд, и таймер молчит, пока GPU
+        // выполняет один пакет на несколько секунд. Поэтому размер группы
+        // слоёв между синхронизациями подбирается по замеренному времени
+        // предыдущей группы и целится в PREFILL_FENCE; проверка по `Instant`
+        // остаётся страховкой на случай медленного хоста.
+        let mut fence_at = Instant::now();
+        let mut fence_pending = 0usize;
+        let mut fence_span = 1usize;
+        let fence_layers = self.layer_end.saturating_sub(self.layer_start).max(1);
         for layer in self.layer_start..self.layer_end {
             let prefix = format!("blk.{layer}");
             if layer == self.layer_start {
@@ -4888,6 +4911,20 @@ impl GpuModel {
                     .gpu
                     .download_at(&self.bufs.xb, ((ntok - 1) * h) * 4, h)?;
                 self.traced.push(v);
+            }
+            // На decode (ntok == 1) один слой короткий, лишние `finish` не нужны.
+            if ntok > 1 {
+                fence_pending += 1;
+                if fence_pending >= fence_span || fence_at.elapsed() >= PREFILL_FENCE {
+                    self.gpu.queue.finish()?;
+                    let took = fence_at.elapsed().as_secs_f64();
+                    let scaled = (fence_pending as f64 * PREFILL_FENCE.as_secs_f64()
+                        / took.max(1e-6))
+                    .floor() as usize;
+                    fence_span = scaled.clamp(1, fence_layers);
+                    fence_at = Instant::now();
+                    fence_pending = 0;
+                }
             }
         }
         if need_logits && self.has_head {

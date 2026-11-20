@@ -5,6 +5,7 @@
 #   tools/bench_check.sh amd            # RX 6400 (Rusticl без переменных)
 #   tools/bench_check.sh igpu           # Intel UHD 630 (RUSTICL_ENABLE=iris)
 #   tools/bench_check.sh amd --server   # плюс смоук `lfm serve`
+#   tools/bench_check.sh amd --long     # плюс длинный prefill 4096 (вотчдог amdgpu)
 #
 # Пороги зафиксированы по замерам сессий 13–15 (см. benchmarks/machine.md).
 # Скрипт проверяет именно split-пути (len > 512): ошибки нормировки в kvarn
@@ -16,10 +17,12 @@ SRV=${SRV:-./target/release/lfm}
 APP=${APP:-./target/release/lfm}
 MODE=${1:-amd}
 SERVER=0
+LONG=0
 TP=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --server) SERVER=1 ;;
+        --long) LONG=1 ;;
         --tp) shift; TP=${1:-} ;;
     esac
     shift
@@ -142,6 +145,21 @@ if [ "$SERVER" = "1" ]; then
     fi
     kill "$srv_pid" 2>/dev/null
     wait "$srv_pid" 2>/dev/null
+fi
+
+if [ "$LONG" = "1" ]; then
+    # Регресс на вотчдог amdgpu: `lockup_timeout` по умолчанию 2 с, и если
+    # prefill-чанк уходит в драйвер одним пакетом дольше, контекст теряется
+    # (`ring gfx timeout` / `The CS has cancelled because the context is lost`).
+    # CPU-эталон такой баг не ловит: там длинный prefill просто медленный,
+    # контекст никуда не теряется. Проверяем именно длину контекста (4096),
+    # а не скорость; 600 с с запасом хватает даже на слабой iGPU.
+    if timeout 600 "$BIN" gpu-prefill --tokens 4096 --decode 8 \
+        >/tmp/opencode/bench_check_long.log 2>&1; then
+        ok "длинный prefill 4096 (без ring timeout)"
+    else
+        bad "длинный prefill 4096 (см. /tmp/opencode/bench_check_long.log)"
+    fi
 fi
 
 if [ "$FAIL" -eq 0 ]; then
