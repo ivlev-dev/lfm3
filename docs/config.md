@@ -56,7 +56,7 @@ lfm chat --ctx 32768 --kv kvarn # оверрайды только для это�
 | ключ | CLI | дефолт | смысл |
 |---|---|---|---|
 | `system` | `--system` | `You are a helpful assistant.` | системный промпт |
-| `max_tokens` | `--max-tokens` | `256` | максимум новых токенов |
+| `max_tokens` | `--max-tokens` | `0` | максимум новых токенов; `0` — до EOS или заполнения контекста |
 | `temperature` | `--temperature` | `0.7` | температура (0 = greedy) |
 | `top_k` | `--top-k` | `40` | top-k |
 | `top_p` | `--top-p` | `0.95` | top-p |

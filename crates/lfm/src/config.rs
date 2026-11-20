@@ -165,7 +165,7 @@ impl Default for ChatSection {
     fn default() -> Self {
         Self {
             system: "You are a helpful assistant.".to_string(),
-            max_tokens: 256,
+            max_tokens: 0,
             temperature: 0.7,
             top_k: 40,
             top_p: 0.95,
@@ -300,9 +300,6 @@ impl Config {
         if self.backend.tiers.iter().any(|p| *p > 100) {
             bail!("backend.tiers: проценты должны быть 0..=100");
         }
-        if self.chat.max_tokens == 0 {
-            bail!("chat.max_tokens должен быть положительным");
-        }
         if self.server.max_body < 1024 {
             bail!("server.max_body должен быть не меньше 1024 байт");
         }
@@ -390,6 +387,7 @@ mod tests {
         assert_eq!(cfg.backend.ctx, 4096);
         assert_eq!(cfg.backend.kv, "f16");
         assert_eq!(cfg.backend.mode, BackendMode::Single);
+        assert_eq!(cfg.chat.max_tokens, 0, "0 = до EOS/контекста");
     }
 
     #[test]

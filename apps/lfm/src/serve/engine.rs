@@ -864,7 +864,15 @@ impl Worker {
                 return;
             }
         };
-        let enqueued = match self.sched.enqueue(prompt.len(), params.max_tokens) {
+        let requested = if params.max_tokens == 0 {
+            self.sched
+                .config()
+                .max_ctx
+                .saturating_sub(prompt.len())
+        } else {
+            params.max_tokens
+        };
+        let enqueued = match self.sched.enqueue(prompt.len(), requested) {
             Ok(enqueued) => enqueued,
             Err(e) => {
                 let _ = tx.send(Event::Error(format!("{e}")));

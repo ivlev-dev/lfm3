@@ -111,7 +111,15 @@ impl Chat {
                 avail
             );
         }
-        let max_new = params.max_tokens.max(1).min(avail - ids.len());
+        let room = avail - ids.len() - 1;
+        let max_new = if params.max_tokens == 0 {
+            room
+        } else {
+            params.max_tokens.min(room)
+        };
+        if max_new == 0 {
+            bail!("в контексте не осталось места для ответа");
+        }
         let mut session = ChatSession::new();
         if self.thinking {
             session.begin_thinking();
