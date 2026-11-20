@@ -6,7 +6,6 @@ tokenizer := "models/hf/tokenizer.json"
 template := "models/hf/chat_template.jinja"
 addr := "127.0.0.1:8000"
 ctx := "4096"
-power := "/sys/class/drm/card1/device/power_dpm_force_performance_level"
 
 default:
     @just --list
@@ -47,20 +46,15 @@ bench-multi:
 check:
     ./target/release/lfm-bench gpu-check --ids 1,2,3,4,5,6,7,8,9,10
 
-power-high:
-    echo high | sudo tee {{power}}
-
-power-auto:
-    echo auto | sudo tee {{power}}
-
+# Регрессия корректности. `amd` — профиль для AMD; на текущей машине это Vega 8.
 bench-check:
     tools/bench_check.sh amd
 
-bench-check-igpu:
-    tools/bench_check.sh igpu
+# То же на текущей APU (Vega 8): отдельного профиля в скрипте нет, `amd` уже
+# не выставляет RUSTICL_ENABLE. Рецепты `igpu*` относились к Intel UHD 630 —
+# устройства в системе больше нет.
+bench-check-apu:
+    tools/bench_check.sh amd
 
 bench-check-server:
     tools/bench_check.sh amd --server
-
-bench-check-igpu-full:
-    tools/bench_check.sh igpu-full

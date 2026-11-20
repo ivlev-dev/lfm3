@@ -4,10 +4,12 @@
 # План работ
 
 > Исторический документ: план и логи сессий 1–9. Актуальные цифры —
-> `benchmarks/machine.md` и `benchmarks/llama-cpp.md`; удалённые пути (`LFM_KV=f32`,
-> `lds11`) в тексте оставлены как история.
+> `benchmarks/machine.md` (сейчас — Машина 2, Vega 8; разделы RX 6400 —
+> история) и `benchmarks/llama-cpp.md`; удалённые пути (`LFM_KV=f32`,
+> `lds11`, `apps/server`, `lfm-server`) в тексте оставлены как история.
 
-Контракт производительности (RX 6400, 1.09 ГБ весов Q4_K_M):
+Контракт производительности для Машины 1 (RX 6400, 1.09 ГБ весов Q4_K_M),
+история; на Vega 8 цели и замеры пересматриваются по `benchmarks/machine.md`:
 - decode 1 стрим, ctx 8192: ≥ 70 tok/s (нужно ~83 ГБ/с из 128);
 - decode 4–6 стримов: ≥ 200 tok/s агрегат (веса амортизируются);
 - prefill 8192 чанком ≥ 4096: ≥ 300 tok/s (1 стрим), ≥ 800 агрегат;
@@ -20,34 +22,32 @@
 | M2 | OpenCL decode-граф, сэмплер, CLI one-shot | ≥ 70 tok/s на 1 стриме | 82.7 tok/s (ctx 64), 74.8 (512), 71.4 (4096), 65.5 (8192); цель 70 на 8192 не взята |
 | M3 | paged KV, continuous batching, KV int8/int4 | 6 стримов без расхождений, ≥ 200 агрегат | paged KV + пер-последовательное состояние + батч шага; агрегат 4/6/8 стримов = 128/143/125 tok/s |
 | M4 | radix prefix cache, смешанный батч, FA3-prefill | 8192 prefill ≥ 300, prefix-hit TTFT < 10% | prefill 183 (512) / 166 (4096) / 152 (8192), prepack Q4 +5%; radix cache готов: повтор промпта 512 ток. — 193 мс против 2773 мс (×14), логиты бит-в-бит; осталось prefill ≥ 300 и смешанный батч |
-| M5 | OpenAI-сервер (SSE/WS/tools/thinking) + TUI | e2e openai-python, load-тест, TUI | сервер + планировщик continuous batching + `/metrics` + flow control h2; два TUI (in-process и клиент `lfm-tui`); load-тест 6 соединений без ошибок; осталось: tools/`tool_calls`, `/v1/completions`, e2e openai-python |
+| M5 | OpenAI-сервер (SSE/WS/tools/thinking) + TUI | e2e openai-python, load-тест, TUI | сервер + планировщик continuous batching + `/metrics` + flow control h2; два TUI (in-process и серверный клиент, позже удалён); load-тест 6 соединений без ошибок; осталось: tools/`tool_calls`, `/v1/completions`, e2e openai-python |
 | M6 | 3-tier слоёв и KV, TP+PP, PoCL CPU | конфиг 20/80/0, 2-device тесты | PP (20/80/0) и full TP (головы/FFN/lm_head) готовы: ids совпадают, logits cos 0.9997 |
 | M7 | NPU-порт Hexagon v68, hardening, docs | feature-сборка, спека протокола | |
 | M8 | CPU (AVX2/NEON) и OpenCL; цель — llama.cpp | prefill/decode ≥ llama.cpp | CPU/OpenCL готовы; Vulkan/ROCm исключены; идёт оптимизация GEMM |
 
 ## Текущее состояние (сводка)
 
-- 13 членов workspace: 10 крейтов (`domain`, `application`, `infra-gguf/quant/cpu/hf/
-  tokenizer/chat/opencl`, `backend-opencl`) и 3 приложения (`apps/bench`, `apps/server`,
-  `apps/tui`).
-- 245 тестов зелёных, сборка без предупреждений.
-- KV хранится в fp16 (`LFM_KV=f32` — старый путь): VRAM под кэш вдвое меньше,
-  A/B на 8192 даёт +4–10% decode.
-- decode: 82.7 / 74.8 / 71.4 / 65.5 tok/s на ctx 64 / 512 / 4096 / 8192
-  (записано на простое; в текущем состоянии машины int8-пик 8.8 TOPS против 12.3,
-  поэтому свежие прогоны дают 66 / 68 / 58 / 50–57 — для A/B использовать пары
-  чередующихся прогонов).
-- prefill (PB=6): 191 (64), 183 (512), 176 (1024), 166 (4096), 152 (8192) tok/s.
-- мультистрим: 128 (4) / 143 (6) / 125 (8) tok/s агрегат (в текущем состоянии машины
-  6 стримов — 148–155), 0 расхождений с одиночным прогоном.
-- радикс-кэш префиксов: TTFT повторного промпта 512 токенов — 193 мс вместо 2773 мс (×14),
-  480 из 512 токенов берутся из KV, `cos` логитов 1.00000000.
+- 13 членов workspace = 11 крейтов (`domain`, `application`, `infra-gguf/quant/
+  opencl/hf/tokenizer/chat/cpu`, `backend-opencl`, `lfm`) + приложение
+  `apps/lfm` (бинарь `lfm`: `chat` + `serve`) + стенд `tools/bench`
+  (`lfm-bench`, в поставку не входит).
+- Тесты зелёные, см. `cargo test --workspace` (число не хардкодим); сборка без
+  предупреждений.
+- KV задаётся `backend.kv` (`f16` по умолчанию, также `q4`, `kvarn`,
+  `kvarn_k4v4`); память KV — `docs/backends.md`, раздел «kvarn».
+- Производительность: актуальные замеры — `benchmarks/machine.md` (Машина 2,
+  Vega 8); разделы M0–M4 ниже — история Машины 1 (RX 6400).
 - режимы проверки: `gpu-cmp` (батч == последовательный), `gpu-multi` (мультистрим),
   `gpu-cache` (префикс-кэш, вытеснение, общий префикс), `gpu-check` (CPU-эталон).
 
 ## План дальше
 
-### P0. Закрыть M4: prefill 8192 ≥ 300 tok/s (сейчас 152)
+> В P0–P2 `LFM_*` — исторические env стенда и A/B-экспериментов; текущая
+> настройка приложения — TOML/CLI (см. `docs/config.md`).
+
+### P0. Закрыть M4: prefill 8192 ≥ 300 tok/s — закрыт
 
 1. **Сделано: prepack Q4_K для prefill.** Второй набор Q4-весов (`LFM_PREPACK=0`
    выключает): блок 144 → 148 байт, 6-битные пары скейл/мин распакованы в байты и
@@ -92,10 +92,10 @@
    Суммарно attention + GEMV: **+14.9%** на 8192 и 512 (3/3 пары), агрегат 6 стримов
    140→159 (3/3).
 
-DoD этапа: `gpu-prefill --tokens 8192` ≥ 300 tok/s, `gpu-cmp --len 601 --batch 6`
-cos ≥ 0.9998 (сейчас 0.999927), prefix-hit TTFT < 10% от холодного (уже 7%).
+DoD этапа: `gpu-prefill --tokens 8192` ≥ 300 tok/s (закрыт),
+`gpu-cmp --len 601 --batch 6` cos ≥ 0.9998, prefix-hit TTFT < 10% от холодного.
 
-### P1. Decode ctx 8192 ≥ 70 tok/s (сейчас 65.5)
+### P1. Decode ctx 8192 ≥ 70 tok/s — открыт
 
 1. **Сделано: KV fp16.** K и V хранятся как `half` в той же страничной раскладке;
    лейн читает пару соседних dim через `vload_half2` (было `lane` и `lane+64`).
@@ -127,7 +127,7 @@ cos ≥ 0.9998 (сейчас 0.999927), prefix-hit TTFT < 10% от холодн�
 DoD этапа: `gpu-prefill --tokens 8192 --decode 24` ≥ 70 tok/s, текст `gpu-gen`
 совпадает с llama.cpp, `gpu-cmp --len 2048` cos ≥ 0.9998.
 
-### P2. Агрегат 6 стримов ≥ 200 tok/s (сейчас 148–155)
+### P2. Агрегат 6 стримов ≥ 200 tok/s — закрыт
 
 1. **Сделано: lm_head по строкам.** `step_mixed_rows(reqs, logits_rows)` собирает
    нужные строки `hqx`/`hsx` в компактные буферы, считает lm_head только для них и
@@ -149,11 +149,17 @@ DoD этапа: `gpu-prefill --tokens 8192 --decode 24` ≥ 70 tok/s, текст
    (см. «Проверено и откачено»); остаётся переработка батчевого Q4-GEMV и тайловый
    prefill-attention.
 
-DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 расхождений.
+DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (закрыт), 0 расхождений.
 
 ### P3. M5 — OpenAI-сервер и TUI
 
-1. **Сделано: сервер v1** (`apps/server`, бинарь `lfm-server`). Своими руками, без
+> Пункты писались до перехода на один бинарь. Исторические имена
+> (`apps/server`/`lfm-server`, `apps/tui`/`lfm-tui`, `gpu-chat --tui`) ниже
+> заменены на текущие: сервер и чат — `apps/lfm` (`lfm serve`/`lfm chat`),
+> стенд — `lfm-bench`.
+
+1. **Сделано: сервер v1** (`apps/lfm/src/serve`, подкоманда `lfm serve`;
+   исторически `apps/server`, бинарь `lfm-server`). Своими руками, без
    зависимостей: HTTP/1.1 на std, движок в отдельном потоке (модель грузится там же,
    main ждёт готовности), очередь запросов через канал. Эндпоинты: `GET /health`,
    `GET /v1/models`, `POST /v1/chat/completions` в обычном и потоковом виде
@@ -173,31 +179,31 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    C.4.2, C.6.1 и known-answer для SHA-1; проверено curl'ом: `/health` по HTTP/2
    (`http_version=2`), `/v1/models`, обычный ответ и SSE-поток по h2c, плюс тот же
    сервер отвечает по HTTP/1.1.
-2. **Сделано: интерактивный CLI-чат** (`gpu-chat --interactive`): многоходовой диалог,
+2. **Сделано: интерактивный CLI-чат** (сейчас `lfm chat`; исторически
+   `gpu-chat --interactive`): многоходовой диалог,
    `/exit` и `/reset`, история хранится в `ChatSession`, каждый ход — `generate_stream`
    (освобождение слота + `prefill`, поэтому общий префикс истории берётся из кэша).
    Проверено: на вопрос «What is my name?» после «Hi, my name is Alex» отвечает
    «Your name is Alex».
 3. **Сделано: планировщик continuous batching** (`crates/application/src/scheduler.rs`,
-   `apps/server/src/engine.rs`). Чистая логика: FIFO-очередь, admission по свободным
+   `apps/lfm/src/serve/engine.rs`). Чистая логика: FIFO-очередь, admission по свободным
    KV-страницам с резервом под `max_new` (пересчёт `ceil((prompt+max_new)/32)`),
    план шага — атомарный `prefill` при отсутствии декодов (сохраняет радикс-кэш),
    иначе `step_mixed`: 1 токен на декод + prefill-чанки в бюджете
    `prefill_budget` (64). Движок: один поток, общий шаг на все активные,
    сэмплинг по строкам, стриминг событий в каналы, отмена по ошибке `tx.send`
-   (разрыв соединения), освобождение слота, метрики шага (`LFM_SCHED_LOG=1`).
+   (разрыв соединения), освобождение слота, метрики шага в `/metrics`.
    API `Engine::submit` не изменился, транспорт не потребовал правок.
-4. **Сделано: TUI-чат** (`gpu-chat --tui`) доведён: scroll PgUp/PgDn/Home/End,
+4. **Сделано: TUI-чат** (сейчас `lfm chat`; стенд — `lfm-bench gpu-chat --tui`)
+   доведён: scroll PgUp/PgDn/Home/End,
    история ввода Up/Down с черновиком, resize во время стрима, тулколлы отдельным
    блоком, `/help`, и **Ctrl+C прерывает генерацию** (`generate_stream_cancel` +
    `stty min 0 time 0` на время стрима, введённое сохраняется в `pending`).
    Проверено в pty: «прервано (214 ток.)», сессия продолжается, `/exit` — rc 0.
-5. **Сделано: серверный TUI-клиент** (`apps/tui`, `lfm-tui`): свой HTTP/1.1 +
-   chunked/SSE парсер с UTF-8-склейкой, скролл/история ввода/resize, thinking и
-   тулколлы, Ctrl+C закрывает сокет (сервер отменяет), статус из `GET /metrics`
-   (active/waiting, KV used/free, cache hits, TTFT, tok/s), `/save`/`/load`.
-   59 тестов крейта, pty-смоук против живого сервера: «Paris», `lfm3 ctx 4096`,
-   182 мс TTFT, 59 tok/s, «прервано» без выхода.
+5. **Было: серверный TUI-клиент** (`apps/tui`, `lfm-tui`). При переходе на один
+   бинарь удалён: в поставке остаётся локальный `lfm chat`, которому сервер не
+   нужен. Исторические детали клиента (HTTP/1.1 + chunked/SSE, статус из
+   `/metrics`, `/save`/`/load`) в текущем коде отсутствуют.
 6. **Сделано: tools/`tool_calls` и `/v1/completions` (P3, сессия 4).**
    Protocol: `tools`/`tool_choice` (auto/none), `tool_calls`+`tool_call_id` в истории,
    `finish_reason: tool_calls`, стриминговые дельты `tool_calls` по индексам.
@@ -223,20 +229,19 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    сначала обрабатывает отложенные кадры. Тест
    `window_wait_defers_pipelined_headers_and_body`; `/health`, SSE и completions по
    h2c и параллельные запросы проверены curl'ом.
-6. **Сделано: `GET /metrics`** (HTTP/1.1 и h2): атомарный снимок из воркера
+9. **Сделано: `GET /metrics`** (HTTP/1.1 и h2): атомарный снимок из воркера
    (`active/waiting`, `steps`, `avg_step_ms`, KV-страницы, `cache_hits`,
    `reused_tokens`, `uptime_s`), строгая JSON-схема, тесты на сериализацию и роуты.
-7. **Дальше: tools**: `tools`/`tool_calls` в запросе и ответе, `/v1/completions`.
-8. Границы транспорта: TLS не поддерживается (h2c по prior knowledge, без
+10. Границы транспорта: TLS не поддерживается (h2c по prior knowledge, без
    `Upgrade: h2c` и server push). **Flow control HTTP/2 сделан**: окна соединения и
    стримов, `SETTINGS_INITIAL_WINDOW_SIZE` с отрицательной дельтой, ожидание
    `WINDOW_UPDATE` с чтением входящих фреймов (PING/SETTINGS/RST/GOAWAY), ошибки
    переполнения без паник. Проверено: SSE по h2c на **124 647 Б** (702 чанка,
    `[DONE]`) при стартовом окне 64 КБ.
-9. DoD: e2e openai-python (обычный ответ, стриминг, thinking) — сделано curl/loadtest;
-   load-тест 6 соединений — 0 ошибок, агрегат 45 tok/s, второй запрос стартует до
-   конца первого; TUI показывает метрики — сделано. Осталось: tools и e2e
-   openai-python.
+11. DoD выполнен: e2e openai-python (обычный ответ, стриминг, tools, completions) —
+   сделано; load-тест 6 соединений — 0 ошибок, второй запрос стартует до конца
+   первого. Осталось только TLS (h2c по prior knowledge) — по требованию, для
+   OpenAI-клиентов не критично.
 
 ### P4. M6 — устройства и раскладка
 
@@ -244,24 +249,27 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
    (embed на первой ступени, lm_head на последней, остальные веса не читаются);
    `PipelineModel` передаёт hidden через host, синхронизирует `prefill_begin/finish`
    и радикс-кэш (одинаковые хэши → одинаковые страницы), `step` прогоняет батч через
-   все ступени. `LFM_DEVICE` выбирает устройство, `LFM_TIERS=20/80/0` — раскладку
-   (сервер и `gpu-pp`). Проверка: 20/80/0 (GPU 4 слоя + PoCL CPU 20) и 50/50 дают
+   все ступени. `--devices`/`backend.devices` выбирает устройство, `--tiers`/
+   `backend.tiers = [20,80,0]` — раскладку (сервер и `gpu-pp`; в стенде
+   исторически `LFM_DEVICE`/`LFM_TIERS`). Проверка: 20/80/0 (GPU 4 слоя + PoCL CPU 20) и 50/50 дают
    те же greedy-ids, что одиночный GPU (16 токенов), `logits cos 0.999824`, top-5
-   совпадает; сервер с `LFM_TIERS` переиспользует кэш на обеих ступенях (reused 192).
+   совпадает; сервер с `--tiers` переиспользует кэш на обеих ступенях (reused 192).
 2. **Сделано: full TP (сессия 6).** q/k/v/g и gate делятся по головам,
    `attn_output` — по столбцам (сумма партиалов), FFN: `up/gate` по строкам,
    `down` по столбцам (сумма), lm_head — по словарю с host-gather. Синхронизация
    `x/hq/hs` после каждой фазы (детерминизм между устройствами), `TpShard` в
-   загрузчике режет Q4/Q6-байты по строкам/блокам. `LFM_TP=0/1`/`gpu-tp`: ids
-   совпадают с single GPU (8/8), `logits cos 0.999745`; сервер с `LFM_TP`
+   загрузчике режет Q4/Q6-байты по строкам/блокам. `--mode tp --devices 0,1`/
+   `gpu-tp` (исторически `LFM_TP`): ids
+   совпадают с single GPU (8/8), `logits cos 0.999745`; сервер в режиме tp
    отвечает. На GPU+CPU это корректность, не ускорение.
 3. DoD: конфиг 20/80/0 проходит `gpu-cmp`, 2-device тесты дают те же логиты —
    выполнено для PP и full TP (ids/logits выше).
 
 ### P4b. Бэкенды: CPU и OpenCL, цель — llama.cpp
 
-1. **CPU-бэкенд вынесен** в отдельный проект; в этом репозитории — только OpenCL.
-3. **Vulkan/ROCm исключены** решением от 18.11. Остаются CPU и OpenCL.
+1. **CPU-бэкенд вынесен** в отдельный проект; в этом репозитории остаётся
+   `infra-cpu` как эталон для сверки, рабочего серверного CPU-бэкенда нет.
+2. **Vulkan/ROCm исключены** решением от 18.11. Остаются CPU и OpenCL.
 3. **Цель: обогнать llama.cpp** по prefill и decode на CPU и OpenCL
    (бейзлайн — `benchmarks/llama-cpp.md`).
 4. **Сделано: LDS-GEMM для prefill (OpenCL).** `gemm_q4_k_i8_lds17` (варп = 4 токена,
@@ -297,8 +305,8 @@ DoD: `gpu-multi --seqs 6 --tokens 48` ≥ 200 tok/s (сейчас 148–155), 0 
   `gpu-check` (CPU-эталон). Для бит-точных задач обязательны cos и top-5.
 - Любая оптимизация сначала измеряется на целевой точке (8192 / 6 стримов), потом
   либо остаётся, либо удаляется (как PB=7/8 и 4-головое внимание).
-- Один прогон тестов в конце: `cargo test --workspace` (245 тестов) + сборка без
-  предупреждений.
+- Один прогон тестов в конце: `cargo test --workspace` (число тестов — по выводу
+  раннера) + сборка без предупреждений.
 
 ## M0 — итог
 

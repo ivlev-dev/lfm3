@@ -5,10 +5,14 @@
 
 ## Возможности
 
-- **OpenCL-бэкенд** (Rusticl): отдельные пути ядер под AMD (подгруппа 64) и
-  Intel iGPU (16, без fp16), KV `f16` / `q4` / `kvarn` / `kvarn_k4v4`.
-- **Multi-device**: `single`, `pipeline` (слои по устройствам, конвейер по
-  чанкам) и `tp` (тензорный параллелизм, взвешенный шардинг).
+- **OpenCL-бэкенд** (Rusticl): путь под AMD (подгруппа 64) и переносимый путь
+  для устройств без fp16 (исторически — Intel UHD 630), KV `f16` / `q4` /
+  `kvarn` / `kvarn_k4v4`.
+- **Устройства**: `single`, `pipeline` (слои по устройствам, конвейер по
+  чанкам) и `tp` (тензорный параллелизм). На текущей машине OpenCL-устройство
+  одно — Vega 8, поэтому рабочий режим `single`; `pipeline` требует второго
+  устройства, `tp` — от двух до четырёх (только `kv = "f16"`). Неверная
+  комбинация режима и устройств — ошибка валидации.
 - **Сервинг**: continuous batching, paged KV, radix prefix cache, пул KV
   (`kv_pool`), адресные логиты, GPU-argmax для greedy.
 - **Чат**: streaming, reasoning (`thinking`), tool calling, TTFT и счётчики
@@ -61,7 +65,11 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -
 Приоритет: **CLI > `--config`/`lfm.toml` > значения по умолчанию**.
 Полное описание ключей — `docs/config.md`.
 
-Пример: GPU + iGPU, сжатый KV, контекст 32k:
+`lfm config init` создаёт безопасный пример для одного устройства (Vega 8):
+`devices = [0]`, `mode = "single"`. Раскладка для двух устройств (GPU + iGPU)
+описана ниже и в комментариях-подсказках внутри сгенерированного файла.
+
+Пример: GPU + iGPU (машина с двумя устройствами), сжатый KV, контекст 32k:
 
 ```toml
 [backend]
@@ -72,21 +80,36 @@ kv = "kvarn"
 ctx = 32000
 ```
 
+Запуск на такой машине:
+
 ```bash
-RUSTICL_ENABLE=iris,radeonsi ./target/release/lfm chat
+./target/release/lfm chat   # индексы устройств и раскладка берутся из lfm.toml
 ```
+
+Пример `[backend]` выше — только для конфигурации с двумя устройствами; на
+текущей машине второго устройства нет.
 
 ## Устройства и KV
 
 | режим | как включить | когда |
 |---|---|---|
-| single | `backend.devices = [0]` | одна карта (быстрее всего) |
-| pipeline | `mode = "pipeline"`, `devices = [0,1]`, `tiers = [96,4]` | не хватает VRAM, есть iGPU/CPU |
-| tp | `mode = "tp"`, `devices = [0,1]` | одинаковые быстрые GPU; только `kv = "f16"` |
+| single | `backend.devices = [0]` (по умолчанию) | одно устройство — текущая машина |
+| pipeline | `mode = "pipeline"`, `devices = [0,1]`, `tiers = [96,4]` | машина с двумя устройствами и не хватает памяти |
+| tp | `mode = "tp"`, `devices = [0,1]` | два одинаковых быстрых GPU; только `kv = "f16"` |
 
-Индексы устройств зависят от `RUSTICL_ENABLE`: без переменных `0` — дискретный
-GPU, `1` — CPU; с `RUSTICL_ENABLE=iris,radeonsi` — `0` GPU, `1` iGPU, `2` CPU.
-Замеры, ограничения и выбор раскладки — `docs/backends.md`.
+`single` допускает ровно одно устройство, `pipeline` — минимум два, `tp` — от
+двух до четырёх. Неверная комбинация — ошибка валидации.
+
+На текущей машине OpenCL-устройство одно: индекс `0` — интегрированный
+**AMD Radeon Vega 8** (Raven/Picasso, 8 CU, подгруппа 64, fp16; память общая с
+CPU, UMA). Дискретной карты и Intel iGPU в системе нет, `RUSTICL_ENABLE` для
+Vega 8 не нужен. CPU через PoCL виден как отдельное OpenCL-устройство, но
+годится только для диагностики: `pipeline`/`tp` с ним медленнее.
+
+`pipeline` требует как минимум двух устройств; `single` — ровно одно; `tp` —
+от двух до четырёх и делит головы/FFN между устройствами. Нарушение этих
+правил (`Config::validate`) — ошибка загрузки конфига. Замеры, ограничения и
+выбор раскладки — `docs/backends.md`; актуальные числа — `benchmarks/machine.md`.
 
 ## Библиотека
 
@@ -115,10 +138,13 @@ println!(
 
 ```bash
 cargo test --workspace
-tools/bench_check.sh amd            # корректность на RX 6400
-tools/bench_check.sh igpu           # Intel UHD 630
+tools/bench_check.sh amd            # корректность на AMD (текущая машина — Vega 8)
 tools/bench_check.sh amd --server   # плюс смоук сервера
 ```
+
+`amd` — профиль для текущей машины; `just bench-check-apu` запускает тот же
+прогон. Профили `igpu`/`igpu-full` относились к Intel UHD 630, которого в
+системе больше нет, и на Vega 8 не используются.
 
 `lfm-bench` (`tools/bench/`) — диагностический стенд: профили ядер, сравнение
 батчей, замеры prefill/decode. В поставку не входит.
