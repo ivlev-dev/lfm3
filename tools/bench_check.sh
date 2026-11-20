@@ -81,6 +81,9 @@ for kv in f16 kvarn; do
     esac
 done
 
+timeout 300 "$BIN" --kv-cache kvarn gpu-chat --ctx 32000 --tui </dev/null >/tmp/opencode/bench_check_ctx.log 2>&1
+if [ $? -eq 0 ]; then ok "kvarn ctx 32000 загружается"; else bad "kvarn ctx 32000 (см. /tmp/opencode/bench_check_ctx.log)"; fi
+
 pps=$(timeout 900 "$BIN" gpu-prefill --tokens 512 --decode 16 --kv-cache kvarn 2>/dev/null \
     | awk -F'[()]' '/^decode/ { print $2 }' | awk '{ print $1 }')
 check_min "kvarn decode tok/s" "$pps" 1.0

@@ -590,6 +590,10 @@ pub struct GpuModel {
     pub traced: Vec<Vec<f32>>,
 }
 
+fn zero_grid(len: usize, local: usize) -> usize {
+    len.div_ceil(16).div_ceil(local) * local
+}
+
 fn pick_logits_rows(
     need_logits: bool,
     logits_rows: Option<&[usize]>,
@@ -1898,24 +1902,30 @@ impl GpuModel {
         Ok(())
     }
 
+    fn zero_fill(&self, buf: ClMemRaw, off: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let local = 256usize;
+        let grid = zero_grid(len, local);
+        unsafe {
+            self.gpu.launch(
+                &self.kernels.fill_b,
+                grid,
+                local,
+                &[Arg::Mem(buf), Arg::U64(off as u64), Arg::U64(len as u64)],
+            )?;
+        }
+        Ok(())
+    }
+
     fn clear_conv_slot(&mut self, slot: usize) -> Result<()> {
         let conv_len = (self.cfg.conv_cache - 1) * self.cfg.hidden_size;
         let off = slot * conv_len * 4;
         let n = conv_len * 4;
         for layer in self.layers.iter() {
             if let Some(conv) = &layer.conv {
-                unsafe {
-                    self.gpu.launch(
-                        &self.kernels.fill_b,
-                        n.div_ceil(16),
-                        256,
-                        &[
-                            Arg::Mem(conv.get()),
-                            Arg::U64(off as u64),
-                            Arg::U64(n as u64),
-                        ],
-                    )?;
-                }
+                self.zero_fill(conv.get(), off, n)?;
             }
         }
         Ok(())
@@ -5302,31 +5312,13 @@ impl GpuModel {
         let conv_bytes = self.max_seqs * (self.cfg.conv_cache - 1) * h * 4;
         for layer in &self.layers {
             if let Some(conv) = &layer.conv {
-                unsafe {
-                    self.gpu.launch(
-                        &self.kernels.fill_b,
-                        conv_bytes.div_ceil(16),
-                        256,
-                        &[
-                            Arg::Mem(conv.get()),
-                            Arg::U64(0),
-                            Arg::U64(conv_bytes as u64),
-                        ],
-                    )?;
-                }
+                self.zero_fill(conv.get(), 0, conv_bytes)?;
             }
             match (&layer.k, &layer.v) {
                 (Some(KvBuf::F16(k)), Some(KvBuf::F16(v))) => {
                     let bytes = kv_len * kv_wide * 2;
-                    unsafe {
-                        for buf in [k.get(), v.get()] {
-                            self.gpu.launch(
-                                &self.kernels.fill_b,
-                                bytes.div_ceil(16),
-                                256,
-                                &[Arg::Mem(buf), Arg::U64(0), Arg::U64(bytes as u64)],
-                            )?;
-                        }
+                    for buf in [k.get(), v.get()] {
+                        self.zero_fill(buf, 0, bytes)?;
                     }
                 }
                 (
@@ -5341,23 +5333,11 @@ impl GpuModel {
                 ) => {
                     let codes = slots * heads * 64;
                     let scales = slots * heads * 2;
-                    unsafe {
-                        for buf in [kc.get(), vc.get()] {
-                            self.gpu.launch(
-                                &self.kernels.fill_b,
-                                codes.div_ceil(16),
-                                256,
-                                &[Arg::Mem(buf), Arg::U64(0), Arg::U64(codes as u64)],
-                            )?;
-                        }
-                        for buf in [kn.get(), vs.get()] {
-                            self.gpu.launch(
-                                &self.kernels.fill_b,
-                                scales.div_ceil(16),
-                                256,
-                                &[Arg::Mem(buf), Arg::U64(0), Arg::U64(scales as u64)],
-                            )?;
-                        }
+                    for buf in [kc.get(), vc.get()] {
+                        self.zero_fill(buf, 0, codes)?;
+                    }
+                    for buf in [kn.get(), vs.get()] {
+                        self.zero_fill(buf, 0, scales)?;
                     }
                 }
                 (
@@ -5389,15 +5369,8 @@ impl GpuModel {
                         (vbz.get(), wide(blocks * heads * 32)),
                         (vc.get(), wide(blocks * heads * 128)),
                     ];
-                    unsafe {
-                        for (buf, n) in sizes {
-                            self.gpu.launch(
-                                &self.kernels.fill_b,
-                                n.div_ceil(16),
-                                256,
-                                &[Arg::Mem(buf), Arg::U64(0), Arg::U64(n as u64)],
-                            )?;
-                        }
+                    for (buf, n) in sizes {
+                        self.zero_fill(buf, 0, n)?;
                     }
                 }
                 _ => {}
@@ -5664,6 +5637,18 @@ mod tests {
         let vocab: Vec<usize> = shards.iter().map(|s| s.vocab_count).collect();
         assert_eq!(vocab.iter().sum::<usize>(), 128000);
         assert_eq!(vocab, vec![42667, 42667, 42666]);
+    }
+
+    #[test]
+    fn zero_grid_is_a_multiple_of_local() {
+        assert_eq!(zero_grid(0, 256), 0);
+        assert_eq!(zero_grid(16, 256), 256);
+        assert_eq!(zero_grid(256_000, 256), 16128);
+        for len in [1usize, 15, 16, 17, 256_000, 256_256, 1_048_576] {
+            let g = zero_grid(len, 256);
+            assert_eq!(g % 256, 0, "len={len}");
+            assert!(g * 16 >= len, "len={len} grid={g}");
+        }
     }
 
     #[test]
