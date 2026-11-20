@@ -1900,7 +1900,7 @@ __kernel void gemm_q4_k_i8_b8(__global const uchar *w, __global const char *xq, 
     }
 }
 
-__kernel void gemm_q4_k_i8_b8p(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+__kernel void gemm_q4_k_i8_b8p(__global const uchar *w, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok, uint tok0) {
     uint lane = get_local_id(0);
     uint gid = get_group_id(0);
     uint row = gid * 64u + lane;
@@ -1927,7 +1927,7 @@ __kernel void gemm_q4_k_i8_b8p(__global const uchar *w, __global const char *xq,
     char16 pc = (char16)(0);
     int psn = 0;
     if (stok) {
-        __global const char *src = xq + (ulong)st * cols + sc * 32u;
+        __global const char *src = xq + (ulong)(tok0 + st) * cols + sc * 32u;
         pa = vload16(0, src);
         pc = vload16(0, src + 16u);
         psn = (int)LFM_DOT(pa.s0123, ones) + (int)LFM_DOT(pa.s4567, ones)
@@ -1957,7 +1957,7 @@ __kernel void gemm_q4_k_i8_b8p(__global const uchar *w, __global const char *xq,
             char16 c = (char16)(0);
             int sn = 0;
             if (stok) {
-                __global const char *src = xq + (ulong)st * cols + (ulong)(b + 1u) * 256u + sc * 32u;
+                __global const char *src = xq + (ulong)(tok0 + st) * cols + (ulong)(b + 1u) * 256u + sc * 32u;
                 a = vload16(0, src);
                 c = vload16(0, src + 16u);
                 sn = (int)LFM_DOT(a.s0123, ones) + (int)LFM_DOT(a.s4567, ones)
@@ -2010,7 +2010,7 @@ __kernel void gemm_q4_k_i8_b8p(__global const uchar *w, __global const char *xq,
                         dh = lfm_dot4(hi4, y4, dh); dh = lfm_dot4(hi5, y5, dh); dh = lfm_dot4(hi6, y6, dh); dh = lfm_dot4(hi7, y7, dh);
                         int suml = sm[t * 8u + 2u * q];
                         int sumh = sm[t * 8u + 2u * q + 1u];
-                        ulong g = (ulong)t * ngs + (ulong)b * 8u + 2u * q;
+                        ulong g = (ulong)(tok0 + t) * ngs + (ulong)b * 8u + 2u * q;
                         acc[t] += xs[g] * ((float)dl * scl - (float)suml * mnl);
                         acc[t] += xs[g + 1u] * ((float)dh * sch - (float)sumh * mnh);
                     }
@@ -2023,7 +2023,7 @@ __kernel void gemm_q4_k_i8_b8p(__global const uchar *w, __global const char *xq,
         #pragma unroll
         for (uint t = 0u; t < 8u; ++t) {
             if (t < ntok) {
-                y[(ulong)t * rows + row] = acc[t];
+                y[(ulong)(tok0 + t) * rows + row] = acc[t];
             }
         }
     }
@@ -2426,7 +2426,7 @@ __kernel void gemm_i8_pf16(__global const char *wq8, __global const float *wsc, 
     }
 }
 
-__kernel void gemm_q6_i8_b8p(__global const char *w, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok) {
+__kernel void gemm_q6_i8_b8p(__global const char *w, __global const float *wsc, __global const char *xq, __global const float *xs, __global float *y, uint rows, uint cols, uint ntok, uint tok0) {
     uint lane = get_local_id(0);
     uint gid = get_group_id(0);
     uint row = gid * 64u + lane;
@@ -2445,7 +2445,7 @@ __kernel void gemm_q6_i8_b8p(__global const char *w, __global const float *wsc, 
     char16 pa = (char16)(0);
     char16 pc = (char16)(0);
     if (stok) {
-        __global const char *src = xq + (ulong)st * cols + sc * 32u;
+        __global const char *src = xq + (ulong)(tok0 + st) * cols + sc * 32u;
         pa = vload16(0, src);
         pc = vload16(0, src + 16u);
     }
@@ -2459,7 +2459,7 @@ __kernel void gemm_q6_i8_b8p(__global const char *w, __global const float *wsc, 
             char16 a = (char16)(0);
             char16 c = (char16)(0);
             if (stok) {
-                __global const char *src = xq + (ulong)st * cols + (ulong)(b + 1u) * 256u + sc * 32u;
+                __global const char *src = xq + (ulong)(tok0 + st) * cols + (ulong)(b + 1u) * 256u + sc * 32u;
                 a = vload16(0, src);
                 c = vload16(0, src + 16u);
             }
@@ -2490,7 +2490,7 @@ __kernel void gemm_q6_i8_b8p(__global const char *w, __global const float *wsc, 
                         dl = lfm_dot4(wb.y, xc.y, dl);
                         dl = lfm_dot4(wb.z, xc.z, dl);
                         dl = lfm_dot4(wb.w, xc.w, dl);
-                        acc[t] += ws * xs[(ulong)t * ngs + gbase + g] * (float)dl;
+                        acc[t] += ws * xs[(ulong)(tok0 + t) * ngs + gbase + g] * (float)dl;
                     }
                 }
             }
@@ -2501,7 +2501,7 @@ __kernel void gemm_q6_i8_b8p(__global const char *w, __global const float *wsc, 
         #pragma unroll
         for (uint t = 0u; t < 8u; ++t) {
             if (t < ntok) {
-                y[(ulong)t * rows + row] = acc[t];
+                y[(ulong)(tok0 + t) * rows + row] = acc[t];
             }
         }
     }

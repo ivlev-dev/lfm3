@@ -552,6 +552,7 @@ pub struct GpuModel {
     flash_on: bool,
     flash2_on: bool,
     i8_pf_on: bool,
+    b8_split: bool,
     kernels: Kernels,
     rope_full: Buffer<f32>,
     rope_sliding: Buffer<f32>,
@@ -688,6 +689,7 @@ impl GpuModel {
         let flash_on = opts.flash;
         let flash2_on = opts.flash2;
         let i8_pf_on = opts.i8pf && gpu.caps.sub_group_size > 16;
+        let b8_split = gpu.caps.sub_group_size <= 16;
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
@@ -1195,6 +1197,7 @@ impl GpuModel {
             flash_on,
             flash2_on,
             i8_pf_on,
+            b8_split,
             kernels,
             rope_full,
             rope_sliding,
@@ -1274,6 +1277,7 @@ impl GpuModel {
                         Arg::U32(rows as u32),
                         Arg::U32(cols as u32),
                         Arg::U32(1),
+                        Arg::U32(0),
                     ],
                 )?;
             }
@@ -1335,6 +1339,62 @@ impl GpuModel {
         Ok(())
     }
 
+    fn launch_b8p_chunks(
+        &self,
+        kernel: &Kernel,
+        w: ClMemRaw,
+        wsc: Option<ClMemRaw>,
+        xq: &Buffer<i8>,
+        xs: &Buffer<f32>,
+        y: &Buffer<f32>,
+        rows: usize,
+        cols: usize,
+        ntok: usize,
+    ) -> Result<()> {
+        let grid = rows.div_ceil(64) * 64;
+        let mut t0 = 0usize;
+        while t0 < ntok {
+            let n = (ntok - t0).min(8);
+            unsafe {
+                match wsc {
+                    Some(sc) => self.gpu.launch(
+                        kernel,
+                        grid,
+                        64,
+                        &[
+                            Arg::Mem(w),
+                            Arg::Mem(sc),
+                            Arg::Mem(xq.get()),
+                            Arg::Mem(xs.get()),
+                            Arg::Mem(y.get()),
+                            Arg::U32(rows as u32),
+                            Arg::U32(cols as u32),
+                            Arg::U32(n as u32),
+                            Arg::U32(t0 as u32),
+                        ],
+                    )?,
+                    None => self.gpu.launch(
+                        kernel,
+                        grid,
+                        64,
+                        &[
+                            Arg::Mem(w),
+                            Arg::Mem(xq.get()),
+                            Arg::Mem(xs.get()),
+                            Arg::Mem(y.get()),
+                            Arg::U32(rows as u32),
+                            Arg::U32(cols as u32),
+                            Arg::U32(n as u32),
+                            Arg::U32(t0 as u32),
+                        ],
+                    )?,
+                };
+            }
+            t0 += n;
+        }
+        Ok(())
+    }
+
     fn gemv_auto_b(
         &self,
         name: &str,
@@ -1356,6 +1416,37 @@ impl GpuModel {
             list.split(',')
                 .any(|pat| !pat.is_empty() && name.contains(pat))
         });
+        if self.b8_split && self.q4_b8p_on && !force && (2..=16).contains(&ntok) {
+            if let (Weight::Q4(_), Some(p)) = (weight, packed) {
+                return self.launch_b8p_chunks(
+                    &self.kernels.gemm_q4_b8p,
+                    p.get(),
+                    None,
+                    xq,
+                    xs,
+                    y,
+                    rows,
+                    cols,
+                    ntok,
+                );
+            }
+            if self.q6_int8_on
+                && matches!(weight, Weight::Q6(_))
+                && let Some((w8, wsc, _)) = self.prepacked_i8.get(name)
+            {
+                return self.launch_b8p_chunks(
+                    &self.kernels.gemm_q6_b8p,
+                    w8.get(),
+                    Some(wsc.get()),
+                    xq,
+                    xs,
+                    y,
+                    rows,
+                    cols,
+                    ntok,
+                );
+            }
+        }
         if self.kv_f32 && matches!(weight, Weight::Q6(_)) {
             let (w8, wsc, _) = self.prepacked_i8.get(name).ok_or_else(|| {
                 anyhow!("Q6 без fp16 считает только int8-ядро, нужен prepack: {name}")
@@ -1380,6 +1471,7 @@ impl GpuModel {
                             Arg::U32(rows as u32),
                             Arg::U32(cols as u32),
                             Arg::U32(ntok as u32),
+                            Arg::U32(0),
                         ],
                     )?;
                 }
@@ -1433,6 +1525,7 @@ impl GpuModel {
                         Arg::U32(rows as u32),
                         Arg::U32(cols as u32),
                         Arg::U32(ntok as u32),
+                        Arg::U32(0),
                     ],
                 )?;
             }
@@ -1544,6 +1637,7 @@ impl GpuModel {
                                     Arg::U32(rows as u32),
                                     Arg::U32(cols as u32),
                                     Arg::U32(ntok as u32),
+                                    Arg::U32(0),
                                 ],
                             )?;
                         }
