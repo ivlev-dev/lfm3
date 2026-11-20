@@ -329,23 +329,6 @@ impl Config {
         Ok(toml::to_string_pretty(self)?)
     }
 
-    pub fn example_toml() -> String {
-        let mut cfg = Self::default();
-        cfg.backend.mode = BackendMode::Pipeline;
-        cfg.backend.devices = vec![0, 1];
-        cfg.backend.tiers = vec![96, 4];
-        cfg.backend.kv = "kvarn".to_string();
-        cfg.backend.ctx = 32768;
-        let body = cfg.to_toml().unwrap_or_default();
-        format!(
-            "# lfm.toml — конфигурация LFM3\n\
-             # backend.devices: индексы OpenCL-устройств (0=GPU, 1=iGPU при RUSTICL_ENABLE=iris,radeonsi)\n\
-             # backend.mode: single | pipeline | tp; tiers — проценты слоёв для pipeline\n\
-             # backend.kv: f16 | q4 | kvarn | kvarn_k4v4 | k4v4\n\
-             # Приоритет: CLI > этот файл > значения по умолчанию\n\n{body}"
-        )
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.backend.kind != "opencl" {
             bail!(
@@ -384,7 +367,14 @@ impl Config {
             bail!("backend.splits должен быть в 1..=16");
         }
         match self.backend.mode {
-            BackendMode::Single => {}
+            BackendMode::Single => {
+                if self.backend.devices.len() > 1 {
+                    bail!(
+                        "режим single допускает одно устройство, devices = {:?}",
+                        self.backend.devices
+                    );
+                }
+            }
             BackendMode::Pipeline => {
                 if self.backend.devices.len() < 2 {
                     bail!("backend.mode = pipeline требует минимум 2 устройства");
@@ -395,6 +385,12 @@ impl Config {
                 }
             }
             BackendMode::Tp => {
+                if self.backend.devices.len() < 2 {
+                    bail!(
+                        "режим tp требует минимум два устройства, devices = {:?}",
+                        self.backend.devices
+                    );
+                }
                 if self.backend.kv != "f16" {
                     bail!("tensor parallel поддерживает только kv = f16");
                 }
@@ -801,6 +797,34 @@ mod tests {
         let mut cfg = Config::default();
         cfg.backend.mode = BackendMode::Tp;
         cfg.backend.devices = vec![0, 1, 2, 3];
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_single_with_multiple_devices() {
+        // single молча игнорировал devices[1..] в to_options — теперь ошибка
+        let mut cfg = Config::default();
+        cfg.backend.devices = vec![0, 1];
+        assert_invalid(&cfg, "допускает одно устройство");
+
+        // положительный контроль: одно устройство проходит
+        let mut cfg = Config::default();
+        cfg.backend.devices = vec![0];
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_tp_with_one_device() {
+        // tp с одним устройством вырождался в single — теперь ошибка
+        let mut cfg = Config::default();
+        cfg.backend.mode = BackendMode::Tp;
+        cfg.backend.devices = vec![0];
+        assert_invalid(&cfg, "минимум два устройства");
+
+        // положительный контроль: два устройства с kv = f16 проходят
+        let mut cfg = Config::default();
+        cfg.backend.mode = BackendMode::Tp;
+        cfg.backend.devices = vec![0, 1];
         cfg.validate().unwrap();
     }
 

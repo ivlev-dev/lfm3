@@ -36,7 +36,12 @@ fn config_init_writes_loadable_file() {
     );
     let text = std::fs::read_to_string(&path).unwrap();
     let value: toml::Value = toml::from_str(&text).unwrap();
-    assert_eq!(value["backend"]["mode"].as_str(), Some("pipeline"));
+    assert_eq!(value["backend"]["mode"].as_str(), Some("single"));
+    assert_eq!(
+        value["backend"]["devices"].as_array().map(|a| a.len()),
+        Some(1),
+        "пример init должен быть безопасен для одного устройства"
+    );
     let again = lfm()
         .args(["config", "init", "--output"])
         .arg(&path)
@@ -46,6 +51,57 @@ fn config_init_writes_loadable_file() {
         !again.status.success(),
         "без --force файл перезаписываться не должен"
     );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
+fn config_init_output_passes_config_print() {
+    let dir = std::env::temp_dir().join(format!("lfm-cli-init-print-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lfm.toml");
+    let _ = std::fs::remove_file(&path);
+
+    let init = lfm()
+        .args(["config", "init", "--output"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // пример из init обязан загружаться и проходить validate()
+    let printed = lfm()
+        .arg("--config")
+        .arg(&path)
+        .args(["config", "print"])
+        .output()
+        .unwrap();
+    assert!(
+        printed.status.success(),
+        "init → print упал: {}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let effective: toml::Value =
+        toml::from_str(&String::from_utf8(printed.stdout).unwrap()).unwrap();
+    assert_eq!(effective["backend"]["mode"].as_str(), Some("single"));
+    assert_eq!(
+        effective["backend"]["devices"].as_array().map(|a| a.len()),
+        Some(1)
+    );
+
+    // подсказки для двух устройств — только комментарии, без чужих железяк
+    let example = std::fs::read_to_string(&path).unwrap();
+    assert!(example.contains("# devices = [0, 1]"));
+    assert!(example.contains("# mode = \"pipeline\""));
+    assert!(example.contains("# tiers = [96, 4]"));
+    for stale in ["RX 6400", "RUSTICL_ENABLE", "iris"] {
+        assert!(!example.contains(stale), "в примере осталось {stale:?}");
+    }
+
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
 }

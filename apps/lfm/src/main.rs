@@ -266,18 +266,18 @@ fn init_config(output: &Path, force: bool) -> Result<()> {
 }
 
 fn example_config() -> String {
-    let mut cfg = Config::default();
-    cfg.backend.mode = BackendMode::Pipeline;
-    cfg.backend.devices = vec![0, 1];
-    cfg.backend.tiers = vec![96, 4];
-    cfg.backend.kv = "kvarn".to_string();
-    cfg.backend.ctx = 32768;
-    let body = cfg.to_toml().unwrap_or_default();
+    let body = Config::default().to_toml().unwrap_or_default();
     format!(
         "# lfm.toml — конфигурация LFM3\n\
-         # backend.devices: индексы OpenCL-устройств (0=RX 6400, 1=iGPU при RUSTICL_ENABLE=iris,radeonsi)\n\
-         # backend.mode: single | pipeline | tp; tiers — проценты слоёв для pipeline\n\
-         # backend.kv: f16 | q4 | kvarn | kvarn_k4v4 | k4v4\n\
+         # backend.devices: индексы OpenCL-устройств; на текущей машине одно — 0 (Vega 8)\n\
+         # backend.mode: single | pipeline | tp\n\
+         #   single   — одно устройство (значение по умолчанию, безопасно)\n\
+         #   pipeline — слои по устройствам, нужно минимум два устройства:\n\
+         #              # devices = [0, 1]\n\
+         #              # mode = \"pipeline\"\n\
+         #              # tiers = [96, 4]\n\
+         #   tp       — тензорный параллелизм, нужно 2..=4 одинаковых быстрых GPU и kv = \"f16\"\n\
+         # backend.kv: f16 | q4 | k4v4 | kvarn | kvarn_k4v2 | kvarn_k4v4\n\
          # Приоритет: CLI > этот файл > значения по умолчанию\n\n{body}"
     )
 }
