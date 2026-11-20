@@ -48,6 +48,7 @@
 | `program_cache` | `LFM_PROGRAM_CACHE` | `--no-program-cache` | `true` | кэш скомпилированных ядер OpenCL в `$XDG_CACHE_HOME/lfm3/programs` (ключ: исходники + опции + устройство + драйвер) |
 | `fuse` | `LFM_FUSE` | `--no-fuse` | `true` | слияние `q‖k‖g` и `gate‖up` |
 | `pb` | `LFM_PB` | `--pb` | `6` | порог батчевого GEMV, 1..=12 |
+| `kv_pool` | `LFM_KV_POOL` | `--kv-pool` | `1` | во сколько раз пул KV больше `ctx` одной последовательности, 1..=16; больше пул — больше одновременных длинных запросов (память KV растёт линейно) |
 | `prefill_ntok` | `LFM_PREFILL_NTOK` | `--prefill-ntok` | `128` | размер чанка prefill, 1..=128; у `kv=kvarn` задаёт ещё и размер staging-кольца (память KV при ctx 8192 и 8 seq: ≈65 МБ на 128, ≈59 на 64, ≈56 на 32) |
 | `max_seqs` | `LFM_SEQS` | `--max-seqs` | `8` | одновременных последовательностей, 1..=16 |
 | `cache` | `LFM_CACHE` | `--no-cache` | `true` | кэш префиксов (radix) |

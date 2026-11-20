@@ -957,7 +957,7 @@ impl GpuModel {
         let kvd = cfg.kv_dim();
         let ffn = cfg.ffn_size;
         let vocab = cfg.vocab_size;
-        let kv_blocks = max_ctx.div_ceil(KV_PAGE);
+        let kv_blocks = max_ctx.div_ceil(KV_PAGE) * opts.kv_pool;
         let kv_slots = kv_blocks * KV_PAGE;
         let max_seqs = opts.max_seqs;
         let cache_on = opts.cache;

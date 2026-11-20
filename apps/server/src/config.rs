@@ -38,6 +38,7 @@ pub struct EngineFile {
     pub kv: Option<String>,
     pub prepack: Option<bool>,
     pub prepack_threads: Option<usize>,
+    pub kv_pool: Option<usize>,
     pub program_cache: Option<bool>,
     pub fuse: Option<bool>,
     pub pb: Option<usize>,
@@ -84,6 +85,9 @@ impl FileConfig {
         }
         if let Some(v) = e.prepack_threads {
             o.prepack_threads = v;
+        }
+        if let Some(v) = e.kv_pool {
+            o.kv_pool = v;
         }
         if let Some(v) = e.program_cache {
             o.program_cache = v;
@@ -285,6 +289,7 @@ pub fn dump(cfg: &Resolved, backend: &str) -> String {
     out.push_str(&format!("kv = \"{}\"\n", e.kv));
     out.push_str(&format!("prepack = {}\n", e.prepack));
     out.push_str(&format!("prepack_threads = {}\n", e.prepack_threads));
+    out.push_str(&format!("kv_pool = {}\n", e.kv_pool));
     out.push_str(&format!("program_cache = {}\n", e.program_cache));
     out.push_str(&format!("fuse = {}\n", e.fuse));
     out.push_str(&format!("pb = {}\n", e.pb));

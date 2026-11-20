@@ -30,6 +30,7 @@ pub struct Options {
     pub gemm_force: Option<String>,
     pub prepack_threads: usize,
     pub program_cache: bool,
+    pub kv_pool: usize,
 }
 
 impl Default for Options {
@@ -60,6 +61,7 @@ impl Default for Options {
             gemm_force: None,
             prepack_threads: 0,
             program_cache: true,
+            kv_pool: 1,
         }
     }
 }
@@ -109,6 +111,9 @@ impl Options {
         }
         if let Some(v) = num("LFM_SEQS", 1, 16) {
             o.max_seqs = v;
+        }
+        if let Some(v) = num("LFM_KV_POOL", 1, 16) {
+            o.kv_pool = v;
         }
         if let Some(v) = flag("LFM_CACHE") {
             o.cache = v;
@@ -208,6 +213,9 @@ impl Options {
         }
         if !(1..=16).contains(&self.max_seqs) {
             return Err(format!("max_seqs must be in 1..=16, got {}", self.max_seqs));
+        }
+        if !(1..=16).contains(&self.kv_pool) {
+            return Err(format!("kv_pool must be in 1..=16, got {}", self.kv_pool));
         }
         if self.prepack_threads > MAX_PREPACK_THREADS {
             return Err(format!(

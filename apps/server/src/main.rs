@@ -115,6 +115,8 @@ struct Cli {
     no_prepack: bool,
     #[arg(long, help = "потоков на prepack, 0 = авто, 1 = последовательно [0]")]
     prepack_threads: Option<usize>,
+    #[arg(long, help = "во сколько раз пул KV больше ctx одной последовательности, 1..=16 [1]")]
+    kv_pool: Option<usize>,
     #[arg(long, help = "отключить кэш скомпилированных ядер OpenCL")]
     no_program_cache: bool,
     #[arg(long, help = "отключить пары позиций в коротком внимании")]
@@ -178,6 +180,9 @@ fn apply_engine_cli(opts: &mut lfm_gpu::Options, cli: &Cli) {
     }
     if let Some(v) = cli.prepack_threads {
         opts.prepack_threads = v;
+    }
+    if let Some(v) = cli.kv_pool {
+        opts.kv_pool = v;
     }
     if cli.no_program_cache {
         opts.program_cache = false;
