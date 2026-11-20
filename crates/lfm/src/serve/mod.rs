@@ -1,25 +1,24 @@
-mod config;
-mod engine;
-mod h2;
+pub mod engine;
+pub mod h2;
 mod hpack;
 mod hpack_tables;
-mod http;
-mod protocol;
+pub mod http;
+pub mod protocol;
 mod ws;
 
 use anyhow::Result;
-use clap::Parser;
-use engine::{ChatJob, Engine, Event, ServeConfig};
-use http::{Request, SseWriter, read_request, write_json};
-use protocol::{ChatRequest, CompletionMeta, CompletionRequest, Delta, metrics_json, models_json};
 use serde_json::json;
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::config::BackendMode;
+use crate::serve::engine::{ChatJob, Engine, Event, ServeConfig};
+use crate::serve::http::{Request, SseWriter, read_request, write_json};
+use crate::serve::protocol::{ChatRequest, CompletionMeta, CompletionRequest, Delta, metrics_json, models_json};
 
 const MAX_BATCH_EVENTS: usize = 64;
 
@@ -58,282 +57,96 @@ pub(crate) fn pump_events(
     }
 }
 
-#[derive(Parser)]
-#[command(name = "lfm-server", about = "OpenAI-совместимый сервер LFM3 (OpenCL)")]
-struct Cli {
-    #[arg(long, help = "TOML-конфигурация (см. docs/config.md)")]
-    config: Option<PathBuf>,
-    #[arg(long, help = "напечатать эффективную конфигурацию и выйти")]
-    print_config: bool,
-    #[arg(long, help = "GGUF-модель [models/LFM3-1.7B-Q4_K_M.gguf]")]
-    model: Option<PathBuf>,
-    #[arg(long, help = "tokenizer.json [models/hf/tokenizer.json]")]
-    tokenizer: Option<PathBuf>,
-    #[arg(long, help = "chat_template.jinja [models/hf/chat_template.jinja]")]
-    template: Option<PathBuf>,
-    #[arg(long, help = "адрес [127.0.0.1:8000]")]
-    addr: Option<String>,
-    #[arg(long, help = "контекст в токенах, кратный 32 [4096]")]
-    ctx: Option<usize>,
-    #[arg(long, help = "системный промпт по умолчанию []")]
-    system: Option<String>,
-    #[arg(long, help = "имя модели в API [lfm3]")]
-    name: Option<String>,
-    #[arg(long, help = "логировать запросы (access log + планировщик)")]
-    log_requests: bool,
-    #[arg(long, help = "максимальный размер тела запроса в байтах [4194304]")]
-    max_body: Option<usize>,
-    #[arg(long, help = "бюджет prefill-токенов на шаг, 1..=128 [64]")]
-    prefill_budget: Option<usize>,
-    #[arg(long, help = "сколько prefill-токенов подмешивать в шаг с decode, 0..=64 [8]")]
-    prefill_in_decode: Option<usize>,
-    #[arg(
-        long,
-        help = "проверять обрыв клиента на h2 каждые N батчей, 1..=1024 [16]"
-    )]
-    h2_cancel_interval: Option<usize>,
-    #[arg(long, help = "индекс OpenCL-устройства [0]")]
-    device: Option<usize>,
-    #[arg(
-        long,
-        help = "тип KV-кэша: f16, q4, kvarn (=kvarn_k4v2), kvarn_k4v4 [f16]"
-    )]
-    kv: Option<String>,
-    #[arg(long, help = "порог батчевого GEMV, 1..=12 [6]")]
-    pb: Option<usize>,
-    #[arg(long, help = "размер чанка prefill, 1..=128 [128]")]
-    prefill_ntok: Option<usize>,
-    #[arg(long, help = "максимум одновременных последовательностей, 1..=16 [8]")]
-    max_seqs: Option<usize>,
-    #[arg(long, help = "максимум сплитов внимания, 1..=16 [16]")]
-    splits: Option<usize>,
-    #[arg(long, help = "отключить кэш префиксов")]
-    no_cache: bool,
-    #[arg(long, help = "собирать тайминги ядер (LFM_PROFILE)")]
-    profile: bool,
-    #[arg(long, help = "отключить слияние q/k/v/g и gate/up")]
-    no_fuse: bool,
-    #[arg(long, help = "отключить prepack (148-байтная раскладка и int8-копии)")]
-    no_prepack: bool,
-    #[arg(long, help = "потоков на prepack, 0 = авто, 1 = последовательно [0]")]
-    prepack_threads: Option<usize>,
-    #[arg(long, help = "во сколько раз пул KV больше ctx одной последовательности, 1..=16 [1]")]
-    kv_pool: Option<usize>,
-    #[arg(long, help = "отключить кэш скомпилированных ядер OpenCL")]
-    no_program_cache: bool,
-    #[arg(long, help = "отключить пары позиций в коротком внимании")]
-    no_attn2: bool,
-    #[arg(long, help = "отключить GQA-шеринг K/V (4 головы на группу)")]
-    no_attn4: bool,
-    #[arg(long, help = "отключить flash-внимание (4 головы × 16 полос)")]
-    no_flash: bool,
-    #[arg(long, help = "отключить два токена на волну в split-внимании")]
-    no_flash2: bool,
-    #[arg(long, help = "отключить префетч x в b8-ядрах decode")]
-    no_b8p: bool,
-    #[arg(long, help = "отключить префетч весов группы в int8-GEMM")]
-    no_i8pf: bool,
-    #[arg(long, help = "отключить int8-перепаковку Q4_K для prefill")]
-    no_q4i8: bool,
-    #[arg(long, help = "int8-копии Q4 только для FFN (-370 МБ VRAM, prefill -3..4%)")]
-    q4i8_ffn_only: bool,
-    #[arg(long, help = "отключить Q6-prefill на int8-ядре")]
-    no_q6i8: bool,
-    #[arg(long, help = "строк на подгруппу в decode-GEMV, 1..=16 [4]")]
-    rgemv: Option<usize>,
-    #[arg(long, help = "строк на подгруппу в батчевом GEMV, 1..=8 [5]")]
-    rgemv_b: Option<usize>,
-    #[arg(long, help = "размер рабочей группы decode-GEMV, кратен 64 [256]")]
-    wg: Option<usize>,
-    #[arg(long, help = "размер рабочей группы батчевого GEMV, кратен 64 [64]")]
-    wg_b: Option<usize>,
-    #[arg(long, help = "принудительный GEMM по подстроке имени тензора []")]
-    gemm_force: Option<String>,
-}
-
-fn apply_engine_cli(opts: &mut lfm_gpu::Options, cli: &Cli) {
-    if let Some(v) = cli.device {
-        opts.device = v;
-    }
-    if let Some(v) = &cli.kv {
-        opts.kv = v.clone();
-    }
-    if let Some(v) = cli.pb {
-        opts.pb = v;
-    }
-    if let Some(v) = cli.prefill_ntok {
-        opts.prefill_ntok = v;
-    }
-    if let Some(v) = cli.max_seqs {
-        opts.max_seqs = v;
-    }
-    if let Some(v) = cli.splits {
-        opts.splits = v;
-    }
-    if cli.no_cache {
-        opts.cache = false;
-    }
-    if cli.profile {
-        opts.profile = true;
-    }
-    if cli.no_fuse {
-        opts.fuse = false;
-    }
-    if cli.no_prepack {
-        opts.prepack = false;
-    }
-    if let Some(v) = cli.prepack_threads {
-        opts.prepack_threads = v;
-    }
-    if let Some(v) = cli.kv_pool {
-        opts.kv_pool = v;
-    }
-    if cli.no_program_cache {
-        opts.program_cache = false;
-    }
-    if cli.no_attn2 {
-        opts.attn2 = false;
-    }
-    if cli.no_attn4 {
-        opts.attn4 = false;
-    }
-    if cli.no_flash {
-        opts.flash = false;
-    }
-    if cli.no_flash2 {
-        opts.flash2 = false;
-    }
-    if cli.no_b8p {
-        opts.b8p = false;
-    }
-    if cli.no_i8pf {
-        opts.i8pf = false;
-    }
-    if cli.no_q4i8 {
-        opts.q4i8 = false;
-    }
-    if cli.q4i8_ffn_only {
-        opts.q4i8_ffn_only = true;
-    }
-    if cli.no_q6i8 {
-        opts.q6i8 = false;
-    }
-    if let Some(v) = cli.rgemv {
-        opts.rgemv = v;
-    }
-    if let Some(v) = cli.rgemv_b {
-        opts.rgemv_b = v;
-    }
-    if let Some(v) = cli.wg {
-        opts.wg = v / 64 * 64;
-    }
-    if let Some(v) = cli.wg_b {
-        opts.wg_b = v / 64 * 64;
-    }
-    if let Some(v) = &cli.gemm_force {
-        opts.gemm_force = if v.is_empty() { None } else { Some(v.clone()) };
-    }
-}
-
-fn backend_name() -> String {
-    match std::env::var("LFM_TP") {
-        Ok(v) if !v.is_empty() => format!("tp:{v}"),
-        _ => match std::env::var("LFM_TIERS") {
-            Ok(v) if !v.is_empty() => format!("pipeline:{v}"),
-            _ => "opencl".to_string(),
-        },
-    }
-}
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let file = match &cli.config {
-        Some(path) => config::load(path)?,
-        None => config::FileConfig::default(),
-    };
-    let mut engine_opts = file.engine(lfm_gpu::Options::from_env());
-    apply_engine_cli(&mut engine_opts, &cli);
-    let overrides = config::Overrides {
-        model: cli.model.clone(),
-        tokenizer: cli.tokenizer.clone(),
-        template: cli.template.clone(),
-        addr: cli.addr.clone(),
-        ctx: cli.ctx,
-        system: cli.system.clone(),
-        name: cli.name.clone(),
-        log_requests: cli.log_requests.then_some(true),
-        max_body: cli.max_body,
-        prefill_budget: cli.prefill_budget,
-        prefill_in_decode: cli.prefill_in_decode,
-        h2_cancel_interval: cli.h2_cancel_interval,
-    };
-    let cfg = config::resolve(&file, &overrides, engine_opts)?;
-    let backend_name = backend_name();
-    if cli.print_config {
-        print!("{}", config::dump(&cfg, &backend_name));
-        return Ok(());
-    }
-    let opts = cfg.engine.clone();
-    let backend: lfm_app::BackendLoader = match std::env::var("LFM_TP") {
-        Ok(devices) if !devices.is_empty() => Box::new(move |path, ctx| {
-            let devices: Vec<usize> = devices
-                .split('/')
-                .filter_map(|d| d.parse::<usize>().ok())
-                .collect();
-            Ok(Box::new(lfm_gpu::TpModel::load(path, ctx, &devices)?))
+pub fn run(cfg: &crate::Config) -> Result<()> {
+    cfg.validate()?;
+    let opts = cfg.backend.to_options();
+    let mode = cfg.backend.mode;
+    let devices = cfg.backend.devices.clone();
+    let plan: Vec<(usize, usize)> = devices
+        .iter()
+        .copied()
+        .zip(cfg.backend.effective_tiers()?)
+        .collect();
+    let backend: lfm_app::BackendLoader = match mode {
+        BackendMode::Single => Box::new(move |path, ctx| {
+            Ok(Box::new(lfm_gpu::GpuModel::load_with(path, ctx, &opts)?))
         }),
-        _ => match std::env::var("LFM_TIERS") {
-            Ok(tiers) if !tiers.is_empty() => Box::new(move |path, ctx| {
-                let percents: Vec<usize> = tiers
-                    .split('/')
-                    .filter_map(|p| p.parse::<usize>().ok())
-                    .collect();
-                let plan: Vec<(usize, usize)> = percents
-                    .iter()
-                    .enumerate()
-                    .map(|(device, &percent)| (device, percent))
-                    .collect();
-                Ok(Box::new(lfm_gpu::PipelineModel::load_tiers(
-                    path, ctx, &plan,
-                )?))
-            }),
-            _ => Box::new(move |path, ctx| {
-                Ok(Box::new(lfm_gpu::GpuModel::load_with(path, ctx, &opts)?))
-            }),
-        },
+        BackendMode::Pipeline => Box::new(move |path, ctx| {
+            Ok(Box::new(lfm_gpu::PipelineModel::load_tiers_with(
+                path, ctx, &plan, &opts,
+            )?))
+        }),
+        BackendMode::Tp => Box::new(move |path, ctx| {
+            Ok(Box::new(lfm_gpu::TpModel::load_with(
+                path, ctx, &devices, &opts,
+            )?))
+        }),
     };
-    let tokenizer: lfm_app::TokenizerLoader =
-        Box::new(|path| Ok(Box::new(lfm_tokenizer::LfmTokenizer::from_file(path)?)));
+    let backend_name = match mode {
+        BackendMode::Single => "opencl".to_string(),
+        BackendMode::Pipeline => format!(
+            "pipeline:{}",
+            cfg.backend
+                .devices
+                .iter()
+                .zip(cfg.backend.effective_tiers()?)
+                .map(|(d, p)| format!("{d}@{p}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
+        BackendMode::Tp => format!(
+            "tp:{}",
+            cfg.backend
+                .devices
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
+    };
+    crate::serve::protocol::set_defaults(lfm_domain::SamplingParams {
+        temperature: cfg.chat.temperature,
+        top_k: cfg.chat.top_k,
+        top_p: cfg.chat.top_p,
+        min_p: cfg.chat.min_p,
+        repeat_penalty: cfg.chat.repeat_penalty,
+        max_tokens: cfg.chat.max_tokens,
+        seed: cfg.chat.seed,
+        ..lfm_domain::SamplingParams::default()
+    });
+    let tokenizer: lfm_app::TokenizerLoader = Box::new(|path| {
+        Ok(Box::new(lfm_tokenizer::LfmTokenizer::from_file(path)?))
+    });
     let engine = Engine::spawn(
         ServeConfig {
-            model: cfg.model.clone(),
-            tokenizer: cfg.tokenizer.clone(),
-            template: cfg.template.clone(),
-            ctx: cfg.ctx,
-            system: cfg.system.clone(),
-            log_requests: cfg.log_requests,
-            max_seqs: cfg.engine.max_seqs,
-            prefill_budget: cfg.prefill_budget,
-            prefill_in_decode: cfg.prefill_in_decode,
+            model: cfg.model.path.clone(),
+            tokenizer: cfg.model.tokenizer.clone(),
+            template: cfg.model.template.clone(),
+            ctx: cfg.backend.ctx,
+            system: cfg.server.system.clone(),
+            log_requests: cfg.server.log_requests,
+            max_seqs: cfg.backend.max_seqs,
+            prefill_budget: cfg.server.prefill_budget,
+            prefill_in_decode: cfg.server.prefill_in_decode,
         },
         backend,
         tokenizer,
     )?;
     let info = Arc::new(ServerInfo {
-        model: cfg.name.clone(),
-        ctx: cfg.ctx,
+        model: cfg.server.name.clone(),
+        ctx: cfg.backend.ctx,
         backend: backend_name,
         started: Instant::now(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     });
-    let listener = TcpListener::bind(&cfg.addr)?;
+    let listener = TcpListener::bind(&cfg.server.addr)?;
     listener.set_nonblocking(true)?;
     println!(
-        "lfm-server {}: http://{} (модель {}, ctx {}, бэкенд {})",
-        info.version, cfg.addr, info.model, info.ctx, info.backend
+        "lfm {}: http://{} (модель {}, ctx {}, бэкенд {})",
+        info.version, cfg.server.addr, info.model, info.ctx, info.backend
     );
-    if cfg.log_requests {
-        println!("lfm-server: логирование запросов включено");
+    if cfg.server.log_requests {
+        println!("lfm: логирование запросов включено");
     }
     let running = Arc::new(AtomicBool::new(true));
     let flag = Arc::clone(&running);
@@ -342,8 +155,8 @@ fn main() -> Result<()> {
     });
     let active = Arc::new(AtomicUsize::new(0));
     let limits = Limits {
-        max_body: cfg.max_body,
-        h2_cancel_interval: cfg.h2_cancel_interval,
+        max_body: cfg.server.max_body,
+        h2_cancel_interval: cfg.server.h2_cancel_interval,
     };
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -381,17 +194,17 @@ fn main() -> Result<()> {
             }
         }
     }
-    println!("lfm-server: остановка, ждём активные соединения");
+    println!("lfm: остановка, ждём активные соединения");
     let deadline = Instant::now() + Duration::from_secs(10);
     while active.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
     let left = active.load(Ordering::SeqCst);
     if left > 0 {
-        eprintln!("lfm-server: соединений осталось {left}, останавливаем движок");
+        eprintln!("lfm: соединений осталось {left}, останавливаем движок");
     }
     engine.shutdown();
-    println!("lfm-server: остановлен");
+    println!("lfm: остановлен");
     Ok(())
 }
 
@@ -870,50 +683,5 @@ mod tests {
         assert_eq!(v["cache_hits"], 6);
         assert_eq!(v["reused_tokens"], 8);
         assert_eq!(v["uptime_s"].as_f64(), Some(9.5));
-    }
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-    use clap::Parser;
-
-    #[test]
-    fn engine_flags_override_config() {
-        let cli = Cli::parse_from([
-            "lfm-server",
-            "--no-flash",
-            "--no-q4i8",
-            "--no-prepack",
-            "--rgemv",
-            "6",
-            "--wg",
-            "128",
-            "--gemm-force",
-            "ffn_down",
-        ]);
-        let mut opts = lfm_gpu::Options::default();
-        opts.flash = true;
-        opts.q4i8 = true;
-        opts.prepack = true;
-        opts.rgemv = 4;
-        opts.wg = 256;
-        apply_engine_cli(&mut opts, &cli);
-        assert!(!opts.flash);
-        assert!(!opts.q4i8);
-        assert!(!opts.prepack);
-        assert!(opts.q6i8, "флаги не должны трогать остальные ключи");
-        assert_eq!(opts.rgemv, 6);
-        assert_eq!(opts.wg, 128);
-        assert_eq!(opts.gemm_force.as_deref(), Some("ffn_down"));
-    }
-
-    #[test]
-    fn empty_gemm_force_clears() {
-        let cli = Cli::parse_from(["lfm-server", "--gemm-force", ""]);
-        let mut opts = lfm_gpu::Options::default();
-        opts.gemm_force = Some("ffn".to_string());
-        apply_engine_cli(&mut opts, &cli);
-        assert!(opts.gemm_force.is_none());
     }
 }

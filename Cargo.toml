@@ -11,9 +11,9 @@ members = [
     "crates/infra-tokenizer",
     "crates/infra-chat",
     "crates/infra-cpu",
-    "apps/bench",
-    "apps/server",
-    "apps/tui",
+    "crates/lfm",
+    "tools/bench",
+    "apps/lfm",
 ]
 
 [workspace.package]

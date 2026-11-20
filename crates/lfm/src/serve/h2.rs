@@ -1,10 +1,10 @@
-use crate::engine::{ChatJob, Engine, Event};
-use crate::hpack::{self, HpackCtx};
-use crate::protocol::{
+use crate::serve::engine::{ChatJob, Engine, Event};
+use crate::serve::hpack::{self, HpackCtx};
+use crate::serve::protocol::{
     ChatRequest, CompletionMeta, CompletionRequest, Delta, metrics_json, models_json, push_sse,
     push_sse_data,
 };
-use crate::{Limits, Pump, pump_events};
+use crate::serve::{Limits, Pump, pump_events};
 use anyhow::{Result, anyhow};
 use serde_json::json;
 use std::collections::HashMap;
@@ -597,7 +597,7 @@ struct Pending {
 pub fn serve(
     stream: TcpStream,
     engine: &Engine,
-    info: &crate::ServerInfo,
+    info: &crate::serve::ServerInfo,
     limits: Limits,
 ) -> Result<()> {
     let max_body = limits.max_body;
@@ -800,7 +800,7 @@ fn route(method: &str, path: &str) -> Route {
     }
 }
 
-fn handle(conn: &mut Conn, engine: &Engine, info: &crate::ServerInfo, req: Pending) -> Result<()> {
+fn handle(conn: &mut Conn, engine: &Engine, info: &crate::serve::ServerInfo, req: Pending) -> Result<()> {
     match route(&req.method, &req.path) {
         Route::Health => {
             let code = if engine.alive() { "200" } else { "503" };
@@ -849,7 +849,7 @@ fn chat(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> Result<(
     };
     let params = parsed.to_params();
     let job = ChatJob::chat(messages, params, parsed.thinking(), parsed.to_tools());
-    let _cancel = crate::engine::CancelGuard::new(job.cancel_handle());
+    let _cancel = crate::serve::engine::CancelGuard::new(job.cancel_handle());
     let events = engine.submit(job)?;
     let name = parsed.model.as_deref().unwrap_or(model);
     let meta = CompletionMeta::new(name);
@@ -1005,7 +1005,7 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
             );
         }
         let job = ChatJob::completion(prompts[0].clone(), params);
-        let _cancel = crate::engine::CancelGuard::new(job.cancel_handle());
+        let _cancel = crate::serve::engine::CancelGuard::new(job.cancel_handle());
         let events = engine.submit(job)?;
         let block = hpack::encode(&[
             (":status", "200".to_string()),
@@ -1071,7 +1071,7 @@ fn completions(conn: &mut Conn, engine: &Engine, model: &str, req: Pending) -> R
     let mut completion_tokens = 0usize;
     for prompt in prompts {
         let job = ChatJob::completion(prompt, params.clone());
-        let _cancel = crate::engine::CancelGuard::new(job.cancel_handle());
+        let _cancel = crate::serve::engine::CancelGuard::new(job.cancel_handle());
         let events = engine.submit(job)?;
         let mut text = String::new();
         let mut finish_reason = "stop";
@@ -1529,7 +1529,7 @@ mod tests {
 
     #[test]
     fn metrics_response_uses_json_headers_and_flow_control() {
-        use crate::engine::EngineMetricsSnapshot;
+        use crate::serve::engine::EngineMetricsSnapshot;
 
         let (mut conn, mut client) = pair();
         conn.flow.apply_initial_window(64).unwrap();

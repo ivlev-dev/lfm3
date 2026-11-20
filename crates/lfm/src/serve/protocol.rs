@@ -5,14 +5,24 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::EngineMetricsSnapshot;
+use crate::serve::engine::EngineMetricsSnapshot;
+use std::sync::OnceLock;
 
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_TOP_K: usize = 40;
 pub const DEFAULT_TOP_P: f32 = 0.95;
 pub const DEFAULT_MAX_TOKENS: usize = 256;
 
+static DEFAULTS: OnceLock<SamplingParams> = OnceLock::new();
+
+pub fn set_defaults(params: SamplingParams) {
+    let _ = DEFAULTS.set(params);
+}
+
 fn default_params() -> SamplingParams {
+    if let Some(params) = DEFAULTS.get() {
+        return params.clone();
+    }
     SamplingParams {
         temperature: DEFAULT_TEMPERATURE,
         top_k: DEFAULT_TOP_K,

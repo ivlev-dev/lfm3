@@ -14,6 +14,15 @@ pub struct PipelineModel {
 
 impl PipelineModel {
     pub fn load_tiers(path: &Path, max_ctx: usize, tiers: &[(usize, usize)]) -> Result<Self> {
+        Self::load_tiers_with(path, max_ctx, tiers, &crate::Options::from_env())
+    }
+
+    pub fn load_tiers_with(
+        path: &Path,
+        max_ctx: usize,
+        tiers: &[(usize, usize)],
+        opts: &crate::Options,
+    ) -> Result<Self> {
         let total: usize = tiers.iter().map(|(_, percent)| *percent).sum();
         if total != 100 {
             return Err(anyhow!("tier percentages must sum to 100"));
@@ -43,12 +52,13 @@ impl PipelineModel {
             if from >= to {
                 continue;
             }
-            stages.push(GpuModel::load_stage(
+            stages.push(GpuModel::load_opts(
                 path,
                 max_ctx,
                 Some(device),
                 Some((from, to)),
                 None,
+                opts,
             )?);
         }
         if stages.is_empty() {

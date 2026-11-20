@@ -158,6 +158,15 @@ fn tp_weights(world: usize) -> Result<Option<Vec<u32>>> {
 
 impl TpModel {
     pub fn load(path: &Path, max_ctx: usize, devices: &[usize]) -> Result<Self> {
+        Self::load_with(path, max_ctx, devices, &crate::Options::from_env())
+    }
+
+    pub fn load_with(
+        path: &Path,
+        max_ctx: usize,
+        devices: &[usize],
+        opts: &crate::Options,
+    ) -> Result<Self> {
         let world = devices.len();
         if world == 0 {
             return Err(anyhow!("no tp devices"));
@@ -215,12 +224,13 @@ impl TpModel {
                     cfg.vocab_size,
                 ),
             };
-            stages.push(GpuModel::load_stage(
+            stages.push(GpuModel::load_opts(
                 path,
                 max_ctx,
                 Some(device),
                 None,
                 Some(shard),
+                opts,
             )?);
         }
         Ok(Self {

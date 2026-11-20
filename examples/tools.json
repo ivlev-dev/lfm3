@@ -1,0 +1,13 @@
+[
+  {
+    "name": "get_weather",
+    "description": "Текущая погода в городе",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "city": { "type": "string", "description": "Название города" }
+      },
+      "required": ["city"]
+    }
+  }
+]

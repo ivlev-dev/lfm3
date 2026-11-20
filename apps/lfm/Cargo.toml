@@ -1,0 +1,15 @@
+[package]
+name = "lfm-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lfm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+lfm = { path = "../../crates/lfm" }
+lfm-domain.workspace = true
+toml.workspace = true

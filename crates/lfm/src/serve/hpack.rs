@@ -1,4 +1,4 @@
-use crate::hpack_tables::{HUFFMAN, STATIC_TABLE};
+use crate::serve::hpack_tables::{HUFFMAN, STATIC_TABLE};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::OnceLock;

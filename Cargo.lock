@@ -1026,6 +1026,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "lfm-app",
+ "lfm-chat",
+ "lfm-domain",
+ "lfm-gpu",
+ "lfm-tokenizer",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "lfm-app"
 version = "0.1.0"
 dependencies = [
@@ -1064,6 +1080,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "lfm-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "lfm",
+ "lfm-domain",
+ "toml",
 ]
 
 [[package]]
@@ -1141,23 +1168,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lfm-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "ctrlc",
- "lfm-app",
- "lfm-chat",
- "lfm-domain",
- "lfm-gpu",
- "lfm-tokenizer",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
 name = "lfm-tokenizer"
 version = "0.1.0"
 dependencies = [
@@ -1166,16 +1176,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokenizers",
-]
-
-[[package]]
-name = "lfm-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde",
- "serde_json",
 ]
 
 [[package]]

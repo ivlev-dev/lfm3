@@ -4,7 +4,7 @@
 # Использование:
 #   tools/bench_check.sh amd            # RX 6400 (Rusticl без переменных)
 #   tools/bench_check.sh igpu           # Intel UHD 630 (RUSTICL_ENABLE=iris)
-#   tools/bench_check.sh amd --server   # плюс смоук lfm-server
+#   tools/bench_check.sh amd --server   # плюс смоук `lfm serve`
 #
 # Пороги зафиксированы по замерам сессий 13–15 (см. benchmarks/machine.md).
 # Скрипт проверяет именно split-пути (len > 512): ошибки нормировки в kvarn
@@ -12,7 +12,8 @@
 set -uo pipefail
 
 BIN=${BIN:-./target/release/lfm-bench}
-SRV=${SRV:-./target/release/lfm-server}
+SRV=${SRV:-./target/release/lfm}
+APP=${APP:-./target/release/lfm}
 MODE=${1:-amd}
 SERVER=0
 TP=""
@@ -57,6 +58,12 @@ cos_check() { # ids kv
 
 echo "== $MODE =="
 
+if "$APP" config print >/tmp/opencode/bench_check_cfg.toml 2>/tmp/opencode/bench_check_cfg.err; then
+    ok "lfm config print"
+else
+    bad "lfm config print"
+fi
+
 check_min "gpu-check f16"          "$(cos_check 1,2,3 f16)"   0.9975
 check_min "gpu-check kvarn"        "$(cos_check 1,2,3 kvarn)" 0.9965
 
@@ -95,7 +102,7 @@ if [ -n "$TP" ]; then
     if [ "$tp_devices" -ge 3 ] && [ "$MODE" != "igpu" ] && [ "$MODE" != "igpu-full" ]; then
         tp_env="RUSTICL_ENABLE=iris,radeonsi LFM_TP=$TP"
     fi
-    ( env $tp_env "$SRV" --addr 127.0.0.1:$port --ctx 1024 >/tmp/opencode/bench_check_tp.log 2>&1 ) &
+    ( env $tp_env "$SRV" serve --mode tp --devices "${TP//\//,}" --addr 127.0.0.1:$port --ctx 1024 >/tmp/opencode/bench_check_tp.log 2>&1 ) &
     srv_pid=$!
     for _ in $(seq 1 60); do
         curl -sf --max-time 1 http://127.0.0.1:$port/health >/dev/null 2>&1 && break
@@ -117,7 +124,7 @@ fi
 
 if [ "$SERVER" = "1" ]; then
     port=8177
-    "$SRV" --addr 127.0.0.1:$port --ctx 1024 --kv kvarn --kv-pool 2 --prefill-in-decode 4 >/tmp/opencode/bench_check_srv.log 2>&1 &
+    "$SRV" serve --addr 127.0.0.1:$port --ctx 1024 --kv kvarn >/tmp/opencode/bench_check_srv.log 2>&1 &
     srv_pid=$!
     for _ in $(seq 1 40); do
         curl -sf --max-time 1 http://127.0.0.1:$port/health >/dev/null 2>&1 && break

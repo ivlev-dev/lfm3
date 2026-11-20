@@ -27,10 +27,16 @@ fmt-check:
     cargo fmt --all -- --check
 
 serve:
-    ./target/release/lfm-server --model {{model}} --tokenizer {{tokenizer}} --template {{template}} --addr {{addr}} --ctx {{ctx}}
+    ./target/release/lfm serve --model {{model}} --addr {{addr}} --ctx {{ctx}}
 
-tui:
-    ./target/release/lfm-tui --url http://{{addr}}
+chat:
+    ./target/release/lfm chat --model {{model}}
+
+config-init:
+    ./target/release/lfm config init
+
+config-print:
+    ./target/release/lfm config print
 
 bench-prefill:
     ./target/release/lfm-bench gpu-prefill --tokens 512 --decode 128
@@ -38,7 +44,7 @@ bench-prefill:
 bench-multi:
     ./target/release/lfm-bench gpu-multi --seqs 8 --prompt 128 --tokens 64
 
-bench-check:
+check:
     ./target/release/lfm-bench gpu-check --ids 1,2,3,4,5,6,7,8,9,10
 
 power-high:

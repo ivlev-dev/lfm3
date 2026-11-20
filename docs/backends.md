@@ -34,10 +34,10 @@ apps/*  (composition root: выбор бэкенда по CLI/env)
 
 ## Выбор бэкенда
 
-Env/CLI (composition root):
+Конфигурация (TOML + CLI, см. `docs/config.md`):
 - бэкенд один — OpenCL;
-- `LFM_DEVICE` — индекс устройства у OpenCL;
-- `LFM_TIERS` — PP по слоям (OpenCL), `LFM_TP` — full TP (OpenCL);
+- `backend.devices` / `--devices` — индексы устройств;
+- `backend.mode = single|pipeline|tp`, `tiers` — раскладка слоёв;
 - Cargo-фич для выбора бэкенда нет: `infra-cpu` — эталонная CPU-реализация для
   сверки (`lfm-bench gpu-check`, `ref-gen`), серверный инференс идёт через
   `backend-opencl`; Vulkan/ROCm
@@ -127,7 +127,7 @@ prefill: коды декодируются в batch-внимании; после
 
 Два режима, оба через переменные окружения сервера:
 
-| | `LFM_TP=0/1` (tensor parallel) | `LFM_TIERS=50/50` (pipeline) |
+| | `lfm serve --mode tp --devices 0/1` (tensor parallel) | `lfm serve --mode pipeline --tiers 50/50` (pipeline) |
 |---|---|---|
 | что делится | головы внимания и FFN (каждый слой на всех устройствах) | слои модели (каждое устройство считает свой диапазон) |
 | ограничение | число устройств ≤ KV-голов (4); KV-головы делятся неравномерно: 4 → 2/1/1, тогда query-головы 8/4/4; миры 1–4 | число слоёв делится по процентам: 24 слоя → 2, 3, 4 и т.д. стадии |
@@ -176,20 +176,20 @@ CPU через PoCL работает (`cl_khr_integer_dot_product` и `cl_khr_fp
 
 ### TUI-чат на нескольких устройствах
 
-`lfm-bench gpu-chat --tui` теперь понимает `LFM_TIERS` (pipeline) и `LFM_TP`
-(тензорный параллелизм), как сервер. Для GPU + iGPU с `kvarn` и ctx 65536:
+`lfm chat` и `lfm serve` понимают `--mode pipeline|tp`, `--devices` и
+`--tiers`. Для GPU + iGPU с `kvarn` и ctx 65536:
 
 ```bash
-RUSTICL_ENABLE=iris,radeonsi LFM_TIERS=96/4 \
-  ./target/release/lfm-bench --kv-cache kvarn gpu-chat --ctx 65536 --tui
+RUSTICL_ENABLE=iris,radeonsi ./target/release/lfm chat \
+  --devices 0,1 --mode pipeline --tiers 96/4 --kv kvarn --ctx 65536
 ```
 
 Индексы устройств при `RUSTICL_ENABLE=iris,radeonsi`: 0 — RX 6400, 1 — UHD 630,
-2 — CPU. Доли `LFM_TIERS` — проценты слоёв; вторая стадия на iGPU в 30–80 раз
+2 — CPU. Доли `tiers` — проценты слоёв; вторая стадия на iGPU в 30–80 раз
 медленнее на слой, поэтому имеет смысл отдавать ей 1–2 слоя. Замеры для
 ctx 65536 / kvarn / 48 токенов (RX 6400 + UHD 630):
 
-| LFM_TIERS | слои AMD/iGPU | decode |
+| tiers | слои AMD/iGPU | decode |
 |---|---|---|
 | один AMD | 24 / 0 | **11.3 tok/s** (при `LFM_CACHE=0`) |
 | 96/4 | 23 / 1 | 5.3 tok/s |

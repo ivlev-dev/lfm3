@@ -1,130 +1,133 @@
-# Конфигурация
+# Конфигурация `lfm`
 
-Приоритет источников: **CLI > файл `--config` > переменные окружения > дефолт**.
-`lfm-server --print-config` печатает эффективные значения в формате TOML — этот
-вывод можно сохранить в файл и передать обратно через `--config` (round-trip
-проверен тестом вручную: `dump` → `--config` → `dump` совпадает).
+Один источник настроек — TOML-файл и флаги CLI. Приоритет:
+**CLI > `--config` (или `lfm.toml` в текущем каталоге) > значения по умолчанию**.
 
 ```bash
-./target/release/lfm-server --print-config > server.toml
-./target/release/lfm-server --config server.toml
+lfm config init                  # создать lfm.toml с примером
+lfm config print                 # эффективный конфиг (TOML)
+lfm --config prod.toml serve
+lfm chat --ctx 32768 --kv kvarn # оверрайды только для этого запуска
 ```
 
-Неизвестные ключи в файле отвергаются (`deny_unknown_fields`), опечатка не
-проглотится молча.
+Неизвестные ключи отвергаются (`deny_unknown_fields`): опечатка не проходит молча.
 
-## Сервер
+## `[model]`
 
-| ключ TOML | флаг CLI | дефолт | смысл |
+| ключ | CLI | дефолт | смысл |
 |---|---|---|---|
-| `model` | `--model` | `models/LFM3-1.7B-Q4_K_M.gguf` | GGUF-модель |
-| `tokenizer` | `--tokenizer` | `models/hf/tokenizer.json` | tokenizer.json |
-| `template` | `--template` | `models/hf/chat_template.jinja` | chat-шаблон |
-| `addr` | `--addr` | `127.0.0.1:8000` | адрес прослушивания |
-| `ctx` | `--ctx` | `4096` | контекст в токенах, кратный 32 |
-| `system` | `--system` | `""` | системный промпт по умолчанию |
+| `path` | `--model` | `models/LFM3-1.7B-Q4_K_M.gguf` | GGUF-модель |
+| `tokenizer` | — | `models/hf/tokenizer.json` | tokenizer.json |
+| `template` | — | `models/hf/chat_template.jinja` | chat-шаблон |
+
+## `[backend]`
+
+| ключ | CLI | дефолт | смысл |
+|---|---|---|---|
+| `kind` | — | `opencl` | вычислительный бэкенд (сейчас только OpenCL) |
+| `devices` | `--devices 0,1` | `[0]` | индексы OpenCL-устройств |
+| `mode` | `--mode` | `single` | `single`, `pipeline`, `tp` |
+| `tiers` | `--tiers 96/4` | `[]` (поровну) | проценты слоёв для `pipeline`, сумма 100 |
+| `kv` | `--kv` | `f16` | `f16`, `q4`, `k4v4`, `kvarn` (=`kvarn_k4v2`), `kvarn_k4v4` |
+| `ctx` | `--ctx` | `4096` | контекст одной последовательности, кратен 32 |
+| `kv_pool` | — | `1` | во сколько раз пул KV больше `ctx`, 1..=16 |
+| `max_seqs` | `--max-seqs` | `8` | одновременных последовательностей, 1..=16 |
+| `prefill_ntok` | — | `128` | размер чанка prefill, 1..=128 |
+| `pb` | — | `6` | порог батчевого GEMV, 1..=12 |
+| `splits` | — | `16` | максимум сплитов внимания, 1..=16 |
+| `cache` | — | `true` | radix prefix cache (снапшоты conv входят в память) |
+| `fuse` | — | `true` | слияние q‖k‖g и gate‖up |
+| `attn4` / `attn2` | — | `true` | GQA-шеринг K/V и пары позиций в коротком внимании |
+| `flash` / `flash2` | — | `true` | flash-внимание и два токена на волну в split |
+| `b8p` | — | `true` | префетч x в b8-ядрах |
+| `i8pf` | — | `true` | префетч весов в int8-GEMM (на подгруппе ≤16 выключается) |
+| `q4i8` / `q6i8` | — | `true` | int8-копии Q4/Q6 для prefill |
+| `q4i8_ffn_only` | — | `false` | int8 только для FFN (−370 МБ VRAM, prefill −6%) |
+| `wg` / `wg_b` | — | `256` / `64` | рабочие группы GEMV |
+| `rgemv` / `rgemv_b` | — | `4` / `5` | строк на подгруппу |
+| `prepack` | — | `true` | 148-байтная раскладка и int8-копии |
+| `prepack_threads` | — | `0` | потоки CPU-prepack (0 = авто) |
+| `program_cache` | — | `true` | кэш скомпилированных ядер в `$XDG_CACHE_HOME/lfm3/programs` |
+| `gemm_force` | — | — | принудительный GEMM по подстроке имени (диагностика) |
+| `profile` | — | `false` | тайминги ядер |
+
+## `[chat]`
+
+| ключ | CLI | дефолт | смысл |
+|---|---|---|---|
+| `system` | `--system` | `You are a helpful assistant.` | системный промпт |
+| `max_tokens` | `--max-tokens` | `256` | максимум новых токенов |
+| `temperature` | `--temperature` | `0.7` | температура (0 = greedy) |
+| `top_k` | `--top-k` | `40` | top-k |
+| `top_p` | `--top-p` | `0.95` | top-p |
+| `min_p` | `--min-p` | `0.0` | min-p |
+| `repeat_penalty` | `--repeat-penalty` | `1.05` | штраф за повторы |
+| `seed` | `--seed` | `0` | 0 — фиксированное зерно по умолчанию |
+| `thinking` | `--thinking` | `false` | режим рассуждений |
+| `tools` | `--tools` | — | JSON с определениями инструментов (OpenAI tools) |
+
+## `[server]`
+
+| ключ | CLI | дефолт | смысл |
+|---|---|---|---|
+| `addr` | `--addr` | `127.0.0.1:8000` | адрес сервера |
 | `name` | `--name` | `lfm3` | имя модели в API |
-| `log_requests` | `--log-requests` | `false` | access log + лог планировщика (`sched: …`) |
-| `max_body` | `--max-body` | `4194304` | максимальный размер тела запроса, байт |
-| `prefill_budget` | `--prefill-budget` | `64` | бюджет prefill-токенов на шаг, 1..=128 |
-| `prefill_in_decode` | `--prefill-in-decode` | `8` | сколько prefill-токенов подмешивать в шаг, где уже есть decode, 0..=64 |
-| `h2_cancel_interval` | `--h2-cancel-interval` | `16` | как часто (в батчах ответа) HTTP/2 проверяет обрыв клиента, 1..=1024 |
+| `max_body` | — | `4194304` | максимальный размер тела, байт |
+| `prefill_budget` | `--prefill-budget` | `64` | prefill-токенов на шаг, 1..=128 |
+| `prefill_in_decode` | `--prefill-in-decode` | `8` | prefill-токенов в шаге с decode, 0..=64 |
+| `h2_cancel_interval` | — | `16` | проверка обрыва h2 раз в N батчей |
+| `log_requests` | `--log-requests` | `false` | access log и лог планировщика |
+| `system` | — | `You are a helpful assistant.` | системный промпт сервера |
 
-## Движок (`[engine]`)
+## `[ui]`
 
-Все ключи можно задать флагом сервера (приоритет CLI > файл > env > дефолт).
-Булевы ключи со значением `true` по умолчанию выключаются отрицательными
-флагами: `--no-prepack`, `--no-fuse`, `--no-attn2`, `--no-attn4`,
-`--no-flash`, `--no-flash2`, `--no-b8p`, `--no-i8pf`, `--no-q4i8`,
-`--no-q6i8`, `--no-cache`. Те же значения читаются из переменных окружения
-(для `lfm-bench` и обратной совместимости).
+| ключ | CLI | дефолт | смысл |
+|---|---|---|---|
+| `stats` | `--no-stats` (у chat) | `true` | TTFT и prefill/decode tok/s в статусе и после ответа |
 
-| ключ TOML | env | флаг CLI | дефолт | смысл |
-|---|---|---|---|---|
-| `device` | `LFM_DEVICE` | `--device` | `0` | индекс OpenCL-устройства |
-| `profile` | `LFM_PROFILE` | `--profile` | `false` | тайминги ядер (`lfm-bench gpu-prefill` печатает профиль) |
-| `kv` | `LFM_KV` | `--kv` | `f16` | тип KV-кэша: `f16`, `q4`, `k4v4`, `kvarn` (=`kvarn_k4v2`, K 4 бита + V 2 бита), `kvarn_k4v4` (K 4 бита + V 4 бита, память +25 МБ, качество ближе к f16); на устройстве без fp16 `f16` хранится во float, `kvarn*` работают на float-скейлах, `q4` недоступен |
-| `prepack` | `LFM_PREPACK` | `--no-prepack` | `true` | 148-байтная раскладка Q4_K и int8-копии; `false` оставляет только decode (prefill требует prepack) |
-| `prepack_threads` | `LFM_PREPACK_THREADS` | `--prepack-threads` | `0` | потоков на CPU-prepack, 0 = авто (rayon), 1 = последовательно; 0..=256 |
-| `program_cache` | `LFM_PROGRAM_CACHE` | `--no-program-cache` | `true` | кэш скомпилированных ядер OpenCL в `$XDG_CACHE_HOME/lfm3/programs` (ключ: исходники + опции + устройство + драйвер) |
-| `fuse` | `LFM_FUSE` | `--no-fuse` | `true` | слияние `q‖k‖g` и `gate‖up` |
-| `pb` | `LFM_PB` | `--pb` | `6` | порог батчевого GEMV, 1..=12 |
-| `kv_pool` | `LFM_KV_POOL` | `--kv-pool` | `1` | во сколько раз пул KV больше `ctx` одной последовательности, 1..=16; больше пул — больше одновременных длинных запросов (память KV растёт линейно) |
-| `prefill_ntok` | `LFM_PREFILL_NTOK` | `--prefill-ntok` | `128` | размер чанка prefill, 1..=128; у `kv=kvarn` задаёт ещё и размер staging-кольца (память KV при ctx 8192 и 8 seq: ≈65 МБ на 128, ≈59 на 64, ≈56 на 32) |
-| `max_seqs` | `LFM_SEQS` | `--max-seqs` | `8` | одновременных последовательностей, 1..=16 |
-| `cache` | `LFM_CACHE` | `--no-cache` | `true` | кэш префиксов (radix) |
-| `splits` | `LFM_SPLITS` | `--splits` | `16` | максимум сплитов внимания, 1..=16 |
-| `attn4` | `LFM_ATTN4` | `--no-attn4` | `true` | GQA-шеринг K/V (4 головы на группу) |
-| `attn2` | `LFM_ATTN2` | `--no-attn2` | `true` | пары позиций в коротком внимании |
-| `flash` | `LFM_FLASH` | `--no-flash` | `true` | flash-внимание: 4 головы × 16 полос |
-| `flash2` | `LFM_FLASH2` | `--no-flash2` | `true` | два токена на волну в split-внимании |
-| `b8p` | `LFM_B8P` | `--no-b8p` | `true` | префетч x в b8-ядрах decode |
-| `i8pf` | `LFM_I8PF` | `--no-i8pf` | `true` | префетч весов группы в int8-GEMM; на устройстве с подгруппой ≤16 выключается (не хватает регистров) |
-| `q4i8` | `LFM_Q4I8` | `--no-q4i8` | `true` | int8-перепаковка Q4_K для prefill |
-| `q4i8_ffn_only` | `LFM_Q4I8_FFN_ONLY` | `--q4i8-ffn-only` | `false` | int8-копии Q4 только для FFN: −370 МБ VRAM, prefill −6% |
-| `q6i8` | `LFM_Q6I8` | `--no-q6i8` | `true` | Q6-prefill на int8-ядре |
-| `wg` | `LFM_WG` | `--wg` | `256` | размер рабочей группы decode-GEMV (кратен 64) |
-| `wg_b` | `LFM_WG_B` | `--wg-b` | `64` | рабочая группа батчевого GEMV |
-| `rgemv` | `LFM_RGEMV` | `--rgemv` | `4` | строк на подгруппу в decode-GEMV, 1..=16; на устройстве с подгруппой ≤16 поднимается до 16 |
-| `rgemv_b` | `LFM_RGEMV_B` | `--rgemv-b` | `5` | строк на подгруппу в батчевом GEMV, 1..=8 |
-| `gemm_force` | `LFM_GEMM_FORCE` | `--gemm-force` | `""` | принудительный GEMM по подстроке имени тензора |
+## Примеры
 
-## Переменные, которых нет в файле
+Один GPU, сжатый KV, контекст 32k:
+
+```toml
+[backend]
+kv = "kvarn"
+ctx = 32000
+kv_pool = 2
+```
+
+GPU + iGPU (pipeline), 23 слоя на GPU и 1 на iGPU:
+
+```toml
+[backend]
+devices = [0, 1]
+mode = "pipeline"
+tiers = [96, 4]
+kv = "kvarn"
+ctx = 32000
+```
+
+Tensor parallel на двух одинаковых GPU (только `kv = "f16"`):
+
+```toml
+[backend]
+devices = [0, 1]
+mode = "tp"
+```
+
+## Переменные окружения
+
+Пользовательские настройки — только TOML/CLI. Env остались для драйвера и
+диагностики:
 
 | env | где | смысл |
 |---|---|---|
-| `LFM_TP` | сервер | tensor parallel, устройства через `/`: `LFM_TP=0/1`; головы (16/4) должны делиться на число устройств — миры 1, 2, 4, 8, 16, три устройства невозможны |
-| `LFM_TIERS` | сервер | pipeline parallel, проценты слоёв: `LFM_TIERS=60/40`; поддерживает любое число стадий (24 слоя → 3×33/33/34) и батчевый prefill |
-| `RUSTICL_ENABLE` | окружение драйвера | какие GPU видит Rusticl: `iris` — только Intel, `iris,radeonsi` — Intel и AMD; PoCL CPU виден всегда отдельной платформой |
-| `LFM_SCHED_LOG` | сервер | алиас `log_requests` |
-| `LFM_TP_WEIGHTS` | tp.rs | доли работы по стадиям TP, например `75/25`; головы KV округляются целыми, FFN — до 256; по умолчанию поровну, но для пары GPU+CPU автоматически 75/25 |
-| `LFM_TP_BATCH_DEC` | tp.rs | `0` — построчный decode в TP (по умолчанию строки разных слотов считаются одним батчем) |
-| `LFM_TP_SYNC_NORMS` | tp.rs | `1` — вернуть синхронизацию x/hq/hs после каждой нормы (A/B, по умолчанию стадии считают нормы сами) |
-| `LFM_ARGMAX` | сервер | `0` — отключить GPU-argmax для greedy (A/B; по умолчанию включён) |
-| `LFM_PLATFORM` | infra-opencl | индекс OpenCL-платформы |
-| `LFM_LAUNCH_DEBUG` | infra-opencl | печать параметров запуска ядер |
-| `LFM_CPU_W4A8` | infra-cpu | W4A8-веса на CPU |
-| `LFM_VERBOSE`, `LFM_OLD` | bench | диагностика бенчмарка |
+| `RUSTICL_ENABLE` | драйвер | какие устройства видит Rusticl: `iris` (Intel), `iris,radeonsi` (Intel+AMD) |
+| `LFM_LAUNCH_DEBUG` | `lfm-opencl` | печать запусков ядер |
+| `LFM_PROFILE` | `lfm-bench` | тайминги ядер в стенде |
+| `LFM_PIPE_DEBUG` | `lfm-gpu` | время чанков по стадиям pipeline |
+| `LFM_TP_DEBUG` | `lfm-gpu` | фазы TP-prefill |
+| `LFM_TP_WEIGHTS` | `lfm-gpu` | доли работы TP (`75/25`); для пары GPU+CPU выбирается автоматически |
 
-Важно: при `LFM_TP`/`LFM_TIERS` настройки `[engine]` из файла
-не применяются — эти пути читают окружение сами (см. `docs/backends.md`).
-`lfm-bench` файл конфигурации не читает, только окружение.
-
-## Intel iGPU
-
-Встроенная Intel (Gen9/UHD 630) появляется в OpenCL только через Rusticl с
-`RUSTICL_ENABLE=iris`; без переменной устройств не будет вовсе:
-
-```bash
-RUSTICL_ENABLE=iris ./target/release/lfm-bench info
-RUSTICL_ENABLE=iris ./target/release/lfm-server --config server.toml
-```
-
-Индекс устройства — как обычно (`LFM_DEVICE`/`device`). На таком устройстве нет
-`cl_khr_fp16`: KV-кэш `f16` и staging/scales у `kv = "kvarn"` хранятся во float,
-`kv = "q4"` возвращает ошибку при загрузке. Подробности — `docs/backends.md`.
-
-## Пример
-
-```toml
-model = "models/LFM3-1.7B-Q4_K_M.gguf"
-addr = "0.0.0.0:8000"
-ctx = 8192
-name = "lfm3"
-log_requests = true
-prefill_budget = 96
-
-[engine]
-kv = "f16"
-pb = 6
-prefill_ntok = 128
-max_seqs = 8
-cache = true
-splits = 16
-flash = true
-flash2 = true
-q4i8 = true
-q6i8 = true
-```
-
-Проверка: `lfm-server --config server.toml --print-config`.
+`lfm-bench` (стенд) по-прежнему читает `LFM_*` — это диагностический
+инструмент, не часть приложения.
