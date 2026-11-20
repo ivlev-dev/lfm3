@@ -416,9 +416,53 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Мягкие предупреждения о несогласованных `kv_pool` / `max_seqs` / `ctx`.
+    ///
+    /// Жёсткую проверку «на каждый слот — весь `ctx`» сделать нельзя: пул
+    /// страниц общий (radix prefix cache), а планировщик выдаёт страницы по мере
+    /// роста последовательностей и урезает/придерживает запросы
+    /// ([`lfm_app::Scheduler::admit`]). Поэтому эвристики ниже только
+    /// предупреждают, а не ломают запуск.
+    ///
+    /// Дефолт (`max_seqs = 8`, `ctx = 4096`, `kv_pool = 1`) не шумит: на слот
+    /// приходится ровно `ctx/8`.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let b = &self.backend;
+        let slots = b.max_seqs.max(1);
+        let pages = b.kv_pages();
+        if pages < slots {
+            out.push(format!(
+                "backend: пул KV = {pages} страниц (ctx = {}, kv_pool = {}) меньше max_seqs = {slots}: \
+                 одновременно поместится не больше {pages} последовательностей, остальные будут ждать; \
+                 увеличьте kv_pool или уменьшите max_seqs",
+                b.ctx, b.kv_pool
+            ));
+        }
+        if b.kv_pool.saturating_mul(8) < slots {
+            let per_seq = b.ctx.saturating_mul(b.kv_pool) / slots;
+            let need_pool = slots.div_ceil(8).clamp(1, 16);
+            out.push(format!(
+                "backend: max_seqs = {slots} и ctx = {} при kv_pool = {} дают ~{per_seq} токенов \
+                 на последовательность (меньше ctx/8 = {}): запросы будут урезаться по KV; \
+                 увеличьте kv_pool до {need_pool} (или уменьшите max_seqs до {})",
+                b.ctx,
+                b.kv_pool,
+                (b.ctx / 8).max(1),
+                b.kv_pool.saturating_mul(8)
+            ));
+        }
+        out
+    }
 }
 
 impl BackendSection {
+    /// Число страниц KV-пула: `ceil(ctx/32) * kv_pool` (страница = 32 токена).
+    pub fn kv_pages(&self) -> usize {
+        self.ctx.div_ceil(32).saturating_mul(self.kv_pool)
+    }
+
     pub fn effective_tiers(&self) -> Result<Vec<usize>> {
         let n = self.devices.len();
         if n == 0 {
@@ -872,6 +916,79 @@ mod tests {
         check("prefill_ntok", |c| c.backend.prefill_ntok = 129);
         check("pb", |c| c.backend.pb = 13);
         check("splits", |c| c.backend.splits = 0);
+    }
+
+    #[test]
+    fn default_config_has_no_kv_warnings() {
+        let cfg = Config::default();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.backend.kv_pages(), 128, "4096/32 * kv_pool 1");
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+    }
+
+    #[test]
+    fn kv_warning_for_many_seqs_on_small_pool() {
+        // Симптом из рантайма: "no free sequence slots" / "KV pool exhausted".
+        let mut cfg = Config::default();
+        cfg.backend.max_seqs = 16;
+        cfg.backend.kv_pool = 1;
+        cfg.validate()
+            .expect("предупреждение не должно ломать валидацию");
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let msg = &warnings[0];
+        assert!(msg.contains("max_seqs = 16"), "{msg}");
+        assert!(msg.contains("ctx = 4096"), "{msg}");
+        assert!(msg.contains("kv_pool = 1"), "{msg}");
+        assert!(msg.contains("256"), "~256 токенов на слот: {msg}");
+        assert!(msg.contains("kv_pool до 2"), "подсказка: {msg}");
+    }
+
+    #[test]
+    fn kv_warnings_boundaries() {
+        // Пропорция не хуже ctx/8 на слот и страниц не меньше слотов — тишина.
+        for (ctx, kv_pool, max_seqs) in [
+            (32, 1, 1),
+            (4096, 1, 8),
+            (4096, 2, 16),
+            (4096, 4, 32),
+            (8192, 1, 8),
+            (8192, 2, 16),
+            (8192, 4, 32),
+        ] {
+            let mut cfg = Config::default();
+            cfg.backend.ctx = ctx;
+            cfg.backend.kv_pool = kv_pool;
+            cfg.backend.max_seqs = max_seqs;
+            cfg.validate().unwrap();
+            assert!(
+                cfg.warnings().is_empty(),
+                "ctx={ctx} kv_pool={kv_pool} max_seqs={max_seqs}: {:?}",
+                cfg.warnings()
+            );
+        }
+
+        // ctx = 32: в пуле всего kv_pool страниц — слотов больше, чем страниц.
+        let mut cfg = Config::default();
+        cfg.backend.ctx = 32;
+        cfg.backend.kv_pool = 1;
+        cfg.backend.max_seqs = 8;
+        cfg.validate().unwrap();
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("одновременно поместится"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("kv_pool"), "{warnings:?}");
+
+        // ctx = 32, kv_pool = 16: 16 страниц < 32 слотов — тоже предупреждение.
+        let mut cfg = Config::default();
+        cfg.backend.ctx = 32;
+        cfg.backend.kv_pool = 16;
+        cfg.backend.max_seqs = 32;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.warnings().len(), 1, "{:?}", cfg.warnings());
     }
 
     #[test]

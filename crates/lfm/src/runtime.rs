@@ -16,6 +16,9 @@ pub struct Runtime {
 impl Runtime {
     pub fn open(cfg: &Config) -> Result<Self> {
         cfg.validate()?;
+        for warning in cfg.warnings() {
+            eprintln!("lfm: {warning}");
+        }
         let opts = cfg.backend.to_options();
         let ctx = cfg.backend.ctx;
         let backend: Box<dyn InferenceBackend> = match cfg.backend.mode {

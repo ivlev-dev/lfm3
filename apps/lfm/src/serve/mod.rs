@@ -61,6 +61,9 @@ pub(crate) fn pump_events(
 
 pub fn run(cfg: &lfm::Config) -> Result<()> {
     cfg.validate()?;
+    for warning in cfg.warnings() {
+        eprintln!("lfm: {warning}");
+    }
     let opts = cfg.backend.to_options();
     let mode = cfg.backend.mode;
     let devices = cfg.backend.devices.clone();
