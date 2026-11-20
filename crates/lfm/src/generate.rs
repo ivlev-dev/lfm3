@@ -56,9 +56,8 @@ pub fn generate_stream(
         backend.prefill(slot, ids, true)?;
         let mut logits = backend.logits()?;
         stats.prefill_s = started.elapsed().as_secs_f64();
-        let mut pos = ids.len();
         let mut first: Option<Instant> = None;
-        for step in 0..max_new {
+        for (step, pos) in (ids.len()..).take(max_new).enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -78,7 +77,6 @@ pub fn generate_stream(
             }
             backend.step(&[SequenceStep { slot, token, pos }], true)?;
             logits = backend.logits_row(0)?;
-            pos += 1;
         }
         if let Some(first) = first {
             stats.decode_s = first.elapsed().as_secs_f64();

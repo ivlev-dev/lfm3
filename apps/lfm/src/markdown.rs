@@ -261,7 +261,10 @@ pub fn render(text: &str, width: usize) -> Vec<String> {
         if let Some((prefix, body)) = list_item(line) {
             let pad = visible(&prefix);
             let runs = inline_runs(body);
-            for (i, l) in wrap_runs(&runs, width.saturating_sub(pad)).into_iter().enumerate() {
+            for (i, l) in wrap_runs(&runs, width.saturating_sub(pad))
+                .into_iter()
+                .enumerate()
+            {
                 if i == 0 {
                     out.push(format!("{prefix}{l}"));
                 } else {

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_H2_CANCEL_INTERVAL: usize = 16;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub model: ModelSection,
@@ -99,18 +99,6 @@ pub struct ServerSection {
 #[serde(default, deny_unknown_fields)]
 pub struct UiSection {
     pub stats: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            model: ModelSection::default(),
-            backend: BackendSection::default(),
-            chat: ChatSection::default(),
-            server: ServerSection::default(),
-            ui: UiSection::default(),
-        }
-    }
 }
 
 impl Default for ModelSection {
@@ -344,35 +332,35 @@ impl BackendSection {
     }
 
     pub fn to_options(&self) -> lfm_gpu::Options {
-        let mut o = lfm_gpu::Options::default();
-        o.device = self.devices.first().copied().unwrap_or(0);
-        o.profile = self.profile;
-        o.kv = self.kv.clone();
-        o.prepack = self.prepack;
-        o.fuse = self.fuse;
-        o.pb = self.pb;
-        o.prefill_ntok = self.prefill_ntok;
-        o.max_seqs = self.max_seqs;
-        o.cache = self.cache;
-        o.splits = self.splits;
-        o.attn4 = self.attn4;
-        o.attn2 = self.attn2;
-        o.flash = self.flash;
-        o.flash2 = self.flash2;
-        o.b8p = self.b8p;
-        o.i8pf = self.i8pf;
-        o.q4i8 = self.q4i8;
-        o.q6i8 = self.q6i8;
-        o.q4i8_ffn_only = self.q4i8_ffn_only;
-        o.wg = self.wg;
-        o.wg_b = self.wg_b;
-        o.rgemv = self.rgemv;
-        o.rgemv_b = self.rgemv_b;
-        o.prepack_threads = self.prepack_threads;
-        o.program_cache = self.program_cache;
-        o.kv_pool = self.kv_pool;
-        o.gemm_force = self.gemm_force.clone();
-        o
+        lfm_gpu::Options {
+            device: self.devices.first().copied().unwrap_or(0),
+            profile: self.profile,
+            kv: self.kv.clone(),
+            prepack: self.prepack,
+            fuse: self.fuse,
+            pb: self.pb,
+            prefill_ntok: self.prefill_ntok,
+            max_seqs: self.max_seqs,
+            cache: self.cache,
+            splits: self.splits,
+            attn4: self.attn4,
+            attn2: self.attn2,
+            flash: self.flash,
+            flash2: self.flash2,
+            b8p: self.b8p,
+            i8pf: self.i8pf,
+            q4i8: self.q4i8,
+            q6i8: self.q6i8,
+            q4i8_ffn_only: self.q4i8_ffn_only,
+            wg: self.wg,
+            wg_b: self.wg_b,
+            rgemv: self.rgemv,
+            rgemv_b: self.rgemv_b,
+            prepack_threads: self.prepack_threads,
+            program_cache: self.program_cache,
+            kv_pool: self.kv_pool,
+            gemm_force: self.gemm_force.clone(),
+        }
     }
 }
 

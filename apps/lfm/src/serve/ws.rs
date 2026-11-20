@@ -356,10 +356,7 @@ mod tests {
             let mask = [9u8; 4];
             let mut out = Vec::new();
             for (i, part) in [b"he".as_slice(), b"ll", b"o"].iter().enumerate() {
-                let mut frame = vec![
-                    if i == 2 { 0x80 } else { 0x01 } | 0x00,
-                    0x80 | part.len() as u8,
-                ];
+                let mut frame = vec![if i == 2 { 0x80 } else { 0x01 }, 0x80 | part.len() as u8];
                 if i == 0 {
                     frame[0] = 0x01;
                 } else {

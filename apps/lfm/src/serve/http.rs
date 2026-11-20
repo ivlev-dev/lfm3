@@ -9,6 +9,8 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
+// разбор стартовой строки и заголовков
+#[allow(clippy::type_complexity)]
 pub fn parse_head(head: &str) -> Result<(String, String, Vec<(String, String)>)> {
     let mut lines = head.split("\r\n");
     let first = lines.next().ok_or_else(|| anyhow!("empty request"))?;
@@ -346,10 +348,7 @@ mod tests {
     fn decode_chunked(body: &str) -> String {
         let mut out = String::new();
         let mut rest = body;
-        loop {
-            let Some((size, tail)) = rest.split_once("\r\n") else {
-                break;
-            };
+        while let Some((size, tail)) = rest.split_once("\r\n") {
             let size = usize::from_str_radix(size, 16).unwrap();
             if size == 0 {
                 break;

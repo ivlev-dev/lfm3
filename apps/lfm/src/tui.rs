@@ -17,7 +17,8 @@ const ACCENT: &str = "\x1b[38;5;114m";
 const ALERT: &str = "\x1b[38;5;203m";
 const TOOL: &str = "\x1b[38;5;221m";
 
-const HELP: &str = "/help — справка · /reset — очистить · /thinking — показать/скрыть рассуждения · /exit — выход";
+const HELP: &str =
+    "/help — справка · /reset — очистить · /thinking — показать/скрыть рассуждения · /exit — выход";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -113,8 +114,14 @@ fn term_size() -> (usize, usize) {
             return (r, c);
         }
     }
-    let rows = std::env::var("LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
-    let cols = std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()).unwrap_or(80);
+    let rows = std::env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80);
     (rows, cols)
 }
 
@@ -292,7 +299,7 @@ fn push_block(lines: &mut Vec<String>, block: &Block, cols: usize) {
         }
         Kind::System => {
             for l in md::plain(&block.text, cols.saturating_sub(2)) {
-                lines.push(format!("{l}"));
+                lines.push(l);
             }
             lines.push(String::new());
         }
@@ -381,12 +388,11 @@ fn render(state: &mut TuiState) {
     let start = max_scroll - scroll;
     let mut out = String::new();
     // header
-    let title = format!(
-        " lfm · {} · {} ",
-        state.title,
-        state.info
-    );
-    out.push_str(&format!("\x1b[1;1H\x1b[48;5;236m\x1b[38;5;252m{}\x1b[0m", pad_or_fit(&title, cols)));
+    let title = format!(" lfm · {} · {} ", state.title, state.info);
+    out.push_str(&format!(
+        "\x1b[1;1H\x1b[48;5;236m\x1b[38;5;252m{}\x1b[0m",
+        pad_or_fit(&title, cols)
+    ));
     // body
     for i in 0..body_rows {
         out.push_str(&format!("\x1b[{};1H\x1b[2K", i + 2));
@@ -403,7 +409,12 @@ fn render(state: &mut TuiState) {
     ));
     // input
     let prompt = format!("{ACCENT}you ›{RESET} ");
-    out.push_str(&format!("\x1b[{};1H\x1b[2K{}\x1b[38;5;252m{}\x1b[0m", rows, prompt, fit(&state.input, cols.saturating_sub(6))));
+    out.push_str(&format!(
+        "\x1b[{};1H\x1b[2K{}\x1b[38;5;252m{}\x1b[0m",
+        rows,
+        prompt,
+        fit(&state.input, cols.saturating_sub(6))
+    ));
     out.push_str("\x1b[?25h");
     print!("{out}");
     let _ = std::io::stdout().flush();

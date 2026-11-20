@@ -18,7 +18,11 @@ use lfm_domain::SamplingParams;
     args_conflicts_with_subcommands = false
 )]
 struct Cli {
-    #[arg(long, global = true, help = "TOML-конфигурация [lfm.toml, если существует]")]
+    #[arg(
+        long,
+        global = true,
+        help = "TOML-конфигурация [lfm.toml, если существует]"
+    )]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -250,10 +254,7 @@ fn chat(mut cfg: Config, args: ChatArgs) -> Result<()> {
         ),
         lfm::BackendMode::Tp => "tp".to_string(),
     };
-    let info = format!(
-        "{mode} · {} · ctx {}",
-        cfg.backend.kv, cfg.backend.ctx
-    );
+    let info = format!("{mode} · {} · ctx {}", cfg.backend.kv, cfg.backend.ctx);
     if let Some(text) = args.once {
         let text = if text == "-" {
             let mut buf = String::new();
@@ -301,7 +302,10 @@ fn print_config(cfg: Config) -> Result<()> {
 
 fn init_config(output: &Path, force: bool) -> Result<()> {
     if output.exists() && !force {
-        bail!("{} уже существует (--force для перезаписи)", output.display());
+        bail!(
+            "{} уже существует (--force для перезаписи)",
+            output.display()
+        );
     }
     std::fs::write(output, example_config())
         .with_context(|| format!("запись {}", output.display()))?;

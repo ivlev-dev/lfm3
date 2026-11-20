@@ -665,7 +665,11 @@ impl Metrics {
 
 fn argmax_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LFM_ARGMAX").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("LFM_ARGMAX")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 fn greedy_token(ids: &[(usize, u32)], row: usize) -> Option<u32> {
@@ -865,10 +869,7 @@ impl Worker {
             }
         };
         let requested = if params.max_tokens == 0 {
-            self.sched
-                .config()
-                .max_ctx
-                .saturating_sub(prompt.len())
+            self.sched.config().max_ctx.saturating_sub(prompt.len())
         } else {
             params.max_tokens
         };

@@ -196,7 +196,8 @@ impl TpModel {
                 weights = Some(vec![75, 25]);
             }
         }
-        if weights.is_none() && (cfg.ffn_size % world != 0 || (cfg.ffn_size / world) % 256 != 0)
+        if weights.is_none()
+            && (cfg.ffn_size % world != 0 || !(cfg.ffn_size / world).is_multiple_of(256))
         {
             return Err(anyhow!(
                 "ffn {} cannot be split into {world} column shards (need multiple of 256)",

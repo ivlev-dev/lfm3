@@ -1015,6 +1015,9 @@ struct StepTensor {
     bytes: u64,
 }
 
+/// Группа тензоров для fused-gemv: индексы, вес, выход, rows, cols, Q4-флаг.
+type FusedGroup = (Vec<usize>, Buffer<u8>, Buffer<f32>, usize, usize, bool);
+
 fn step(path: &Path, rgemv: u32, mode: &str, reps: usize) -> Result<()> {
     let gguf = lfm_gguf::GgufFile::open(path)?;
     let gpu = Gpu::open(0)?;
@@ -1100,7 +1103,7 @@ fn step(path: &Path, rgemv: u32, mode: &str, reps: usize) -> Result<()> {
         });
     }
     if mode == "fused" {
-        let mut groups: Vec<(Vec<usize>, Buffer<u8>, Buffer<f32>, usize, usize, bool)> = Vec::new();
+        let mut groups: Vec<FusedGroup> = Vec::new();
         let mut used = vec![false; tensors.len()];
         let mut push_group = |idx: Vec<usize>, gpu: &Gpu| -> Result<()> {
             let rows: usize = idx.iter().map(|&i| tensors[i].rows).sum();
@@ -1177,9 +1180,7 @@ fn step(path: &Path, rgemv: u32, mode: &str, reps: usize) -> Result<()> {
             prepared.push((xq, xs));
         }
         let enq_fused =
-            |groups: &Vec<(Vec<usize>, Buffer<u8>, Buffer<f32>, usize, usize, bool)>,
-             prepared: &Vec<(Buffer<i8>, Buffer<f32>)>|
-             -> Result<()> {
+            |groups: &Vec<FusedGroup>, prepared: &Vec<(Buffer<i8>, Buffer<f32>)>| -> Result<()> {
                 for (gi, (_, w, y, rows, cols, is_q4)) in groups.iter().enumerate() {
                     let kern = if *is_q4 { &k.q4 } else { &k.q6 };
                     let (xq, xs) = &prepared[gi];
@@ -1524,8 +1525,7 @@ fn stream_backend(
         }
         backend.prefill(slot, ids, true)?;
         let mut logits = backend.logits()?;
-        let mut pos = ids.len();
-        for step in 0..max_new {
+        for (step, pos) in (ids.len()..).take(max_new).enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -1540,7 +1540,6 @@ fn stream_backend(
             }
             backend.step(&[lfm_app::SequenceStep { slot, token, pos }], true)?;
             logits = backend.logits_row(0)?;
-            pos += 1;
         }
         Ok(())
     })();
@@ -1548,6 +1547,8 @@ fn stream_backend(
     result.and(freed)
 }
 
+// параметры запуска генерации
+#[allow(clippy::too_many_arguments)]
 fn gpu_chat(
     model: &Path,
     tokenizer: &Path,
@@ -3268,231 +3269,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
     dot / (na.sqrt() * nb.sqrt() + 1e-12)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn empty_state() -> TuiState {
-        TuiState {
-            history: Vec::new(),
-            assistant: String::new(),
-            thinking: String::new(),
-            tools: Vec::new(),
-            input: String::new(),
-            input_history: InputHistory::new(),
-            status: String::new(),
-            scroll: 0,
-            pending: Vec::new(),
-        }
-    }
-
-    fn chat_state(messages: usize) -> TuiState {
-        let mut state = empty_state();
-        for i in 0..messages {
-            state.history.push(("you".to_string(), format!("m{i}")));
-        }
-        state
-    }
-
-    #[test]
-    fn scroll_pgup_pgdn_respects_bounds() {
-        assert_eq!(scroll_after_pgup(0, 5), 5);
-        assert_eq!(scroll_after_pgup(3, 5), 8);
-        assert_eq!(scroll_after_pgup(usize::MAX, 5), usize::MAX);
-        assert_eq!(scroll_after_pgdn(8, 5), 3);
-        assert_eq!(scroll_after_pgdn(2, 5), 0);
-        assert_eq!(scroll_after_pgdn(0, 5), 0);
-        assert_eq!(scroll_after_pgup(0, 0), 1);
-        assert_eq!(scroll_after_pgdn(1, 0), 0);
-    }
-
-    #[test]
-    fn scroll_home_end() {
-        assert_eq!(scroll_home(40, 7), 33);
-        assert_eq!(scroll_home(3, 7), 0);
-        assert_eq!(scroll_home(0, 0), 0);
-        assert_eq!(scroll_end(), 0);
-    }
-
-    #[test]
-    fn input_history_empty_returns_none() {
-        let mut hist = InputHistory::new();
-        assert_eq!(hist.up("draft"), None);
-        assert_eq!(hist.down(), None);
-        assert_eq!(hist.entries.len(), 0);
-    }
-
-    #[test]
-    fn input_history_up_down_walk() {
-        let mut hist = InputHistory::new();
-        hist.push("a");
-        hist.push("b");
-        assert_eq!(hist.pos, 2);
-        assert_eq!(hist.up("draft"), Some("b".to_string()));
-        assert_eq!(hist.up("draft"), Some("a".to_string()));
-        assert_eq!(hist.up("draft"), Some("a".to_string()));
-        assert_eq!(hist.down(), Some("b".to_string()));
-        assert_eq!(hist.down(), Some("draft".to_string()));
-        assert_eq!(hist.down(), None);
-        assert_eq!(hist.down(), None);
-    }
-
-    #[test]
-    fn input_history_skips_empty_and_consecutive_duplicates() {
-        let mut hist = InputHistory::new();
-        hist.push("a");
-        hist.push("a");
-        hist.push("  ");
-        hist.push("b");
-        hist.push("a");
-        assert_eq!(hist.entries, vec!["a", "b", "a"]);
-        assert_eq!(hist.pos, 3);
-    }
-
-    #[test]
-    fn input_history_up_after_typing_new_line() {
-        let mut hist = InputHistory::new();
-        hist.push("one");
-        hist.push("two");
-        hist.reset();
-        assert_eq!(hist.up(""), Some("two".to_string()));
-        hist.push("three");
-        assert_eq!(hist.pos, 3);
-        assert_eq!(hist.up(""), Some("three".to_string()));
-    }
-
-    #[test]
-    fn visible_lines_small_window_keeps_tail() {
-        let mut state = empty_state();
-        state.history.push(("ai".to_string(), "tail".to_string()));
-        let view = visible_lines(&state, 3, 40);
-        assert_eq!(view.area, 1);
-        assert_eq!(view.body.len(), 1);
-        assert_eq!(view.total, 2);
-        assert_eq!(view.scroll, 0);
-        assert!(view.body[0].is_empty());
-    }
-
-    #[test]
-    fn visible_lines_large_window_pads() {
-        let state = chat_state(3);
-        let view = visible_lines(&state, 200, 80);
-        assert_eq!(view.area, 197);
-        assert_eq!(view.body.len(), 197);
-        assert!(view.body[0].starts_with("you> m0"));
-        assert_eq!(view.scroll, 0);
-    }
-
-    #[test]
-    fn visible_lines_scrolls_up() {
-        let mut state = chat_state(20);
-        let last = visible_lines(&state, 10, 40);
-        assert_eq!(last.area, 7);
-        assert_eq!(last.total, 40);
-        assert!(last.body.iter().any(|l| l.contains("m19")));
-        state.scroll = 3;
-        let scrolled = visible_lines(&state, 10, 40);
-        assert_eq!(scrolled.scroll, 3);
-        assert_eq!(scrolled.body[0], "you> m15");
-        state.scroll = usize::MAX;
-        let top = visible_lines(&state, 10, 40);
-        assert_eq!(top.scroll, 33);
-        assert_eq!(top.body[0], "you> m0");
-    }
-
-    #[test]
-    fn visible_lines_renders_tools_after_answer() {
-        let mut state = empty_state();
-        state.assistant = "ans".to_string();
-        state
-            .tools
-            .push(("calc".to_string(), "{\"a\":1}".to_string()));
-        let view = visible_lines(&state, 12, 40);
-        let text = view.body.join("\n");
-        assert!(text.contains("ai>  ans"));
-        assert!(text.contains("[tool] calc"));
-        assert!(text.contains("{\"a\":1}"));
-    }
-
-    #[test]
-    fn visible_lines_zero_size_does_not_panic() {
-        let mut state = chat_state(5);
-        state.scroll = 10;
-        let view = visible_lines(&state, 0, 0);
-        assert_eq!(view.body.len(), 1);
-        assert_eq!(view.area, 1);
-        tui_render(&state, 0, 0);
-    }
-
-    #[test]
-    fn format_tool_call_wraps_long_args() {
-        let args = "x".repeat(500);
-        let lines = format_tool_call("fn", &args, 40);
-        assert_eq!(lines[0], "[tool] fn");
-        assert!(lines.len() > 2);
-        assert!(lines.iter().all(|l| l.chars().count() <= 40));
-        assert!(lines[1].starts_with("  "));
-        let body_len: usize = lines[1..]
-            .iter()
-            .map(|l| l.trim_start().chars().count())
-            .sum();
-        assert_eq!(body_len, 500);
-    }
-
-    #[test]
-    fn format_tool_call_truncates_huge_args() {
-        let args = "y".repeat(TOOL_ARGS_MAX + 500);
-        let lines = format_tool_call("fn", &args, 60);
-        let joined: String = lines.join("");
-        assert!(joined.ends_with('…'));
-        assert!(joined.chars().count() <= TOOL_ARGS_MAX + 200);
-    }
-
-    #[test]
-    fn format_tool_call_edge_sizes() {
-        let lines = format_tool_call("", "", 0);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].is_empty());
-        let lines = format_tool_call("fn", "   ", 10);
-        assert_eq!(lines, vec!["[tool] fn".to_string()]);
-        let very_long_name = "n".repeat(200);
-        let lines = format_tool_call(&very_long_name, "", 20);
-        assert_eq!(lines[0].chars().count(), 20);
-    }
-
-    #[test]
-    fn parse_escape_recognizes_navigation_keys() {
-        assert_eq!(parse_escape("[A"), Key::Up);
-        assert_eq!(parse_escape("[B"), Key::Down);
-        assert_eq!(parse_escape("[5~"), Key::PgUp);
-        assert_eq!(parse_escape("[6~"), Key::PgDn);
-        assert_eq!(parse_escape("[H"), Key::Home);
-        assert_eq!(parse_escape("[1~"), Key::Home);
-        assert_eq!(parse_escape("[F"), Key::End);
-        assert_eq!(parse_escape("[4~"), Key::End);
-        assert_eq!(parse_escape("OH"), Key::Home);
-        assert_eq!(parse_escape("OF"), Key::End);
-        assert_eq!(parse_escape("[C"), Key::Other);
-        assert_eq!(parse_escape("[D"), Key::Other);
-        assert_eq!(parse_escape(""), Key::Other);
-    }
-
-    #[test]
-    fn status_scroll_indicator_appended_on_render() {
-        let mut state = empty_state();
-        state.status = "idle".to_string();
-        state.scroll = 5;
-        let view = visible_lines(&state, 10, 40);
-        assert_eq!(view.scroll, 0);
-        state.history = (0..30)
-            .map(|i| ("you".to_string(), format!("m{i}")))
-            .collect();
-        let view = visible_lines(&state, 10, 40);
-        assert_eq!(view.scroll, 5);
-        tui_render(&state, 10, 40);
-    }
-}
-
 fn prepack_q4_key(src: &[u8]) -> Vec<u8> {
     assert!(src.len().is_multiple_of(144));
     let blocks = src.len() / 144;
@@ -3521,6 +3297,8 @@ fn prepack_q4_key(src: &[u8]) -> Vec<u8> {
     out
 }
 
+// сигнатура запуска ядра
+#[allow(clippy::too_many_arguments)]
 fn gemm_launch(
     gpu: &Gpu,
     program: &Program,
@@ -3610,6 +3388,8 @@ fn gemm_launch(
     Ok((gpu.download(&yb, rows * ntok)?, st))
 }
 
+// сигнатура запуска ядра
+#[allow(clippy::too_many_arguments)]
 fn gemm_one(
     gpu: &Gpu,
     program: &Program,
@@ -3869,4 +3649,229 @@ fn kernel_bin(name: &str, out: &std::path::Path) -> Result<()> {
         return Err(anyhow!("driver returned no program binaries"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_state() -> TuiState {
+        TuiState {
+            history: Vec::new(),
+            assistant: String::new(),
+            thinking: String::new(),
+            tools: Vec::new(),
+            input: String::new(),
+            input_history: InputHistory::new(),
+            status: String::new(),
+            scroll: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    fn chat_state(messages: usize) -> TuiState {
+        let mut state = empty_state();
+        for i in 0..messages {
+            state.history.push(("you".to_string(), format!("m{i}")));
+        }
+        state
+    }
+
+    #[test]
+    fn scroll_pgup_pgdn_respects_bounds() {
+        assert_eq!(scroll_after_pgup(0, 5), 5);
+        assert_eq!(scroll_after_pgup(3, 5), 8);
+        assert_eq!(scroll_after_pgup(usize::MAX, 5), usize::MAX);
+        assert_eq!(scroll_after_pgdn(8, 5), 3);
+        assert_eq!(scroll_after_pgdn(2, 5), 0);
+        assert_eq!(scroll_after_pgdn(0, 5), 0);
+        assert_eq!(scroll_after_pgup(0, 0), 1);
+        assert_eq!(scroll_after_pgdn(1, 0), 0);
+    }
+
+    #[test]
+    fn scroll_home_end() {
+        assert_eq!(scroll_home(40, 7), 33);
+        assert_eq!(scroll_home(3, 7), 0);
+        assert_eq!(scroll_home(0, 0), 0);
+        assert_eq!(scroll_end(), 0);
+    }
+
+    #[test]
+    fn input_history_empty_returns_none() {
+        let mut hist = InputHistory::new();
+        assert_eq!(hist.up("draft"), None);
+        assert_eq!(hist.down(), None);
+        assert_eq!(hist.entries.len(), 0);
+    }
+
+    #[test]
+    fn input_history_up_down_walk() {
+        let mut hist = InputHistory::new();
+        hist.push("a");
+        hist.push("b");
+        assert_eq!(hist.pos, 2);
+        assert_eq!(hist.up("draft"), Some("b".to_string()));
+        assert_eq!(hist.up("draft"), Some("a".to_string()));
+        assert_eq!(hist.up("draft"), Some("a".to_string()));
+        assert_eq!(hist.down(), Some("b".to_string()));
+        assert_eq!(hist.down(), Some("draft".to_string()));
+        assert_eq!(hist.down(), None);
+        assert_eq!(hist.down(), None);
+    }
+
+    #[test]
+    fn input_history_skips_empty_and_consecutive_duplicates() {
+        let mut hist = InputHistory::new();
+        hist.push("a");
+        hist.push("a");
+        hist.push("  ");
+        hist.push("b");
+        hist.push("a");
+        assert_eq!(hist.entries, vec!["a", "b", "a"]);
+        assert_eq!(hist.pos, 3);
+    }
+
+    #[test]
+    fn input_history_up_after_typing_new_line() {
+        let mut hist = InputHistory::new();
+        hist.push("one");
+        hist.push("two");
+        hist.reset();
+        assert_eq!(hist.up(""), Some("two".to_string()));
+        hist.push("three");
+        assert_eq!(hist.pos, 3);
+        assert_eq!(hist.up(""), Some("three".to_string()));
+    }
+
+    #[test]
+    fn visible_lines_small_window_keeps_tail() {
+        let mut state = empty_state();
+        state.history.push(("ai".to_string(), "tail".to_string()));
+        let view = visible_lines(&state, 3, 40);
+        assert_eq!(view.area, 1);
+        assert_eq!(view.body.len(), 1);
+        assert_eq!(view.total, 2);
+        assert_eq!(view.scroll, 0);
+        assert!(view.body[0].is_empty());
+    }
+
+    #[test]
+    fn visible_lines_large_window_pads() {
+        let state = chat_state(3);
+        let view = visible_lines(&state, 200, 80);
+        assert_eq!(view.area, 197);
+        assert_eq!(view.body.len(), 197);
+        assert!(view.body[0].starts_with("you> m0"));
+        assert_eq!(view.scroll, 0);
+    }
+
+    #[test]
+    fn visible_lines_scrolls_up() {
+        let mut state = chat_state(20);
+        let last = visible_lines(&state, 10, 40);
+        assert_eq!(last.area, 7);
+        assert_eq!(last.total, 40);
+        assert!(last.body.iter().any(|l| l.contains("m19")));
+        state.scroll = 3;
+        let scrolled = visible_lines(&state, 10, 40);
+        assert_eq!(scrolled.scroll, 3);
+        assert_eq!(scrolled.body[0], "you> m15");
+        state.scroll = usize::MAX;
+        let top = visible_lines(&state, 10, 40);
+        assert_eq!(top.scroll, 33);
+        assert_eq!(top.body[0], "you> m0");
+    }
+
+    #[test]
+    fn visible_lines_renders_tools_after_answer() {
+        let mut state = empty_state();
+        state.assistant = "ans".to_string();
+        state
+            .tools
+            .push(("calc".to_string(), "{\"a\":1}".to_string()));
+        let view = visible_lines(&state, 12, 40);
+        let text = view.body.join("\n");
+        assert!(text.contains("ai>  ans"));
+        assert!(text.contains("[tool] calc"));
+        assert!(text.contains("{\"a\":1}"));
+    }
+
+    #[test]
+    fn visible_lines_zero_size_does_not_panic() {
+        let mut state = chat_state(5);
+        state.scroll = 10;
+        let view = visible_lines(&state, 0, 0);
+        assert_eq!(view.body.len(), 1);
+        assert_eq!(view.area, 1);
+        tui_render(&state, 0, 0);
+    }
+
+    #[test]
+    fn format_tool_call_wraps_long_args() {
+        let args = "x".repeat(500);
+        let lines = format_tool_call("fn", &args, 40);
+        assert_eq!(lines[0], "[tool] fn");
+        assert!(lines.len() > 2);
+        assert!(lines.iter().all(|l| l.chars().count() <= 40));
+        assert!(lines[1].starts_with("  "));
+        let body_len: usize = lines[1..]
+            .iter()
+            .map(|l| l.trim_start().chars().count())
+            .sum();
+        assert_eq!(body_len, 500);
+    }
+
+    #[test]
+    fn format_tool_call_truncates_huge_args() {
+        let args = "y".repeat(TOOL_ARGS_MAX + 500);
+        let lines = format_tool_call("fn", &args, 60);
+        let joined: String = lines.join("");
+        assert!(joined.ends_with('…'));
+        assert!(joined.chars().count() <= TOOL_ARGS_MAX + 200);
+    }
+
+    #[test]
+    fn format_tool_call_edge_sizes() {
+        let lines = format_tool_call("", "", 0);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].is_empty());
+        let lines = format_tool_call("fn", "   ", 10);
+        assert_eq!(lines, vec!["[tool] fn".to_string()]);
+        let very_long_name = "n".repeat(200);
+        let lines = format_tool_call(&very_long_name, "", 20);
+        assert_eq!(lines[0].chars().count(), 20);
+    }
+
+    #[test]
+    fn parse_escape_recognizes_navigation_keys() {
+        assert_eq!(parse_escape("[A"), Key::Up);
+        assert_eq!(parse_escape("[B"), Key::Down);
+        assert_eq!(parse_escape("[5~"), Key::PgUp);
+        assert_eq!(parse_escape("[6~"), Key::PgDn);
+        assert_eq!(parse_escape("[H"), Key::Home);
+        assert_eq!(parse_escape("[1~"), Key::Home);
+        assert_eq!(parse_escape("[F"), Key::End);
+        assert_eq!(parse_escape("[4~"), Key::End);
+        assert_eq!(parse_escape("OH"), Key::Home);
+        assert_eq!(parse_escape("OF"), Key::End);
+        assert_eq!(parse_escape("[C"), Key::Other);
+        assert_eq!(parse_escape("[D"), Key::Other);
+        assert_eq!(parse_escape(""), Key::Other);
+    }
+
+    #[test]
+    fn status_scroll_indicator_appended_on_render() {
+        let mut state = empty_state();
+        state.status = "idle".to_string();
+        state.scroll = 5;
+        let view = visible_lines(&state, 10, 40);
+        assert_eq!(view.scroll, 0);
+        state.history = (0..30)
+            .map(|i| ("you".to_string(), format!("m{i}")))
+            .collect();
+        let view = visible_lines(&state, 10, 40);
+        assert_eq!(view.scroll, 5);
+        tui_render(&state, 10, 40);
+    }
 }

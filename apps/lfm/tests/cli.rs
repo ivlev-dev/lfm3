@@ -7,7 +7,11 @@ fn lfm() -> Command {
 #[test]
 fn config_print_is_valid_toml() {
     let out = lfm().args(["config", "print"]).output().unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).unwrap();
     let value: toml::Value = toml::from_str(&text).unwrap();
     assert_eq!(value["backend"]["ctx"].as_integer(), Some(4096));
@@ -25,7 +29,11 @@ fn config_init_writes_loadable_file() {
         .arg(&path)
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = std::fs::read_to_string(&path).unwrap();
     let value: toml::Value = toml::from_str(&text).unwrap();
     assert_eq!(value["backend"]["mode"].as_str(), Some("pipeline"));
@@ -34,7 +42,10 @@ fn config_init_writes_loadable_file() {
         .arg(&path)
         .output()
         .unwrap();
-    assert!(!again.status.success(), "без --force файл перезаписываться не должен");
+    assert!(
+        !again.status.success(),
+        "без --force файл перезаписываться не должен"
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
 }

@@ -755,18 +755,15 @@ impl GpuModel {
                     }
                 }
                 GgmlType::Q6_K => {
-                    if prepack_on && info.dims.len() == 2 {
-                        if lcols.is_multiple_of(256) && lrows > 0 {
-                            let (q, sc) = prepack::prepack_q6_i8_with_threads(
-                                data.as_ref(),
-                                lcols,
-                                opts.prepack_threads,
-                            )?;
-                            prepacked_i8.insert(
-                                info.name.clone(),
-                                (gpu.upload(&q)?, gpu.upload(&sc)?, rows),
-                            );
-                        }
+                    if prepack_on && info.dims.len() == 2 && lcols.is_multiple_of(256) && lrows > 0
+                    {
+                        let (q, sc) = prepack::prepack_q6_i8_with_threads(
+                            data.as_ref(),
+                            lcols,
+                            opts.prepack_threads,
+                        )?;
+                        prepacked_i8
+                            .insert(info.name.clone(), (gpu.upload(&q)?, gpu.upload(&sc)?, rows));
                     }
                     Weight::Q6(gpu.upload_bytes(data.as_ref())?)
                 }
@@ -1343,6 +1340,8 @@ impl GpuModel {
         Ok(())
     }
 
+    // сигнатура запуска ядра
+    #[allow(clippy::too_many_arguments)]
     fn launch_b8p_chunks(
         &self,
         kernel: &Kernel,
@@ -1399,6 +1398,8 @@ impl GpuModel {
         Ok(())
     }
 
+    // сигнатура запуска ядра
+    #[allow(clippy::too_many_arguments)]
     fn gemv_auto_b(
         &self,
         name: &str,
@@ -2315,9 +2316,10 @@ impl GpuModel {
                         (None, Some((kc, kn, vc, vs))) => DecKv::Q4 { kc, kn, vc, vs },
                         (None, None) => DecKv::F16,
                     };
-                    if kv_kvarn.is_some() && (pos + 1).is_multiple_of(KV_PAGE) {
+                    if (pos + 1).is_multiple_of(KV_PAGE)
+                        && let Some((kst, vst, kcode, ka, kc, vcode, vb, vbz, vc)) = kv_kvarn
+                    {
                         let page = ((pos + 1) / KV_PAGE - 1) as u32;
-                        let (kst, vst, kcode, ka, kc, vcode, vb, vbz, vc) = kv_kvarn.unwrap();
                         unsafe {
                             self.gpu.launch(
                                 &self.kernels.kvarn_commit,
@@ -4889,14 +4891,9 @@ impl GpuModel {
             }
         }
         if need_logits && self.has_head {
-            let sel = pick_logits_rows(
-                need_logits,
-                logits_rows,
-                logits_row,
-                ntok,
-                self.logit_rows,
-            )?
-                .ok_or_else(|| anyhow!("missing logits selection"))?;
+            let sel =
+                pick_logits_rows(need_logits, logits_rows, logits_row, ntok, self.logit_rows)?
+                    .ok_or_else(|| anyhow!("missing logits selection"))?;
             if sel.is_empty() {
                 if ntok > self.logit_rows {
                     return Err(anyhow!(
@@ -5119,6 +5116,8 @@ impl GpuModel {
         Ok((bcx, op))
     }
 
+    // отладочный срез: norm/up/gate/down
+    #[allow(clippy::type_complexity)]
     pub fn debug_ffn(
         &mut self,
         layer: usize,
@@ -5213,7 +5212,9 @@ impl GpuModel {
             if self.kv_f32 {
                 let raw = self.gpu.download_at(buf, slot * kvd * 4, kvd * 2)?;
                 Ok(raw
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| f32::from_bits(u32::from(c[0]) | (u32::from(c[1]) << 16)))
                     .collect())
             } else {
@@ -5616,6 +5617,82 @@ impl GpuModel {
     }
 }
 
+pub fn half_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    let out = if exp == 0 {
+        if frac == 0 {
+            sign << 31
+        } else {
+            let mut f = frac;
+            let mut e = -1i32;
+            while f & 0x400 == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            let exp32 = (114 + e) as u32;
+            (sign << 31) | (exp32 << 23) | ((f & 0x3ff) << 13)
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | (0xff << 23) | (frac << 13)
+    } else {
+        (sign << 31) | ((exp + 112) << 23) | (frac << 13)
+    };
+    f32::from_bits(out)
+}
+
+pub fn argmax(x: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, v) in x.iter().enumerate() {
+        if *v > best_v {
+            best_v = *v;
+            best = i;
+        }
+    }
+    best as u32
+}
+
+// параметры раскладки KV-буферов
+#[allow(clippy::too_many_arguments)]
+fn make_kv(
+    gpu: &Gpu,
+    q4: bool,
+    kvarn: bool,
+    f32_kv: bool,
+    kv4: bool,
+    max_seqs: usize,
+    stage: usize,
+    slots: usize,
+    blocks: usize,
+    kvd: usize,
+    head_dim: usize,
+) -> Result<KvBuf> {
+    let heads = kvd / head_dim;
+    let kv_wide = if f32_kv { 2 } else { 1 };
+    let staging_slots = max_seqs * stage;
+    Ok(if kvarn {
+        KvBuf::Kvarn {
+            staging: gpu.alloc::<u16>(staging_slots * kvd * kv_wide)?,
+            kcode: gpu.alloc::<u8>(slots * heads * 64)?,
+            ka: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,
+            kc: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
+            vcode: gpu.alloc::<u8>(slots * heads * if kv4 { 64 } else { 32 })?,
+            vb: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
+            vbz: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
+            vc: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,
+        }
+    } else if q4 {
+        KvBuf::Q4 {
+            code: gpu.alloc::<u8>(slots * heads * 64)?,
+            scale: gpu.alloc::<u16>(slots * heads)?,
+        }
+    } else {
+        KvBuf::F16(gpu.alloc::<u16>(if f32_kv { slots * kvd * 2 } else { slots * kvd })?)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5767,78 +5844,4 @@ mod tests {
         assert!(pick_logits_rows(true, None, Some(9), 6, 8).is_err());
         assert!(pick_logits_rows(true, Some(&[]), None, 6, 8).is_err());
     }
-}
-
-pub fn half_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x3ff) as u32;
-    let out = if exp == 0 {
-        if frac == 0 {
-            sign << 31
-        } else {
-            let mut f = frac;
-            let mut e = -1i32;
-            while f & 0x400 == 0 {
-                f <<= 1;
-                e -= 1;
-            }
-            let exp32 = (114 + e) as u32;
-            (sign << 31) | (exp32 << 23) | ((f & 0x3ff) << 13)
-        }
-    } else if exp == 0x1f {
-        (sign << 31) | (0xff << 23) | (frac << 13)
-    } else {
-        (sign << 31) | ((exp + 112) << 23) | (frac << 13)
-    };
-    f32::from_bits(out)
-}
-
-pub fn argmax(x: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, v) in x.iter().enumerate() {
-        if *v > best_v {
-            best_v = *v;
-            best = i;
-        }
-    }
-    best as u32
-}
-
-fn make_kv(
-    gpu: &Gpu,
-    q4: bool,
-    kvarn: bool,
-    f32_kv: bool,
-    kv4: bool,
-    max_seqs: usize,
-    stage: usize,
-    slots: usize,
-    blocks: usize,
-    kvd: usize,
-    head_dim: usize,
-) -> Result<KvBuf> {
-    let heads = kvd / head_dim;
-    let kv_wide = if f32_kv { 2 } else { 1 };
-    let staging_slots = max_seqs * stage;
-    Ok(if kvarn {
-        KvBuf::Kvarn {
-            staging: gpu.alloc::<u16>(staging_slots * kvd * kv_wide)?,
-            kcode: gpu.alloc::<u8>(slots * heads * 64)?,
-            ka: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,
-            kc: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
-            vcode: gpu.alloc::<u8>(slots * heads * if kv4 { 64 } else { 32 })?,
-            vb: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
-            vbz: gpu.alloc::<u16>(blocks * heads * 32 * kv_wide)?,
-            vc: gpu.alloc::<u16>(blocks * heads * 128 * kv_wide)?,
-        }
-    } else if q4 {
-        KvBuf::Q4 {
-            code: gpu.alloc::<u8>(slots * heads * 64)?,
-            scale: gpu.alloc::<u16>(slots * heads)?,
-        }
-    } else {
-        KvBuf::F16(gpu.alloc::<u16>(if f32_kv { slots * kvd * 2 } else { slots * kvd })?)
-    })
 }

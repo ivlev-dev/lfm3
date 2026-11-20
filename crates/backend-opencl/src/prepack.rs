@@ -176,6 +176,44 @@ pub fn scale_min(blk: &[u8], j: usize) -> (u8, u8) {
     if h == 0 { (lo_d, lo_m) } else { (hi_d, hi_m) }
 }
 
+pub fn prepack_q4_i8(src: &[u8], cols: usize) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
+    prepack_q4_i8_with_threads(src, cols, 0)
+}
+
+pub fn prepack_q4_i8_with_threads(
+    src: &[u8],
+    cols: usize,
+    threads: usize,
+) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
+    if cols == 0 || !cols.is_multiple_of(256) {
+        anyhow::bail!("q4 cols {cols} not a non-zero multiple of 256");
+    }
+    let per_row = cols / 256 * Q4K_PACKED;
+    if src.is_empty() || !src.len().is_multiple_of(per_row) {
+        anyhow::bail!(
+            "q4 packed bytes {} not a non-zero multiple of {per_row}",
+            src.len()
+        );
+    }
+    let rows = src.len() / per_row;
+    let groups = cols / 32;
+    let mut q = vec![0i8; groups * rows * 32];
+    let mut scales = vec![0f32; groups * rows];
+    with_threads(threads, || {
+        let sink = RowSink::new(&mut q, &mut scales, rows);
+        if threads == 1 {
+            for r in 0..rows {
+                q4_i8_row(src, per_row, cols, r, &sink);
+            }
+        } else {
+            (0..rows)
+                .into_par_iter()
+                .for_each(|r| q4_i8_row(src, per_row, cols, r, &sink));
+        }
+    });
+    Ok((q, scales))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,11 +222,11 @@ mod tests {
         let mut b = vec![0u8; Q4K_BLOCK];
         b[0..2].copy_from_slice(&d.to_le_bytes());
         b[2..4].copy_from_slice(&dmin.to_le_bytes());
-        for i in 4..16 {
-            b[i] = seed.wrapping_mul(31).wrapping_add(i as u8 * 7);
+        for (i, v) in b.iter_mut().enumerate().take(16).skip(4) {
+            *v = seed.wrapping_mul(31).wrapping_add(i as u8 * 7);
         }
-        for i in 16..144 {
-            b[i] = seed.wrapping_add((i as u8).wrapping_mul(13));
+        for (i, v) in b.iter_mut().enumerate().take(144).skip(16) {
+            *v = seed.wrapping_add((i as u8).wrapping_mul(13));
         }
         b
     }
@@ -301,8 +339,8 @@ mod tests {
         for i in 0..16 {
             b[192 + i] = (i as i8 - 8) as u8;
         }
-        for i in 0..128 {
-            b[i] = (i as u8).wrapping_mul(37).wrapping_add(seed);
+        for (i, v) in b.iter_mut().enumerate().take(128) {
+            *v = (i as u8).wrapping_mul(37).wrapping_add(seed);
         }
         for i in 0..64 {
             b[128 + i] = (i as u8).wrapping_mul(53).wrapping_add(seed);
@@ -437,42 +475,4 @@ mod tests {
         assert_eq!(q, q_ref);
         assert_eq!(sc, sc_ref);
     }
-}
-
-pub fn prepack_q4_i8(src: &[u8], cols: usize) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
-    prepack_q4_i8_with_threads(src, cols, 0)
-}
-
-pub fn prepack_q4_i8_with_threads(
-    src: &[u8],
-    cols: usize,
-    threads: usize,
-) -> anyhow::Result<(Vec<i8>, Vec<f32>)> {
-    if cols == 0 || !cols.is_multiple_of(256) {
-        anyhow::bail!("q4 cols {cols} not a non-zero multiple of 256");
-    }
-    let per_row = cols / 256 * Q4K_PACKED;
-    if src.is_empty() || !src.len().is_multiple_of(per_row) {
-        anyhow::bail!(
-            "q4 packed bytes {} not a non-zero multiple of {per_row}",
-            src.len()
-        );
-    }
-    let rows = src.len() / per_row;
-    let groups = cols / 32;
-    let mut q = vec![0i8; groups * rows * 32];
-    let mut scales = vec![0f32; groups * rows];
-    with_threads(threads, || {
-        let sink = RowSink::new(&mut q, &mut scales, rows);
-        if threads == 1 {
-            for r in 0..rows {
-                q4_i8_row(src, per_row, cols, r, &sink);
-            }
-        } else {
-            (0..rows)
-                .into_par_iter()
-                .for_each(|r| q4_i8_row(src, per_row, cols, r, &sink));
-        }
-    });
-    Ok((q, scales))
 }

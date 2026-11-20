@@ -15,10 +15,12 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lfm::BackendMode;
 use crate::serve::engine::{ChatJob, Engine, Event, ServeConfig};
 use crate::serve::http::{Request, SseWriter, read_request, write_json};
-use crate::serve::protocol::{ChatRequest, CompletionMeta, CompletionRequest, Delta, metrics_json, models_json};
+use crate::serve::protocol::{
+    ChatRequest, CompletionMeta, CompletionRequest, Delta, metrics_json, models_json,
+};
+use lfm::BackendMode;
 
 const MAX_BATCH_EVENTS: usize = 64;
 
@@ -68,9 +70,9 @@ pub fn run(cfg: &lfm::Config) -> Result<()> {
         .zip(cfg.backend.effective_tiers()?)
         .collect();
     let backend: lfm_app::BackendLoader = match mode {
-        BackendMode::Single => Box::new(move |path, ctx| {
-            Ok(Box::new(lfm_gpu::GpuModel::load_with(path, ctx, &opts)?))
-        }),
+        BackendMode::Single => {
+            Box::new(move |path, ctx| Ok(Box::new(lfm_gpu::GpuModel::load_with(path, ctx, &opts)?)))
+        }
         BackendMode::Pipeline => Box::new(move |path, ctx| {
             Ok(Box::new(lfm_gpu::PipelineModel::load_tiers_with(
                 path, ctx, &plan, &opts,
@@ -114,9 +116,8 @@ pub fn run(cfg: &lfm::Config) -> Result<()> {
         seed: cfg.chat.seed,
         ..lfm_domain::SamplingParams::default()
     });
-    let tokenizer: lfm_app::TokenizerLoader = Box::new(|path| {
-        Ok(Box::new(lfm_tokenizer::LfmTokenizer::from_file(path)?))
-    });
+    let tokenizer: lfm_app::TokenizerLoader =
+        Box::new(|path| Ok(Box::new(lfm_tokenizer::LfmTokenizer::from_file(path)?)));
     let engine = Engine::spawn(
         ServeConfig {
             model: cfg.model.path.clone(),
@@ -589,7 +590,7 @@ fn ws_session(mut stream: TcpStream, engine: &Engine, request: &Request) -> Resu
                         completion_tokens,
                         ..
                     } => ws::OutMessage::Done {
-                        finish_reason: *finish_reason,
+                        finish_reason,
                         usage: ws::Usage {
                             prompt_tokens: *prompt_tokens,
                             completion_tokens: *completion_tokens,

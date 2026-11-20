@@ -800,7 +800,12 @@ fn route(method: &str, path: &str) -> Route {
     }
 }
 
-fn handle(conn: &mut Conn, engine: &Engine, info: &crate::serve::ServerInfo, req: Pending) -> Result<()> {
+fn handle(
+    conn: &mut Conn,
+    engine: &Engine,
+    info: &crate::serve::ServerInfo,
+    req: Pending,
+) -> Result<()> {
     match route(&req.method, &req.path) {
         Route::Health => {
             let code = if engine.alive() { "200" } else { "503" };

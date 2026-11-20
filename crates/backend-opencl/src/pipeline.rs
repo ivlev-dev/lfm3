@@ -129,7 +129,11 @@ impl PipelineModel {
             for i in 0..n {
                 let mut stage = slots[i].take().expect("stage");
                 let rx = receivers[i].take();
-                let tx = if i + 1 < n { senders[i + 1].take() } else { None };
+                let tx = if i + 1 < n {
+                    senders[i + 1].take()
+                } else {
+                    None
+                };
                 let handle = scope.spawn(move || -> (GpuModel, Result<()>) {
                     let mut result = Ok(());
                     let dbg = std::env::var("LFM_PIPE_DEBUG").is_ok();
@@ -198,12 +202,11 @@ impl PipelineModel {
             }
         });
         self.stages = results.into_iter().map(|s| s.expect("stage")).collect();
-        for e in errors.into_iter().flatten() {
+        if let Some(e) = errors.into_iter().flatten().next() {
             return Err(e);
         }
         Ok(())
     }
-
 }
 
 impl InferenceBackend for PipelineModel {

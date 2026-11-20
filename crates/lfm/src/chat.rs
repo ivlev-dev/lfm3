@@ -39,8 +39,8 @@ pub fn load_tools(path: &Path) -> Result<Vec<ToolDef>> {
     struct Wrapper {
         tools: Vec<ToolDef>,
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     if let Ok(list) = serde_json::from_str::<Vec<ToolDef>>(&text) {
         return Ok(list);
     }
@@ -92,13 +92,10 @@ impl Chat {
     ) -> Result<Reply> {
         let mut messages = self.history.clone();
         messages.push(Message::user(user));
-        let prompt = self.runtime.template.render(
-            &messages,
-            &self.tools,
-            true,
-            self.thinking,
-            false,
-        )?;
+        let prompt =
+            self.runtime
+                .template
+                .render(&messages, &self.tools, true, self.thinking, false)?;
         let ids = self.runtime.tokenizer.encode(&prompt, false)?;
         if ids.is_empty() {
             bail!("промпт токенизировался в пустоту");
@@ -130,9 +127,7 @@ impl Chat {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let stats = {
             let Runtime {
-                backend,
-                tokenizer,
-                ..
+                backend, tokenizer, ..
             } = &mut self.runtime;
             generate_stream(
                 &mut **backend,

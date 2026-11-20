@@ -243,21 +243,29 @@ mod tests {
 
     #[test]
     fn rejects_unknown_kv() {
-        let mut o = Options::default();
-        o.kv = "q8".to_string();
+        let o = Options {
+            kv: "q8".to_string(),
+            ..Options::default()
+        };
         assert!(o.validate().is_err());
     }
 
     #[test]
     fn rejects_bad_pb_and_wg() {
-        let mut o = Options::default();
-        o.pb = 13;
+        let o = Options {
+            pb: 13,
+            ..Options::default()
+        };
         assert!(o.validate().is_err());
-        let mut o = Options::default();
-        o.wg = 100;
+        let o = Options {
+            wg: 100,
+            ..Options::default()
+        };
         assert!(o.validate().is_err());
-        let mut o = Options::default();
-        o.splits = 0;
+        let o = Options {
+            splits: 0,
+            ..Options::default()
+        };
         assert!(o.validate().is_err());
     }
 

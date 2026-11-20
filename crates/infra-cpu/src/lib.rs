@@ -278,8 +278,8 @@ impl Lfm3Ref {
         for ch in 0..h {
             let wrow = w.row(ch);
             let mut acc = wrow[kernel - 1] * bx[ch];
-            for t in 0..kernel - 1 {
-                acc += wrow[t] * st.conv[t * h + ch];
+            for (t, wt) in wrow.iter().enumerate().take(kernel - 1) {
+                acc += wt * st.conv[t * h + ch];
             }
             out[ch] = acc;
         }
@@ -389,14 +389,12 @@ impl Lfm3Ref {
         }
         let mut out = Vec::new();
         let mut next = argmax(&logits);
-        let mut pos = prompt.len();
-        for _ in 0..max_new {
+        for pos in (prompt.len()..).take(max_new) {
             out.push(next);
             if next == eos {
                 break;
             }
             logits = self.forward(&mut state, next, pos)?;
-            pos += 1;
             next = argmax(&logits);
         }
         Ok(out)
@@ -483,6 +481,8 @@ impl Lfm3Ref {
         self.conv_block(layer, h, &mut st)
     }
 
+    // отладочный срез: norm/up/gate/out
+    #[allow(clippy::type_complexity)]
     pub fn ffn_debug(
         &self,
         layer: usize,
@@ -550,11 +550,11 @@ mod tests {
         }
         .inv_freq();
         rope_inplace(&mut v, 7, &inv);
-        for i in 32..64 {
-            assert_eq!(v[i], 0.3);
+        for x in v.iter().take(64).skip(32) {
+            assert_eq!(*x, 0.3);
         }
-        for i in 96..128 {
-            assert_eq!(v[i], 0.3);
+        for x in v.iter().take(128).skip(96) {
+            assert_eq!(*x, 0.3);
         }
         assert_ne!(v[0], 0.3);
         assert_ne!(v[64], 0.3);

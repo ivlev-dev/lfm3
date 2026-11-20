@@ -66,8 +66,8 @@ fn q8_0_values() {
         b[2 + i] = (i as i32 - 10) as i8 as u8;
     }
     let y = dequant_q8_0(&b);
-    for i in 0..32 {
-        assert_eq!(y[i], (i as i32 - 10) as f32);
+    for (i, v) in y.iter().enumerate().take(32) {
+        assert_eq!(*v, (i as i32 - 10) as f32);
     }
 }
 
@@ -85,11 +85,11 @@ fn pseudo_q4_blocks(n: usize, seed: u64) -> Vec<u8> {
         let mut b = [0u8; 144];
         b[0..2].copy_from_slice(&half_bits(0.001 + (lcg(&mut s) % 100) as f32 * 1e-5));
         b[2..4].copy_from_slice(&half_bits((lcg(&mut s) % 100) as f32 * 1e-5));
-        for i in 4..16 {
-            b[i] = lcg(&mut s) as u8;
+        for v in b.iter_mut().take(16).skip(4) {
+            *v = lcg(&mut s) as u8;
         }
-        for i in 16..144 {
-            b[i] = lcg(&mut s) as u8;
+        for v in b.iter_mut().take(144).skip(16) {
+            *v = lcg(&mut s) as u8;
         }
         out.extend_from_slice(&b);
     }
@@ -102,8 +102,8 @@ fn pseudo_q6_blocks(n: usize, seed: u64) -> Vec<u8> {
     for _ in 0..n {
         let mut b = [0u8; 210];
         b[208..210].copy_from_slice(&half_bits(0.001 + (lcg(&mut s) % 100) as f32 * 1e-5));
-        for i in 0..208 {
-            b[i] = lcg(&mut s) as u8;
+        for v in b.iter_mut().take(208) {
+            *v = lcg(&mut s) as u8;
         }
         out.extend_from_slice(&b);
     }
@@ -172,7 +172,11 @@ fn q4_k_golden_nibble_layout() {
         let high = j % 2 == 1;
         for l in 0..32usize {
             let byte = block[16 + qq * 32 + l];
-            let want = if high { (byte >> 4) as f32 } else { (byte & 0x0F) as f32 };
+            let want = if high {
+                (byte >> 4) as f32
+            } else {
+                (byte & 0x0F) as f32
+            };
             assert_eq!(y[j * 32 + l], want, "j={j} l={l}");
         }
     }
