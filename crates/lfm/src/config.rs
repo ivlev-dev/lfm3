@@ -170,7 +170,7 @@ impl Default for ChatSection {
             top_k: 40,
             top_p: 0.95,
             min_p: 0.0,
-            repeat_penalty: 1.05,
+            repeat_penalty: 1.0,
             seed: 0,
             thinking: false,
             tools: None,
@@ -262,8 +262,8 @@ impl Config {
                 self.backend.kv
             );
         }
-        if !(1..=16).contains(&self.backend.max_seqs) {
-            bail!("backend.max_seqs должен быть в 1..=16");
+        if !(1..=32).contains(&self.backend.max_seqs) {
+            bail!("backend.max_seqs должен быть в 1..=32");
         }
         if !(1..=16).contains(&self.backend.kv_pool) {
             bail!("backend.kv_pool должен быть в 1..=16");

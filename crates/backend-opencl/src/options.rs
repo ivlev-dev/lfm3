@@ -111,7 +111,7 @@ impl Options {
         if let Some(v) = num("LFM_PREFILL_NTOK", 1, 128) {
             o.prefill_ntok = v;
         }
-        if let Some(v) = num("LFM_SEQS", 1, 16) {
+        if let Some(v) = num("LFM_SEQS", 1, 32) {
             o.max_seqs = v;
         }
         if let Some(v) = num("LFM_KV_POOL", 1, 16) {
@@ -216,8 +216,8 @@ impl Options {
         if !(1..=16).contains(&self.rgemv) || !(1..=8).contains(&self.rgemv_b) {
             return Err("rgemv/rgemv_b must be in 1..=8".to_string());
         }
-        if !(1..=16).contains(&self.max_seqs) {
-            return Err(format!("max_seqs must be in 1..=16, got {}", self.max_seqs));
+        if !(1..=32).contains(&self.max_seqs) {
+            return Err(format!("max_seqs must be in 1..=32, got {}", self.max_seqs));
         }
         if !(1..=16).contains(&self.kv_pool) {
             return Err(format!("kv_pool must be in 1..=16, got {}", self.kv_pool));

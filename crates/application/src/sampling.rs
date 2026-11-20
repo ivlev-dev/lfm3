@@ -56,9 +56,7 @@ impl Sampler {
     }
 
     pub fn is_greedy(&self) -> bool {
-        self.params.temperature <= 0.0
-            && self.params.top_k <= 1
-            && self.params.repeat_penalty == 1.0
+        self.params.temperature <= 0.0 && self.params.repeat_penalty == 1.0
     }
 
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {

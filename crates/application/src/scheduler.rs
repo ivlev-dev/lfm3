@@ -26,7 +26,7 @@ impl SchedulerConfig {
         let max_batch = max_batch.max(1);
         Self {
             max_ctx: max_ctx.max(1),
-            max_active: max_active.clamp(1, 16),
+            max_active: max_active.clamp(1, 32),
             max_batch,
             prefill_budget: prefill_budget.max(1),
             prefill_in_decode: prefill_budget.max(1),

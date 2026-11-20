@@ -765,7 +765,7 @@ impl Worker {
         let mut gpu = backend(&cfg.model, cfg.ctx)?;
         let _ = gpu.free_sequence(0);
         let batch_cap = gpu.prefill_batch_size().max(1);
-        let max_active = cfg.max_seqs.clamp(1, 16).min(gpu.max_sequences());
+        let max_active = cfg.max_seqs.clamp(1, 32).min(gpu.max_sequences());
         let prefill_budget = cfg.prefill_budget.clamp(1, 128);
         let mut scfg = SchedulerConfig::new(gpu.max_ctx(), max_active, batch_cap, prefill_budget);
         scfg.max_decode = max_active.min(batch_cap);

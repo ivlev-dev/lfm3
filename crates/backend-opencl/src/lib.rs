@@ -693,7 +693,7 @@ impl GpuModel {
         let flash_on = opts.flash;
         let flash2_on = opts.flash2;
         let i8_pf_on = opts.i8pf && gpu.caps.sub_group_size > 16;
-        let b8_split = gpu.caps.sub_group_size <= 16;
+        let b8_split = gpu.caps.sub_group_size <= 16 || gpu.caps.device_type == "cpu";
         let mut weights = HashMap::new();
         let mut prepacked: HashMap<String, Buffer<u8>> = HashMap::new();
         let mut prepacked_i8: HashMap<String, (Buffer<i8>, Buffer<f32>, usize)> = HashMap::new();
@@ -1420,7 +1420,7 @@ impl GpuModel {
             list.split(',')
                 .any(|pat| !pat.is_empty() && name.contains(pat))
         });
-        if self.b8_split && self.q4_b8p_on && !force && (2..=16).contains(&ntok) {
+        if self.b8_split && self.q4_b8p_on && !force && (1..=128).contains(&ntok) {
             if let (Weight::Q4(_), Some(p)) = (weight, packed) {
                 return self.launch_b8p_chunks(
                     &self.kernels.gemm_q4_b8p,

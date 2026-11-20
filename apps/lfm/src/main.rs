@@ -95,7 +95,7 @@ struct ServeArgs {
     addr: Option<String>,
     #[arg(long)]
     name: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "одновременных последовательностей, 1..=32 [8]")]
     max_seqs: Option<usize>,
     #[arg(long)]
     prefill_budget: Option<usize>,
