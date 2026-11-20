@@ -19,6 +19,7 @@ lfm-domain.workspace = true
 lfm-tokenizer.workspace = true
 lfm-gpu.workspace = true
 lfm-chat.workspace = true
+unicode-width = "0.2"
 
 [dev-dependencies]
 toml.workspace = true

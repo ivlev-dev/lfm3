@@ -1,3 +1,4 @@
+mod markdown;
 mod serve;
 mod tui;
 
@@ -235,6 +236,24 @@ fn chat(mut cfg: Config, args: ChatArgs) -> Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "lfm".to_string());
+    let mode = match cfg.backend.mode {
+        lfm::BackendMode::Single => "single".to_string(),
+        lfm::BackendMode::Pipeline => format!(
+            "pipeline {}",
+            cfg.backend
+                .devices
+                .iter()
+                .zip(cfg.backend.effective_tiers().unwrap_or_default())
+                .map(|(d, p)| format!("{d}@{p}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
+        lfm::BackendMode::Tp => "tp".to_string(),
+    };
+    let info = format!(
+        "{mode} · {} · ctx {}",
+        cfg.backend.kv, cfg.backend.ctx
+    );
     if let Some(text) = args.once {
         let text = if text == "-" {
             let mut buf = String::new();
@@ -248,7 +267,7 @@ fn chat(mut cfg: Config, args: ChatArgs) -> Result<()> {
     if !std::io::stdout().is_terminal() {
         bail!("stdout не терминал: используйте `lfm chat --once \"...\"` или запустите в TTY");
     }
-    tui::run_chat(&mut chat, &name, &params, show_stats)
+    tui::run_chat(&mut chat, &name, &info, &params, show_stats)
 }
 
 fn serve(mut cfg: Config, args: ServeArgs) -> Result<()> {

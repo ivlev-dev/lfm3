@@ -1,25 +1,58 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use lfm::{Chat, ChatEvent};
+use lfm::{Chat, ChatEvent, Stats};
 use lfm_domain::SamplingParams;
+use unicode_width::UnicodeWidthStr;
 
-const TOOL_ARGS_MAX: usize = 2000;
+mod md {
+    pub use crate::markdown::{plain, render};
+}
 
-const TUI_HELP: &str = "/help — эта справка\n/reset — очистить историю\n/exit, /quit — выход\nPgUp/PgDn — листать историю\nHome/End — начало/конец\nUp/Down — история ввода (при пустой строке — прокрутка)\nCtrl+C — выход";
+const RESET: &str = "\x1b[0m";
+const DIM: &str = "\x1b[38;5;245m";
+const BOLD: &str = "\x1b[1m";
+const ACCENT: &str = "\x1b[38;5;114m";
+const ALERT: &str = "\x1b[38;5;203m";
+const TOOL: &str = "\x1b[38;5;221m";
+
+const HELP: &str = "/help — справка · /reset — очистить · /thinking — показать/скрыть рассуждения · /exit — выход";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    You,
+    Assistant,
+    Thinking,
+    Tool,
+    System,
+}
+
+struct Block {
+    kind: Kind,
+    text: String,
+}
 
 struct TuiState {
-    history: Vec<(String, String)>,
+    title: String,
+    info: String,
+    max_ctx: usize,
+    history: Vec<Block>,
     assistant: String,
     thinking: String,
     tools: Vec<(String, String)>,
     input: String,
     input_history: InputHistory,
-    status: String,
     scroll: usize,
     pending: Vec<u8>,
+    show_thinking: bool,
+    stats: Option<Stats>,
+    live_started: Option<Instant>,
+    live_tokens: usize,
+    ttft: Option<f64>,
+    note: Option<String>,
+    last_render: Instant,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -39,10 +72,6 @@ impl InputHistory {
         if !line.is_empty() && self.entries.last().map(|l| l.as_str()) != Some(line) {
             self.entries.push(line.to_string());
         }
-        self.reset();
-    }
-
-    fn reset(&mut self) {
         self.pos = self.entries.len();
         self.draft.clear();
     }
@@ -73,25 +102,8 @@ impl InputHistory {
     }
 }
 
-fn scroll_after_pgup(scroll: usize, area: usize) -> usize {
-    scroll.saturating_add(area.max(1))
-}
-
-fn scroll_after_pgdn(scroll: usize, area: usize) -> usize {
-    scroll.saturating_sub(area.max(1))
-}
-
-fn scroll_home(total: usize, area: usize) -> usize {
-    total.saturating_sub(area.max(1))
-}
-
-fn scroll_end() -> usize {
-    0
-}
-
 fn term_size() -> (usize, usize) {
-    let out = std::process::Command::new("stty").arg("size").output();
-    if let Ok(out) = out {
+    if let Ok(out) = std::process::Command::new("stty").arg("size").output() {
         let text = String::from_utf8_lossy(&out.stdout);
         let mut parts = text.split_whitespace();
         if let (Some(r), Some(c)) = (parts.next(), parts.next())
@@ -102,7 +114,9 @@ fn term_size() -> (usize, usize) {
             return (r, c);
         }
     }
-    (24, 80)
+    let rows = std::env::var("LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+    let cols = std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()).unwrap_or(80);
+    (rows, cols)
 }
 
 fn set_term_raw(on: bool) -> Result<()> {
@@ -146,12 +160,71 @@ fn poll_interrupt(pending: &mut Vec<u8>) -> bool {
     interrupt
 }
 
-fn clip(text: &str, cols: usize) -> String {
-    text.chars().take(cols).collect()
+fn ansi_width(text: &str) -> usize {
+    let mut used = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        used += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    used
 }
 
-fn wrap(text: &str, cols: usize) -> Vec<String> {
-    let width = cols.max(8);
+fn fit(text: &str, cols: usize) -> String {
+    if ansi_width(text) <= cols {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            out.push(ch);
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap());
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > cols {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    if !out.is_empty() {
+        out.push_str(RESET);
+    }
+    out
+}
+
+fn pad_or_fit(text: &str, cols: usize) -> String {
+    let mut out = fit(text, cols);
+    let w = ansi_width(&out);
+    if w < cols {
+        out.push_str(&" ".repeat(cols - w));
+    }
+    out
+}
+
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(4);
     let mut out = Vec::new();
     for raw in text.split('\n') {
         if raw.is_empty() {
@@ -159,133 +232,183 @@ fn wrap(text: &str, cols: usize) -> Vec<String> {
             continue;
         }
         let mut line = String::new();
-        let mut count = 0usize;
+        let mut used = 0;
         for ch in raw.chars() {
-            if count == width {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > width && used > 0 {
                 out.push(std::mem::take(&mut line));
-                count = 0;
+                used = 0;
             }
             line.push(ch);
-            count += 1;
+            used += w;
         }
         out.push(line);
     }
     out
 }
 
-fn history_prefix(who: &str) -> &'static str {
-    match who {
-        "you" => "you> ",
-        "ai" => "ai>  ",
-        _ => "[sys] ",
+fn push_prefixed(lines: &mut Vec<String>, prefix: &str, text: &str, cols: usize) {
+    let pad = ansi_width(prefix);
+    let width = cols.saturating_sub(pad).max(4);
+    for (i, l) in wrap_plain(text, width).into_iter().enumerate() {
+        if i == 0 {
+            lines.push(format!("{prefix}{l}"));
+        } else {
+            lines.push(format!("{}{l}", " ".repeat(pad)));
+        }
     }
 }
 
-fn format_tool_call(name: &str, args: &str, cols: usize) -> Vec<String> {
-    let width = cols.max(8);
-    let head = format!("[tool] {}", if name.is_empty() { "?" } else { name });
-    let mut out = vec![clip(&head, cols)];
-    let args = args.trim();
-    if args.is_empty() {
-        return out;
+fn push_block(lines: &mut Vec<String>, block: &Block, cols: usize) {
+    match block.kind {
+        Kind::You => {
+            push_prefixed(lines, &format!("{ACCENT}you ›{RESET} "), &block.text, cols);
+            lines.push(String::new());
+        }
+        Kind::Assistant => {
+            for l in md::render(&block.text, cols.saturating_sub(2)) {
+                lines.push(format!("  {l}"));
+            }
+            lines.push(String::new());
+        }
+        Kind::Thinking => {
+            let head = format!("{DIM}thinking ›{RESET}");
+            let mut first = true;
+            for l in md::plain(&block.text, cols.saturating_sub(13)) {
+                if first {
+                    lines.push(format!("{head} {l}{RESET}"));
+                    first = false;
+                } else {
+                    lines.push(format!("           {l}{RESET}"));
+                }
+            }
+            lines.push(String::new());
+        }
+        Kind::Tool => {
+            let (name, args) = block.text.split_once('\n').unwrap_or((&block.text, ""));
+            lines.push(format!(
+                "{TOOL}⚙ {name}{RESET} {DIM}{}{RESET}",
+                fit(args, cols.saturating_sub(name.width() + 4))
+            ));
+        }
+        Kind::System => {
+            for l in md::plain(&block.text, cols.saturating_sub(2)) {
+                lines.push(format!("{l}"));
+            }
+            lines.push(String::new());
+        }
     }
-    let total = args.chars().count();
-    let mut body: String = args.chars().take(TOOL_ARGS_MAX).collect();
-    if total > TOOL_ARGS_MAX {
-        body.push('…');
-    }
-    for line in wrap(&body, width.saturating_sub(2)) {
-        out.push(clip(&format!("  {line}"), cols));
-    }
-    out
 }
 
-fn push_block(lines: &mut Vec<String>, head: String, indent: usize, cols: usize) {
-    let pad = " ".repeat(indent);
-    for (i, l) in wrap(&head, cols).into_iter().enumerate() {
-        lines.push(if i == 0 { l } else { format!("{pad}{l}") });
+fn body_lines(state: &TuiState, cols: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for block in &state.history {
+        push_block(&mut lines, block, cols);
     }
-}
-
-fn transcript_lines(state: &TuiState, cols: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for (who, text) in &state.history {
-        let prefix = history_prefix(who);
+    if !state.thinking.is_empty() && state.show_thinking {
         push_block(
             &mut lines,
-            format!("{prefix}{text}"),
-            prefix.chars().count(),
+            &Block {
+                kind: Kind::Thinking,
+                text: state.thinking.clone(),
+            },
             cols,
         );
-        lines.push(String::new());
-    }
-    if !state.thinking.is_empty() {
-        push_block(&mut lines, format!("[think] {}", state.thinking), 7, cols);
-    }
-    if !state.assistant.is_empty() {
-        push_block(&mut lines, format!("ai>  {}", state.assistant), 5, cols);
     }
     for (name, args) in &state.tools {
-        lines.extend(format_tool_call(name, args, cols));
+        push_block(
+            &mut lines,
+            &Block {
+                kind: Kind::Tool,
+                text: format!("{name}\n{args}"),
+            },
+            cols,
+        );
+    }
+    if !state.assistant.is_empty() {
+        let text = state.assistant.clone();
+        for l in md::render(&text, cols.saturating_sub(2)) {
+            lines.push(format!("  {l}"));
+        }
+    }
+    if let Some(note) = &state.note {
+        for l in md::plain(note, cols.saturating_sub(2)) {
+            lines.push(format!("{ALERT}{l}{RESET}"));
+        }
     }
     lines
 }
 
-#[derive(Debug, Clone, Default)]
-struct LinesView {
-    body: Vec<String>,
-    area: usize,
-    total: usize,
-    scroll: usize,
+fn stats_line(state: &TuiState) -> String {
+    let mut parts = Vec::new();
+    if let Some(s) = &state.stats {
+        parts.push(format!("prefill {:.0} tok/s", s.prefill_tok_s()));
+        parts.push(format!("decode {:.1} tok/s", s.decode_tok_s()));
+        parts.push(format!("TTFT {:.2}s", s.ttft_s));
+        parts.push(format!("{} tok", s.completion_tokens));
+    } else if let Some(start) = state.live_started {
+        let elapsed = start.elapsed().as_secs_f64();
+        let tps = state.live_tokens as f64 / elapsed.max(1e-9);
+        let ttft = state
+            .ttft
+            .map(|t| format!("{t:.2}s"))
+            .unwrap_or_else(|| "…".to_string());
+        parts.push(format!("{tps:.1} tok/s"));
+        parts.push(format!("TTFT {ttft}"));
+        parts.push(format!("{} tok", state.live_tokens));
+        parts.push("Esc/Ctrl+C — стоп".to_string());
+    } else {
+        parts.push(format!("ctx 0/{}", state.max_ctx));
+        parts.push(format!(
+            "thinking: {}",
+            if state.show_thinking { "on" } else { "off" }
+        ));
+    }
+    if state.scroll > 0 {
+        parts.push(format!("↑{}", state.scroll));
+    }
+    parts.join(" · ")
 }
 
-fn body_area(rows: usize) -> usize {
-    rows.saturating_sub(3).max(1)
-}
-
-fn visible_lines(state: &TuiState, rows: usize, cols: usize) -> LinesView {
-    let lines = transcript_lines(state, cols);
-    let area = body_area(rows);
+fn render(state: &mut TuiState) {
+    let (rows, cols) = term_size();
+    let cols = cols.max(24);
+    let rows = rows.max(6);
+    let body_rows = rows.saturating_sub(3).max(1);
+    let lines = body_lines(state, cols);
     let total = lines.len();
-    let max_scroll = total.saturating_sub(area);
+    let max_scroll = total.saturating_sub(body_rows);
     let scroll = state.scroll.min(max_scroll);
     let start = max_scroll - scroll;
-    let mut body: Vec<String> = Vec::with_capacity(area);
-    for i in 0..area {
-        body.push(lines.get(start + i).cloned().unwrap_or_default());
+    let mut out = String::new();
+    // header
+    let title = format!(
+        " lfm · {} · {} ",
+        state.title,
+        state.info
+    );
+    out.push_str(&format!("\x1b[1;1H\x1b[48;5;236m\x1b[38;5;252m{}\x1b[0m", pad_or_fit(&title, cols)));
+    // body
+    for i in 0..body_rows {
+        out.push_str(&format!("\x1b[{};1H\x1b[2K", i + 2));
+        if let Some(line) = lines.get(start + i) {
+            out.push_str(&fit(line, cols));
+        }
     }
-    LinesView {
-        body,
-        area,
-        total,
-        scroll,
-    }
-}
-
-fn tui_render(state: &TuiState, rows: usize, cols: usize) {
-    let view = visible_lines(state, rows, cols);
-    let mut out = String::from("\x1b[H");
-    for line in &view.body {
-        out.push_str("\x1b[2K");
-        out.push_str(&clip(line, cols));
-        out.push_str("\r\n");
-    }
-    let mut status = state.status.clone();
-    if view.scroll > 0 {
-        status.push_str(&format!(" | ↑{}", view.scroll));
-    }
-    out.push_str("\x1b[2K\x1b[7m");
-    out.push_str(&clip(&status, cols));
-    out.push_str("\x1b[0m\r\n\x1b[2Kyou> ");
-    out.push_str(&clip(&state.input, cols.saturating_sub(5)));
+    // stats
+    let stats = stats_line(state);
+    out.push_str(&format!(
+        "\x1b[{};1H\x1b[2K{DIM}{}\x1b[0m",
+        rows - 1,
+        pad_or_fit(&format!(" {stats}"), cols)
+    ));
+    // input
+    let prompt = format!("{ACCENT}you ›{RESET} ");
+    out.push_str(&format!("\x1b[{};1H\x1b[2K{}\x1b[38;5;252m{}\x1b[0m", rows, prompt, fit(&state.input, cols.saturating_sub(6))));
     out.push_str("\x1b[?25h");
     print!("{out}");
     let _ = std::io::stdout().flush();
-}
-
-fn render_now(state: &TuiState) {
-    let (rows, cols) = term_size();
-    tui_render(state, rows, cols);
+    state.last_render = Instant::now();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,42 +459,47 @@ fn read_escape(stdin: &mut std::io::Stdin) -> Option<Key> {
     Some(parse_escape(&seq))
 }
 
-fn scroll_key(state: &mut TuiState, key: Key) {
+fn scroll_by(state: &mut TuiState, delta: isize) {
     let (rows, cols) = term_size();
-    let view = visible_lines(state, rows, cols);
-    let max_scroll = view.total.saturating_sub(view.area);
-    let area = view.area;
-    let next = match key {
-        Key::PgUp => scroll_after_pgup(state.scroll, area),
-        Key::PgDn => scroll_after_pgdn(state.scroll, area),
-        Key::Up => scroll_after_pgup(state.scroll, 1),
-        Key::Down => scroll_after_pgdn(state.scroll, 1),
-        Key::Home => scroll_home(view.total, area),
-        Key::End | Key::Other => scroll_end(),
+    let lines = body_lines(state, cols.max(24));
+    let area = rows.saturating_sub(3).max(1);
+    let max_scroll = lines.len().saturating_sub(area);
+    let next = if delta >= 0 {
+        state.scroll.saturating_add(delta as usize)
+    } else {
+        state.scroll.saturating_sub((-delta) as usize)
     };
     state.scroll = next.min(max_scroll);
-    tui_render(state, rows, cols);
 }
 
 fn handle_nav_key(state: &mut TuiState, key: Key) {
+    let (rows, _) = term_size();
+    let area = rows.saturating_sub(3).max(1);
     match key {
-        Key::PgUp | Key::PgDn | Key::Home | Key::End => scroll_key(state, key),
-        Key::Up if state.input.is_empty() => scroll_key(state, Key::Up),
-        Key::Down if state.input.is_empty() => scroll_key(state, Key::Down),
+        Key::PgUp => scroll_by(state, area as isize),
+        Key::PgDn => scroll_by(state, -(area as isize)),
+        Key::Home => {
+            let (rows, cols) = term_size();
+            let lines = body_lines(state, cols.max(24));
+            state.scroll = lines.len().saturating_sub(rows.saturating_sub(3).max(1));
+        }
+        Key::End => state.scroll = 0,
+        Key::Up if state.input.is_empty() => scroll_by(state, 1),
+        Key::Down if state.input.is_empty() => scroll_by(state, -1),
         Key::Up => {
             if let Some(line) = state.input_history.up(&state.input) {
                 state.input = line;
             }
-            render_now(state);
         }
         Key::Down => {
             if let Some(line) = state.input_history.down() {
                 state.input = line;
-                render_now(state);
             }
         }
         Key::Other => {}
+        _ => {}
     }
+    render(state);
 }
 
 fn read_input_line(state: &mut TuiState) -> Option<String> {
@@ -390,14 +518,18 @@ fn read_input_line(state: &mut TuiState) -> Option<String> {
         };
         match byte {
             3 | 4 => return None,
+            0x14 => {
+                state.show_thinking = !state.show_thinking;
+                render(state);
+            }
             b'\r' | b'\n' => {
-                state.input_history.reset();
+                state.input_history.push(&state.input);
                 return Some(std::mem::take(&mut state.input));
             }
             0x7f | 0x08 => {
                 state.input.pop();
                 utf8.clear();
-                render_now(state);
+                render(state);
             }
             0x1b => {
                 let key = read_escape(&mut stdin)?;
@@ -409,34 +541,39 @@ fn read_input_line(state: &mut TuiState) -> Option<String> {
                     state.input.push_str(text);
                     utf8.clear();
                 }
-                render_now(state);
+                render(state);
             }
             _ => {}
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-
 pub fn run_chat(
     chat: &mut Chat,
     model_name: &str,
+    info: &str,
     params: &SamplingParams,
     show_stats: bool,
 ) -> Result<()> {
     let mut state = TuiState {
+        title: model_name.to_string(),
+        info: info.to_string(),
+        max_ctx: chat.runtime.max_ctx,
         history: Vec::new(),
         assistant: String::new(),
         thinking: String::new(),
         tools: Vec::new(),
         input: String::new(),
         input_history: InputHistory::new(),
-        status: format!(
-            "{model_name} | ctx {} | PgUp/PgDn — история, /help | Ctrl+C — выход",
-            chat.runtime.max_ctx
-        ),
         scroll: 0,
         pending: Vec::new(),
+        show_thinking: true,
+        stats: None,
+        live_started: None,
+        live_tokens: 0,
+        ttft: None,
+        note: None,
+        last_render: Instant::now(),
     };
     set_term_raw(true)?;
     print!("\x1b[?1049h\x1b[2J");
@@ -454,10 +591,8 @@ fn tui_loop(
     show_stats: bool,
     state: &mut TuiState,
 ) -> Result<()> {
-    let base_status = state.status.clone();
     loop {
-        let (rows, cols) = term_size();
-        tui_render(state, rows, cols);
+        render(state);
         let Some(line) = read_input_line(state) else {
             return Ok(());
         };
@@ -465,95 +600,111 @@ fn tui_loop(
         if text.is_empty() {
             continue;
         }
-        if text == "/exit" || text == "/quit" {
-            return Ok(());
+        match text.as_str() {
+            "/exit" | "/quit" => return Ok(()),
+            "/help" => {
+                state.history.push(Block {
+                    kind: Kind::System,
+                    text: HELP.to_string(),
+                });
+                continue;
+            }
+            "/reset" => {
+                chat.reset();
+                state.history.clear();
+                state.stats = None;
+                state.note = None;
+                state.scroll = 0;
+                continue;
+            }
+            "/thinking" => {
+                state.show_thinking = !state.show_thinking;
+                continue;
+            }
+            _ => {}
         }
-        state.input_history.push(&text);
-        state.scroll = 0;
-        if text == "/help" {
-            state
-                .history
-                .push(("sys".to_string(), TUI_HELP.to_string()));
-            continue;
-        }
-        if text == "/reset" {
-            chat.reset();
-            state.history.clear();
-            state.tools.clear();
-            state.status = base_status.clone();
-            continue;
-        }
-        state.history.push(("you".to_string(), text.clone()));
+        state.history.push(Block {
+            kind: Kind::You,
+            text: text.clone(),
+        });
         state.assistant.clear();
         state.thinking.clear();
         state.tools.clear();
-        let started = Instant::now();
-        let mut tokens = 0usize;
-        let mut first: Option<f64> = None;
+        state.note = None;
+        state.stats = None;
+        state.scroll = 0;
+        state.live_started = Some(Instant::now());
+        state.live_tokens = 0;
+        state.ttft = None;
         let cancel = AtomicBool::new(false);
         set_term_timeout(true)?;
         let res = chat.send_stream(&text, params, &cancel, |event| {
             if poll_interrupt(&mut state.pending) {
                 cancel.store(true, Ordering::Relaxed);
             }
-            state.scroll = 0;
             match event {
-                ChatEvent::Token(_) => tokens += 1,
+                ChatEvent::Token(_) => {
+                    state.live_tokens += 1;
+                    if state.ttft.is_none() {
+                        state.ttft = state.live_started.map(|s| s.elapsed().as_secs_f64());
+                    }
+                }
                 ChatEvent::Thinking(t) => state.thinking.push_str(&t),
                 ChatEvent::Content(t) => state.assistant.push_str(&t),
-                ChatEvent::ToolCall(tc) => {
-                    state.tools.push((tc.name, tc.arguments.to_string()));
+                ChatEvent::ToolCall(call) => {
+                    state.tools.push((call.name, call.arguments.to_string()));
                 }
             }
-            let elapsed = started.elapsed().as_secs_f64();
-            let ttft = *first.get_or_insert(elapsed);
-            if show_stats {
-                state.status = format!(
-                    "{base_status} | TTFT {ttft:.2} c | {:.1} tok/s | {tokens} ток.",
-                    tokens as f64 / elapsed.max(1e-9)
-                );
+            state.scroll = 0;
+            if state.last_render.elapsed() >= Duration::from_millis(30) {
+                render(state);
             }
-            let (rows, cols) = term_size();
-            tui_render(state, rows, cols);
         });
         set_term_timeout(false)?;
-        let cancelled = cancel.load(Ordering::Relaxed);
+        state.live_started = None;
         match res {
             Ok(reply) => {
-                if cancelled {
-                    state.status = format!(
-                        "прервано ({} ток.) | {base_status}",
-                        reply.stats.completion_tokens
-                    );
-                } else if show_stats {
-                    let stats = reply.stats;
-                    state.status = format!(
-                        "{base_status} | prefill {:.1} tok/s | decode {:.1} tok/s | TTFT {:.2} c | {} ток.",
-                        stats.prefill_tok_s(),
-                        stats.decode_tok_s(),
-                        stats.ttft_s,
-                        stats.completion_tokens
-                    );
+                let cancelled = cancel.load(Ordering::Relaxed);
+                if !state.thinking.is_empty() && state.show_thinking {
+                    let thinking = std::mem::take(&mut state.thinking);
+                    state.history.push(Block {
+                        kind: Kind::Thinking,
+                        text: thinking,
+                    });
+                } else {
+                    state.thinking.clear();
                 }
-                let (_, cols) = term_size();
-                let mut answer = std::mem::take(&mut state.assistant);
-                for (name, args) in state.tools.drain(..) {
-                    if !answer.is_empty() && !answer.ends_with('\n') {
-                        answer.push('\n');
-                    }
-                    answer.push_str(&format_tool_call(&name, &args, cols).join("\n"));
+                let tools = std::mem::take(&mut state.tools);
+                for (name, args) in tools {
+                    state.history.push(Block {
+                        kind: Kind::Tool,
+                        text: format!("{name}\n{args}"),
+                    });
                 }
-                if answer.is_empty() {
+                let content = std::mem::take(&mut state.assistant);
+                if content.is_empty() {
                     state.history.pop();
-                    continue;
+                } else {
+                    state.history.push(Block {
+                        kind: Kind::Assistant,
+                        text: content,
+                    });
                 }
-                state.history.push(("ai".to_string(), answer));
+                if cancelled {
+                    state.note = Some("остановлено".to_string());
+                }
+                if show_stats {
+                    state.stats = Some(reply.stats);
+                }
             }
             Err(e) => {
-                state.status = format!("ошибка: {e} | {base_status}");
-                state.history.pop();
+                state.assistant.clear();
+                state.thinking.clear();
+                state.tools.clear();
+                state.note = Some(format!("ошибка: {e}"));
             }
         }
+        render(state);
     }
 }
 
@@ -566,27 +717,27 @@ pub fn run_once(
     let cancel = AtomicBool::new(false);
     let reply = chat.send_stream(text, params, &cancel, |event| match event {
         ChatEvent::Thinking(t) => {
-            eprint!("{t}");
+            eprint!("{DIM}{t}{RESET}");
             let _ = std::io::stderr().flush();
         }
         ChatEvent::Content(t) => {
             print!("{t}");
             let _ = std::io::stdout().flush();
         }
-        ChatEvent::ToolCall(tc) => {
-            println!("\n[tool_call] {} {}", tc.name, tc.arguments);
+        ChatEvent::ToolCall(call) => {
+            println!("\n[tool] {} {}", call.name, call.arguments);
         }
         ChatEvent::Token(_) => {}
     })?;
     println!();
     if show_stats {
-        let stats = reply.stats;
+        let s = reply.stats;
         eprintln!(
-            "[prefill {:.1} tok/s, decode {:.1} tok/s, TTFT {:.2} c, {} токенов]",
-            stats.prefill_tok_s(),
-            stats.decode_tok_s(),
-            stats.ttft_s,
-            stats.completion_tokens
+            "[prefill {:.0} tok/s, decode {:.1} tok/s, TTFT {:.2}s, {} токенов]",
+            s.prefill_tok_s(),
+            s.decode_tok_s(),
+            s.ttft_s,
+            s.completion_tokens
         );
     }
     Ok(())
