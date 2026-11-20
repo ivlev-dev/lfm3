@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use lfm::config::{BackendMode, Config};
+use lfm::config::{BackendMode, Config, Overrides};
 use lfm_domain::SamplingParams;
 
 #[derive(Parser)]
@@ -151,38 +151,20 @@ fn load_config(path: Option<&Path>) -> Result<Config> {
     Ok(Config::default())
 }
 
-fn apply_common(cfg: &mut Config, common: &CommonArgs) -> Result<()> {
-    if let Some(path) = &common.model {
-        cfg.model.path = path.clone();
-    }
-    if let Some(ctx) = common.ctx {
-        cfg.backend.ctx = ctx;
-    }
-    if let Some(kv) = &common.kv {
-        cfg.backend.kv = kv.clone();
-    }
-    if let Some(devices) = &common.devices {
-        cfg.backend.devices = devices.clone();
-    }
-    if let Some(mode) = common.mode {
-        cfg.backend.mode = match mode {
+fn common_overrides(common: &CommonArgs) -> Overrides {
+    Overrides {
+        model: common.model.clone(),
+        ctx: common.ctx,
+        kv: common.kv.clone(),
+        devices: common.devices.clone(),
+        mode: common.mode.map(|mode| match mode {
             ModeArg::Single => BackendMode::Single,
             ModeArg::Pipeline => BackendMode::Pipeline,
             ModeArg::Tp => BackendMode::Tp,
-        };
+        }),
+        tiers: common.tiers.clone(),
+        ..Overrides::default()
     }
-    if let Some(tiers) = &common.tiers {
-        let mut out = Vec::new();
-        for part in tiers.split('/') {
-            out.push(
-                part.trim()
-                    .parse::<usize>()
-                    .with_context(|| format!("доли tiers {tiers:?}"))?,
-            );
-        }
-        cfg.backend.tiers = out;
-    }
-    Ok(())
 }
 
 fn params(cfg: &Config) -> SamplingParams {
@@ -199,37 +181,18 @@ fn params(cfg: &Config) -> SamplingParams {
 }
 
 fn chat(mut cfg: Config, args: ChatArgs) -> Result<()> {
-    apply_common(&mut cfg, &args.common)?;
-    if let Some(system) = &args.system {
-        cfg.chat.system = system.clone();
-    }
-    if let Some(v) = args.max_tokens {
-        cfg.chat.max_tokens = v;
-    }
-    if let Some(v) = args.temperature {
-        cfg.chat.temperature = v;
-    }
-    if let Some(v) = args.top_k {
-        cfg.chat.top_k = v;
-    }
-    if let Some(v) = args.top_p {
-        cfg.chat.top_p = v;
-    }
-    if let Some(v) = args.min_p {
-        cfg.chat.min_p = v;
-    }
-    if let Some(v) = args.repeat_penalty {
-        cfg.chat.repeat_penalty = v;
-    }
-    if let Some(v) = args.seed {
-        cfg.chat.seed = v;
-    }
-    if args.thinking {
-        cfg.chat.thinking = true;
-    }
-    if let Some(path) = &args.tools {
-        cfg.chat.tools = Some(path.clone());
-    }
+    let mut ov = common_overrides(&args.common);
+    ov.system = args.system.clone();
+    ov.max_tokens = args.max_tokens;
+    ov.temperature = args.temperature;
+    ov.top_k = args.top_k;
+    ov.top_p = args.top_p;
+    ov.min_p = args.min_p;
+    ov.repeat_penalty = args.repeat_penalty;
+    ov.seed = args.seed;
+    ov.thinking = args.thinking.then_some(true);
+    ov.tools = args.tools.clone();
+    cfg.apply_overrides(&ov)?;
     cfg.validate()?;
     let mut chat = lfm::Chat::open(&cfg)?;
     let params = params(&cfg);
@@ -272,25 +235,14 @@ fn chat(mut cfg: Config, args: ChatArgs) -> Result<()> {
 }
 
 fn serve(mut cfg: Config, args: ServeArgs) -> Result<()> {
-    apply_common(&mut cfg, &args.common)?;
-    if let Some(addr) = args.addr {
-        cfg.server.addr = addr;
-    }
-    if let Some(name) = args.name {
-        cfg.server.name = name;
-    }
-    if let Some(v) = args.max_seqs {
-        cfg.backend.max_seqs = v;
-    }
-    if let Some(v) = args.prefill_budget {
-        cfg.server.prefill_budget = v;
-    }
-    if let Some(v) = args.prefill_in_decode {
-        cfg.server.prefill_in_decode = v;
-    }
-    if args.log_requests {
-        cfg.server.log_requests = true;
-    }
+    let mut ov = common_overrides(&args.common);
+    ov.addr = args.addr;
+    ov.name = args.name;
+    ov.max_seqs = args.max_seqs;
+    ov.prefill_budget = args.prefill_budget;
+    ov.prefill_in_decode = args.prefill_in_decode;
+    ov.log_requests = args.log_requests.then_some(true);
+    cfg.apply_overrides(&ov)?;
     cfg.validate()?;
     serve::run(&cfg)
 }
