@@ -13,7 +13,6 @@ mod md {
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[38;5;245m";
-const BOLD: &str = "\x1b[1m";
 const ACCENT: &str = "\x1b[38;5;114m";
 const ALERT: &str = "\x1b[38;5;203m";
 const TOOL: &str = "\x1b[38;5;221m";
@@ -497,7 +496,6 @@ fn handle_nav_key(state: &mut TuiState, key: Key) {
             }
         }
         Key::Other => {}
-        _ => {}
     }
     render(state);
 }
