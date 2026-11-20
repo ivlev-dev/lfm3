@@ -473,6 +473,32 @@ wg = 128
     }
 
     #[test]
+    fn prefill_in_decode_defaults_and_cli_priority() {
+        let cfg = empty();
+        let mut cli = Overrides {
+            model: None,
+            tokenizer: None,
+            template: None,
+            addr: None,
+            ctx: None,
+            system: None,
+            name: None,
+            log_requests: None,
+            max_body: None,
+            prefill_budget: None,
+            prefill_in_decode: None,
+            h2_cancel_interval: None,
+        };
+        let r = resolve(&cfg, &cli, Options::default()).unwrap();
+        assert_eq!(r.prefill_in_decode, 8);
+        cli.prefill_in_decode = Some(0);
+        let r = resolve(&cfg, &cli, Options::default()).unwrap();
+        assert_eq!(r.prefill_in_decode, 0);
+        cli.prefill_in_decode = Some(65);
+        assert!(resolve(&cfg, &cli, Options::default()).is_err());
+    }
+
+    #[test]
     fn rejects_unknown_server_keys() {
         let parsed: Result<FileConfig, _> = toml::from_str("[server]\nnope = 1\n");
         assert!(parsed.is_err());

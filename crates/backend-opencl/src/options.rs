@@ -264,6 +264,24 @@ mod tests {
     }
 
     #[test]
+    fn kv_pool_bounds() {
+        for pool in [1usize, 2, 16] {
+            let o = Options {
+                kv_pool: pool,
+                ..Options::default()
+            };
+            assert!(o.validate().is_ok(), "pool={pool}");
+        }
+        for pool in [0usize, 17] {
+            let o = Options {
+                kv_pool: pool,
+                ..Options::default()
+            };
+            assert!(o.validate().is_err(), "pool={pool}");
+        }
+    }
+
+    #[test]
     fn rejects_excessive_prepack_threads() {
         let too_many = Options {
             prepack_threads: MAX_PREPACK_THREADS + 1,

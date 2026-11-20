@@ -584,6 +584,12 @@ struct MetricsBody<'a> {
     waiting: u32,
     steps: u64,
     avg_step_ms: f64,
+    avg_gpu_us: u64,
+    avg_logits_us: u64,
+    avg_sample_us: u64,
+    avg_detok_us: u64,
+    rows_total: u64,
+    rows_logits: u64,
     kv_used_pages: u64,
     kv_free_pages: u64,
     kv_cached_pages: u64,
@@ -600,6 +606,12 @@ pub fn metrics_json(model: &str, snapshot: &EngineMetricsSnapshot) -> String {
         waiting: snapshot.waiting,
         steps: snapshot.steps,
         avg_step_ms: snapshot.avg_step_ms,
+        avg_gpu_us: snapshot.avg_gpu_us,
+        avg_logits_us: snapshot.avg_logits_us,
+        avg_sample_us: snapshot.avg_sample_us,
+        avg_detok_us: snapshot.avg_detok_us,
+        rows_total: snapshot.rows_total,
+        rows_logits: snapshot.rows_logits,
         kv_used_pages: snapshot.kv_used_pages,
         kv_free_pages: snapshot.kv_free_pages,
         kv_cached_pages: snapshot.kv_cached_pages,
@@ -740,7 +752,7 @@ mod tests {
         let body = metrics_json("lfm3", &EngineMetricsSnapshot::default());
         assert_eq!(
             body,
-            r#"{"model":"lfm3","ctx":0,"active":0,"waiting":0,"steps":0,"avg_step_ms":0.0,"kv_used_pages":0,"kv_free_pages":0,"kv_cached_pages":0,"cache_hits":0,"reused_tokens":0,"uptime_s":0.0}"#
+            r#"{"model":"lfm3","ctx":0,"active":0,"waiting":0,"steps":0,"avg_step_ms":0.0,"avg_gpu_us":0,"avg_logits_us":0,"avg_sample_us":0,"avg_detok_us":0,"rows_total":0,"rows_logits":0,"kv_used_pages":0,"kv_free_pages":0,"kv_cached_pages":0,"cache_hits":0,"reused_tokens":0,"uptime_s":0.0}"#
         );
         let v: Value = serde_json::from_str(&body).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -751,6 +763,12 @@ mod tests {
             "waiting",
             "steps",
             "avg_step_ms",
+            "avg_gpu_us",
+            "avg_logits_us",
+            "avg_sample_us",
+            "avg_detok_us",
+            "rows_total",
+            "rows_logits",
             "kv_used_pages",
             "kv_free_pages",
             "kv_cached_pages",
@@ -790,6 +808,12 @@ mod tests {
             waiting: 1,
             steps: 7,
             avg_step_ms: 12.5,
+            avg_gpu_us: 100,
+            avg_logits_us: 200,
+            avg_sample_us: 30,
+            avg_detok_us: 40,
+            rows_total: 11,
+            rows_logits: 9,
             kv_used_pages: 3,
             kv_free_pages: 4,
             kv_cached_pages: 5,
@@ -800,7 +824,7 @@ mod tests {
         let body = metrics_json("m", &snapshot);
         assert_eq!(
             body,
-            r#"{"model":"m","ctx":4096,"active":2,"waiting":1,"steps":7,"avg_step_ms":12.5,"kv_used_pages":3,"kv_free_pages":4,"kv_cached_pages":5,"cache_hits":6,"reused_tokens":8,"uptime_s":9.25}"#
+            r#"{"model":"m","ctx":4096,"active":2,"waiting":1,"steps":7,"avg_step_ms":12.5,"avg_gpu_us":100,"avg_logits_us":200,"avg_sample_us":30,"avg_detok_us":40,"rows_total":11,"rows_logits":9,"kv_used_pages":3,"kv_free_pages":4,"kv_cached_pages":5,"cache_hits":6,"reused_tokens":8,"uptime_s":9.25}"#
         );
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ctx"], 4096);

@@ -114,7 +114,7 @@ fi
 
 if [ "$SERVER" = "1" ]; then
     port=8177
-    "$SRV" --addr 127.0.0.1:$port --ctx 1024 --kv kvarn >/tmp/opencode/bench_check_srv.log 2>&1 &
+    "$SRV" --addr 127.0.0.1:$port --ctx 1024 --kv kvarn --kv-pool 2 --prefill-in-decode 4 >/tmp/opencode/bench_check_srv.log 2>&1 &
     srv_pid=$!
     for _ in $(seq 1 40); do
         curl -sf --max-time 1 http://127.0.0.1:$port/health >/dev/null 2>&1 && break
