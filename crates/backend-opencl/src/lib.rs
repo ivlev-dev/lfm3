@@ -725,10 +725,14 @@ impl GpuModel {
                 GgmlType::Q4_K => {
                     if prepack_on {
                         let packed = prepack::prepack_q4_k(data.as_ref())?;
+                        let ffn_weight = info.name.ends_with(".ffn_up.weight")
+                            || info.name.ends_with(".ffn_down.weight")
+                            || info.name.ends_with(".ffn_gate.weight");
                         if info.dims.len() == 2
                             && lcols.is_multiple_of(256)
                             && lrows > 0
                             && q4_i8_on
+                            && (!opts.q4i8_ffn_only || ffn_weight)
                         {
                             let (q8, sc) = prepack::prepack_q4_i8_with_threads(
                                 &packed,

@@ -55,6 +55,7 @@ pub struct EngineFile {
     pub i8pf: Option<bool>,
     pub q4i8: Option<bool>,
     pub q6i8: Option<bool>,
+    pub q4i8_ffn_only: Option<bool>,
     pub wg: Option<usize>,
     pub wg_b: Option<usize>,
     pub rgemv: Option<usize>,
@@ -134,6 +135,9 @@ impl FileConfig {
         }
         if let Some(v) = e.q6i8 {
             o.q6i8 = v;
+        }
+        if let Some(v) = e.q4i8_ffn_only {
+            o.q4i8_ffn_only = v;
         }
         if let Some(v) = e.wg {
             o.wg = v / 64 * 64;
@@ -322,6 +326,7 @@ pub fn dump(cfg: &Resolved, backend: &str) -> String {
     out.push_str(&format!("i8pf = {}\n", e.i8pf));
     out.push_str(&format!("q4i8 = {}\n", e.q4i8));
     out.push_str(&format!("q6i8 = {}\n", e.q6i8));
+    out.push_str(&format!("q4i8_ffn_only = {}\n", e.q4i8_ffn_only));
     out.push_str(&format!("wg = {}\n", e.wg));
     out.push_str(&format!("wg_b = {}\n", e.wg_b));
     out.push_str(&format!("rgemv = {}\n", e.rgemv));

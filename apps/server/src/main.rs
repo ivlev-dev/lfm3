@@ -135,6 +135,8 @@ struct Cli {
     no_i8pf: bool,
     #[arg(long, help = "отключить int8-перепаковку Q4_K для prefill")]
     no_q4i8: bool,
+    #[arg(long, help = "int8-копии Q4 только для FFN (-370 МБ VRAM, prefill -3..4%)")]
+    q4i8_ffn_only: bool,
     #[arg(long, help = "отключить Q6-prefill на int8-ядре")]
     no_q6i8: bool,
     #[arg(long, help = "строк на подгруппу в decode-GEMV, 1..=16 [4]")]
@@ -209,6 +211,9 @@ fn apply_engine_cli(opts: &mut lfm_gpu::Options, cli: &Cli) {
     }
     if cli.no_q4i8 {
         opts.q4i8 = false;
+    }
+    if cli.q4i8_ffn_only {
+        opts.q4i8_ffn_only = true;
     }
     if cli.no_q6i8 {
         opts.q6i8 = false;

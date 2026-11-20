@@ -61,6 +61,7 @@
 | `b8p` | `LFM_B8P` | `--no-b8p` | `true` | префетч x в b8-ядрах decode |
 | `i8pf` | `LFM_I8PF` | `--no-i8pf` | `true` | префетч весов группы в int8-GEMM; на устройстве с подгруппой ≤16 выключается (не хватает регистров) |
 | `q4i8` | `LFM_Q4I8` | `--no-q4i8` | `true` | int8-перепаковка Q4_K для prefill |
+| `q4i8_ffn_only` | `LFM_Q4I8_FFN_ONLY` | `--q4i8-ffn-only` | `false` | int8-копии Q4 только для FFN: −370 МБ VRAM, prefill −6% |
 | `q6i8` | `LFM_Q6I8` | `--no-q6i8` | `true` | Q6-prefill на int8-ядре |
 | `wg` | `LFM_WG` | `--wg` | `256` | размер рабочей группы decode-GEMV (кратен 64) |
 | `wg_b` | `LFM_WG_B` | `--wg-b` | `64` | рабочая группа батчевого GEMV |

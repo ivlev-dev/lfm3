@@ -31,6 +31,7 @@ pub struct Options {
     pub prepack_threads: usize,
     pub program_cache: bool,
     pub kv_pool: usize,
+    pub q4i8_ffn_only: bool,
 }
 
 impl Default for Options {
@@ -62,6 +63,7 @@ impl Default for Options {
             prepack_threads: 0,
             program_cache: true,
             kv_pool: 1,
+            q4i8_ffn_only: false,
         }
     }
 }
@@ -114,6 +116,9 @@ impl Options {
         }
         if let Some(v) = num("LFM_KV_POOL", 1, 16) {
             o.kv_pool = v;
+        }
+        if let Some(v) = flag("LFM_Q4I8_FFN_ONLY") {
+            o.q4i8_ffn_only = v;
         }
         if let Some(v) = flag("LFM_CACHE") {
             o.cache = v;
