@@ -162,6 +162,7 @@ struct Kernels {
     gemm_q6_pp: Kernel,
     q6_b: Kernel,
     conv_b: Kernel,
+    conv_b7: Kernel,
     rms_rope_heads_b: Kernel,
     kv_store_b_h: Kernel,
     kv_store_q: Kernel,
@@ -936,6 +937,7 @@ impl GpuModel {
             gemm_q6_pp: Kernel::create(&program, "gemm_q6_i8_pp")?,
             q6_b: Kernel::create(&program, "gemv_q6_k_i8_b")?,
             conv_b: Kernel::create(&program, "conv_step_b")?,
+            conv_b7: Kernel::create(&program, "conv_step_b7")?,
             rms_rope_heads_b: Kernel::create(&program, "rms_rope_heads_b")?,
             kv_store_b_h: Kernel::create(&program, "kv_store_b_h")?,
             kv_store_q: Kernel::create(&program, "kv_store_q")?,
@@ -3971,37 +3973,59 @@ impl GpuModel {
                         .as_ref()
                         .unwrap_or(&self.bufs.snap_dummy);
                     unsafe {
-                        self.gpu.launch(
-                            &self.kernels.conv_b,
-                            h,
-                            256,
-                            &[
-                                Arg::Mem(self.bufs.bcxb.get()),
-                                Arg::Mem(conv_w.get()),
-                                Arg::Mem(state.get()),
-                                Arg::Mem(self.bufs.opb.get()),
-                                Arg::Mem(self.bufs.conv_off_b.get()),
-                                Arg::Mem(self.bufs.snap_page.get()),
-                                Arg::Mem(snap.get()),
-                                Arg::U32(h as u32),
-                                Arg::U32(self.cfg.conv_cache as u32),
-                                Arg::U32(n32),
-                                Arg::U32(((self.cfg.conv_cache - 1) * h) as u32),
-                            ],
-                        )?;
-                        self.gpu.launch(
-                            &self.kernels.quant_b,
-                            ntok * (h / GROUP),
-                            0,
-                            &[
-                                Arg::Mem(self.bufs.opb.get()),
-                                Arg::Mem(self.bufs.hqx.get()),
-                                Arg::Mem(self.bufs.hsx.get()),
-                                Arg::U32(h as u32),
-                                Arg::U32(GROUP as u32),
-                                Arg::U32(n32),
-                            ],
-                        )?;
+                        if self.cfg.conv_cache == 7 {
+                            self.gpu.launch(
+                                &self.kernels.conv_b7,
+                                h,
+                                256,
+                                &[
+                                    Arg::Mem(self.bufs.bcxb.get()),
+                                    Arg::Mem(conv_w.get()),
+                                    Arg::Mem(state.get()),
+                                    Arg::Mem(self.bufs.opb.get()),
+                                    Arg::Mem(self.bufs.conv_off_b.get()),
+                                    Arg::Mem(self.bufs.snap_page.get()),
+                                    Arg::Mem(snap.get()),
+                                    Arg::Mem(self.bufs.hqx.get()),
+                                    Arg::Mem(self.bufs.hsx.get()),
+                                    Arg::U32(h as u32),
+                                    Arg::U32(n32),
+                                    Arg::U32(((self.cfg.conv_cache - 1) * h) as u32),
+                                ],
+                            )?;
+                        } else {
+                            self.gpu.launch(
+                                &self.kernels.conv_b,
+                                h,
+                                256,
+                                &[
+                                    Arg::Mem(self.bufs.bcxb.get()),
+                                    Arg::Mem(conv_w.get()),
+                                    Arg::Mem(state.get()),
+                                    Arg::Mem(self.bufs.opb.get()),
+                                    Arg::Mem(self.bufs.conv_off_b.get()),
+                                    Arg::Mem(self.bufs.snap_page.get()),
+                                    Arg::Mem(snap.get()),
+                                    Arg::U32(h as u32),
+                                    Arg::U32(self.cfg.conv_cache as u32),
+                                    Arg::U32(n32),
+                                    Arg::U32(((self.cfg.conv_cache - 1) * h) as u32),
+                                ],
+                            )?;
+                            self.gpu.launch(
+                                &self.kernels.quant_b,
+                                ntok * (h / GROUP),
+                                0,
+                                &[
+                                    Arg::Mem(self.bufs.opb.get()),
+                                    Arg::Mem(self.bufs.hqx.get()),
+                                    Arg::Mem(self.bufs.hsx.get()),
+                                    Arg::U32(h as u32),
+                                    Arg::U32(GROUP as u32),
+                                    Arg::U32(n32),
+                                ],
+                            )?;
+                        }
                     }
                     self.gemv_auto_b(
                         &format!("{prefix}.shortconv.out_proj.weight"),

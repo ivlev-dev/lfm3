@@ -27,6 +27,7 @@
 | `log_requests` | `--log-requests` | `false` | access log + лог планировщика (`sched: …`) |
 | `max_body` | `--max-body` | `4194304` | максимальный размер тела запроса, байт |
 | `prefill_budget` | `--prefill-budget` | `64` | бюджет prefill-токенов на шаг, 1..=128 |
+| `prefill_in_decode` | `--prefill-in-decode` | `8` | сколько prefill-токенов подмешивать в шаг, где уже есть decode, 0..=64 |
 | `h2_cancel_interval` | `--h2-cancel-interval` | `16` | как часто (в батчах ответа) HTTP/2 проверяет обрыв клиента, 1..=1024 |
 
 ## Движок (`[engine]`)

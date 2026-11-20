@@ -642,6 +642,108 @@ __kernel void conv_step_b(__global const float *bcx, __global const float *w, __
     }
 }
 
+__kernel void conv_step_b7(__global const float *bcx, __global const float *w, __global float *state, __global float *y, __global const uint *offs, __global const uint *snap_page, __global float *snap, __global char *xq, __global float *xs, uint h, uint ntok, uint snap_stride) {
+    uint ch = get_global_id(0);
+    uint lid = get_local_id(0);
+    bool act = ch < h;
+    __local float qred[512];
+    uint off0 = offs[0];
+    __global float *st = state + off0;
+    float p0 = 0.0f;
+    float p1 = 0.0f;
+    float p2 = 0.0f;
+    float p3 = 0.0f;
+    float p4 = 0.0f;
+    float p5 = 0.0f;
+    if (act) {
+        p0 = st[ch];
+        p1 = st[h + ch];
+        p2 = st[2u * h + ch];
+        p3 = st[3u * h + ch];
+        p4 = st[4u * h + ch];
+        p5 = st[5u * h + ch];
+    }
+    uint ng = h >> 5;
+    for (uint t = 0u; t < ntok; ++t) {
+        float yv = 0.0f;
+        if (offs[t] != off0) {
+            if (act) {
+                st[ch] = p0;
+                st[h + ch] = p1;
+                st[2u * h + ch] = p2;
+                st[3u * h + ch] = p3;
+                st[4u * h + ch] = p4;
+                st[5u * h + ch] = p5;
+            }
+            off0 = offs[t];
+            st = state + off0;
+            if (act) {
+                p0 = st[ch];
+                p1 = st[h + ch];
+                p2 = st[2u * h + ch];
+                p3 = st[3u * h + ch];
+                p4 = st[4u * h + ch];
+                p5 = st[5u * h + ch];
+            }
+        }
+        __global const float *src = bcx + (ulong)t * 3u * h;
+        if (act) {
+            float bx = src[ch] * src[2u * h + ch];
+            uint wb = ch * 7u;
+            float acc = w[wb + 6u] * bx;
+            acc += w[wb] * p0;
+            acc += w[wb + 1u] * p1;
+            acc += w[wb + 2u] * p2;
+            acc += w[wb + 3u] * p3;
+            acc += w[wb + 4u] * p4;
+            acc += w[wb + 5u] * p5;
+            p0 = p1;
+            p1 = p2;
+            p2 = p3;
+            p3 = p4;
+            p4 = p5;
+            p5 = bx;
+            yv = src[h + ch] * acc;
+            y[(ulong)t * h + ch] = yv;
+        }
+        uint qb = (t & 1u) << 8;
+        qred[qb + lid] = act ? fabs(yv) : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (act && (lid & 31u) == 0u) {
+            float m = qred[qb + lid];
+            for (uint i = 1u; i < 32u; ++i) {
+                m = fmax(m, qred[qb + lid + i]);
+            }
+            qred[qb + lid] = m;
+            xs[(ulong)t * ng + (ch >> 5)] = m > 0.0f ? m / 127.0f : 0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (act) {
+            float m = qred[qb + ((lid >> 5) << 5)];
+            float inv = m > 0.0f ? 127.0f / m : 0.0f;
+            xq[(ulong)t * h + ch] = (char)convert_int_rte(yv * inv);
+            uint sp = snap_page[t];
+            if (sp != 0xffffffffu) {
+                ulong base = (ulong)sp * (ulong)snap_stride;
+                snap[base + ch] = p0;
+                snap[base + h + ch] = p1;
+                snap[base + 2u * h + ch] = p2;
+                snap[base + 3u * h + ch] = p3;
+                snap[base + 4u * h + ch] = p4;
+                snap[base + 5u * h + ch] = p5;
+            }
+        }
+    }
+    if (act) {
+        st[ch] = p0;
+        st[h + ch] = p1;
+        st[2u * h + ch] = p2;
+        st[3u * h + ch] = p3;
+        st[4u * h + ch] = p4;
+        st[5u * h + ch] = p5;
+    }
+}
+
 __kernel void rms_rope_heads_b(__global float *x, __global const float *w, __global const float *inv_freq, __global const uint *pos_b, uint head_dim, uint nheads, uint ntok) {
     uint gid = get_group_id(0);
     uint nt = nheads * ntok;
