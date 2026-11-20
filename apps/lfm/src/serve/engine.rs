@@ -282,6 +282,9 @@ impl EngineMetrics {
 
 const IDLE_POLL: Duration = Duration::from_millis(20);
 const BATCH_WINDOW: Duration = Duration::from_micros(2000);
+/// Пока ожидающие запросы не допущены из-за нехватки страниц KV, воркер
+/// опрашивает канал заданий и cancel-флаги с этим интервалом вместо спина.
+const BLOCKED_POLL: Duration = Duration::from_millis(2);
 
 impl Engine {
     pub fn spawn(
@@ -821,8 +824,28 @@ impl Worker {
             self.admit();
             if self.sched.active_len() > 0 {
                 self.step();
+                self.publish();
+                continue;
             }
+            // Планировщик непуст, но admit ничего не допустил: свободных
+            // страниц KV нет (активных последовательностей тоже нет, так что
+            // освобождать их внутри воркера некому). Без ожидания цикл крутился
+            // бы вхолостую и никогда не читал cancel-флаги ожидающих запросов.
+            self.drop_cancelled();
             self.publish();
+            if self.sched.is_empty() {
+                continue;
+            }
+            if closed {
+                // Канал закрыт, а прогресса не будет: активных нет, страницы
+                // освобождать некому. Выходим, чтобы не зависнуть навсегда.
+                break;
+            }
+            match job_rx.recv_timeout(BLOCKED_POLL) {
+                Ok(job) => self.register(job),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => closed = true,
+            }
         }
         let pending: Vec<JobId> = self.reqs.keys().copied().collect();
         for id in pending {
@@ -1797,6 +1820,10 @@ mod tests {
         cancel: Option<Arc<AtomicBool>>,
         fail_step_calls: usize,
         fail_prefill_calls: usize,
+        /// Текущее число свободных страниц KV, которое видит планировщик.
+        free_pages: usize,
+        /// Сколько раз воркер спросил `free_pages` — индикатор холостого спина.
+        free_pages_calls: usize,
     }
 
     struct FakeBackend {
@@ -1905,7 +1932,9 @@ mod tests {
         }
 
         fn free_pages(&self) -> usize {
-            1024
+            let mut stats = self.lock();
+            stats.free_pages_calls += 1;
+            stats.free_pages
         }
 
         fn cache_stats(&self) -> CacheStats {
@@ -1916,6 +1945,7 @@ mod tests {
     fn fake_backend(script: &str) -> (FakeBackend, Arc<Mutex<FakeStats>>) {
         let stats = Arc::new(Mutex::new(FakeStats {
             script: script.bytes().map(u32::from).collect(),
+            free_pages: 1024,
             ..FakeStats::default()
         }));
         (
@@ -1932,6 +1962,11 @@ mod tests {
             max_tokens,
             ..SamplingParams::default()
         }
+    }
+
+    /// Число свободных страниц KV, которое увидит планировщик.
+    fn set_free_pages(stats: &Arc<Mutex<FakeStats>>, pages: usize) {
+        stats.lock().unwrap().free_pages = pages;
     }
 
     fn test_worker(backend: FakeBackend) -> Worker {
@@ -2097,6 +2132,91 @@ mod tests {
         assert_eq!(stats.created, 2);
         assert_eq!(stats.freed, 2);
         assert!(stats.active.is_empty());
+    }
+
+    #[test]
+    fn blocked_waiting_request_reads_cancel_and_leaks_no_slot() {
+        let (backend, stats) = fake_backend("");
+        set_free_pages(&stats, 0);
+        let harness = Harness::start(backend);
+
+        let job = ChatJob::completion("prompt".to_string(), greedy(8));
+        let flag = job.cancel_handle();
+        let rx = harness.submit(job);
+
+        // Запрос зарегистрирован, но без страниц он остаётся в waiting.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            stats.lock().unwrap().created,
+            0,
+            "без страниц admit не проходит"
+        );
+        flag.store(true, Ordering::Relaxed);
+
+        let events = drain_until_terminal(&rx);
+        assert_eq!(expect_error(&events), "cancelled by client");
+        assert!(flag.load(Ordering::Relaxed));
+
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.created, 0, "без страниц слот не создаётся");
+        assert_eq!(stats.freed, 0);
+        assert!(stats.active.is_empty());
+    }
+
+    #[test]
+    fn blocked_worker_admits_waiting_request_once_pages_are_freed() {
+        let (backend, stats) = fake_backend("ok");
+        set_free_pages(&stats, 0);
+        let harness = Harness::start(backend);
+        let rx = harness.submit(ChatJob::completion("prompt".to_string(), greedy(8)));
+
+        std::thread::sleep(Duration::from_millis(30));
+        {
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.created, 0, "при нуле страниц admit не проходит");
+            assert!(stats.active.is_empty());
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        set_free_pages(&stats, 1024);
+        let events = drain_until_terminal(&rx);
+        assert_eq!(streamed_text(&events), "ok");
+        let Event::Final { text, .. } = expect_final(&events) else {
+            panic!("expected final event");
+        };
+        assert_eq!(text, "ok");
+
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.created, 1);
+        assert_eq!(stats.freed, 1);
+        assert!(stats.active.is_empty());
+    }
+
+    #[test]
+    fn blocked_worker_yields_instead_of_spinning() {
+        let (backend, stats) = fake_backend("");
+        set_free_pages(&stats, 0);
+        let harness = Harness::start(backend);
+        let rx = harness.submit(ChatJob::completion("prompt".to_string(), greedy(4)));
+
+        std::thread::sleep(Duration::from_millis(100));
+        let calls = stats.lock().unwrap().free_pages_calls;
+        assert!(
+            calls <= 200,
+            "за 100 мс воркер опросил free_pages {calls} раз — цикл крутится вхолостую"
+        );
+
+        set_free_pages(&stats, 1024);
+        drain_until_terminal(&rx);
+        let worker = harness.shutdown();
+        assert!(worker.sched.is_empty());
+        assert!(worker.reqs.is_empty());
     }
 
     #[test]
