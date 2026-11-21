@@ -50,11 +50,11 @@ check:
 bench-check:
     tools/bench_check.sh amd
 
-# То же на текущей APU (Vega 8): отдельного профиля в скрипте нет, `amd` уже
-# не выставляет RUSTICL_ENABLE. Рецепты `igpu*` относились к Intel UHD 630 —
-# устройства в системе больше нет.
+# То же на текущей APU (Vega 8): профиль `apu` — синоним `amd`, RUSTICL_ENABLE
+# не выставляет. Рецепты `igpu*` относились к Intel UHD 630 — устройства в
+# системе больше нет.
 bench-check-apu:
-    tools/bench_check.sh amd
+    tools/bench_check.sh apu
 
 bench-check-server:
     tools/bench_check.sh amd --server
