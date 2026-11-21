@@ -248,7 +248,7 @@ fn serve(mut cfg: Config, args: ServeArgs) -> Result<()> {
 }
 
 fn print_config(cfg: Config) -> Result<()> {
-    print!("{}", cfg.to_toml()?);
+    print!("{}", cfg.to_toml_effective()?);
     Ok(())
 }
 
@@ -278,6 +278,7 @@ fn example_config() -> String {
          #              # tiers = [96, 4]\n\
          #   tp       — тензорный параллелизм, нужно 2..=4 одинаковых быстрых GPU и kv = \"f16\"\n\
          # backend.kv: f16 | q4 | k4v4 | kvarn | kvarn_k4v2 | kvarn_k4v4\n\
+         # backend.kv_pool: 0 = auto (равен max_seqs), 1..=32 — явный множитель пула\n\
          # Приоритет: CLI > этот файл > значения по умолчанию\n\n{body}"
     )
 }

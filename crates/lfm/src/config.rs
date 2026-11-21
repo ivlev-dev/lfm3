@@ -5,6 +5,21 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_H2_CANCEL_INTERVAL: usize = 16;
 
+/// Сколько токенов покрывает одна KV-страница.
+pub const KV_PAGE_TOKENS: usize = 32;
+
+/// LFM3 1.7B: 24 слоя, из них 13 conv без KV — attention-слоёв 11.
+pub const LFM3_ATTENTION_LAYERS: usize = 11;
+
+/// LFM3 1.7B: 4 KV-головы × head_dim 128.
+pub const LFM3_KV_HEADS: usize = 4;
+pub const LFM3_HEAD_DIM: usize = 128;
+/// `kv_dim = LFM3_KV_HEADS * LFM3_HEAD_DIM`.
+pub const LFM3_KV_DIM: usize = LFM3_KV_HEADS * LFM3_HEAD_DIM;
+
+/// Порог, после которого пул KV считается опасно большим для iGPU.
+pub const KV_MEMORY_WARN_BYTES: u64 = 1_500_000_000;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -40,6 +55,8 @@ pub struct BackendSection {
     pub tiers: Vec<usize>,
     pub kv: String,
     pub ctx: usize,
+    /// `0` — auto: пул равен `max_seqs` (каждая последовательность может
+    /// занять весь `ctx`); `1..=32` — явный множитель.
     pub kv_pool: usize,
     pub max_seqs: usize,
     pub prefill_ntok: usize,
@@ -120,7 +137,7 @@ impl Default for BackendSection {
             tiers: Vec::new(),
             kv: "f16".to_string(),
             ctx: 4096,
-            kv_pool: 1,
+            kv_pool: 0,
             max_seqs: 8,
             prefill_ntok: 128,
             pb: 6,
@@ -329,6 +346,30 @@ impl Config {
         Ok(toml::to_string_pretty(self)?)
     }
 
+    /// TOML для `lfm config print`: `kv_pool = 0` (auto) печатается уже
+    /// разрешённым числом плюс комментарий `# auto (max_seqs=N)`.
+    /// Сам конфиг (`to_toml`, `config init`) сохраняет `0`, чтобы auto не
+    /// «запекался» в файл.
+    pub fn to_toml_effective(&self) -> Result<String> {
+        if self.backend.kv_pool != 0 {
+            return self.to_toml();
+        }
+        let mut resolved = self.clone();
+        resolved.backend.kv_pool = self.backend.effective_kv_pool();
+        let text = resolved.to_toml()?;
+        let comment = format!("# auto (max_seqs={})", self.backend.max_seqs);
+        let mut out = String::with_capacity(text.len() + comment.len() + 1);
+        for line in text.lines() {
+            out.push_str(line);
+            out.push('\n');
+            if line.trim_start().starts_with("kv_pool") {
+                out.push_str(&comment);
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.backend.kind != "opencl" {
             bail!(
@@ -354,8 +395,8 @@ impl Config {
         if !(1..=32).contains(&self.backend.max_seqs) {
             bail!("backend.max_seqs должен быть в 1..=32");
         }
-        if !(1..=16).contains(&self.backend.kv_pool) {
-            bail!("backend.kv_pool должен быть в 1..=16");
+        if self.backend.kv_pool > 32 {
+            bail!("backend.kv_pool должен быть 0 (auto) или в 1..=32");
         }
         if !(1..=128).contains(&self.backend.prefill_ntok) {
             bail!("backend.prefill_ntok должен быть в 1..=128");
@@ -417,7 +458,8 @@ impl Config {
         Ok(())
     }
 
-    /// Мягкие предупреждения о несогласованных `kv_pool` / `max_seqs` / `ctx`.
+    /// Мягкие предупреждения о несогласованных `kv_pool` / `max_seqs` / `ctx`
+    /// и о слишком большом пуле KV.
     ///
     /// Жёсткую проверку «на каждый слот — весь `ctx`» сделать нельзя: пул
     /// страниц общий (radix prefix cache), а планировщик выдаёт страницы по мере
@@ -425,32 +467,42 @@ impl Config {
     /// ([`lfm_app::Scheduler::admit`]). Поэтому эвристики ниже только
     /// предупреждают, а не ломают запуск.
     ///
-    /// Дефолт (`max_seqs = 8`, `ctx = 4096`, `kv_pool = 1`) не шумит: на слот
-    /// приходится ровно `ctx/8`.
+    /// Дефолт (`max_seqs = 8`, `ctx = 4096`, `kv_pool = 0` = auto → 8,
+    /// `kv = f16`) не шумит: на слот приходится ровно `ctx`, память KV
+    /// ≈ 738 МБ — ниже [`KV_MEMORY_WARN_BYTES`].
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         let b = &self.backend;
         let slots = b.max_seqs.max(1);
+        let pool = b.effective_kv_pool();
         let pages = b.kv_pages();
         if pages < slots {
             out.push(format!(
-                "backend: пул KV = {pages} страниц (ctx = {}, kv_pool = {}) меньше max_seqs = {slots}: \
+                "backend: пул KV = {pages} страниц (ctx = {}, kv_pool = {pool}) меньше max_seqs = {slots}: \
                  одновременно поместится не больше {pages} последовательностей, остальные будут ждать; \
                  увеличьте kv_pool или уменьшите max_seqs",
-                b.ctx, b.kv_pool
+                b.ctx
             ));
         }
-        if b.kv_pool.saturating_mul(8) < slots {
-            let per_seq = b.ctx.saturating_mul(b.kv_pool) / slots;
+        if pool.saturating_mul(8) < slots {
+            let per_seq = b.ctx.saturating_mul(pool) / slots;
             let need_pool = slots.div_ceil(8).clamp(1, 16);
             out.push(format!(
-                "backend: max_seqs = {slots} и ctx = {} при kv_pool = {} дают ~{per_seq} токенов \
+                "backend: max_seqs = {slots} и ctx = {} при kv_pool = {pool} дают ~{per_seq} токенов \
                  на последовательность (меньше ctx/8 = {}): запросы будут урезаться по KV; \
                  увеличьте kv_pool до {need_pool} (или уменьшите max_seqs до {})",
                 b.ctx,
-                b.kv_pool,
                 (b.ctx / 8).max(1),
-                b.kv_pool.saturating_mul(8)
+                pool.saturating_mul(8)
+            ));
+        }
+        let bytes = b.estimated_kv_bytes();
+        if bytes > KV_MEMORY_WARN_BYTES {
+            out.push(format!(
+                "backend: KV-пул займёт ~{:.1} ГБ ({pages} страниц × {LFM3_ATTENTION_LAYERS} \
+                 attention-слоёв, kv = {}); уменьшите kv_pool/max_seqs/ctx или включите kvarn",
+                bytes as f64 / 1e9,
+                b.kv
             ));
         }
         out
@@ -458,9 +510,41 @@ impl Config {
 }
 
 impl BackendSection {
-    /// Число страниц KV-пула: `ceil(ctx/32) * kv_pool` (страница = 32 токена).
+    /// Разрешает `kv_pool = 0` (auto) в `max_seqs`: каждая последовательность
+    /// может занять весь `ctx`. Явное `1..=32` возвращается как есть.
+    ///
+    /// Единственная точка разрешения: её используют `kv_pages()`,
+    /// `warnings()`, `to_options()` и `config print`, поэтому все потребители
+    /// (OpenCL, будущий NPU) видят уже посчитанное число.
+    pub fn effective_kv_pool(&self) -> usize {
+        if self.kv_pool == 0 {
+            self.max_seqs.max(1)
+        } else {
+            self.kv_pool
+        }
+    }
+
+    /// Число страниц KV-пула: `ceil(ctx/32) * effective_kv_pool()`
+    /// (страница = 32 токена).
     pub fn kv_pages(&self) -> usize {
-        self.ctx.div_ceil(32).saturating_mul(self.kv_pool)
+        self.ctx
+            .div_ceil(KV_PAGE_TOKENS)
+            .saturating_mul(self.effective_kv_pool())
+    }
+
+    /// Оценка памяти под KV-пул (без staging-кольца `kvarn` и snap-кэша conv).
+    ///
+    /// `n_attn_pages * page_bytes`, где страница — один слой × 32 токена.
+    /// Число attention-слоёв и `kv_dim` берутся из констант LFM3 1.7B
+    /// (24 слоя, 13 conv без KV, 4 KV-головы × 128): `Config::warnings()`
+    /// вызывается до загрузки GGUF, а `ModelConfig` доступен только после
+    /// чтения модели. Для другой архитектуры оценку нужно перенести в бэкенд,
+    /// где `ModelConfig` уже разобран.
+    pub fn estimated_kv_bytes(&self) -> u64 {
+        let page_bytes = kv_page_bytes(&self.kv);
+        (self.kv_pages() as u64)
+            .saturating_mul(LFM3_ATTENTION_LAYERS as u64)
+            .saturating_mul(page_bytes)
     }
 
     pub fn effective_tiers(&self) -> Result<Vec<usize>> {
@@ -522,9 +606,31 @@ impl BackendSection {
             rgemv_b: self.rgemv_b,
             prepack_threads: self.prepack_threads,
             program_cache: self.program_cache,
-            kv_pool: self.kv_pool,
+            kv_pool: self.effective_kv_pool(),
             gemm_force: self.gemm_force.clone(),
         }
+    }
+}
+
+/// Байт на одну KV-страницу (32 токена) одного attention-слоя.
+///
+/// Формулы повторяют раскладку `make_kv` в OpenCL-бэкенде для `kv_dim = 512`,
+/// `heads = 4`: `f16` — K и V по 32×512×2 байта; `q4` — коды и скейлы K/V;
+/// `kvarn` — коды K/V на слот плюс `ka/kc/vb/vbz/vc` на блок.
+fn kv_page_bytes(kv: &str) -> u64 {
+    let page = KV_PAGE_TOKENS as u64;
+    let heads = LFM3_KV_HEADS as u64;
+    match kv {
+        "f16" => page * LFM3_KV_DIM as u64 * 2 * 2,
+        "q4" | "k4v4" => page * 2 * heads * (64 + 2),
+        "kvarn" | "kvarn_k4v2" | "kvarn_k4v4" => {
+            let v_code = if kv == "kvarn_k4v4" { 64 } else { 32 };
+            let codes = page * heads * (64 + v_code);
+            // ka/kc/vb/vbz/vc — u16 на блок (страницу).
+            let meta = heads * (128 + 32 + 32 + 32 + 128) * 2;
+            codes + meta
+        }
+        _ => 0,
     }
 }
 
@@ -540,6 +646,8 @@ mod tests {
         assert_eq!(cfg.backend.kv, "f16");
         assert_eq!(cfg.backend.mode, BackendMode::Single);
         assert_eq!(cfg.chat.max_tokens, 0, "0 = до EOS/контекста");
+        assert_eq!(cfg.backend.kv_pool, 0, "0 = auto");
+        assert_eq!(cfg.backend.effective_kv_pool(), 8, "auto = max_seqs");
     }
 
     #[test]
@@ -794,11 +902,146 @@ mod tests {
 
     #[test]
     fn backend_defaults_match_options_defaults() {
+        // В конфиге kv_pool = 0 (auto → max_seqs = 8); сам бэкенд хранит
+        // сырое значение 1 и не знает про auto. Остальные поля обязаны совпадать.
         assert_eq!(
             BackendSection::default().to_options(),
-            lfm_gpu::Options::default(),
+            lfm_gpu::Options {
+                kv_pool: 8,
+                ..lfm_gpu::Options::default()
+            },
             "дефолты конфига и бэкенда разъехались"
         );
+    }
+
+    #[test]
+    fn auto_kv_pool_equals_max_seqs() {
+        for max_seqs in [8usize, 16, 32] {
+            let mut cfg = Config::default();
+            cfg.backend.kv_pool = 0;
+            cfg.backend.max_seqs = max_seqs;
+            cfg.validate().unwrap();
+            assert_eq!(
+                cfg.backend.effective_kv_pool(),
+                max_seqs,
+                "auto при max_seqs={max_seqs}"
+            );
+            assert_eq!(cfg.backend.kv_pages(), 128 * max_seqs);
+            let opts = cfg.backend.to_options();
+            assert_eq!(
+                opts.kv_pool, max_seqs,
+                "бэкенд должен получить разрешённое значение"
+            );
+            opts.validate()
+                .unwrap_or_else(|e| panic!("auto при max_seqs={max_seqs} отвергнут бэкендом: {e}"));
+        }
+    }
+
+    #[test]
+    fn explicit_max_kv_pool_is_accepted_by_backend() {
+        let mut cfg = Config::default();
+        cfg.backend.kv_pool = 32;
+        cfg.validate().unwrap();
+        let opts = cfg.backend.to_options();
+        assert_eq!(opts.kv_pool, 32);
+        opts.validate()
+            .expect("kv_pool = 32 должен проходить Options::validate");
+
+        // 32 × ctx на f16 ≈ 2.9 ГБ: остаётся только предупреждение про память.
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("KV-пул займёт"), "{warnings:?}");
+
+        cfg.backend.kv_pool = 33;
+        assert_invalid(&cfg, "1..=32");
+    }
+
+    #[test]
+    fn explicit_kv_pool_is_not_overridden_by_auto() {
+        let mut cfg = Config::default();
+        cfg.backend.max_seqs = 16;
+        cfg.backend.kv_pool = 2;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.backend.effective_kv_pool(), 2);
+        assert_eq!(cfg.backend.kv_pages(), 256);
+        assert_eq!(cfg.backend.to_options().kv_pool, 2);
+
+        cfg.backend.max_seqs = 8;
+        cfg.backend.kv_pool = 4;
+        assert_eq!(cfg.backend.effective_kv_pool(), 4);
+    }
+
+    #[test]
+    fn kv_page_bytes_match_backend_layout() {
+        assert_eq!(kv_page_bytes("f16"), 65_536);
+        assert_eq!(kv_page_bytes("q4"), 16_896);
+        assert_eq!(kv_page_bytes("k4v4"), 16_896, "k4v4 — алиас q4");
+        assert_eq!(kv_page_bytes("kvarn"), 15_104);
+        assert_eq!(kv_page_bytes("kvarn_k4v2"), 15_104);
+        assert_eq!(kv_page_bytes("kvarn_k4v4"), 19_200);
+        assert_eq!(kv_page_bytes("unknown"), 0);
+    }
+
+    #[test]
+    fn kv_memory_estimate_and_warning() {
+        // Дефолт: auto 8, ctx 4096, f16 → 1024 страницы × 11 × 64 КиБ ≈ 738 МБ.
+        let cfg = Config::default();
+        assert_eq!(cfg.backend.estimated_kv_bytes(), 738_197_504);
+        assert!(
+            cfg.backend.estimated_kv_bytes() < KV_MEMORY_WARN_BYTES,
+            "738 МБ ниже порога 1.5 ГБ"
+        );
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+
+        // Большой ctx: 8192 страниц × 11 × 64 КиБ ≈ 5.9 ГБ.
+        let mut cfg = Config::default();
+        cfg.backend.ctx = 32768;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.backend.estimated_kv_bytes(), 5_905_580_032);
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("KV-пул займёт ~5.9 ГБ"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("kvarn"), "{warnings:?}");
+        assert!(warnings[0].contains("уменьшите kv_pool"), "{warnings:?}");
+
+        // Тот же ctx на kvarn ≈ 1.36 ГБ — предупреждения нет.
+        cfg.backend.kv = "kvarn".to_string();
+        assert_eq!(cfg.backend.estimated_kv_bytes(), 1_361_051_648);
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+
+        // kvarn_k4v4 дороже 1.5 ГБ — предупреждение возвращается.
+        cfg.backend.kv = "kvarn_k4v4".to_string();
+        assert_eq!(cfg.backend.estimated_kv_bytes(), 1_730_150_400);
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("~1.7 ГБ"), "{warnings:?}");
+    }
+
+    #[test]
+    fn config_print_shows_effective_kv_pool() {
+        let cfg = Config::default();
+        let text = cfg.to_toml_effective().unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.backend.kv_pool, 8, "печатается эффективное значение");
+        assert!(
+            text.contains("# auto (max_seqs=8)"),
+            "нет комментария auto:\n{text}"
+        );
+        assert!(
+            cfg.to_toml().unwrap().contains("kv_pool = 0"),
+            "to_toml должен сохранять auto как 0"
+        );
+
+        // Явный пул печатается без комментария auto.
+        let mut cfg = Config::default();
+        cfg.backend.kv_pool = 3;
+        let text = cfg.to_toml_effective().unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.backend.kv_pool, 3);
+        assert!(!text.contains("auto (max_seqs"), "{text}");
     }
 
     #[test]
@@ -912,17 +1155,24 @@ mod tests {
         }
         check("max_seqs", |c| c.backend.max_seqs = 0);
         check("max_seqs", |c| c.backend.max_seqs = 33);
-        check("kv_pool", |c| c.backend.kv_pool = 0);
+        check("kv_pool", |c| c.backend.kv_pool = 33);
         check("prefill_ntok", |c| c.backend.prefill_ntok = 129);
         check("pb", |c| c.backend.pb = 13);
         check("splits", |c| c.backend.splits = 0);
+
+        // 0 = auto и верхняя граница явного значения проходят
+        let mut cfg = Config::default();
+        cfg.backend.kv_pool = 0;
+        cfg.validate().unwrap();
+        cfg.backend.kv_pool = 32;
+        cfg.validate().unwrap();
     }
 
     #[test]
     fn default_config_has_no_kv_warnings() {
         let cfg = Config::default();
         cfg.validate().unwrap();
-        assert_eq!(cfg.backend.kv_pages(), 128, "4096/32 * kv_pool 1");
+        assert_eq!(cfg.backend.kv_pages(), 1024, "4096/32 * auto(max_seqs=8)");
         assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
     }
 
@@ -1120,7 +1370,7 @@ mod tests {
         assert!(cfg.backend.tiers.is_empty(), "пусто = поровну");
         assert_eq!(cfg.backend.kv, "f16");
         assert_eq!(cfg.backend.ctx, 4096);
-        assert_eq!(cfg.backend.kv_pool, 1);
+        assert_eq!(cfg.backend.kv_pool, 0, "0 = auto (= max_seqs)");
         assert_eq!(cfg.backend.max_seqs, 8);
         assert_eq!(cfg.backend.prefill_ntok, 128);
         assert_eq!(cfg.backend.pb, 6);

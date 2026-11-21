@@ -114,7 +114,7 @@ impl Options {
         if let Some(v) = num("LFM_SEQS", 1, 32) {
             o.max_seqs = v;
         }
-        if let Some(v) = num("LFM_KV_POOL", 1, 16) {
+        if let Some(v) = num("LFM_KV_POOL", 1, 32) {
             o.kv_pool = v;
         }
         if let Some(v) = flag("LFM_Q4I8_FFN_ONLY") {
@@ -219,8 +219,8 @@ impl Options {
         if !(1..=32).contains(&self.max_seqs) {
             return Err(format!("max_seqs must be in 1..=32, got {}", self.max_seqs));
         }
-        if !(1..=16).contains(&self.kv_pool) {
-            return Err(format!("kv_pool must be in 1..=16, got {}", self.kv_pool));
+        if !(1..=32).contains(&self.kv_pool) {
+            return Err(format!("kv_pool must be in 1..=32, got {}", self.kv_pool));
         }
         if self.prepack_threads > MAX_PREPACK_THREADS {
             return Err(format!(
@@ -278,19 +278,20 @@ mod tests {
 
     #[test]
     fn kv_pool_bounds() {
-        for pool in [1usize, 2, 16] {
+        for pool in [1usize, 2, 16, 32] {
             let o = Options {
                 kv_pool: pool,
                 ..Options::default()
             };
             assert!(o.validate().is_ok(), "pool={pool}");
         }
-        for pool in [0usize, 17] {
+        for pool in [0usize, 33] {
             let o = Options {
                 kv_pool: pool,
                 ..Options::default()
             };
-            assert!(o.validate().is_err(), "pool={pool}");
+            let err = o.validate().expect_err("ожидалась ошибка");
+            assert!(err.contains("1..=32"), "pool={pool}: {err}");
         }
     }
 

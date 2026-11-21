@@ -16,6 +16,12 @@ fn config_print_is_valid_toml() {
     let value: toml::Value = toml::from_str(&text).unwrap();
     assert_eq!(value["backend"]["ctx"].as_integer(), Some(4096));
     assert_eq!(value["backend"]["mode"].as_str(), Some("single"));
+    // kv_pool = 0 (auto) печатается уже разрешённым в max_seqs.
+    assert_eq!(value["backend"]["kv_pool"].as_integer(), Some(8));
+    assert!(
+        text.contains("# auto (max_seqs=8)"),
+        "нет пометки auto:\n{text}"
+    );
 }
 
 #[test]
