@@ -1,156 +1,240 @@
-# Myelin architecture
+# Архитектура Myelin
 
-Myelin is a mobile LLM runtime for the Hexagon NPU. This document describes the
-skeleton built in stage 1: a workspace that builds on the host and for Android,
-streams fake tokens end to end, and keeps model knowledge in one place per
-family.
+Документ описывает фактическое устройство репозитория `myelin/` на 22.11.2026:
+слои, крейты, поток данных одного шага, разделение работы host/DSP и правила
+добавления новой модели. Там, где реализация ещё заглушка, это сказано прямо.
+
+## 1. Слои
 
 ```
-Kotlin app
-   │  UniFFI bindings (uniffi.myelin)
+Kotlin (Compose demo, android/app)
+   │  generated UniFFI bindings, package uniffi.myelin
    ▼
-myelin-ffi  ── C ABI (include/myelin.h) ── native callers
-   │
-   ├── runtime.rs     validate input, drive generation, emit events
-   ├── uniffi_api.rs  Engine / Session / TokenEvent / MyelinError
-   └── capi.rs        opaque handles + versioned structs
-   │
+myelin-ffi ── UniFFI (myelin.udl) ──┐
+   │                                ├── C ABI (include/myelin.h)
+   │                                └── Kotlin через JNA (libmyelin.so)
+   ├── runtime.rs      валидация, генерация, события, отмена
+   ├── uniffi_api.rs   Engine / Session / TokenEvent / MyelinError
+   └── capi.rs         opaque-хэндлы, версионированные структуры, коды ошибок
    ▼
 myelin-core
-   ├── gguf.rs   GgufMeta (typed metadata map, no parser yet)
-   ├── arch/     one adapter per family; LFM3 lives in arch/lfm3.rs
-   ├── spec.rs   ModelSpec: plain data, no family checks
-   └── engine.rs deterministic fake-token engine
-   │
+   ├── spec.rs         ModelSpec, Dims, RopeConfig, LayerSpec — чистые данные
+   ├── gguf.rs         GgufMeta — типизированная карта метаданных (парсера нет)
+   ├── arch.rs         таблица адаптеров Arch
+   ├── arch/lfm3.rs    единственное место с числами LFM3
+   └── engine.rs       детерминированный движок-заглушка (splitmix64)
    ▼
 myelin-npu
-   └── NpuBackend trait + MockBackend (FastRPC transport comes later)
+   └── NpuBackend trait + MockBackend (FastRPC-транспорт ещё не подключён)
+
+── граница процесса/домена (план) ──────────────────────────────
+   FastRPC (qaic stub/skel, libcdsprpc.so)
+   ▼
+DSP: Hexagon CDSP v68, unsigned PD
+   ├── int4/int8 GEMV, FFN, attention, shortconv   (/tmp/opencode/gemv, conv)
+   ├── HMX prefill (R&D)                            (/tmp/opencode/hmx4)
+   └── staging KV, conv-состояние, kvarn commit
 ```
 
-## Design rule: models are data, not branches
+Крейт `lfm-npu-ref` (в репозитории `lfm3`, не в workspace `myelin`) —
+host-эталон контрактов будущего DSP-бэкенда: побайтовый ABI, формулы арен,
+скалярный кодек `kvarn`. Он не входит в `myelin`, но задаёт семантику, которую
+DSP-порт обязан повторить.
 
-No crate outside `myelin-core::arch` may contain model-specific numbers or GGUF
-key names. An adapter performs exactly one job:
+## 2. Крейты
+
+| Крейт | Роль | Что внутри | Статус |
+|---|---|---|---|
+| `myelin-core` | модель как данные | `ModelSpec`, `GgufMeta`, `Arch`, `Engine` | спецификация и валидация готовы; GGUF-парсер и математика — заглушки |
+| `myelin-npu` | транспорт к NPU | `NpuBackend { prepare, step, reset }`, `MockBackend` | только mock |
+| `myelin-ffi` | два фронта | `runtime.rs`, `uniffi_api.rs`, `capi.rs`, `myelin.udl`, `include/myelin.h` | работает на заглушке |
+| `lfm-npu-ref` (lfm3) | оракул контрактов | `abi.rs`, `layout.rs`, `kvarn.rs` | готов, покрыт тестами |
+| DSP-артефакты (`/tmp/opencode`) | ядра | `lfmgemv`, `mx4`, `lfmconv` | измерены отдельно, в рантайм не вкомпонованы |
+
+`myelin-core` не знает про Android и FastRPC; `myelin-ffi` не знает про
+конкретную модель; `myelin-npu` не знает про UI. Числа LFM3 (2048, 7680,
+128 000, 24 слоя, окно 256) живут только в `arch/lfm3.rs`; это проверяет
+интеграционный тест `no_lfm3_constants`.
+
+## 3. Модель как данные: `ModelSpec` и `Arch`
+
+Адаптер семьи делает ровно две вещи:
 
 ```
 GgufMeta ──Arch::detect──▶ ModelFamily
-         ──Arch::build_spec──▶ ModelSpec (validated)
+         ──Arch::build_spec──▶ ModelSpec (провалидированный)
 ```
 
-`ModelSpec` is consumed by the engine, the FFI and future backends without any
-`match family` beyond naming. The `no_lfm3_constants` integration test scans
-`myelin-core/src` and fails if LFM3 values (for example `7680`, `128_000`)
-appear outside `arch/lfm3.rs`.
+Ключевые типы (`crates/myelin-core/src/spec.rs`):
 
-### Key types
-
-* `ModelSpec { family, dims, rope, layers, kv_format, tokenizer,
-  chat_template, weight_format }`
+* `ModelSpec { family, dims, rope, layers, kv_format, tokenizer, chat_template,
+  weight_format }`.
 * `Dims { hidden, ffn, layers, heads, kv_heads, head_dim, vocab, conv_cache,
-  sliding_window }`
+  sliding_window }`; `q_dim() = heads*head_dim`, `kv_dim() = kv_heads*head_dim`.
 * `LayerSpec::Attention { kind: Full | Sliding } | Conv { ksize } |
-  Moe { experts, top_k }` — MoE is modelled but not executed.
-* `RopeConfig { full: RopeSpec, sliding: Option<RopeSpec> }`, where
-  `RopeKind` is `Full` or `Partial { rotated_dim }`.
-* `KvFormat`, `TokenizerSpec`, `ChatTemplateSpec`, `WeightFormat` are plain
-  data carried through the FFI.
+  Moe { experts, top_k }`; MoE смоделирован, но не исполняется.
+* `RopeConfig { full, sliding: Option<RopeSpec> }`, `RopeKind::Full |
+  Partial { rotated_dim }`.
+* `KvFormat` (dtype + group_size), `Quant`/`WeightFormat`, `TokenizerSpec`,
+  `ChatTemplateSpec` — plain data, едут через FFI.
 
-`ModelSpec::validate()` rejects inconsistent shapes before any backend sees
-them: `hidden == heads * head_dim`, KV heads divide query heads, layer vector
-length matches `dims.layers`, rope dimensions match, sliding layers have a
-window, MoE top-k is within range.
+`ModelSpec::validate()` отсекает несогласованные формы до бэкенда:
+`hidden == heads*head_dim`, `kv_heads` делит `heads`, длина `layers` совпадает
+с `dims.layers`, размеры rope совпадают с `head_dim`, у sliding-слоя есть окно,
+`top_k <= experts`, `conv ksize >= 2`.
 
-## Adding a model family
+LFM3-профиль (`arch/lfm3.rs`): hidden 2048, ffn 7680, 24 слоя, 16 голов,
+head_dim 128, vocab 128 000, `conv_cache` 7, окно 256, 11 attention-слоёв
+(4 KV-головы, GQA 16/4) и 13 conv-слоёв; sliding — слои 4, 8, 12, 16, 20;
+rope: full θ=1e6, sliding θ=1e4. Значения по умолчанию переопределяются
+ключами GGUF (`lfm3.block_count`, `lfm3.attention.head_count`,
+`lfm3.attention.head_count_kv`, `lfm3.attention.sliding_window_pattern` и т.д.).
 
-1. Add a variant to `ModelFamily` in `crates/myelin-core/src/spec.rs`.
-2. Create `crates/myelin-core/src/arch/<family>.rs` with a marker type that
-   implements `Arch`:
-   * `detect(meta)` returns `Some(ModelFamily)` for its architecture string;
-   * `build_spec(meta)` reads only prefixed keys via
-     `GgufMeta::get_arch_*` / `require_arch_*`;
-   * all family defaults and layer layouts stay in this file.
-3. Add one row to `ARCHES` in `crates/myelin-core/src/arch.rs`.
-4. Add a synthetic `GgufMeta` test under `crates/myelin-core/tests/`.
-5. Run `cargo test`; the constant guard test will fail if numbers leaked out.
+### Как добавить модель
 
-Do not add family checks to `engine.rs`, `runtime.rs` or `capi.rs`.
+1. Вариант в `ModelFamily` (`spec.rs`).
+2. Файл `arch/<family>.rs` с типом, реализующим `Arch`:
+   `detect` по `general.architecture`; `build_spec` читает только
+   `get_arch_*`/`require_arch_*`; все дефолты семьи — здесь.
+3. Строка в `ARCHES` (`arch.rs`).
+4. Синтетический `GgufMeta`-тест в `crates/myelin-core/tests/`.
+5. `cargo test`: тест-страж констант упадёт, если числа утекли из адаптера.
 
-## C ABI
+Никаких `match family` в `engine.rs`, `runtime.rs`, `capi.rs` быть не должно.
+Если новая семья требует новое поле в `ModelSpec` — это изменение контракта,
+а не ветка в движке.
 
-`myelin-ffi/include/myelin.h` is the source of truth for C consumers. The ABI
-is versioned with `MYELIN_ABI_VERSION` and `myelin_version()`.
+## 4. Поток данных одного шага
 
-Conventions:
+### Сейчас (заглушка)
 
-* Opaque `myelin_engine` / `myelin_session` pointers, allocated and freed by
-  the library.
-* Every input struct starts with `size`. Calls reject sizes smaller than the
-  current struct and accept larger ones, so fields can be appended later.
-* Strings are NUL-terminated UTF-8, borrowed for the duration of the call.
-* Return code `0` means success. Errors also fill `myelin_error.message`.
-* Streams use `myelin_session_generate(session, messages, n, sampling,
-  callback, user, err)`. The callback returns non-zero to cancel.
+```
+Kotlin Session.generate(messages, sampling, sink)
+  → runtime.rs: валидация сообщений/сэмплинга, busy-флаг
+  → myelin-core::Engine::step(1): splitmix64 → один u32-токен
+  → sleep 10 мс → TokenEvent::Delta{index, token, "<token>"}
+  → 5 раз → TokenEvent::Done{total=5}
+```
 
-| Code | Meaning |
-| --- | --- |
+Сеть, файл модели, токенизатор и DSP не участвуют. Это позволяет проверять
+ABI, UniFFI, JNA, упаковку `.so` и lifecycle на телефоне без модели.
+
+### Целевой (после подключения FastRPC)
+
+1. Хост принимает сообщения, применяет chat template и токенизатор (пока нет).
+2. Планировщик формирует строки шага: `Row { token, seq, pos, ntok, kv_off,
+   tbl_off }` и `StepDesc { n_rows, ntok, window, flags, max_rows }`.
+   `flags & FLAG_PREFILL` — prefill-чанк; иначе decode.
+3. FastRPC-вызов уходит в DSP (одна команда на шаг, не на слой).
+4. DSP проходит слои: conv или attention (с paged KV и kvarn) → FFN (один RPC
+   на слой в текущем стенде) → логиты; коммитит готовые KV-страницы.
+5. Возвращается `StepOut { n_rows, ntok, logits_off, status }`; сами логиты
+   лежат в общей арене (ION/rpcmem), а не копируются в ответе.
+6. Хост сэмплирует, отдаёт `Delta`, обновляет таблицу страниц и повторяет.
+
+### Где что живёт
+
+| Работа | Host (Rust/Android) | DSP (Hexagon) |
+|---|---|---|
+| Токенизация, chat template | да | — |
+| Планировщик, батчинг, `max_seqs` | да | — |
+| Таблица страниц, radix-кэш, LRU | да | — |
+| Выбор страниц, публикация хэшей | да | — |
+| Загрузка/преппак весов, rpcmem | да (инициирует) | принимает, держит резидентно |
+| GEMV/GEMM, attention, conv | — | да |
+| RMSNorm, RoPE, SiLU, residual | — (эталон) | да |
+| kvarn commit (кодирование страницы) | эталон в `lfm-npu-ref` | да |
+| staging-кольцо, conv-состояние | копия для отладки | да |
+| Сэмплинг, детокенизация, UI | да | — |
+
+Важно: `lfm-npu-ref` на хосте повторяет **семантику** раскладки и кодека, но не
+является быстрым путём. Расхождение host-эталона и DSP-порта — баг, а не
+оптимизация.
+
+## 5. C ABI
+
+`crates/myelin-ffi/include/myelin.h` — источник истины для C-потребителей.
+Версия: `MYELIN_ABI_VERSION = 1`, `myelin_version()`,
+`myelin_version_string()`.
+
+Соглашения:
+
+* `myelin_engine` / `myelin_session` — непрозрачные указатели, память выделяет
+  и освобождает библиотека.
+* Каждая входная структура начинается с `size`; вызовы отвергают размер
+  меньше текущего и принимают больше — поля можно добавлять в конец.
+* Строки — NUL-terminated UTF-8, заимствованные на время вызова.
+* `0` — успех; ошибка заполняет `myelin_error { size, code, message[512] }`.
+* Стрим: `myelin_session_generate(session, messages, n, sampling, callback,
+  user, err)`; callback возвращает non-zero, чтобы отменить.
+
+| Код | Значение |
+|---|---|
 | 0 | OK |
 | 1 | invalid argument |
-| 2 | invalid state (for example, session already generating) |
+| 2 | invalid state (например, сессия уже генерирует) |
 | 3 | I/O error |
 | 4 | backend error / unsupported backend |
 | 5 | cancelled |
-| 6 | panic caught at the boundary |
+| 6 | panic пойман на границе |
 | 7 | internal error |
 
-`myelin_session_generate` emits exactly five `Delta` events with token ids and
-text, then one `Done`. Cancellation is checked before every token and aborts
-with code 5. Panics are caught in every `extern "C"` entry point.
+`MYELIN_BACKEND_AUTO=0`, `MOCK=1`, `NPU=2`; сейчас `AUTO` и `MOCK` дают
+`MockBackend`, `NPU` возвращает `MYELIN_ERR_BACKEND`. Паники ловятся во всех
+`extern "C"`-точках.
 
-## UniFFI surface
+## 6. UniFFI
 
-`crates/myelin-ffi/src/myelin.udl` declares:
+`crates/myelin-ffi/src/myelin.udl` объявляет:
 
-* objects `Engine` and `Session`;
-* dictionaries `ChatMessage` and `Sampling`;
+* объекты `Engine` (constructor с необязательным путём, `load`, `new_session`)
+  и `Session` (`generate`, `cancel`);
+* словари `ChatMessage`, `Sampling`;
 * enum `TokenEvent { Delta, ToolCall, Done, Error }`;
-* callback interface `TokenSink`;
-* flat error `MyelinError`.
+* callback `TokenSink { on_token(event) }`;
+* плоскую ошибку `MyelinError` (`InvalidArgument`, `InvalidState`, `Io`,
+  `Backend`, `Cancelled`, `Internal`).
 
-Kotlin is generated by `uniffi-bindgen` (built from the same crate) into
-`android/myelin-sdk/src/main/kotlin`. The generated package is `uniffi.myelin`.
+Kotlin генерируется `uniffi-bindgen` из того же крейта в
+`android/myelin-sdk/src/main/kotlin/uniffi/myelin/`. Сгенерированный класс
+ошибки в Kotlin называется `MyelinException`.
 
-The Kotlin caller creates an `Engine` (optionally with a model path), opens a
-`Session`, and passes a `TokenSink` to `generate`. The same five-token stub runs
-behind both front ends because both use `runtime.rs`.
+`Session.generate` блокирующий: события приходят в `TokenSink`. Демо оборачивает
+его в `callbackFlow` на `Dispatchers.IO`; `cancel()` останавливает Rust-цикл на
+ближайшей границе токена.
 
-## Android build
+## 7. Android
 
 `build-android.sh`:
 
-1. picks the NDK from `ANDROID_NDK_HOME` (default
-   `/tmp/opencode/ndk/android-ndk-r27c`);
-2. builds `myelin-ffi` for `aarch64-linux-android` with API 24;
-3. links with `-Wl,-z,max-page-size=16384` and verifies every `LOAD` segment
-   with `readelf -l`;
-4. copies `libmyelin.so` to
-   `android/myelin-sdk/src/main/jniLibs/arm64-v8a/`;
-5. regenerates Kotlin bindings.
+1. берёт NDK из `ANDROID_NDK_HOME` (по умолчанию `/tmp/opencode/ndk/android-ndk-r27c`);
+2. собирает `myelin-ffi` под `aarch64-linux-android`, API 24;
+3. линкует с `-Wl,-z,max-page-size=16384` и проверяет **каждый** `LOAD`-сегмент
+   через `readelf -l`;
+4. копирует `libmyelin.so` в `android/myelin-sdk/src/main/jniLibs/arm64-v8a/`;
+5. перегенерирует Kotlin-биндинги.
 
-The build does not touch the OpenCL reference workspace at the repository root.
+Gradle: `compileSdk = 37`, `compileSdkMinor = 1`, `buildTools 37.0.0`,
+`minSdk 26`, `targetSdk 37`, JDK/Gradle toolchain 17, AGP 9.5.2, Gradle 9.9,
+только `arm64-v8a`. `packaging.jniLibs.useLegacyPackaging = false` — AGP пакует
+`.so` без сжатия и с 16-КБ выравниванием. Демо — in-process, без демона и без
+разрешений: `Engine(modelPath = null)` выбирает mock.
 
-## What is still a stub
+Имя библиотеки: биндинги ищут `libuniffi_myelin.so`, ядро лежит как
+`libmyelin.so`, поэтому `MyelinApp.onCreate()` выставляет
+`uniffi.component.myelin.libraryOverride=myelin` до первого обращения к UniFFI.
 
-* GGUF parsing: `Engine::load` only checks the `GGUF` magic. Metadata exchange
-  with the DSP is next.
-* Engine math: deterministic `splitmix64` tokens, no attention/conv kernels.
-* Sampling: validated but ignored; exactly five tokens are emitted.
-* NPU: `MockBackend` only. `MYELIN_BACKEND_NPU` returns a backend error.
-* Tokenizer and chat template: carried in the spec, not applied.
-* MoE: enum variant exists, no execution path.
-* Kotlin packaging: bindings and `.so` are placed in a source tree; Gradle
-  publication is out of scope for this stage.
+## 8. Что ещё заглушка
 
-## Tests
+* GGUF: `Engine::load` проверяет только magic `GGUF`; парсер метаданных — следующий этап.
+* Математика движка: `splitmix64`, без attention/conv/FFN.
+* Сэмплинг: валидируется и игнорируется, всегда 5 токенов.
+* NPU: `MockBackend`; `MYELIN_BACKEND_NPU` → ошибка.
+* Токенизатор и chat template: едут в спеке, не применяются.
+* MoE: вариант есть, исполнения нет.
+* Публикация AAR/Maven: вне этапа.
+
+## 9. Тесты
 
 ```
 cd myelin
@@ -159,6 +243,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The suite is deterministic: no network, no GPU, no phone. C ABI tests call the
-exported symbols from Rust (including one independent `extern "C"` declaration);
-UniFFI tests call the same Rust API the generated Kotlin will use.
+Набор детерминированный: без сети, GPU и телефона. C ABI-тесты вызывают
+экспортированные символы из Rust (включая независимое `extern "C"`-объявление);
+UniFFI-тесты дергают тот же Rust API, что и сгенерированный Kotlin. Отдельный
+тест `no_lfm3_constants` сканирует `myelin-core/src` и падает, если числа LFM3
+появились вне `arch/lfm3.rs`.
