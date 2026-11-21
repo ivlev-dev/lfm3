@@ -28,28 +28,32 @@ __kernel void kv_store_h_rot(__global const float *ksrc, __global const float *v
     vdst[base + 2u * lane + 1u] = (KV_T)buf[2u * lane + 1u];
 }
 
+// `nrows` строк батча начиная со строки `row0`: батчевый kvarn пишет ring
+// тайлами, чтобы коммит страницы успевал прочитать её до затирания кольцом.
 __kernel void kv_store_b_h_rot(__global const float *ksrc, __global const float *vsrc,
                                __global KV_T *kdst, __global KV_T *vdst,
                                __global const uint *tbl, __global const uint *tbl_off,
                                __global const uint *pos_b, __global const uint *seq_b,
-                               uint kv_heads, uint head_dim, uint ntok, uint seq_cap, uint rbits) {
+                               uint kv_heads, uint head_dim, uint nrows, uint row0,
+                               uint seq_cap, uint rbits) {
     uint rmask = (1u << rbits) - 1u;
     uint lane = get_local_id(0);
     uint gid = get_group_id(0);
     uint t = gid / kv_heads;
     uint h = gid % kv_heads;
-    if (t >= ntok) {
+    if (t >= nrows) {
         return;
     }
     __local float buf[128];
-    uint seq = seq_b[t];
+    uint row = row0 + t;
+    uint seq = seq_b[row];
     if (seq >= seq_cap) {
         return;
     }
-    uint pos = pos_b[t];
+    uint pos = pos_b[row];
     ulong slot = ((ulong)seq << rbits) + (pos & rmask);
     ulong base = slot * kv_heads * 128u + (ulong)h * 128u;
-    ulong src = ((ulong)t * kv_heads + h) * 128u;
+    ulong src = ((ulong)row * kv_heads + h) * 128u;
     buf[2u * lane] = ksrc[src + 2u * lane];
     buf[2u * lane + 1u] = ksrc[src + 2u * lane + 1u];
     barrier(CLK_LOCAL_MEM_FENCE);

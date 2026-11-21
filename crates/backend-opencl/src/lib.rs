@@ -48,6 +48,33 @@ pub fn attention_splits(span: usize) -> usize {
     (span / 512).clamp(1, MAX_SPLITS)
 }
 
+/// Минимальный размер staging-кольца kvarn — две страницы.
+///
+/// Коммит страницы читает 32 токена из кольца, а store батча идёт тайлами по
+/// [`kvarn_tile_rows`] строк. Двух страниц хватает, чтобы тайл из одной
+/// страницы (минимальный полезный) не затирал её начало.
+const KVARN_MIN_STAGE: usize = 2 * KV_PAGE;
+
+/// Размер staging-кольца kvarn на последовательность:
+/// `max(64, next_pow2(prefill_ntok))`.
+///
+/// Кольцу нужно хранить неполную страницу до коммита, поэтому оно растёт
+/// вместе с чанком prefill, но не опускается ниже двух страниц.
+pub fn kvarn_stage(prefill_ntok: usize) -> usize {
+    prefill_ntok.max(1).next_power_of_two().max(KVARN_MIN_STAGE)
+}
+
+/// Максимум строк в одном store+commit тайле kvarn.
+///
+/// Коммит страницы `p` читает токены `32p ..= 32p+31` из кольца. Если тайл
+/// начинается в середине страницы, её первые токены лежат в кольце с прошлого
+/// чанка, и более поздний токен того же тайла может затереть их: ближайший
+/// такой токен — `32p + stage`. Поэтому тайл ограничен `stage - 32` строками:
+/// тогда страница, чей последний токен попал в тайл, гарантированно ещё цела.
+pub fn kvarn_tile_rows(stage: usize) -> usize {
+    stage.saturating_sub(KV_PAGE)
+}
+
 pub fn reuse_cap(prompt_len: usize) -> usize {
     prompt_len.saturating_sub(1) / KV_PAGE
 }
@@ -586,6 +613,9 @@ pub struct GpuModel {
     kv_f32: bool,
     kv_stage: usize,
     kv_ring_bits: u32,
+    /// Строк батча на один store+commit тайл kvarn (не используется, если
+    /// kv — не kvarn).
+    kvarn_tile: usize,
     splits_cap: usize,
     cache: RadixCache,
     cache_on: bool,
@@ -1063,9 +1093,17 @@ impl GpuModel {
             ));
         }
         let mut kv_stage = KV_PAGE;
+        let mut kvarn_tile = KV_PAGE;
         if kv_kvarn {
-            while kv_stage < prefill_batch.max(1) {
-                kv_stage *= 2;
+            kv_stage = kvarn_stage(prefill_batch);
+            kvarn_tile = kvarn_tile_rows(kv_stage).min(batch_cap);
+            // Инвариант: тайл store+commit не должен догонять коммит страницы.
+            // Иначе чанк, начавшийся не на границе страницы, затирает её
+            // начало до `kvarn_commit` — тихая порча K/V чужими токенами.
+            if kv_stage < KVARN_MIN_STAGE || kvarn_tile + KV_PAGE > kv_stage {
+                return Err(anyhow!(
+                    "kvarn: тайл {kvarn_tile} строк не оставляет места странице в кольце {kv_stage}"
+                ));
             }
         }
         let kv_ring_bits = kv_stage.trailing_zeros();
@@ -1232,6 +1270,7 @@ impl GpuModel {
             kv_f32,
             kv_stage,
             kv_ring_bits,
+            kvarn_tile,
             splits_cap,
             cache: RadixCache::new(kv_blocks),
             cache_on,
@@ -4411,29 +4450,86 @@ impl GpuModel {
                     unsafe {
                         let kv_q4 = match (k_buf, v_buf) {
                             (
-                                KvBuf::Kvarn { staging: ks, .. },
+                                KvBuf::Kvarn {
+                                    staging: ks,
+                                    kcode,
+                                    ka,
+                                    kc,
+                                    vcode,
+                                    vb,
+                                    vbz,
+                                    vc,
+                                },
                                 KvBuf::Kvarn { staging: vs, .. },
                             ) => {
-                                self.gpu.launch(
-                                    &self.kernels.kv_store_b_h_rot,
-                                    ntok * kv_heads * 64,
-                                    64,
-                                    &[
-                                        Arg::Mem(self.bufs.kkb.get()),
-                                        Arg::Mem(self.bufs.vvb.get()),
-                                        Arg::Mem(ks.get()),
-                                        Arg::Mem(vs.get()),
-                                        Arg::Mem(self.bufs.tbl_all.get()),
-                                        Arg::Mem(self.bufs.tbl_off_b.get()),
-                                        Arg::Mem(self.bufs.pos_b.get()),
-                                        Arg::Mem(self.bufs.seq_b.get()),
-                                        Arg::U32(kv_heads as u32),
-                                        Arg::U32(head_dim as u32),
-                                        Arg::U32(ntok as u32),
-                                        Arg::U32(self.max_seqs as u32),
-                                        Arg::U32(self.kv_ring_bits),
-                                    ],
-                                )?;
+                                // Store и commit идут тайлами: `kvarn_commit`
+                                // читает страницу из кольца, и более поздние
+                                // строки тайла не должны успеть затереть её
+                                // начало, пришедшее из прошлого чанка
+                                // (см. `kvarn_tile_rows`).
+                                let tile = self.kvarn_tile.max(1);
+                                let mut row0 = 0usize;
+                                while row0 < ntok {
+                                    let nrows = (ntok - row0).min(tile);
+                                    if nrows + KV_PAGE > self.kv_stage {
+                                        return Err(anyhow!(
+                                            "kvarn: тайл {nrows} строк не оставляет места \
+                                             странице в кольце {}",
+                                            self.kv_stage
+                                        ));
+                                    }
+                                    self.gpu.launch(
+                                        &self.kernels.kv_store_b_h_rot,
+                                        nrows * kv_heads * 64,
+                                        64,
+                                        &[
+                                            Arg::Mem(self.bufs.kkb.get()),
+                                            Arg::Mem(self.bufs.vvb.get()),
+                                            Arg::Mem(ks.get()),
+                                            Arg::Mem(vs.get()),
+                                            Arg::Mem(self.bufs.tbl_all.get()),
+                                            Arg::Mem(self.bufs.tbl_off_b.get()),
+                                            Arg::Mem(self.bufs.pos_b.get()),
+                                            Arg::Mem(self.bufs.seq_b.get()),
+                                            Arg::U32(kv_heads as u32),
+                                            Arg::U32(head_dim as u32),
+                                            Arg::U32(nrows as u32),
+                                            Arg::U32(row0 as u32),
+                                            Arg::U32(self.max_seqs as u32),
+                                            Arg::U32(self.kv_ring_bits),
+                                        ],
+                                    )?;
+                                    for (dt, r) in reqs[row0..row0 + nrows].iter().enumerate() {
+                                        if (r.pos + 1) % KV_PAGE != 0 {
+                                            continue;
+                                        }
+                                        let page = (r.pos / KV_PAGE) as u32;
+                                        self.gpu.launch(
+                                            &self.kernels.kvarn_commit,
+                                            kv_heads * 64,
+                                            64,
+                                            &[
+                                                Arg::Mem(ks.get()),
+                                                Arg::Mem(vs.get()),
+                                                Arg::Mem(kcode.get()),
+                                                Arg::Mem(ka.get()),
+                                                Arg::Mem(kc.get()),
+                                                Arg::Mem(vcode.get()),
+                                                Arg::Mem(vb.get()),
+                                                Arg::Mem(vbz.get()),
+                                                Arg::Mem(vc.get()),
+                                                Arg::Mem(self.bufs.tbl_all.get()),
+                                                Arg::U32(tbl_off_host[row0 + dt]),
+                                                Arg::U32(page),
+                                                Arg::U32(kv_heads as u32),
+                                                Arg::U32(head_dim as u32),
+                                                Arg::U32(r.slot as u32),
+                                                Arg::U32(self.kv_ring_bits),
+                                            ],
+                                        )?;
+                                    }
+                                    row0 += nrows;
+                                }
                                 None
                             }
                             (
@@ -4487,51 +4583,6 @@ impl GpuModel {
                                 None
                             }
                         };
-                        if let KvBuf::Kvarn {
-                            staging: ks,
-                            kcode,
-                            ka,
-                            kc,
-                            vcode,
-                            vb,
-                            vbz,
-                            vc,
-                        } = k_buf
-                        {
-                            let vs = match v_buf {
-                                KvBuf::Kvarn { staging, .. } => staging,
-                                _ => return Err(anyhow!("mixed kv variants")),
-                            };
-                            for (t, r) in reqs.iter().enumerate() {
-                                if (r.pos + 1) % KV_PAGE == 0 {
-                                    let page = (r.pos / KV_PAGE) as u32;
-
-                                    self.gpu.launch(
-                                        &self.kernels.kvarn_commit,
-                                        kv_heads * 64,
-                                        64,
-                                        &[
-                                            Arg::Mem(ks.get()),
-                                            Arg::Mem(vs.get()),
-                                            Arg::Mem(kcode.get()),
-                                            Arg::Mem(ka.get()),
-                                            Arg::Mem(kc.get()),
-                                            Arg::Mem(vcode.get()),
-                                            Arg::Mem(vb.get()),
-                                            Arg::Mem(vbz.get()),
-                                            Arg::Mem(vc.get()),
-                                            Arg::Mem(self.bufs.tbl_all.get()),
-                                            Arg::U32(tbl_off_host[t]),
-                                            Arg::U32(page),
-                                            Arg::U32(kv_heads as u32),
-                                            Arg::U32(head_dim as u32),
-                                            Arg::U32(r.slot as u32),
-                                            Arg::U32(self.kv_ring_bits),
-                                        ],
-                                    )?;
-                                }
-                            }
-                        }
                         let last = reqs.iter().map(|r| r.pos).max().unwrap_or(0) + 1;
                         let span_max = if window > 0 { window.min(last) } else { last };
                         let splits = (span_max / 512).clamp(1, self.splits_cap);
@@ -5807,6 +5858,92 @@ mod tests {
     #[test]
     fn chunk_ranges_handles_zero_batch() {
         assert_eq!(chunk_ranges(3, 0), vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    /// Модель staging-кольца kvarn: пишем токены чанка и коммитим страницы,
+    /// чей последний токен попал в тайл. Ошибка — коммит прочитал бы из кольца
+    /// не тот токен (тихая порча K/V).
+    fn kvarn_ring_check(
+        chunk_start: usize,
+        chunk_len: usize,
+        stage: usize,
+        tile: usize,
+    ) -> Result<(), String> {
+        let end = chunk_start + chunk_len;
+        let mut ring = vec![None::<usize>; stage];
+        let mut pos = 0usize;
+        while pos < end {
+            // Префикс `[0, chunk_start)` уже лежит в кольце: он записан
+            // прошлыми чанками (для теста — одним).
+            let tile_end = if pos < chunk_start {
+                chunk_start
+            } else {
+                (pos + tile).min(end)
+            };
+            for p in pos..tile_end {
+                ring[p % stage] = Some(p);
+            }
+            for p in pos..tile_end {
+                if (p + 1) % KV_PAGE != 0 {
+                    continue;
+                }
+                let page = (p + 1) / KV_PAGE - 1;
+                for i in 0..KV_PAGE {
+                    let want = page * KV_PAGE + i;
+                    if ring[want % stage] != Some(want) {
+                        return Err(format!(
+                            "позиция {p}: страница {page} читает токен {want} как {:?}",
+                            ring[want % stage]
+                        ));
+                    }
+                }
+            }
+            pos = tile_end;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn kvarn_commit_tiles_keep_page_boundary_intact() {
+        let stage = kvarn_stage(128);
+        assert_eq!(stage, 128);
+        let tile = kvarn_tile_rows(stage).min(128);
+        assert_eq!(tile, 96);
+        // Чанк prefill_ntok=128, начинающийся не на границе страницы.
+        for start in [1usize, 31, 32, 33, 63] {
+            kvarn_ring_check(start, 128, stage, tile)
+                .unwrap_or_else(|e| panic!("start={start}: {e}"));
+        }
+    }
+
+    #[test]
+    fn kvarn_whole_chunk_tile_corrupts_boundary_page() {
+        // Старое поведение: один store на весь чанк и коммиты после него.
+        // Страница на стыке читает затёртое кольцо.
+        let stage = 128;
+        for start in [1usize, 31, 33, 63] {
+            assert!(
+                kvarn_ring_check(start, 128, stage, 128).is_err(),
+                "start={start}: порча не воспроизвелась"
+            );
+        }
+        // Выровненный чанк — единственный случай, который старый код переживал.
+        assert!(kvarn_ring_check(32, 128, stage, 128).is_ok());
+    }
+
+    #[test]
+    fn kvarn_stage_keeps_a_page_of_slack() {
+        for ntok in [1usize, 7, 31, 32, 33, 63, 64, 65, 96, 127, 128] {
+            let stage = kvarn_stage(ntok);
+            assert!(stage.is_power_of_two(), "ntok={ntok}");
+            assert!(stage >= ntok, "ntok={ntok}");
+            assert!(stage >= KVARN_MIN_STAGE, "ntok={ntok}");
+            assert!(kvarn_tile_rows(stage) >= KV_PAGE, "ntok={ntok}");
+        }
+        assert_eq!(kvarn_stage(32), 64);
+        assert_eq!(kvarn_stage(96), 128);
+        assert_eq!(kvarn_stage(128), 128);
+        assert!(kvarn_tile_rows(128) + KV_PAGE <= 128);
     }
 
     #[test]

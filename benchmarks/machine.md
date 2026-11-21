@@ -486,7 +486,7 @@ scratch/спиллы IGC; `#pragma unroll 1` на внутренних цикл�
 ## kvarn: staging по последовательностям (сессия 12)
 
 > История; в текущем коде кольцо называется `kv_stage` и равно
-> `max(32, next_pow2(prefill_ntok))`, `KV_STAGE` — прежнее имя.
+> `max(64, next_pow2(prefill_ntok))`, `KV_STAGE` — прежнее имя.
 
 Раньше staging держал полный f16 всего контекста, поэтому `kv=kvarn` занимал
 ~497 МБ при ctx 8192 — больше, чем f16-KV (403 МБ). Теперь staging — кольцо на
