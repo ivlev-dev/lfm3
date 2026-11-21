@@ -1,0 +1,55 @@
+namespace myelin {
+    u32 abi_version();
+};
+
+[Error]
+enum MyelinError {
+    "InvalidArgument",
+    "InvalidState",
+    "Io",
+    "Backend",
+    "Cancelled",
+    "Internal",
+};
+
+dictionary ChatMessage {
+    string role;
+    string content;
+};
+
+dictionary Sampling {
+    f32 temperature = 0.7;
+    u32 top_k = 40;
+    f32 top_p = 0.95;
+    u32 max_tokens = 5;
+    u64 seed = 0;
+};
+
+[Enum]
+interface TokenEvent {
+    Delta(u32 index, u32 token, string text);
+    ToolCall(string payload);
+    Done(u32 total);
+    Error(string message);
+};
+
+callback interface TokenSink {
+    void on_token(TokenEvent event);
+};
+
+interface Engine {
+    [Throws=MyelinError]
+    constructor(string? model_path);
+
+    [Throws=MyelinError]
+    void load(string path);
+
+    Session new_session();
+};
+
+interface Session {
+    [Throws=MyelinError]
+    void generate(sequence<ChatMessage> messages, Sampling sampling, TokenSink callback);
+
+    void cancel();
+};

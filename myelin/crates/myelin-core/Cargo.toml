@@ -1,0 +1,9 @@
+[package]
+name = "myelin-core"
+description = "Model-agnostic runtime core for Myelin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,10 @@
+[package]
+name = "myelin-npu"
+description = "NPU transport boundary for Myelin (mock backend for now)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+myelin-core.workspace = true
