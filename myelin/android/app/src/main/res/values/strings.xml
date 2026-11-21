@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Myelin Demo</string>
+    <string name="header_subtitle">Local LLM runtime · stub backend</string>
+    <string name="empty_state">Ask something — tokens will stream here.</string>
+    <string name="prompt_hint">Prompt…</string>
+    <string name="action_generate">Generate</string>
+    <string name="action_stop">Stop</string>
+    <string name="role_user">You</string>
+    <string name="role_assistant">Myelin</string>
+    <string name="message_pending">…</string>
+</resources>
