@@ -1,0 +1,13 @@
+[package]
+name = "lfm-npu-ref"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lfm_npu_ref"
+path = "src/lib.rs"
+
+[dependencies]
+lfm-domain.workspace = true
+half.workspace = true
+thiserror.workspace = true

@@ -1157,6 +1157,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfm-npu-ref"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "lfm-domain",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lfm-opencl"
 version = "0.1.0"
 dependencies = [

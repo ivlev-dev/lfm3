@@ -12,6 +12,7 @@ members = [
     "crates/infra-chat",
     "crates/infra-cpu",
     "crates/lfm",
+    "crates/lfm-npu-ref",
     "apps/lfm",
     "tools/bench",
 ]
