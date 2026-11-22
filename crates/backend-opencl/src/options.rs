@@ -32,8 +32,6 @@ pub struct Options {
     pub program_cache: bool,
     pub kv_pool: usize,
     pub q4i8_ffn_only: bool,
-    /// Activation quantisation block (32 = per group, 256 = DSP-style block).
-    pub act_block: usize,
 }
 
 impl Default for Options {
@@ -66,7 +64,6 @@ impl Default for Options {
             program_cache: true,
             kv_pool: 1,
             q4i8_ffn_only: false,
-            act_block: 32,
         }
     }
 }
@@ -175,9 +172,6 @@ impl Options {
         }
         if let Some(v) = flag("LFM_PROGRAM_CACHE") {
             o.program_cache = v;
-        }
-        if let Some(v) = num("LFM_ACT_BLOCK", 32, 2048) {
-            o.act_block = v;
         }
         o
     }

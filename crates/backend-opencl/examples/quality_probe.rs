@@ -37,7 +37,9 @@ fn main() {
         .unwrap_or(256);
 
     let mut gpu = GpuModel::load(Path::new(&model), ctx).expect("load");
+    let t0 = std::time::Instant::now();
     gpu.forward_batch(&prompt, 0, true).expect("prefill");
+    let prefill = t0.elapsed().as_secs_f64();
     let mut logits = gpu.logits().expect("logits");
     let mut out = Vec::with_capacity(steps);
     let mut pos = prompt.len();
@@ -52,8 +54,15 @@ fn main() {
         "FIRST {}",
         out.first().copied().unwrap_or_default()
     );
+    let decode = t0.elapsed().as_secs_f64() - prefill;
     println!(
         "TOKENS {}",
         out.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
+    );
+    println!(
+        "TIME prefill {:.1} ms, decode {:.2} ms/token, {:.2} tok/s",
+        prefill * 1e3,
+        decode * 1e3 / steps as f64,
+        steps as f64 / decode
     );
 }

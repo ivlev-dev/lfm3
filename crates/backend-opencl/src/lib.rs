@@ -164,7 +164,6 @@ struct Kernels {
     rms: Kernel,
     rms_add: Kernel,
     quant: Kernel,
-    quant_block: Kernel,
     q4: Kernel,
     q4pk: Kernel,
     q6: Kernel,
@@ -608,7 +607,6 @@ pub struct GpuModel {
     wg: usize,
     wg_b: usize,
     subgroup: usize,
-    act_block: usize,
     kv_blocks: usize,
     kv_q4: bool,
     kv4: bool,
@@ -1017,7 +1015,6 @@ impl GpuModel {
             rms: Kernel::create(&program, "rms_norm")?,
             rms_add: Kernel::create(&program, "rms_norm_add")?,
             quant: Kernel::create(&program, "quantize_q8")?,
-            quant_block: Kernel::create(&program, "quantize_q8_block")?,
             q4: Kernel::create(&program, "gemv_q4_k_i8")?,
             q4pk: Kernel::create(&program, "gemv_q4_k_i8_pk")?,
             q6: Kernel::create(&program, "gemv_q6_k_i8")?,
@@ -1267,7 +1264,6 @@ impl GpuModel {
             wg,
             wg_b,
             subgroup,
-            act_block: opts.act_block,
             kv_blocks,
             kv_q4,
             kv4,
@@ -1831,25 +1827,6 @@ impl GpuModel {
 
     fn quantize(&self, x: &Buffer<f32>, xq: &Buffer<i8>, xs: &Buffer<f32>, n: usize) -> Result<()> {
         unsafe {
-            if self.act_block > GROUP {
-                let ng = n / GROUP;
-                let local = 64usize;
-                let grid = ng.div_ceil(local) * local;
-                self.gpu.launch(
-                    &self.kernels.quant_block,
-                    grid,
-                    local,
-                    &[
-                        Arg::Mem(x.get()),
-                        Arg::Mem(xq.get()),
-                        Arg::Mem(xs.get()),
-                        Arg::U32(n as u32),
-                        Arg::U32(GROUP as u32),
-                        Arg::U32(self.act_block as u32),
-                    ],
-                )?;
-                return Ok(());
-            }
             let groups = n / GROUP;
             let grid = groups.div_ceil(16) * 256;
             self.gpu.launch(
