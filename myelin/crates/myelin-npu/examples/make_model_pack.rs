@@ -137,6 +137,22 @@ impl AbsMax {
 
     /// Real units per int8 code that map the observed range onto `target`
     /// of the 127 signed codes.
+    /// Step that always clips at `sigma` standard deviations, for the buffers
+    /// whose tail is dominated by a handful of channels.
+    fn step_clipped(&self, target: f32, sigma: f32) -> f32 {
+        let rms = self.rms();
+        let range = if rms > 0.0 && self.value > sigma * rms {
+            sigma * rms
+        } else {
+            self.value
+        };
+        if range > 0.0 && range.is_finite() {
+            range / target
+        } else {
+            1.0
+        }
+    }
+
     fn step(&self, target: f32) -> f32 {
         let range = self.robust_max(CLIP_SIGMA);
         if range > 0.0 && range.is_finite() {
@@ -686,8 +702,10 @@ fn build_pack(
             reps: 1,
         };
         let conv = layer.conv.as_ref().map(|conv| {
-            let mix_scale = conv.mix.step(ACT_TARGET);
-            let y_scale = conv.y.step(ACT_TARGET);
+            // The shortconv buffers are the ones the DSP quantises to int8
+            // inside the layer, so their tail costs resolution everywhere.
+            let mix_scale = conv.mix.step_clipped(ACT_TARGET, 8.0);
+            let y_scale = conv.y.step_clipped(ACT_TARGET, 8.0);
             let taps: Vec<f32> = conv.weights.taps.data().to_vec();
             let blob = shortconv::build(
                 &taps,
