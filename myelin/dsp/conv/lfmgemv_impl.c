@@ -101,12 +101,15 @@ static inline int32_t vsum_w(HVX_Vector v) {
  * error ~= (a & 0xff)*b/65536.  Negligible in the SiLU/exp path (b ~ 2^16),
  * but NOT for int8 requantisation with a small multiplier: b ~ 0.015 gives
  * ~4 LSB of 127.  pack_out_i8() and requant_mid() below take the product in
- * 64 bits. */
+ * 64 bits.
+ * The low partial product must be signed: silu_range() calls this with a
+ * negative b (= up), and the old unsigned form returned ~2^24 for it, which
+ * put every lane with up < 0 at +127 in the mid buffer. */
 static inline int32_t mulq16(int32_t a, int32_t b)
 {
     int32_t hi = a >> 16;
     uint32_t lo = ((uint32_t)a >> 8) & 0xFFu;
-    return hi * b + (int32_t)(((uint32_t)lo * (uint32_t)b) >> 8);
+    return hi * b + (int32_t)(((int64_t)lo * (int64_t)b) >> 8);
 }
 
 static int32_t sum_act_i8(const int8_t *a, int K) {

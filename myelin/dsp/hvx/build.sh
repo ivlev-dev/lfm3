@@ -25,6 +25,12 @@ for f in "$CC" "$HCC" "$QAIC"; do
     [ -x "$f" ] || { echo "не найден $f — проверьте HEXAGON_SDK_ROOT / ANDROID_NDK_ROOT" >&2; exit 1; }
 done
 
+# Офлайн-проверка численности FFN: чистая математика, SDK не нужен.
+${HOSTCC:-cc} -O2 -Wall -o ffn_sim ffn_sim.c -lm
+echo "HOST FFN SIM OK"
+${HOSTCC:-cc} -O2 -Wall -o ffn_real_study ffn_real_study.c -lm
+echo "HOST FFN STUDY OK"
+
 # IDL -> lfmgemv.h / lfmgemv_stub.c / lfmgemv_skel.c
 "$QAIC" -I$S/incs -I$S/incs/stddef lfmgemv.idl
 
@@ -52,4 +58,4 @@ $HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o attn_test \
 echo "ATTN OK"
 
 echo "BUILD OK"
-ls -la liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test
+ls -la liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test ffn_sim ffn_real_study

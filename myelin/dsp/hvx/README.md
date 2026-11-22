@@ -11,7 +11,11 @@
 | `lfmgemv_impl.c` | DSP-ядра: int4/int8 GEMV, SiLU-LUT, FFN, paged attention, PV |
 | `host_main.c` | базовый тест GEMV (корректность + полоса) |
 | `ab_main.c` | A/B варианты ядра, пробы полосы, multi-context |
-| `ffn_main.c` | тест FFN-слоя (gate+up → SiLU → down), bit-exact проверка |
+| `ffn_main.c` | тест FFN-слоя (gate+up → SiLU → down): bit-exact + cos/maxerr против f32 |
+| `ffn_ref.h` | общая хостовая модель FFN: та же целочисленная цепочка, f32-эталон, калибровка |
+| `ffn_sim.c` | офлайн-симулятор FFN (без устройства): масштабы, cos, LSB mid, насыщение |
+| `ffn_real_study.c` | прогон на реальных тензорах LFM3: слои 0/12/23, int8/int4, распределения ошибки |
+| `lfm3_fwd.h`, `gguf_f32.h` | f32-форвард LFM3 (зеркало `backend/cpu.rs`) и чтение GGUF для стендов |
 | `attn_main.c` | тест attention: CPU-f32 эталон, cos/max_abs_err, тайминги, проверка exp |
 | `diag_main.c`, `probe_main.c` | мелкие диагностические прогоны |
 | `silu_lut.h`, `exptab.h` | таблицы SiLU и exp |
@@ -40,6 +44,30 @@ export MADB=<adb-серийник>
 
 Офлайн-числодробилки собираются обычным `cc`, например:
 `cc -O2 silu_study.c -lm -o silu_study`.
+
+### Численность FFN без устройства
+
+`build.sh` дополнительно собирает `ffn_sim` и `ffn_real_study` (обычный `cc`):
+
+```bash
+./ffn_sim 8                                    # синтетика: SIM OK / SIM FAIL
+./ffn_real_study ../../../models/LFM3-1.7B-Q4_K_M.gguf 8
+```
+
+Масштабы в стенде — те, что реально ждут ядра: gate/up получают
+`sa = 65536*s_in, so = 1`, поэтому де-квантованный gate — Q16, как у
+`silu_q16()`; `s_mid = absmax(P)/127` из фактического диапазона
+`P = silu(gate)*up`; `s_out = max_r(sw_d*s_mid*acc_max[r])/110` (то же правило,
+что в `conv_sim`). `ffn_sim` падает, если буфер mid вырожден (`|zg| < 1024`
+единиц Q16), если Q16-множитель упёрся в clamp 0.99997 или если cos(out) < 0.99.
+
+Важно: Q16-множитель де-кванта gate/up — это физическое отношение
+`gate/acc`, умноженное на 2^16, и оно ограничено сверху 0.99997. Для реальных
+тензоров LFM3 (per-row int4/int8) это отношение равно 6..215 (int4) и
+0.3..12 (int8), то есть clamp срабатывает и gate выходит не в Q16. Подробности
+и цифры — в отчёте `ffn_real_study`; исправление требует расширить формат
+де-кванта (64-битное произведение + сдвиг на буфер), это изменение ядра, а не
+стенда.
 
 ## Формат весов int4
 
