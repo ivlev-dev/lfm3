@@ -33,7 +33,23 @@
 
 typedef void *Address;
 
-#define MAXBUF 8
+/* Weight handles are cheap metadata: the 24-layer LFM3 graph needs 72 FFN
+ * handles + 44 attention handles (K/KT/V/block table) + 39 conv-layer handles
+ * = 155, and the stand adds 72 more for the arena check.  256 covers a full
+ * model with headroom; weights themselves live in ION arenas. */
+#define MAXBUF 256
+
+/* one host mapping, many views (alloc_view): 0 = model arena, 1 = spare */
+#define MAXARENA 4
+
+typedef struct {
+    uint8_t *base;      /* DSP virtual address of the mapping */
+    int      bytes;
+    int      fd;
+    int      used;
+} arena_t;
+
+static arena_t g_arena[MAXARENA];
 
 typedef struct {
     int      used;
@@ -52,6 +68,8 @@ typedef struct {
     uint8_t *w_heap;    /* weight copy allocated on the DSP heap (alloc_buf) */
     int8_t  *in_ptr;    /* host ION buffer mapped as the weights (attach_in) */
     int      in_bytes;
+    int      in_owned;  /* 1 = in_ptr is this handle's own mapping */
+    int      arena;     /* arena index for an alloc_view handle, else -1 */
     float    sa, so;    /* activation / output scales last given to set_scale */
 } gbuf_t;
 
@@ -1381,6 +1399,8 @@ static int attach_in_locked(gbuf_t *b, int fd, int nbytes)
     b->w_heap = 0;
     b->in_ptr = (int8_t *)(size_t)vadsp;
     b->in_bytes = nbytes;
+    b->in_owned = 1;
+    b->arena = -1;
     b->w = (uint8_t *)b->in_ptr;
     b->wbytes = (size_t)nbytes;
     return 0;
@@ -1403,9 +1423,12 @@ int lfmgemv_detach_in(int h)
 {
     if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
     if (g_buf[h].in_ptr) {
-        apps_mem_share_unmap((uint64)(size_t)g_buf[h].in_ptr, g_buf[h].in_bytes);
+        if (g_buf[h].in_owned)
+            apps_mem_share_unmap((uint64)(size_t)g_buf[h].in_ptr, g_buf[h].in_bytes);
         g_buf[h].in_ptr = 0;
         g_buf[h].in_bytes = 0;
+        g_buf[h].in_owned = 0;
+        g_buf[h].arena = -1;
         g_buf[h].w = 0;
         g_buf[h].wbytes = 0;
     }
@@ -1423,6 +1446,71 @@ int lfmgemv_alloc_in(int fd, int nbytes, int *h)
     rc = attach_in_locked(&g_buf[i], fd, nbytes);
     if (rc != 0) return rc;
     g_buf[i].used = 1;
+    *h = i;
+    return 0;
+}
+
+/* ---------------- arenas: one mapping, many tensor views ----------------
+ * A production model does not fit in MAXBUF separate mappings well: every
+ * rpcmem buffer is its own fd and every attach_in is a driver round trip.
+ * The host instead allocates one arena for the whole model, maps it once and
+ * registers views (offset, length) that behave exactly like attach_in
+ * handles: w = arena_base + off, wbytes = nbytes.  Bounds are checked against
+ * the mapping, so a view can never point outside the buffer.
+ */
+int lfmgemv_map_arena(int fd, int nbytes, int *ah)
+{
+    int i, rc;
+    uint64 vapps = 0, vadsp = 0;
+
+    if (ah == 0 || fd < 0 || nbytes <= 0 || (nbytes & 127) != 0) return AEE_EBADPARM;
+    set_perf();
+    for (i = 0; i < MAXARENA; i++) if (!g_arena[i].used) break;
+    if (i == MAXARENA) return AEE_EBADPARM;
+    rc = apps_mem_share_map(fd, nbytes, &vapps, &vadsp);
+    if (rc != 0 || vadsp == 0) return rc ? rc : AEE_EBADPARM;
+    if ((vadsp & 127) != 0) {
+        apps_mem_share_unmap(vadsp, nbytes);
+        return AEE_EBADPARM;
+    }
+    g_arena[i].base = (uint8_t *)(size_t)vadsp;
+    g_arena[i].bytes = nbytes;
+    g_arena[i].fd = fd;
+    g_arena[i].used = 1;
+    *ah = i;
+    return 0;
+}
+
+int lfmgemv_unmap_arena(int ah)
+{
+    int i;
+    if (ah < 0 || ah >= MAXARENA || !g_arena[ah].used) return AEE_EBADPARM;
+    for (i = 0; i < MAXBUF; i++)
+        if (g_buf[i].used && g_buf[i].arena == ah) return AEE_EBADPARM;
+    apps_mem_share_unmap((uint64)(size_t)g_arena[ah].base, g_arena[ah].bytes);
+    memset(&g_arena[ah], 0, sizeof(g_arena[ah]));
+    return 0;
+}
+
+int lfmgemv_alloc_view(int ah, int off, int nbytes, int *h)
+{
+    gbuf_t *b;
+    int i;
+
+    if (h == 0 || ah < 0 || ah >= MAXARENA || !g_arena[ah].used) return AEE_EBADPARM;
+    if (off < 0 || nbytes <= 0 || (off & 127) != 0) return AEE_EBADPARM;
+    if ((size_t)off + (size_t)nbytes > (size_t)g_arena[ah].bytes) return AEE_EBADPARM;
+    for (i = 0; i < MAXBUF; i++) if (!g_buf[i].used) break;
+    if (i == MAXBUF) return AEE_EBADPARM;
+    b = &g_buf[i];
+    memset(b, 0, sizeof(*b));
+    b->used = 1;
+    b->arena = ah;
+    b->in_owned = 0;
+    b->in_ptr = (int8_t *)(g_arena[ah].base + off);
+    b->in_bytes = nbytes;
+    b->w = (uint8_t *)b->in_ptr;
+    b->wbytes = (size_t)nbytes;
     *h = i;
     return 0;
 }
@@ -1971,9 +2059,9 @@ int lfmgemv_ffn_resident(int hg, int hu, int hd, const unsigned char *act, int a
                     times, timesLen, 1);
 }
 
-int lfmgemv_attn(int hk, int hkt, int hv, int hvs, const unsigned char *q, int qLen,
-                 const int *tbl, int tblLen, int pos, int seq, int window, int reps,
-                 unsigned char *outp, int outLen, int *times, int timesLen)
+static int attn_core(int hk, int hkt, int hv, int hvs, const unsigned char *q, int qLen,
+                     const int *tbl, int tblLen, int pos, int seq, int window, int reps,
+                     unsigned char *outp, int outLen, int *times, int timesLen)
 {
     static int8_t *qe, *qo;
     static int32_t *sumq, *scores, *acc;
@@ -2118,6 +2206,14 @@ int lfmgemv_attn(int hk, int hkt, int hv, int hvs, const unsigned char *q, int q
     return 0;
 }
 
+int lfmgemv_attn(int hk, int hkt, int hv, int hvs, const unsigned char *q, int qLen,
+                 const int *tbl, int tblLen, int pos, int seq, int window, int reps,
+                 unsigned char *outp, int outLen, int *times, int timesLen)
+{
+    return attn_core(hk, hkt, hv, hvs, q, qLen, tbl, tblLen, pos, seq, window, reps,
+                     outp, outLen, times, timesLen);
+}
+
 int lfmgemv_team_info(int *res, int resLen)
 {
     if (!res || resLen < 8) return AEE_EBADPARM;
@@ -2148,6 +2244,7 @@ int lfmgemv_alloc_buf(int nbytes, int *h)
     if (g_buf[i].w == 0) return AEE_ENOMEMORY;
     g_buf[i].w_heap = g_buf[i].w;
     g_buf[i].used = 1;
+    g_buf[i].arena = -1;
     g_buf[i].wbytes = (size_t)nbytes;
     *h = i;
     return 0;
@@ -2919,8 +3016,10 @@ int lfmgemv_release_buf(int h)
 {
     if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
     if (g_buf[h].in_ptr) {
-        apps_mem_share_unmap((uint64)(size_t)g_buf[h].in_ptr, g_buf[h].in_bytes);
+        if (g_buf[h].in_owned)
+            apps_mem_share_unmap((uint64)(size_t)g_buf[h].in_ptr, g_buf[h].in_bytes);
         g_buf[h].in_ptr = 0;
+        g_buf[h].in_bytes = 0;
     }
     if (g_buf[h].out_ptr)
         apps_mem_share_unmap((uint64)(size_t)g_buf[h].out_ptr, g_buf[h].out_bytes);
@@ -2931,5 +3030,368 @@ int lfmgemv_release_buf(int h)
     free(g_buf[h].ae);
     free(g_buf[h].ao);
     memset(&g_buf[h], 0, sizeof(g_buf[h]));
+    return 0;
+}
+
+/* ======================================================================
+ * One-RPC token pipeline: a versioned command list living in ION/DSP memory.
+ *
+ * Why a list and not 48 calls: one FastRPC round trip costs ~145 us on this
+ * device and does not go lower (rpc_test), so a 48-op token spends ~7 ms in
+ * the driver.  The host already knows the graph for the next token, so the
+ * whole sequence is published once and executed on the DSP in one call.
+ *
+ * Memory model
+ *   - command list: host ION arena (map_arena) at byte offset cmd_off; it is
+ *     written before the mapping is established and must not be rewritten
+ *     while mapped (the DSP caches it, see attach_in notes);
+ *   - weights: views of the same or another arena (alloc_view), read in
+ *     place by the existing kernels;
+ *   - activations: one DSP-heap scratch (reserve_scratch), addressed by byte
+ *     offsets.  Nothing intermediate crosses the RPC boundary.
+ *
+ * Every length and offset is checked against its arena before use: this code
+ * runs in the DSP process, where an out-of-bounds read is an SSR, not a
+ * signal.  A malformed list returns AEE_EBADPARM with times[1] = index of the
+ * offending command.
+ * ====================================================================== */
+
+#include "../conv/conv_math.h"
+
+#define LFM_EXEC_MAGIC    0x454D464Cu   /* "LFME" */
+#define LFM_EXEC_VERSION  1u
+#define LFM_CMD_MAX       256
+
+enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
+       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4 };
+enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
+enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
+
+/* Header of the list.  magic/version/cmd_size are the first three checks; a
+ * list built for another struct size is rejected instead of misread. */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t n_cmds;        /* must equal the n_cmds argument */
+    uint32_t cmd_size;      /* sizeof(lfm_cmd) */
+    uint32_t list_bytes;    /* header + n_cmds * cmd_size */
+    uint32_t scratch_bytes; /* scratch the list needs (<= reserve_scratch) */
+    uint32_t flags;         /* 0 */
+    uint32_t hdr_size;      /* sizeof(lfm_exec_hdr) */
+    uint64_t reserved[4];
+} lfm_exec_hdr;
+
+/* One command, 96 B.  Field use per type:
+ *
+ *   QUANT h0=-1  src int32[n] -> dst int8[n], a0 = Q16 multiplier
+ *   GEMV  h0=weight; a0=M (1|2|4), a1=reps; src int8[M*K] -> dst int8[M*N]
+ *   FFN   h0/h1/h2=gate/up/down; a0=reps; src int8[K] -> dst int8[N]
+ *   ATTN  h0/h1/h2=K/KT/V, h3=value-scale handle (reserved, pass 0);
+ *         a0..a3 = pos,seq,window,reps, or rt[rt_base..rt_base+3] when
+ *         rt_base >= 0; src int8[16*128] -> dst int32[16*128];
+ *         block table at tbl_h (weights view, int32) or scratch[tbl_off]
+ *   CONV  h0=quantised shortconv blob (8 phases wq8, then kq[H]); a0=H,
+ *         a1=ksh, a2=slot, a3=token counter; src int8[3H] -> dst int8[H];
+ *         ring state at scratch[tbl_off], 2*H*8 bytes per slot
+ */
+typedef struct {
+    uint32_t type;
+    uint32_t src;       /* LFM_SRC_* */
+    uint32_t dst;       /* LFM_DST_* */
+    uint32_t pad;
+    int32_t  h0, h1, h2, h3;
+    int32_t  dst_h;     /* LFM_DST_ATTACHED: handle whose attach_out is used */
+    int32_t  src_off, src_len;
+    int32_t  dst_off, dst_len;
+    int32_t  tbl_h;     /* ATTN: table view handle (-1: scratch[tbl_off]) */
+    int32_t  tbl_len;   /* ATTN: table entries */
+    int32_t  tbl_off;   /* ATTN table / CONV ring state offset in scratch */
+    int32_t  a0, a1, a2, a3;
+    int32_t  rt_base;   /* >= 0: index into the rt[] argument */
+    int32_t  reserved[3];
+} lfm_cmd;
+
+typedef char lfm_exec_hdr_size_check[(sizeof(lfm_exec_hdr) == 64) ? 1 : -1];
+typedef char lfm_cmd_size_check[(sizeof(lfm_cmd) == 96) ? 1 : -1];
+
+static uint8_t *g_scratch;
+static size_t   g_scratch_bytes;
+
+/* shared int32 result buffer of the depthwise conv dot (2*H words) */
+static int32_t *g_conv_res;
+static int      g_conv_res_words;
+
+/* ---------------- shortconv step (shared math with ../conv) ---------------- */
+
+static void xconv_bx_write(int8_t *hi, int8_t *lo, int p,
+                           const int8_t *b, const int8_t *x, int H)
+{
+    int ch;
+    for (ch = 0; ch < H; ch++) {
+        int32_t t = (int32_t)b[ch] * (int32_t)x[ch];
+        hi[(size_t)ch * 8 + p] = (int8_t)(t >> 8);
+        lo[(size_t)ch * 8 + p] = (int8_t)(t & 0xff);
+    }
+}
+
+static void xconv_dot(const int8_t *hi, const int8_t *lo, const int8_t *wq,
+                      int32_t *res, int ng)
+{
+    const HVX_Vector *W  = (const HVX_Vector *)wq;
+    const HVX_Vector *PH = (const HVX_Vector *)hi;
+    const HVX_Vector *PL = (const HVX_Vector *)lo;
+    HVX_Vector z = Q6_V_vzero();
+    int g;
+
+    for (g = 0; g < ng; g++) {
+        HVX_Vector w  = W[g];
+        HVX_Vector ah = Q6_Vw_vrmpyacc_VwVbVb(z, PH[g], w);
+        HVX_Vector al = Q6_Vw_vrmpyacc_VwVubVb(z, PL[g], w);
+        HVX_Vector r  = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(ah, 8), al);
+        *(HVX_Vector *)(res + (size_t)g * 32) = r;
+    }
+}
+
+static void xconv_pack_y(const int32_t *res, const int8_t *c, const int32_t *kq,
+                         int ksh, int8_t *y, int H)
+{
+    int ch;
+    for (ch = 0; ch < H; ch++)
+        y[ch] = conv_glue(res[2 * ch] + res[2 * ch + 1], c[ch], kq[ch], ksh);
+}
+
+/* ---------------- bounds helpers ---------------- */
+
+static int lfm_range_ok(int off, int len, size_t total)
+{
+    if (off < 0 || len < 0) return 0;
+    if ((size_t)off > total) return 0;
+    return (size_t)len <= total - (size_t)off;
+}
+
+static int lfm_src_ptr(const lfm_cmd *c, const unsigned char *out, int outLen,
+                       const uint8_t **p)
+{
+    if (c->src == LFM_SRC_SCRATCH) {
+        if (!lfm_range_ok(c->src_off, c->src_len, g_scratch_bytes)) return AEE_EBADPARM;
+        *p = g_scratch + c->src_off;
+        return 0;
+    }
+    if (c->src == LFM_SRC_OUT) {
+        if (!out || !lfm_range_ok(c->src_off, c->src_len, (size_t)outLen)) return AEE_EBADPARM;
+        *p = out + c->src_off;
+        return 0;
+    }
+    return AEE_EBADPARM;
+}
+
+static int lfm_dst_ptr(const lfm_cmd *c, unsigned char *out, int outLen,
+                       uint8_t **p)
+{
+    if (c->dst == LFM_DST_SCRATCH) {
+        if (!lfm_range_ok(c->dst_off, c->dst_len, g_scratch_bytes)) return AEE_EBADPARM;
+        *p = g_scratch + c->dst_off;
+        return 0;
+    }
+    if (c->dst == LFM_DST_OUT) {
+        if (!out || !lfm_range_ok(c->dst_off, c->dst_len, (size_t)outLen)) return AEE_EBADPARM;
+        *p = out + c->dst_off;
+        return 0;
+    }
+    if (c->dst == LFM_DST_ATTACHED) {
+        gbuf_t *b;
+        if (c->dst_h < 0 || c->dst_h >= MAXBUF) return AEE_EBADPARM;
+        b = &g_buf[c->dst_h];
+        if (!b->used || !b->out_ptr) return AEE_EBADPARM;
+        if (!lfm_range_ok(c->dst_off, c->dst_len, (size_t)b->out_bytes)) return AEE_EBADPARM;
+        *p = (uint8_t *)b->out_ptr + c->dst_off;
+        return 0;
+    }
+    return AEE_EBADPARM;
+}
+
+/* ---------------- scratch ---------------- */
+
+int lfmgemv_reserve_scratch(int nbytes)
+{
+    free(g_scratch);
+    g_scratch = 0;
+    g_scratch_bytes = 0;
+    if (nbytes <= 0) return 0;
+    g_scratch = (uint8_t *)memalign(128, (size_t)nbytes);
+    if (!g_scratch) return AEE_ENOMEMORY;
+    memset(g_scratch, 0, (size_t)nbytes);
+    g_scratch_bytes = (size_t)nbytes;
+    return 0;
+}
+
+static int lfm_conv_res_ensure(int words)
+{
+    if (g_conv_res_words >= words && g_conv_res) return 0;
+    free(g_conv_res);
+    g_conv_res = (int32_t *)memalign(128, (size_t)words * sizeof(int32_t));
+    g_conv_res_words = g_conv_res ? words : 0;
+    return g_conv_res ? 0 : AEE_ENOMEMORY;
+}
+
+/* ---------------- the DAG executor ---------------- */
+
+static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
+                       unsigned char *out, int outLen)
+{
+    const uint8_t *sp = 0;
+    uint8_t *dp = 0;
+    int rc, reps, n;
+
+    if (c->type > LFM_CMD_CONV) return AEE_EBADPARM;
+    rc = lfm_src_ptr(c, out, outLen, &sp);
+    if (rc != 0) return rc;
+    rc = lfm_dst_ptr(c, out, outLen, &dp);
+    if (rc != 0) return rc;
+
+    switch (c->type) {
+    case LFM_CMD_QUANT: {
+        /* int32 Q12 -> int8 with one Q16 multiplier.  64-bit product, same
+           rounding as pack_out_i8/conv_pack_i8. */
+        const int32_t *s = (const int32_t *)sp;
+        int8_t *d = (int8_t *)dp;
+        int32_t m = c->a0;
+        int i;
+        if (c->src_len < 0 || (c->src_len & 3) != 0) return AEE_EBADPARM;
+        n = c->src_len / 4;
+        if (c->dst_len != n) return AEE_EBADPARM;
+        for (i = 0; i < n; i++) {
+            int64_t v = ((int64_t)s[i] * (int64_t)m + 32768) >> 16;
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            d[i] = (int8_t)v;
+        }
+        return 0;
+    }
+    case LFM_CMD_GEMV:
+        reps = c->a1 < 1 ? 1 : c->a1;
+        return gemv_impl(c->h0, c->a0, sp, c->src_len, reps, dp, c->dst_len,
+                         0, 0, 0);
+    case LFM_CMD_FFN:
+        reps = c->a0 < 1 ? 1 : c->a0;
+        return ffn_impl(c->h0, c->h1, c->h2, sp, c->src_len, reps, dp,
+                        c->dst_len, 0, 0, 0, 0, 0);
+    case LFM_CMD_ATTN: {
+        const int *tbl;
+        int tbl_n = c->tbl_len, pos, seq, window, areps;
+        if (tbl_n < 1 || tbl_n > (1 << 20)) return AEE_EBADPARM;
+        if (c->tbl_h >= 0) {
+            gbuf_t *b;
+            if (c->tbl_h >= MAXBUF) return AEE_EBADPARM;
+            b = &g_buf[c->tbl_h];
+            if (!b->used || !b->w) return AEE_EBADPARM;
+            if ((size_t)tbl_n * sizeof(int32_t) > b->wbytes) return AEE_EBADPARM;
+            tbl = (const int *)b->w;
+        } else {
+            if (!lfm_range_ok(c->tbl_off, tbl_n * 4, g_scratch_bytes)) return AEE_EBADPARM;
+            tbl = (const int *)(g_scratch + c->tbl_off);
+        }
+        if (c->rt_base >= 0) {
+            if (rt == 0 || c->rt_base + 3 >= rt_n) return AEE_EBADPARM;
+            pos = rt[c->rt_base + 0];
+            seq = rt[c->rt_base + 1];
+            window = rt[c->rt_base + 2];
+            areps = rt[c->rt_base + 3];
+        } else {
+            pos = c->a0; seq = c->a1; window = c->a2; areps = c->a3;
+        }
+        return attn_core(c->h0, c->h1, c->h2, c->h3, sp, c->src_len, tbl, tbl_n,
+                         pos, seq, window, areps, dp, c->dst_len, 0, 0);
+    }
+    case LFM_CMD_CONV: {
+        gbuf_t *b;
+        int H = c->a0, ksh = c->a1, slot = c->a2, ctr = c->a3;
+        const int8_t *wq8;
+        const int32_t *kq;
+        int8_t *st, *hi, *lo;
+        size_t need, st_bytes;
+        int p;
+        if (c->h0 < 0 || c->h0 >= MAXBUF) return AEE_EBADPARM;
+        b = &g_buf[c->h0];
+        if (!b->used || !b->w) return AEE_EBADPARM;
+        if (H < 16 || (H & 15) != 0 || H > 16384) return AEE_EBADPARM;
+        if (ksh < 1 || ksh > 40) return AEE_EBADPARM;
+        if (slot < 0 || slot >= 8) return AEE_EBADPARM;
+        need = (size_t)8 * H * 8 + (size_t)4 * H;      /* 8 phases + kq */
+        if (b->wbytes < need) return AEE_EBADPARM;
+        if (c->src_len != 3 * H || c->dst_len != H) return AEE_EBADPARM;
+        st_bytes = (size_t)2 * H * 8 * (slot + 1);
+        if (!lfm_range_ok(c->tbl_off, (int)st_bytes, g_scratch_bytes)) return AEE_EBADPARM;
+        rc = lfm_conv_res_ensure(2 * H);
+        if (rc != 0) return rc;
+        wq8 = (const int8_t *)b->w;
+        kq = (const int32_t *)(b->w + (size_t)8 * H * 8);
+        st = (int8_t *)g_scratch + c->tbl_off + (size_t)slot * 2 * H * 8;
+        hi = st;
+        lo = st + (size_t)H * 8;
+        p = ctr & 7;
+        xconv_bx_write(hi, lo, p, (const int8_t *)sp, (const int8_t *)sp + 2 * H, H);
+        xconv_dot(hi, lo, wq8 + (size_t)p * (H / 16) * 128, g_conv_res, H / 16);
+        xconv_pack_y(g_conv_res, (const int8_t *)sp + H, kq, ksh, (int8_t *)dp, H);
+        return 0;
+    }
+    default:
+        return AEE_EBADPARM;
+    }
+}
+
+int lfmgemv_exec(int ah, int cmd_off, int n_cmds, const unsigned char *act, int actLen,
+                 const int *rt, int rtLen, unsigned char *out, int outLen,
+                 int *times, int timesLen)
+{
+    const lfm_exec_hdr *hdr;
+    const lfm_cmd *cmds;
+    int64_t t0, total = 0;
+    int i, rc, done = 0;
+
+    if (times && timesLen >= 4) { times[0] = 0; times[1] = -1; times[2] = 0; times[3] = 0; }
+    if (ah < 0 || ah >= MAXARENA || !g_arena[ah].used) return AEE_EBADPARM;
+    if (n_cmds < 1 || n_cmds > LFM_CMD_MAX) return AEE_EBADPARM;
+    if (actLen < 0 || (actLen > 0 && !act)) return AEE_EBADPARM;
+    if (rtLen < 0 || (rtLen > 0 && !rt)) return AEE_EBADPARM;
+    if (outLen < 0 || (outLen > 0 && !out)) return AEE_EBADPARM;
+    if (!lfm_range_ok(cmd_off, (int)sizeof(lfm_exec_hdr), (size_t)g_arena[ah].bytes))
+        return AEE_EBADPARM;
+    hdr = (const lfm_exec_hdr *)(g_arena[ah].base + cmd_off);
+    if (hdr->magic != LFM_EXEC_MAGIC || hdr->version != LFM_EXEC_VERSION) return AEE_EBADPARM;
+    if (hdr->hdr_size != (uint32_t)sizeof(lfm_exec_hdr) ||
+        hdr->cmd_size != (uint32_t)sizeof(lfm_cmd)) return AEE_EBADPARM;
+    if (hdr->n_cmds != (uint32_t)n_cmds) return AEE_EBADPARM;
+    if (hdr->list_bytes > (1u << 20)) return AEE_EBADPARM;
+    if (hdr->list_bytes < (uint32_t)(sizeof(lfm_exec_hdr) + (size_t)n_cmds * sizeof(lfm_cmd)))
+        return AEE_EBADPARM;
+    if (!lfm_range_ok(cmd_off, (int)hdr->list_bytes, (size_t)g_arena[ah].bytes))
+        return AEE_EBADPARM;
+    if ((size_t)hdr->scratch_bytes > g_scratch_bytes) return AEE_EBADPARM;
+    if ((size_t)actLen > (size_t)hdr->scratch_bytes) return AEE_EBADPARM;
+    set_perf();
+    if (actLen) memcpy(g_scratch, act, (size_t)actLen);
+
+    cmds = (const lfm_cmd *)((const uint8_t *)hdr + sizeof(lfm_exec_hdr));
+    for (i = 0; i < n_cmds; i++) {
+        t0 = HAP_perf_get_time_us();
+        rc = lfm_run_cmd(&cmds[i], rt, rtLen, out, outLen);
+        total += HAP_perf_get_time_us() - t0;
+        if (rc != 0) {
+            if (times && timesLen >= 4) {
+                times[0] = (int)total;
+                times[1] = i;
+                times[2] = done;
+            }
+            return rc;
+        }
+        done++;
+    }
+    if (times && timesLen >= 4) {
+        times[0] = (int)total;
+        times[1] = -1;
+        times[2] = done;
+        times[3] = g_team_fallbacks;
+    }
     return 0;
 }

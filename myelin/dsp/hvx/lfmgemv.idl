@@ -76,6 +76,39 @@ interface lfmgemv {
    /* create a weight handle that lives entirely in the host fd: no DSP heap
       weight allocation at all (use this for models larger than the DSP heap) */
    long alloc_in(in long fd, in long nbytes, rout long h);
+
+   /* ---- arenas and views -------------------------------------------------
+      One host rpcmem/ION buffer (the whole model, up to ~900 MiB on the
+      device) is mapped once; a view is a (offset, length) window into it and
+      costs no apps_mem_share_map call, so a 24-layer model needs three
+      mappings instead of 100+.  off and nbytes must be 128 B aligned; the
+      mapping itself needs the first byte aligned.  fd < 0 is rejected. */
+   long map_arena(in long fd, in long nbytes, rout long ah);
+
+   /* drop a mapping; every view of it must be released first */
+   long unmap_arena(in long ah);
+
+   /* h = view [off, off+nbytes) of arena ah; acts as a weight handle for
+      set_shape/set_scale/gemv/ffn/attn and the exec command list */
+   long alloc_view(in long ah, in long off, in long nbytes, rout long h);
+
+   /* DSP-heap scratch for intermediate activations: one allocation per
+      session, zeroed here, addressed by byte offsets in the command list.
+      nbytes <= 0 frees it (and drops the mapping-independent state). */
+   long reserve_scratch(in long nbytes);
+
+   /* ---- one-RPC token pipeline ------------------------------------------
+      Execute a fixed, versioned command list stored in arena ah at cmd_off.
+      The list never travels through the RPC: map it once, then one exec per
+      token.  Dynamic per-token values (attention pos/seq/window) come from
+      rt[] and are referenced by each command's rt_base; "act" is copied into
+      scratch[0..actLen).  "out" is the caller-allocated result area for
+      commands with dst = out.  times[0] = DSP microseconds spent in the
+      commands, times[1] = failing command index (-1 on success),
+      times[2] = commands executed, times[3] = team fallbacks. */
+   long exec(in long ah, in long cmd_off, in long n_cmds, in sequence<octet> act,
+             in sequence<long> rt, rout sequence<octet> outp,
+             rout sequence<long> times);
 };
 
 #endif /* LFMGEMV_IDL */
