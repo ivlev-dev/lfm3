@@ -7,3 +7,24 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+half = "2"
+lfm-gguf = { path = "../../../crates/infra-gguf" }
+lfm-quant = { path = "../../../crates/infra-quant" }
+lfm-tokenizer = { path = "../../../crates/infra-tokenizer", optional = true }
+
+[dev-dependencies]
+lfm-cpu = { path = "../../../crates/infra-cpu" }
+
+[features]
+default = []
+# Host-side HF tokenizer adapter. Off by default so the Android/FFI build does
+# not pull the `tokenizers`/oniguruma C dependency.
+hf-tokenizer = ["dep:lfm-tokenizer"]
+
+[[example]]
+name = "host_generate"
+required-features = ["hf-tokenizer"]
+
+[[test]]
+name = "parity"
+required-features = ["hf-tokenizer"]

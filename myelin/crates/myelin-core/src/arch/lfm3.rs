@@ -16,7 +16,10 @@ pub struct Lfm3;
 
 const ARCH_ID: &str = "lfm3";
 const EMBEDDING_TENSOR: &str = "token_embd.weight";
+const OUTPUT_TENSOR: &str = "output.weight";
 const ROPE_FREQS_TENSOR: &str = "rope_freqs.weight";
+/// Fallback RMSNorm epsilon when the checkpoint does not carry one.
+const DEFAULT_NORM_EPS: f32 = 1e-5;
 
 /// Defaults and layer layout of the LFM3 1.7B checkpoint family.
 struct Profile {
@@ -171,6 +174,10 @@ impl Arch for Lfm3 {
 
         let file_type = meta.get_u32("general.file_type").unwrap_or(15);
         let weight_format = WeightFormat::from_quant(Quant::from_gguf_file_type(file_type));
+        let norm_eps = meta
+            .get_arch_f32("attention.layer_norm_rms_epsilon")
+            .unwrap_or(DEFAULT_NORM_EPS);
+        let tied_embeddings = !meta.has_tensor(OUTPUT_TENSOR);
 
         let spec = ModelSpec {
             family: ModelFamily::Lfm3,
@@ -191,6 +198,8 @@ impl Arch for Lfm3 {
             tokenizer,
             chat_template,
             weight_format,
+            norm_eps,
+            tied_embeddings,
         };
         spec.validate()?;
         Ok(spec)

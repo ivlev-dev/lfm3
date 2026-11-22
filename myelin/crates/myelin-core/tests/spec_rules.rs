@@ -43,6 +43,8 @@ fn minimal_spec() -> ModelSpec {
             template: String::new(),
         },
         weight_format: myelin_core::WeightFormat::from_quant(myelin_core::Quant::F16),
+        norm_eps: 1e-5,
+        tied_embeddings: true,
     }
 }
 

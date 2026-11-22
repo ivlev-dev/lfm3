@@ -244,6 +244,10 @@ pub struct ModelSpec {
     pub tokenizer: TokenizerSpec,
     pub chat_template: ChatTemplateSpec,
     pub weight_format: WeightFormat,
+    /// Epsilon of every learned RMSNorm in the model.
+    pub norm_eps: f32,
+    /// The language-model head reuses the embedding matrix.
+    pub tied_embeddings: bool,
 }
 
 impl ModelSpec {
@@ -291,6 +295,8 @@ impl ModelSpec {
                 template: String::new(),
             },
             weight_format: WeightFormat::from_quant(Quant::F16),
+            norm_eps: 1e-5,
+            tied_embeddings: true,
         }
     }
 
@@ -348,6 +354,12 @@ impl ModelSpec {
         }
         if d.conv_cache == 0 {
             return Err(invalid("conv cache must be non-zero"));
+        }
+        if !self.norm_eps.is_finite() || self.norm_eps <= 0.0 {
+            return Err(invalid(format!(
+                "norm epsilon {} is not a positive finite number",
+                self.norm_eps
+            )));
         }
         if self.layers.len() != d.layers {
             return Err(invalid(format!(

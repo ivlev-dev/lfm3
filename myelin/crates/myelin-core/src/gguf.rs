@@ -1,9 +1,11 @@
 //! Minimal, parser-independent view of GGUF metadata.
 //!
-//! The real reader lands in a later stage. For now tests build a
-//! [`GgufMeta`] by hand, and architecture adapters only see this typed map.
+//! [`GgufMeta`] is the typed map architecture adapters see. It can be filled by
+//! hand (tests) or converted from a parsed [`lfm_gguf::GgufFile`].
 
 use std::collections::BTreeMap;
+
+use lfm_gguf::{GgufFile, MetadataValue};
 
 use crate::CoreError;
 
@@ -109,6 +111,30 @@ impl GgufMeta {
             architecture: architecture.into(),
             entries: BTreeMap::new(),
         }
+    }
+
+    /// Convert a parsed GGUF file into the adapter-facing map.
+    ///
+    /// Every tensor is recorded as [`MetaValue::Dims`], so adapters can both
+    /// inspect shapes and probe for optional tensors. Scalar metadata and
+    /// numeric/boolean arrays are converted; string and nested arrays are
+    /// dropped because no adapter consumes them and tokenizer vocabularies are
+    /// large.
+    pub fn from_gguf(file: &GgufFile) -> Self {
+        let architecture = file
+            .get_str("general.architecture")
+            .unwrap_or("unknown")
+            .to_owned();
+        let mut meta = Self::new(architecture);
+        for (key, value) in file.metadata() {
+            if let Some(value) = convert_meta_value(value) {
+                meta.set(key.clone(), value);
+            }
+        }
+        for tensor in file.tensors() {
+            meta.set(tensor.name.clone(), MetaValue::Dims(tensor.dims.clone()));
+        }
+        meta
     }
 
     /// `general.architecture` value.
@@ -220,4 +246,55 @@ impl GgufMeta {
         self.tensor_dims(name)
             .ok_or_else(|| CoreError::MissingKey(name.to_owned()))
     }
+}
+
+fn convert_meta_value(value: &MetadataValue) -> Option<MetaValue> {
+    let converted = match value {
+        MetadataValue::Bool(value) => MetaValue::Bool(*value),
+        MetadataValue::U8(value) => MetaValue::U32(u32::from(*value)),
+        MetadataValue::U16(value) => MetaValue::U32(u32::from(*value)),
+        MetadataValue::U32(value) => MetaValue::U32(*value),
+        MetadataValue::I8(value) => MetaValue::I32(i32::from(*value)),
+        MetadataValue::I16(value) => MetaValue::I32(i32::from(*value)),
+        MetadataValue::I32(value) => MetaValue::I32(*value),
+        MetadataValue::U64(value) => MetaValue::U64(*value),
+        MetadataValue::I64(value) => MetaValue::U64(u64::try_from(*value).ok()?),
+        MetadataValue::F32(value) => MetaValue::F32(*value),
+        MetadataValue::F64(value) => MetaValue::F32(*value as f32),
+        MetadataValue::Str(value) => MetaValue::Str(value.clone()),
+        MetadataValue::Array(array) => match array.elem_type {
+            4 => MetaValue::U32Array(
+                array
+                    .values
+                    .iter()
+                    .map(|value| match value {
+                        MetadataValue::U32(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            5 => MetaValue::I32Array(
+                array
+                    .values
+                    .iter()
+                    .map(|value| match value {
+                        MetadataValue::I32(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            7 => MetaValue::BoolArray(
+                array
+                    .values
+                    .iter()
+                    .map(|value| match value {
+                        MetadataValue::Bool(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            _ => return None,
+        },
+    };
+    Some(converted)
 }
