@@ -300,6 +300,21 @@ impl<'a> Session<'a> {
         })
     }
 
+/// Append one f32 vector to `path` when the environment variable is set.
+fn dump_vector(variable: &str, values: &[f32]) {
+    let Some(path) = std::env::var_os(variable) else {
+        return;
+    };
+    use std::io::Write as _;
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(&bytes);
+    }
+}
+
     fn step(&mut self, token: u32) -> Result<Vec<f32>, RuntimeError> {
         self.step_with(token, &mut |_, _| {})
     }
@@ -344,6 +359,24 @@ impl<'a> Session<'a> {
                 &x,
                 &mut normed,
             )?;
+            // `MYELIN_DUMP_NORMED=path` appends every pre-block normed input so
+            // a device run can be compared with the host oracle layer by layer.
+            if let Some(path) = std::env::var_os("MYELIN_DUMP_NORMED") {
+                if position_now == 0 {
+                    use std::io::Write as _;
+                    let mut bytes = Vec::with_capacity(normed.len() * 4);
+                    for value in &normed {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = file.write_all(&bytes);
+                    }
+                }
+            }
             match spec.layers[layer] {
                 LayerSpec::Attention { kind } => {
                     let start = ops::window_start(kind, position_now, dims.sliding_window);
@@ -378,6 +411,9 @@ impl<'a> Session<'a> {
                     )));
                 }
             }
+            if position_now == 0 {
+                Self::dump_vector("MYELIN_DUMP_BLOCK1", &output);
+            }
             backend.rms_norm(
                 NormWeights::Layer {
                     layer,
@@ -398,6 +434,9 @@ impl<'a> Session<'a> {
                 &mut normed,
             )?;
             backend.ffn_layer(layer, &normed, &mut output)?;
+            if position_now == 0 {
+                Self::dump_vector("MYELIN_DUMP_BLOCK2", &output);
+            }
             backend.rms_norm(
                 NormWeights::Layer {
                     layer,

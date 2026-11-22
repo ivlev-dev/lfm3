@@ -3106,7 +3106,7 @@ int lfmgemv_release_buf(int h)
 #define LFM_CMD_MAX       256
 
 enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
-       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4 };
+       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5 };
 enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
 enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
 
@@ -3302,7 +3302,7 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
     uint8_t *dp = 0;
     int rc, reps, n;
 
-    if (c->type > LFM_CMD_CONV) return AEE_EBADPARM;
+    if (c->type > LFM_CMD_DUMP) return AEE_EBADPARM;
     rc = lfm_src_ptr(c, out, outLen, &sp);
     if (rc != 0) return rc;
     rc = lfm_dst_ptr(c, out, outLen, &dp);
@@ -3362,6 +3362,14 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
         return attn_core(c->h0, c->h1, c->h2, c->h3, sp, c->src_len, tbl, tbl_n,
                          pos, seq, window, areps, dp, c->dst_len, 0, 0);
     }
+    case LFM_CMD_DUMP:
+        /* Debug only: copy a scratch range into the OUT sequence so the host
+           can compare kernel intermediates with its own model. */
+        if (c->src != LFM_SRC_SCRATCH) return AEE_EBADPARM;
+        if (!lfm_range_ok(c->src_off, c->src_len, g_scratch_bytes)) return AEE_EBADPARM;
+        if (!lfm_range_ok(c->dst_off, c->src_len, (size_t)outLen)) return AEE_EBADPARM;
+        memcpy(out + c->dst_off, g_scratch + c->src_off, (size_t)c->src_len);
+        return 0;
     case LFM_CMD_CONV: {
         gbuf_t *b;
         int H = c->a0, ksh = c->a1, slot = c->a2, ctr = c->a3;

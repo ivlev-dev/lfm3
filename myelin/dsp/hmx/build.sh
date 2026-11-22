@@ -10,8 +10,8 @@
 set -e
 cd "$(dirname "$0")"
 
-HEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT:-/tmp/opencode/sdk/6.7.0.0}
-ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-/tmp/opencode/ndk/android-ndk-r27c}
+HEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT:-/opt/hexagon-sdk-6.7.0.0}
+ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-/opt/android-ndk}
 HEXAGON_TOOLS_VERSION=${HEXAGON_TOOLS_VERSION:-21.0.04}
 ANDROID_API=${ANDROID_API:-31}
 

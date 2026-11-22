@@ -637,6 +637,7 @@ pub mod exec {
         Ffn = 2,
         Attn = 3,
         Conv = 4,
+        Dump = 5,
     }
 
     fn put_i32(out: &mut [u8], offset: usize, value: i32) {
@@ -693,6 +694,17 @@ pub mod exec {
             command.dst_off = dst_off;
             command.dst_len = n;
             command.args[0] = multiplier_q16;
+            command
+        }
+
+        /// Debug: copy `len` bytes from `scratch[src_off]` into the OUT
+        /// sequence at `dst_off`. Only the `MYELIN_DUMP_CONV` path uses it.
+        pub const fn dump(src_off: i32, dst_off: i32, len: i32) -> Self {
+            let mut command = Self::empty(Op::Dump);
+            command.src_off = src_off;
+            command.src_len = len;
+            command.dst_off = dst_off;
+            command.dst_len = len;
             command
         }
 
@@ -906,6 +918,7 @@ pub struct DspBackend {
     attention_full: Vec<Option<AttentionFullStage>>,
     conv: Vec<Option<ConvStage>>,
     conv_counters: Vec<i32>,
+    conv_dumped: Vec<bool>,
     scratch_ready: bool,
     exec_micros: i64,
     exec_host_micros: i64,
@@ -941,6 +954,7 @@ impl DspBackend {
             attention_full: vec![None; layers],
             conv: vec![None; layers],
             conv_counters: vec![0; layers],
+            conv_dumped: vec![false; layers],
             scratch_ready: false,
             exec_micros: 0,
             exec_host_micros: 0,
@@ -1395,6 +1409,31 @@ impl DspBackend {
         for (dst, &code) in out.iter_mut().zip(&result.out) {
             *dst = (code as i8) as f32 * stage.out_scale;
         }
+        if std::env::var_os("MYELIN_DUMP_CONV").is_some() {
+            let already = self.conv_dumped.get(layer).copied().unwrap_or(true);
+            if !already {
+                if let Some(flag) = self.conv_dumped.get_mut(layer) {
+                    *flag = true;
+                }
+                let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
+                list.push(exec::Command::dump(SCRATCH_BCX, 0, 3 * hidden));
+                list.push(exec::Command::dump(SCRATCH_CY, 3 * hidden, hidden));
+                match self.run_exec(&list, &[], &[], (4 * hidden) as usize) {
+                  Ok(dump) => {
+                    let split = (3 * hidden) as usize;
+                    let _ = std::fs::write(
+                        format!("/data/local/tmp/conv_bcx_{layer}.bin"),
+                        &dump.out[..split],
+                    );
+                    let _ = std::fs::write(
+                        format!("/data/local/tmp/conv_cy_{layer}.bin"),
+                        &dump.out[split..],
+                    );
+                  }
+                  Err(error) => eprintln!("conv dump failed: {error}"),
+                }
+            }
+        }
         let counter = self
             .conv_counters
             .get_mut(layer)
@@ -1777,6 +1816,22 @@ impl DspBackend {
         };
         match executor.reserve_scratch(handle, i64::from(EXEC_SCRATCH_BYTES)) {
             Ok(()) => {
+                // A freshly reserved scratch is not guaranteed to be zeroed, and
+                // the CONV ring lives in it: garbage taps on the first tokens
+                // would corrupt the shortconv layers. Zero it once here.
+                let prim = 0i32.to_le_bytes();
+                let mut prim_out: [u8; 0] = [];
+                let mut no_out: [&mut [u8]; 0] = [];
+                let call = DspCall {
+                    method: HVX_METHOD_RESET_STATE,
+                    prim_in: &prim,
+                    prim_out: &mut prim_out,
+                    in_bufs: &[],
+                    out_bufs: &mut no_out,
+                };
+                if let Err(error) = executor.invoke(handle, call) {
+                    return Err(self.fail("reset_state", error));
+                }
                 self.scratch_ready = true;
                 Ok(())
             }
@@ -2103,16 +2158,19 @@ impl Backend for DspBackend {
         let act = quantize(x, stage.act_scale);
         let hidden = dims.hidden as i32;
         let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
-        list.push(exec::Command::ffn(
-            stage.gate,
-            stage.up,
-            stage.down,
-            stage.reps,
-            SCRATCH_ACT,
-            hidden,
-            0,
-            hidden,
-        ));
+        list.push(
+            exec::Command::ffn(
+                stage.gate,
+                stage.up,
+                stage.down,
+                stage.reps,
+                SCRATCH_ACT,
+                hidden,
+                0,
+                hidden,
+            )
+            .with_dst(exec::dst::OUT, 0),
+        );
         let result = self.run_exec(&list, &act, &[], dims.hidden)?;
         if result.out.len() != dims.hidden {
             return Err(unsupported(
