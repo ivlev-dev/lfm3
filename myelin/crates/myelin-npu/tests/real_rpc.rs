@@ -250,4 +250,62 @@ mod android {
         }
         scales
     }
+
+    #[test]
+    #[ignore = "requires a phone with libcdsprpc.so and liblfmgemv_skel.so"]
+    fn real_exec_quant_command_list() {
+        use myelin_npu::exec::{self, Command, List};
+
+        let transport = transport();
+        let mut client = HvxClient::open(Arc::clone(&transport) as Arc<dyn Transport>, MODULE)
+            .expect("open lfmgemv");
+
+        // The command list is written into shared memory *before* map_arena,
+        // exactly like a model arena: the DSP caches the mapping.
+        let mut commands = check("alloc_shared(cmd list)", transport.alloc_shared(4096));
+        let mut list = List::new(4096);
+        list.push(Command::quant(0, 0, 256, 4096).with_dst(exec::dst::OUT, 0));
+        let bytes = list.to_bytes();
+        commands.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+        let arena = check("map_arena(cmd list)", client.map_arena(commands.fd(), 4096));
+        check("reserve_scratch(4 KiB)", client.reserve_scratch(4096));
+
+        // act = 256 int32 values; QUANT: clamp((v * 4096 + 32768) >> 16, +-127)
+        let source: Vec<i32> = (0..256).map(|i| (i as i32 - 128) * 977).collect();
+        let act: Vec<u8> = source.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let response = check(
+            "exec(QUANT x256)",
+            client.exec(myelin_npu::ExecRequest {
+                arena,
+                cmd_off: 0,
+                commands: 1,
+                act: &act,
+                rt: &[],
+                out_len: 256,
+            }),
+        );
+        assert_eq!(
+            response.failed_command(),
+            None,
+            "exec reported a bad command"
+        );
+        assert_eq!(response.times[2], 1, "one command must have run");
+        for (index, value) in source.iter().enumerate() {
+            let expected = ((*value as i64 * 4096 + 32768) >> 16).clamp(-127, 127) as i8;
+            assert_eq!(
+                response.out[index] as i8, expected,
+                "QUANT mismatch at {index}"
+            );
+        }
+        println!(
+            "exec QUANT: 256/256 values bit-exact, dsp={} us",
+            response.times[0]
+        );
+
+        check("reserve_scratch(0)", client.reserve_scratch(0));
+        check("unmap_arena", client.unmap_arena(arena));
+        check("close", client.close());
+        drop(list);
+        assert_eq!(exec::HEADER_BYTES + exec::COMMAND_BYTES, bytes.len());
+    }
 }

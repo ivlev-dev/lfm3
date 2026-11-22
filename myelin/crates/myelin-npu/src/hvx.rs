@@ -8,11 +8,12 @@ use std::sync::Arc;
 use crate::error::TransportError;
 use crate::method::FfnScalars;
 use crate::method::{
-    decode_i32s, long_len, method_id, octet_len, AllocBufScalars, AllocInScalars, AttachInScalars,
-    AttachOutScalars, AttnRequest, AttnResponse, AttnWire, DetachInScalars, DetachOutScalars,
-    FfnRequest, FfnResidentWire, FfnResponse, FfnWire, GemvRequest, GemvResidentWire, GemvResponse,
-    GemvWire, LoadBufWire, ReleaseBufScalars, SetScaleWire, SetShapeScalars, TeamInfoScalars,
-    TIMES_VALUES,
+    decode_i32s, long_len, method_id, octet_len, AllocBufScalars, AllocInScalars, AllocViewWire,
+    AttachInScalars, AttachOutScalars, AttnRequest, AttnResponse, AttnWire, DetachInScalars,
+    DetachOutScalars, ExecRequest, ExecResponse, ExecWire, FfnRequest, FfnResidentWire,
+    FfnResponse, FfnWire, GemvRequest, GemvResidentWire, GemvResponse, GemvWire, LoadBufWire,
+    MapArenaWire, ReleaseBufScalars, ReserveScratchScalars, SetScaleWire, SetShapeScalars,
+    TeamInfoScalars, UnmapArenaScalars, TIMES_VALUES,
 };
 use crate::transport::{Call, Handle, Transport};
 
@@ -373,6 +374,116 @@ impl HvxClient {
             out_bufs: &mut no_out,
         })?;
         Ok(i32::from_le_bytes(out))
+    }
+
+    /// Map one host rpcmem/ION buffer once; model tensors become views of it
+    /// ([`HvxClient::alloc_view`]) with no further mappings. Returns the arena
+    /// index. The mapping is established here, so write the buffer first.
+    pub fn map_arena(&self, fd: i32, nbytes: i32) -> Result<i32, TransportError> {
+        let prim = MapArenaWire { fd, nbytes }.to_bytes();
+        let mut out = [0u8; 4];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::MAP_ARENA,
+            prim_in: &prim,
+            prim_out: &mut out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        })?;
+        Ok(i32::from_le_bytes(out))
+    }
+
+    /// Drop an arena mapping. Every view of it must be released first.
+    pub fn unmap_arena(&self, arena: i32) -> Result<(), TransportError> {
+        let prim = UnmapArenaScalars { ah: arena }.to_bytes();
+        let mut prim_out: [u8; 0] = [];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::UNMAP_ARENA,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        })
+    }
+
+    /// Create a weight handle as a `(off, nbytes)` view of `arena`. `off` and
+    /// `nbytes` must be 128-byte aligned and lie inside the mapping.
+    pub fn alloc_view(&self, arena: i32, off: i32, nbytes: i32) -> Result<i32, TransportError> {
+        let prim = AllocViewWire {
+            ah: arena,
+            off,
+            nbytes,
+        }
+        .to_bytes();
+        let mut out = [0u8; 4];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::ALLOC_VIEW,
+            prim_in: &prim,
+            prim_out: &mut out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        })?;
+        Ok(i32::from_le_bytes(out))
+    }
+
+    /// Allocate (or, with `nbytes <= 0`, free) the DSP-heap scratch arena that
+    /// `exec` commands address by byte offset.
+    pub fn reserve_scratch(&self, nbytes: usize) -> Result<(), TransportError> {
+        let nbytes = i32::try_from(nbytes).map_err(|_| TransportError::BufferTooSmall {
+            buffer: "reserve_scratch",
+            expected: nbytes,
+            got: i32::MAX as usize,
+        })?;
+        let prim = ReserveScratchScalars { nbytes }.to_bytes();
+        let mut prim_out: [u8; 0] = [];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::RESERVE_SCRATCH,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        })
+    }
+
+    /// Run a command list in one FastRPC call. The list itself is in memory
+    /// (arena + offset), not in the RPC arguments.
+    pub fn exec(&self, request: ExecRequest<'_>) -> Result<ExecResponse, TransportError> {
+        let n_cmds =
+            i32::try_from(request.commands).map_err(|_| TransportError::BufferTooSmall {
+                buffer: "exec commands",
+                expected: request.commands,
+                got: i32::MAX as usize,
+            })?;
+        let prim = ExecWire {
+            ah: request.arena,
+            cmd_off: request.cmd_off,
+            n_cmds,
+            act_len: octets(request.act.len(), "exec act")?,
+            rt_len: longs(request.rt.len() * 4, "exec rt")?,
+            outp_len: octets(request.out_len, "exec out")?,
+            times_len: TIMES_VALUES as i32,
+        }
+        .to_bytes();
+        let mut out = vec![0u8; request.out_len];
+        let mut times = vec![0u8; TIMES_VALUES * 4];
+        let mut prim_out: [u8; 0] = [];
+        let mut out_bufs: [&mut [u8]; 2] = [out.as_mut_slice(), times.as_mut_slice()];
+        self.invoke(Call {
+            method: method_id::EXEC,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[request.act, i32_bytes(request.rt)],
+            out_bufs: &mut out_bufs,
+        })?;
+        let mut decoded = [0i32; TIMES_VALUES];
+        decoded.copy_from_slice(&decode_i32s(&times));
+        Ok(ExecResponse {
+            out,
+            times: decoded,
+        })
     }
 
     /// Worker-team information (`8` values in the stand).

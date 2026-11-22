@@ -571,3 +571,64 @@ fn mock_handler_sees_exact_call_shape() {
     let client = HvxClient::open(transport, "lfmgemv").expect("open");
     client.load_buf(3, 1024, &[0xab; 4]).expect("load");
 }
+
+#[test]
+fn exec_packs_list_location_and_per_token_values() {
+    let mock = MockTransport::new();
+    mock.set_handler(method_id::EXEC, |call| {
+        assert_eq!(call.prim_in, i32_bytes(&[2, 4096, 2, 4, 4, 8, 8]));
+        assert_eq!(call.in_bufs.len(), 2);
+        assert_eq!(call.in_bufs[0], vec![1u8, 2, 3, 4]);
+        assert_eq!(call.in_bufs[1], i32_bytes(&[1023, 2048, 0, 1]));
+        assert_eq!(call.out_lens, vec![8, 32]);
+        Ok(reply(
+            Vec::new(),
+            vec![vec![9u8; 8], i32_bytes(&[1234, -1, 2, 0, 0, 0, 0, 0])],
+        ))
+    });
+    let client = HvxClient::open(Arc::new(mock.clone()), "lfmgemv").expect("open");
+    let response = client
+        .exec(myelin_npu::ExecRequest {
+            arena: 2,
+            cmd_off: 4096,
+            commands: 2,
+            act: &[1, 2, 3, 4],
+            rt: &[1023, 2048, 0, 1],
+            out_len: 8,
+        })
+        .expect("exec rpc");
+    assert_eq!(response.out, vec![9u8; 8]);
+    assert_eq!(response.times[0], 1234);
+    assert_eq!(response.times[2], 2);
+    assert_eq!(response.failed_command(), None);
+
+    let call = mock.last_call().expect("recorded");
+    assert_eq!(call.method, method_id::EXEC);
+    // method 21, 3 in buffers (scalars, act, rt), 2 out (outp, times).
+    assert_eq!(call.scalars, 0x1503_0200);
+}
+
+#[test]
+fn arena_view_and_scratch_wire_layout() {
+    let mock = MockTransport::new();
+    mock.set_handler(method_id::MAP_ARENA, |call| {
+        assert_eq!(call.prim_in, i32_bytes(&[7, 4096]));
+        Ok(reply(3i32.to_le_bytes().to_vec(), Vec::new()))
+    });
+    mock.set_handler(method_id::ALLOC_VIEW, |call| {
+        assert_eq!(call.prim_in, i32_bytes(&[3, 512, 1024]));
+        Ok(reply(9i32.to_le_bytes().to_vec(), Vec::new()))
+    });
+    let client = HvxClient::open(Arc::new(mock.clone()), "lfmgemv").expect("open");
+    assert_eq!(client.map_arena(7, 4096).expect("map"), 3);
+    assert_eq!(client.alloc_view(3, 512, 1024).expect("view"), 9);
+    client.reserve_scratch(1 << 20).expect("scratch");
+
+    let calls = mock.calls();
+    assert_eq!(calls[0].method, method_id::MAP_ARENA);
+    assert_eq!(calls[1].method, method_id::ALLOC_VIEW);
+    assert_eq!(calls[2].method, method_id::RESERVE_SCRATCH);
+    assert_eq!(calls[2].prim_in, i32_bytes(&[1 << 20]));
+    // map_arena: method 17, one in buffer, one scalar out.
+    assert_eq!(calls[0].scalars, 0x1101_0100);
+}

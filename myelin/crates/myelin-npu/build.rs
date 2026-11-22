@@ -183,9 +183,24 @@ fn read(path: &Path) -> String {
 /// `pub const NAME: u32 = N;` inside the `method_id` module.
 fn parse_constants(source: &str) -> BTreeMap<String, u32> {
     let mut constants = BTreeMap::new();
+    let mut in_module = false;
+    let mut depth = 0usize;
     for line in source.lines() {
         let line = line.trim();
+        if line.starts_with("pub mod method_id") {
+            in_module = true;
+            depth = line.matches('{').count();
+            continue;
+        }
+        if !in_module {
+            continue;
+        }
+        depth += line.matches('{').count();
+        depth = depth.saturating_sub(line.matches('}').count());
         let Some(rest) = line.strip_prefix("pub const ") else {
+            if depth == 0 && line.starts_with('}') {
+                break;
+            }
             continue;
         };
         let Some((name, rest)) = rest.split_once(':') else {

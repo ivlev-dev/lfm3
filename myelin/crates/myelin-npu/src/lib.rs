@@ -41,8 +41,8 @@ pub use error::{fastrpc_error_name, rpc_error, TransportError};
 pub use executor::Executor;
 pub use hvx::HvxClient;
 pub use method::{
-    AttnRequest, AttnResponse, AttnScalars, FfnRequest, FfnResponse, FfnScalars, GemvRequest,
-    GemvResponse, GemvScalars,
+    exec, AttnRequest, AttnResponse, AttnScalars, ExecRequest, ExecResponse, FfnRequest,
+    FfnResponse, FfnScalars, GemvRequest, GemvResponse, GemvScalars,
 };
 pub use mock::{MockCall, MockReply, MockTransport, RecordedCall};
 pub use transport::{Call, Handle, SharedBuffer, SharedOwner, Transport};

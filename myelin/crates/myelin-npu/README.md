@@ -362,6 +362,45 @@ cargo test -p myelin-npu --target aarch64-linux-android -- --ignored
 `open` → `alloc_buf` → `load_buf` 256 КиБ и 4 МиБ → `release_buf`, а также
 `attach_out` + `gemv_resident` против обычного `gemv`.
 
+### Один `exec` на токен
+
+`HvxClient` умеет держать веса в одной ION-арене и исполнять весь граф
+одним вызовом:
+
+```rust
+let mut arena = transport.alloc_shared(model_bytes)?;   // один rpcmem-буфер
+// ... заполнить веса до map_arena ...
+let ah = client.map_arena(arena.fd(), arena.len() as i32)?;
+let gate = client.alloc_view(ah, gate_off as i32, gate_bytes as i32)?;
+client.set_shape(gate, 7680, 2048, 1)?;
+client.reserve_scratch(scratch_bytes)?;
+
+let mut list = myelin_npu::exec::List::new(scratch_bytes as u32);
+list.push(Command::ffn(gate, up, down, 1, 0, 2048, 0, 2048));
+let bytes = list.to_bytes();
+let mut cmds = transport.alloc_shared(bytes.len())?;
+cmds.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+let cmd_arena = client.map_arena(cmds.fd(), cmds.len() as i32)?;
+
+let out = client.exec(myelin_npu::ExecRequest {
+    arena: cmd_arena,
+    cmd_off: 0,
+    commands: list.commands.len(),
+    act: &activations,
+    rt: &[pos, seq, window, 1],
+    out_len: 2048,
+})?;
+```
+
+`exec` — единственный вызов на токен; `act` (вход) и `rt` (pos/seq/window)
+маленькие, всё остальное живёт в арене и в DSP-heap scratch. Список
+команд пишется **до** `map_arena`: DSP кэширует страницы маппинга, правка
+на месте не видна. Формат списка (64-байтный заголовок, 96-байтные
+команды) и проверки границ — в `myelin/dsp/hvx/README.md`.
+
+`tests/real_rpc.rs::real_exec_quant_command_list` (под `#[ignore]`) гоняет
+короткий список на телефоне.
+
 ## Известные ограничения
 
 * Загрузчик весов есть (`weights`), но он грузит **HMX int8** blob из
