@@ -9,6 +9,7 @@ build = "build.rs"
 
 [dependencies]
 myelin-core.workspace = true
+myelin-pack.workspace = true
 libc = "0.2"
 
 [lib]

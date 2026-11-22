@@ -11,6 +11,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 myelin-core = { path = "crates/myelin-core" }
 myelin-npu = { path = "crates/myelin-npu" }
+myelin-pack = { path = "crates/myelin-pack" }
 myelin-ffi = { path = "crates/myelin-ffi" }
 uniffi = "0.29.5"
 

@@ -102,6 +102,47 @@ impl fmt::Display for DspError {
 
 impl std::error::Error for DspError {}
 
+/// Failure of an on-demand layer stage provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageError {
+    /// The layer's resident weights do not fit the memory budget.
+    Budget(String),
+    /// The provider has no plan for this layer or stage kind.
+    Unknown(String),
+    /// The plan, manifest or blob is inconsistent.
+    Layout(String),
+    /// A FastRPC call failed while staging.
+    Transport(DspError),
+}
+
+impl fmt::Display for StageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Budget(message) => write!(f, "weight budget: {message}"),
+            Self::Unknown(message) => write!(f, "no resident plan: {message}"),
+            Self::Layout(message) => write!(f, "resident weight layout: {message}"),
+            Self::Transport(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for StageError {}
+
+/// Supplies resident layer stages on demand.
+///
+/// `DspBackend` asks the provider only when a layer has no explicitly staged
+/// handles, so the planner owns the budget, the LRU order and the transport
+/// buffers. The provider is a host-side object: all device work goes through
+/// the executor and handle it was built with.
+pub trait StageProvider: Send + Sync {
+    /// Load (or reuse) the resident FFN weights of `layer`.
+    fn ffn_stage(&mut self, layer: usize) -> Result<FfnStage, StageError>;
+    /// Load (or reuse) the resident attention state of `layer`.
+    fn attention_stage(&mut self, layer: usize) -> Result<AttentionStage, StageError>;
+    /// Release every resident buffer. Must be idempotent.
+    fn release_all(&mut self);
+}
+
 /// Object-safe transport view used by [`DspBackend`].
 pub trait DspExecutor: Send + Sync {
     /// Open one FastRPC module (for example `"lfmgemv"`).
@@ -245,6 +286,7 @@ pub struct DspBackend {
     link: Option<DspLink>,
     ffn: Vec<Option<FfnStage>>,
     attention: Vec<Option<AttentionStage>>,
+    weights: Option<Box<dyn StageProvider>>,
     last_error: Option<DspError>,
 }
 
@@ -267,6 +309,7 @@ impl DspBackend {
             link: None,
             ffn: vec![None; layers],
             attention: vec![None; layers],
+            weights: None,
             last_error: None,
         }
     }
@@ -308,6 +351,35 @@ impl DspBackend {
         self.link.as_ref().map(|link| link.module.as_str())
     }
 
+    /// FastRPC handle, once a transport is attached.
+    ///
+    /// A [`StageProvider`] built on the same executor and handle can be
+    /// attached with [`DspBackend::attach_weights`].
+    pub fn handle(&self) -> Option<DspHandle> {
+        self.link.as_ref().map(|link| link.handle)
+    }
+
+    /// Executor the backend drives, once attached.
+    pub fn executor(&self) -> Option<Arc<dyn DspExecutor>> {
+        self.link.as_ref().map(|link| Arc::clone(&link.executor))
+    }
+
+    /// Attach an on-demand weight provider.
+    ///
+    /// Layers with an explicit [`DspBackend::stage_ffn`] or
+    /// [`DspBackend::stage_attention`] keep that stage; otherwise the provider
+    /// is asked on the first layer call and its answer is cached. The provider
+    /// must use the same FastRPC handle as this backend (see
+    /// [`DspBackend::handle`]).
+    pub fn attach_weights(&mut self, provider: Box<dyn StageProvider>) {
+        self.weights = Some(provider);
+    }
+
+    /// Whether an on-demand weight provider is attached.
+    pub fn has_weight_provider(&self) -> bool {
+        self.weights.is_some()
+    }
+
     /// Last transport failure, with the original FastRPC code when there is
     /// one. [`BackendError`] only carries static reasons, so this is the place
     /// to inspect the full diagnostic.
@@ -345,7 +417,7 @@ impl DspBackend {
         Ok(())
     }
 
-    fn executor(&self) -> Option<(Arc<dyn DspExecutor>, DspHandle)> {
+    fn link_parts(&self) -> Option<(Arc<dyn DspExecutor>, DspHandle)> {
         self.link
             .as_ref()
             .map(|link| (Arc::clone(&link.executor), link.handle))
@@ -365,6 +437,67 @@ impl DspBackend {
             backend: "dsp",
             operation,
             reason,
+        }
+    }
+
+    fn stage_failure(&mut self, operation: &'static str, error: StageError) -> BackendError {
+        match error {
+            StageError::Transport(error) => self.fail(operation, error),
+            StageError::Budget(message) => BackendError::Budget(message),
+            StageError::Unknown(message) | StageError::Layout(message) => {
+                BackendError::Model(message)
+            }
+        }
+    }
+
+    fn load_ffn_stage(&mut self, layer: usize) -> Result<FfnStage, BackendError> {
+        let loaded = match self.weights.as_mut() {
+            Some(provider) => provider.ffn_stage(layer),
+            None => return Err(unsupported("ffn_layer", MISSING_FFN_STAGE)),
+        };
+        match loaded {
+            Ok(stage) => {
+                stage.validate()?;
+                let layers = self.ffn.len();
+                let slot = self.ffn.get_mut(layer).ok_or_else(|| {
+                    BackendError::Model(format!(
+                        "layer {layer} is outside the model ({layers} layers)"
+                    ))
+                })?;
+                *slot = Some(stage);
+                Ok(stage)
+            }
+            Err(error) => Err(self.stage_failure("ffn_layer", error)),
+        }
+    }
+
+    fn load_attention_stage(&mut self, layer: usize) -> Result<AttentionStage, BackendError> {
+        let loaded = match self.weights.as_mut() {
+            Some(provider) => provider.attention_stage(layer),
+            None => return Err(unsupported("attention_layer", MISSING_ATTENTION_STAGE)),
+        };
+        match loaded {
+            Ok(stage) => {
+                stage.validate()?;
+                let layers = self.attention.len();
+                let slot = self.attention.get_mut(layer).ok_or_else(|| {
+                    BackendError::Model(format!(
+                        "layer {layer} is outside the model ({layers} layers)"
+                    ))
+                })?;
+                *slot = Some(stage);
+                Ok(stage)
+            }
+            Err(error) => Err(self.stage_failure("attention_layer", error)),
+        }
+    }
+}
+
+impl Drop for DspBackend {
+    fn drop(&mut self) {
+        // Resident buffers must go back before `DspLink` closes the handle.
+        if let Some(provider) = self.weights.as_mut() {
+            provider.release_all();
         }
     }
 }
@@ -443,11 +576,12 @@ impl Backend for DspBackend {
                 got: out.len(),
             });
         }
-        let Some((executor, handle)) = self.executor() else {
+        let Some((executor, handle)) = self.link_parts() else {
             return Err(unsupported("ffn_layer", MISSING_TRANSPORT));
         };
-        let Some(stage) = self.ffn.get(layer).copied().flatten() else {
-            return Err(unsupported("ffn_layer", MISSING_FFN_STAGE));
+        let stage = match self.ffn.get(layer).copied().flatten() {
+            Some(stage) => stage,
+            None => self.load_ffn_stage(layer)?,
         };
         self.last_error = None;
 
@@ -513,11 +647,12 @@ impl Backend for DspBackend {
                 got: out.len(),
             });
         }
-        let Some((executor, handle)) = self.executor() else {
+        let Some((executor, handle)) = self.link_parts() else {
             return Err(unsupported("attention_layer", MISSING_TRANSPORT));
         };
-        let Some(stage) = self.attention.get(call.layer).copied().flatten() else {
-            return Err(unsupported("attention_layer", MISSING_ATTENTION_STAGE));
+        let stage = match self.attention.get(call.layer).copied().flatten() {
+            Some(stage) => stage,
+            None => self.load_attention_stage(call.layer)?,
         };
         self.last_error = None;
         if call.position >= kv.capacity() {

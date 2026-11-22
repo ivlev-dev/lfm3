@@ -48,6 +48,8 @@ pub enum BackendError {
     Kv(String),
     /// The model is not loaded as the spec claims.
     Model(String),
+    /// Resident weights do not fit the device memory budget.
+    Budget(String),
 }
 
 impl fmt::Display for BackendError {
@@ -65,6 +67,7 @@ impl fmt::Display for BackendError {
             } => write!(f, "{operation} expected {expected} values, got {got}"),
             Self::Kv(message) => write!(f, "kv cache: {message}"),
             Self::Model(message) => write!(f, "backend model: {message}"),
+            Self::Budget(message) => write!(f, "weight budget: {message}"),
         }
     }
 }

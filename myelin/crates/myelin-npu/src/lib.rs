@@ -10,7 +10,8 @@
 //!
 //! [`HvxClient`] wraps one `lfmgemv` handle and exposes typed methods
 //! (`ffn`, `attn`, `gemv`, ...); [`method`] owns the method IDs and scalar
-//! layouts.
+//! layouts. [`weights`] uploads `myelin-pack` blobs into resident DSP buffers
+//! under an explicit memory budget with LRU eviction.
 
 use std::fmt;
 
@@ -22,6 +23,7 @@ pub mod hvx;
 pub mod method;
 pub mod mock;
 pub mod transport;
+pub mod weights;
 
 #[cfg(target_os = "android")]
 pub mod cdsprpc;
@@ -35,6 +37,11 @@ pub use method::{
 };
 pub use mock::{MockCall, MockReply, MockTransport, RecordedCall};
 pub use transport::{Call, Handle, SharedBuffer, SharedOwner, Transport};
+pub use weights::{
+    AttentionParams, AttentionPlan, FfnPlan, LayerPlan, PackedTensor, ResidentImage,
+    ResidentWeights, StageKind, WeightBudget, WeightError, WeightPlan, WeightPlanBuilder,
+    WeightStats, LOAD_CHUNK,
+};
 
 #[cfg(target_os = "android")]
 pub use cdsprpc::{Cdsprpc, CdsprpcConfig, FASTRPC_ATTR_KEEP_MAP};

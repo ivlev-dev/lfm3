@@ -108,7 +108,8 @@ rpcmem_flags: 1,           // RPCMEM_DEFAULT_FLAGS
 * `DspBackend::attach(spec, executor, "lfmgemv")` открывает handle;
 * `stage_ffn(layer, FfnStage { gate, up, down, act_scale, out_scale, reps })`
   и `stage_attention(layer, AttentionStage { ... })` сообщают handle'ы
-  резидентных буферов и масштабы квантования;
+  резидентных буферов и масштабы квантования; `attach_weights` добавляет
+  планировщик, который загружает стадию при первом обращении к слою;
 * `ffn_layer` квантует активацию в int8, делает один RPC `ffn`, деквантует
   результат в f32;
 * `attention_layer` квантует запрос в int8, строит block table
@@ -122,6 +123,109 @@ rpcmem_flags: 1,           // RPCMEM_DEFAULT_FLAGS
 `BackendError::Unsupported` с конкретной причиной (нет резидентных весов /
 ядра вне HVX-стенда), а не `unimplemented!()`. Полный диагностический
 `DspError` (с кодом FastRPC) доступен через `DspBackend::last_error()`.
+
+Ленивая загрузка: `attach_weights(Box<dyn StageProvider>)` подключает
+планировщик из `myelin-npu`; `ffn_layer`/`attention_layer` спрашивают его при
+первом обращении к слою и кэшируют `FfnStage`/`AttentionStage`. Явно
+застейдженный слой имеет приоритет. Ошибка бюджета приходит как
+`BackendError::Budget`. Handle для планировщика берётся из
+`DspBackend::handle()`, executor — из `DspBackend::executor()`.
+
+## Загрузка весов (`weights`)
+
+`myelin_npu::weights` — планировщик резидентных весов. Вход: manifest + blob
+из `myelin-pack` (`PackedTensor::from_pack`), бюджет DSP-кучи
+(`WeightBudget`). Выход: `FfnStage`/`AttentionStage` для `DspBackend` либо
+типизированная ошибка.
+
+### Порядок вызовов
+
+Сверено со стендом, не придумано:
+
+```text
+FFN-матрица (ffn_main.c:67-81, host_main.c:123-211):
+  alloc_buf(len)
+  set_shape(h, N_padded, K_padded, with_scale = 1)
+  load_buf(h, 0, chunk) ...               # 256 КиБ, как в стенде
+  set_scale(h, payload)
+
+attention (attn_main.c:225-241):
+  alloc_buf(hk), alloc_buf(hkt), alloc_buf(hv)
+  load hk, load hv, load hkt              # именно K, V, KT
+```
+
+`set_scale` получает ровно стендовый `sbuf`:
+
+```text
+[N: i32][K: i32][act_scale: f32][out_scale: f32][scale: f32 × N]
+```
+
+`N`/`K` — padded-размеры матрицы, `scale` — `manifest.scales.scale_f32`
+(включая нули дополненных каналов). `alloc_buf` в IDL принимает только
+`nbytes`: аргумента выравнивания нет, а веса в blob уже начинаются со
+128-байтного `weight_base`.
+
+### Бюджет и LRU
+
+* Единица учёта — стадия слоя (`Ffn` или `Attention`); её размер — сумма
+  длин загружаемых буферов (для FFN это весь blob: заголовок + тайлы + bias,
+  без переупаковки).
+* Если единица больше бюджета, `alloc_buf` не вызывается вовсе:
+  `WeightError::Budget { bytes, budget, used }`. В `DspBackend` это
+  `BackendError::Budget`.
+* Иначе вытесняются целые стадии в LRU-порядке, пока новая не влезет.
+  `ResidentWeights::stats()` отдаёт `loads`, `evictions`, `unloads`,
+  `load_calls`, `live_bytes`, `resident_units`.
+* `Drop` (и `DspBackend::drop` до закрытия handle) вызывает `release_buf` для
+  каждого живого буфера; `release_all()` идемпотентен.
+* Ошибка `alloc_buf`/`set_shape`/`load_buf`/`set_scale` освобождает уже
+  выделенные буферы стадии и сохраняет исходный код FastRPC
+  (`WeightError::Transport(DspError)`).
+
+```rust
+use myelin_npu::weights::{
+    FfnPlan, PackedTensor, ResidentWeights, WeightPlan,
+};
+
+let plan = WeightPlan::builder(48 * 1024 * 1024)
+    .ffn(0, FfnPlan::new(gate, up, down, act_scale, out_scale, 1)?)
+    .build();
+let provider = ResidentWeights::new(executor.clone(), backend.handle().unwrap(), plan);
+backend.attach_weights(Box::new(provider));
+```
+
+### Реальные числа (LFM3-1.7B, `blk.0`)
+
+`#[ignore]`-тест `tests/weights.rs::real_lfm3_ffn_gate_footprint`, полная
+FFN-стадия (gate/up/down), бюджет равен её размеру:
+
+| величина | значение |
+|---|---:|
+| blob одной матрицы 2048×7680 | 15 790 208 Б (15.06 МиБ) |
+| вес (тайлы) | 15 728 640 Б, 15 360 тайлов по 1 КиБ |
+| bias/scale блоки | 61 440 Б (240 × 256) |
+| `load_buf` на матрицу | 61 |
+| FFN-слой целиком | 47 325 568 Б (45.13 МиБ) |
+| `load_buf` на слой | 183 |
+| `alloc_buf` / `set_scale` на слой | 3 / 3 |
+
+Слой влезает в бюджет ровно 45.13 МиБ. Два FFN-слоя (90.3 МиБ) в такой
+бюджет не влезают и требуют LRU-вытеснения. `team_info` сообщает только
+число ядер/потоков и не отдаёт размер кучи, поэтому бюджет задаёт вызывающий.
+
+### Что ждёт устройства
+
+* `myelin-pack` упаковывает **HMX int8** тайлы, а текущий HVX-скелет `ffn`
+  принимает int4. Планировщик загружает и учитывает blob как есть; численное
+  совпадение с ядром появится вместе с HMX int8-ядром или int8-входом HVX.
+* Заголовок `set_scale` (`act_scale`/`out_scale`) — контракт вызывающего.
+  Q16-соглашение стенда для gate/up (`s_in * 65536`) здесь не зашито: его
+  должен задать слой, который знает конкретное ядро.
+* Attention-кэши — сырые образы, а не матрицы `myelin-pack`; стенд не
+  вызывает для них `set_shape`/`set_scale`. Повторная загрузка стадии
+  сбрасывает кэш, поэтому мутация K/V во время генерации остаётся задачей
+  KV-рантайма.
+
 
 ## Проверка на хосте
 
@@ -140,6 +244,25 @@ cargo test --workspace
 * освобождение `SharedBuffer` (счётчики alloc/free, `live_bytes == 0`);
 * `DspBackend`: квантование входа, деквантование выхода, типизированные
   ошибки «нет транспорта»/«нет стадии»/RPC.
+
+`crates/myelin-npu/tests/weights.rs` проверяет планировщик на реальном blob
+из `myelin-pack`, собранном в тесте из маленькой матрицы:
+
+* точную последовательность `alloc_buf`/`set_shape`/`load_buf`/`set_scale`
+  для gate/up/down и `alloc_buf`/`load_buf` для attention;
+* размеры, смещения и разбиение `load_buf` по 256 КиБ;
+* точный бюджет: `bytes` влезает, `bytes - 1` даёт `WeightError::Budget`;
+* LRU-вытеснение со счётчиками `loads`/`evictions`/`unloads`;
+* `live_bytes == 0` после `release_all`/`Drop`, ровно один `release_buf` на
+  каждый `alloc_buf`;
+* сохранение кода FastRPC и освобождение частичных аллокаций при ошибке;
+* ленивую загрузку через `DspBackend::attach_weights` и `BackendError::Budget`.
+
+Реальный слой LFM3 гоняется отдельно и не требует устройства:
+
+```bash
+cargo test -p myelin-npu --test weights -- --ignored --nocapture
+```
 
 ### Сборка под Android
 
@@ -185,9 +308,10 @@ cargo test -p myelin-npu --target aarch64-linux-android -- --ignored
 
 ## Известные ограничения
 
-* Нет загрузчика весов GGUF → int4/int8. `DspBackend` принимает уже
-  загруженные резидентные handle'ы; конвертация и `set_scale` — следующий
-  этап интеграции.
+* Загрузчик весов есть (`weights`), но он грузит **HMX int8** blob из
+  `myelin-pack`; текущий HVX-скелет `ffn` принимает int4. До появления
+  HMX int8-ядра численный прогон на устройстве не проверен — проверены
+  порядок вызовов, бюджет и LRU на моке.
 * `rms_norm`, `embed`, `conv_layer`, `lm_head` не реализованы на DSP и
   возвращают типизированную ошибку с причиной.
 * `attention_layer` считает, что q уже спроецирован, а K/V уже лежат в
