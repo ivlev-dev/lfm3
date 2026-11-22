@@ -672,12 +672,19 @@ fn backend_reset_zeroes_the_device_state() {
 
     let calls = mock.calls();
     let methods: Vec<u32> = calls.iter().map(|call| call.method).collect();
+    // `reserve_scratch` is followed by the one-shot `reset_state` that zeroes
+    // the CONV rings (a fresh scratch is not guaranteed to be zeroed), then
+    // the session reset itself.
     assert_eq!(
         methods,
-        vec![method_id::RESERVE_SCRATCH, method_id::RESET_STATE]
+        vec![
+            method_id::RESERVE_SCRATCH,
+            method_id::RESET_STATE,
+            method_id::RESET_STATE
+        ]
     );
     // flags = 0: scratch and counters.
-    assert_eq!(calls[1].prim_in, i32_bytes(&[0]));
+    assert_eq!(calls[2].prim_in, i32_bytes(&[0]));
     // reset_state: method 23, one scalar in, no sequences.
-    assert_eq!(calls[1].scalars, 0x1701_0000);
+    assert_eq!(calls[2].scalars, 0x1701_0000);
 }

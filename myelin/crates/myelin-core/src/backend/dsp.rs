@@ -701,6 +701,7 @@ pub mod exec {
         }
 
         /// FFN with a 16-bit `mid` buffer (two int8 planes inside the kernel).
+        #[allow(clippy::too_many_arguments)]
         pub const fn ffn16(
             gate: i32,
             up: i32,
@@ -1502,26 +1503,26 @@ impl DspBackend {
                 list.push(exec::Command::dump(SCRATCH_BCX, 256 + hidden, 3 * hidden));
                 list.push(exec::Command::dump(SCRATCH_CY, 256 + 4 * hidden, hidden));
                 match self.run_exec(&list, &[], &[], (256 + 5 * hidden) as usize) {
-                  Ok(dump) => {
-                    let h = hidden as usize;
-                    let _ = std::fs::write(
-                        format!("/data/local/tmp/conv_w_{layer}.bin"),
-                        &dump.out[..256],
-                    );
-                    let _ = std::fs::write(
-                        format!("/data/local/tmp/conv_act_{layer}.bin"),
-                        &dump.out[256..256 + h],
-                    );
-                    let _ = std::fs::write(
-                        format!("/data/local/tmp/conv_bcx_{layer}.bin"),
-                        &dump.out[256 + h..256 + 4 * h],
-                    );
-                    let _ = std::fs::write(
-                        format!("/data/local/tmp/conv_cy_{layer}.bin"),
-                        &dump.out[256 + 4 * h..],
-                    );
-                  }
-                  Err(error) => eprintln!("conv dump failed: {error}"),
+                    Ok(dump) => {
+                        let h = hidden as usize;
+                        let _ = std::fs::write(
+                            format!("/data/local/tmp/conv_w_{layer}.bin"),
+                            &dump.out[..256],
+                        );
+                        let _ = std::fs::write(
+                            format!("/data/local/tmp/conv_act_{layer}.bin"),
+                            &dump.out[256..256 + h],
+                        );
+                        let _ = std::fs::write(
+                            format!("/data/local/tmp/conv_bcx_{layer}.bin"),
+                            &dump.out[256 + h..256 + 4 * h],
+                        );
+                        let _ = std::fs::write(
+                            format!("/data/local/tmp/conv_cy_{layer}.bin"),
+                            &dump.out[256 + 4 * h..],
+                        );
+                    }
+                    Err(error) => eprintln!("conv dump failed: {error}"),
                 }
             }
         }

@@ -116,16 +116,22 @@ fn main() {
         "blk.2.attn_q.weight",
         "blk.0.ffn_gate.weight",
     ];
-    let block: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(32);
+    let block: usize = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
     println!("block = {block}");
-    println!("{:40} {:>8} {:>8} {:>8} {:>8} {:>8}", "tensor", "perrow", "had+row", "block", "had+blk", "colblk");
+    println!(
+        "{:40} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "tensor", "perrow", "had+row", "block", "had+blk", "colblk"
+    );
     for name in tensors {
         let (matrix, _info) = gguf_source::load_matrix(path, name, None).expect("matrix");
         let (n, k) = (matrix.n(), matrix.k());
         let values = matrix.data();
         // deterministic probe vector
         let mut state = 0x1234_5678_9ABC_DEF0u64;
-        let mut x: Vec<f32> = (0..k)
+        let x: Vec<f32> = (0..k)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 7;
@@ -175,7 +181,7 @@ fn main() {
             cos(&values[..k], &wq_row),
             cos(&values[..k], &wq_blk)
         );
-        let (qcol, scales) = quant_colblock(&values, n, k, block);
+        let (qcol, scales) = quant_colblock(values, n, k, block);
         let mut xscaled = vec![0.0f32; k];
         for kk in 0..k {
             xscaled[kk] = x[kk] * scales[kk / block];

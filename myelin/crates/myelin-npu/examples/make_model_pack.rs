@@ -571,13 +571,21 @@ impl ConvAcc {
     /// Per-channel `y` steps: the buffer is heavy-tailed, so each channel gets
     /// its own int8 range and the out projection folds the table in.
     fn y_scales(&self) -> Vec<f32> {
-        self.y_ch
-            .iter()
-            .map(|value| {
-                let step = value / ACT_TARGET;
-                if step > 0.0 { step } else { 1.0 }
-            })
-            .collect()
+        // One scale per group of 32 channels, like the OpenCL reference
+        // (`prepack.rs`: `groups = cols / 32`) and QNN's per-32 bias block.
+        // A single scale for the whole vector loses the tail; one per channel
+        // amplifies the conv's own rounding noise.
+        const GROUP: usize = 32;
+        let mut out = vec![1.0f32; self.y_ch.len()];
+        for start in (0..self.y_ch.len()).step_by(GROUP) {
+            let end = (start + GROUP).min(self.y_ch.len());
+            let max = self.y_ch[start..end].iter().fold(0.0f32, |m, v| m.max(*v));
+            let step = if max > 0.0 { max / ACT_TARGET } else { 1.0 };
+            for slot in out.iter_mut().take(end).skip(start) {
+                *slot = step;
+            }
+        }
+        out
     }
 }
 
@@ -727,9 +735,18 @@ fn build_pack(
             // Per-channel `y` scales are opt-in: they help heavy-tail channels
             // but amplify the conv's own rounding noise where |y| is tiny, and
             // measured worse on LFM3 (0.456 vs 0.910 at layer 0).
-            let per_channel = std::env::var_os("MYELIN_PACK_PERCHANNEL").is_some();
+            // Group-32 `y` scales match the OpenCL reference
+            // (`prepack.rs`: `groups = cols / 32`). Measured on LFM3: it lifts
+            // the deep layers (L5 0.459 -> 0.643 at t=1) but costs the first
+            // ones (0.976 -> 0.955), so it stays behind a flag until the weight
+            // format matches the reference too.
+            let per_channel = std::env::var_os("MYELIN_PACK_GROUP32").is_some();
             let y_scales = conv.y_scales();
-            let y_scale = if per_channel { 1.0 } else { conv.y.step_clipped(ACT_TARGET, 8.0) };
+            let y_scale = if per_channel {
+                1.0
+            } else {
+                conv.y.step_clipped(ACT_TARGET, 8.0)
+            };
             let taps: Vec<f32> = conv.weights.taps.data().to_vec();
             let scales = if per_channel {
                 ActivationScales::channels(mix_scale, y_scales.clone())
@@ -920,7 +937,7 @@ fn pack_blobs(
             // Fold the per-channel `y` scales into the columns of the out
             // projection, so the conv can quantise each channel to its own
             // range while this matrix still sees a single activation scale.
-            if std::env::var_os("MYELIN_PACK_PERCHANNEL").is_some() {
+            if std::env::var_os("MYELIN_PACK_GROUP32").is_some() {
                 let y_scales = conv.y_scales();
                 let matrix = &conv.weights.out_proj;
                 let n = matrix.n();
@@ -934,7 +951,12 @@ fn pack_blobs(
                 let scaled = myelin_pack::Matrix::new(k, n, scaled).expect("scaled out_proj");
                 written += write_gemv(&args.out, &pack_conv.out_proj, &scaled, "conv");
             } else {
-                written += write_gemv(&args.out, &pack_conv.out_proj, &conv.weights.out_proj, "conv");
+                written += write_gemv(
+                    &args.out,
+                    &pack_conv.out_proj,
+                    &conv.weights.out_proj,
+                    "conv",
+                );
             }
         }
         if let (Some(attention), Some(pack_attention)) = (&layer.attention, &pack_layer.attention) {

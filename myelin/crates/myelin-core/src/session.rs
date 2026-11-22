@@ -300,20 +300,24 @@ impl<'a> Session<'a> {
         })
     }
 
-/// Append one f32 vector to `path` when the environment variable is set.
-fn dump_vector(variable: &str, values: &[f32]) {
-    let Some(path) = std::env::var_os(variable) else {
-        return;
-    };
-    use std::io::Write as _;
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
+    /// Append one f32 vector to `path` when the environment variable is set.
+    fn dump_vector(variable: &str, values: &[f32]) {
+        let Some(path) = std::env::var_os(variable) else {
+            return;
+        };
+        use std::io::Write as _;
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(&bytes);
+        }
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = file.write_all(&bytes);
-    }
-}
 
     fn step(&mut self, token: u32) -> Result<Vec<f32>, RuntimeError> {
         self.step_with(token, &mut |_, _| {})
