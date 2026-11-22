@@ -157,6 +157,10 @@ int main(int argc, char **argv)
         printf("pinned tuning: pf=32KB rows=2 threads=%d (sweep skipped)\n", pin_thr);
     }
 
+    /* A/B switch for the SiLU path (probe 45): "scal" forces the scalar chain */
+    if (argc > 3 && strcmp(argv[3], "scal") == 0)
+        lfmgemv_probe(hg, 45, 0, times, 12);
+
     /* ---- team info ---- */
     if (lfmgemv_team_info(info, 8) == 0)
         printf("team before start: state=%d hvx_rc=%d mode=%d created=%d threads=%d\n",
@@ -370,6 +374,28 @@ int main(int argc, char **argv)
         }
     }
 
+    /* ---- 3a. SiLU step profile (probe 40/42, needs the last ffn call) ---- */
+    if (argc > 3 && strcmp(argv[3], "prof") == 0) {
+        static const char *st[4] = { "LUT", "prod_p", "requant", "dequant" };
+        int p[12], q, all;
+        lfmgemv_probe(hg, 40, 16, p, 12);
+        all = p[2];
+        printf("\nSiLU profile (7680 lanes, DSP pcycles/pass, scalar chain):\n");
+        printf("  full chain        %8d  (%.2f cyc/lane)\n", all, all / (double)NH);
+        for (q = 0; q < 4; q++) {
+            static const int slot[4] = { 3, 5, 6, 7 };
+            int nc = p[slot[q]];
+            printf("  skip %-10s  %8d  costs %7d  (%.2f cyc/lane)\n",
+                   st[q], nc, all - nc, (all - nc) / (double)NH);
+        }
+        lfmgemv_probe(hg, 42, 16, p, 12);
+        printf("  vector: guard %d pcycles, pass %d pcycles (rc=%d)\n",
+               p[2], p[3], p[5]);
+        if (p[3] > 0)
+            printf("  vector pass %.2f cyc/lane, %.2fx faster than the scalar loop\n",
+                   p[3] / (double)NH, all / (double)p[3]);
+    }
+
     /* ---- 3b. resident output buffer (apps_mem_share_map, mapped once) ---- */
     {
         void *pdst = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, NH + 4096);
@@ -463,6 +489,17 @@ int main(int argc, char **argv)
                    wmin, wsum / 30, kmin, rpcmem_to_fd(pa));
             rpcmem_free(pa); rpcmem_free(pd);
         } else printf("rpcmem alloc failed\n");
+    }
+
+    /* ---- 5. SiLU vector A/B: arithmetic, LUT grid, whole chain ---- */
+    {
+        int p[12];
+        if (lfmgemv_probe(hg, 44, 0, p, 12) == 0) {
+            printf("SiLU vec A/B: mul_rnd %d/2048, mul_floor %d/2048, LUT %d/131200,"
+                   " chain %d/%d lanes, guard fallbacks %d/6\n",
+                   p[2], p[3], p[5], p[6], 6 * NH, p[7]);
+            if (p[2] || p[3] || p[5] || p[6]) pass = 0;
+        }
     }
 
     printf("\n%s (need: 0 mismatches vs the integer model, worst cos(out) >= %.3f,"

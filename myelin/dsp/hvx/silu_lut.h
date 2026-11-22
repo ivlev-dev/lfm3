@@ -1,6 +1,8 @@
 /* silu(z) in Q16, z = -8 + i/64, i in [0,1024] */
 #define SILU_LUT_N 1025
-static const int silu_lut[SILU_LUT_N] = {
+/* 128-byte aligned: the HVX SiLU path reads it with vgather, and v68 wants
+ * the gather base at a vector boundary. */
+static const int silu_lut[SILU_LUT_N] __attribute__((aligned(128))) = {
     -176, -178, -181, -183, -186, -188, -191, -193,
     -196, -199, -202, -204, -207, -210, -213, -216,
     -219, -222, -225, -228, -231, -234, -237, -241,

@@ -61,6 +61,14 @@ typedef struct {
 } ffn_t;
 static ffn_t g_ffn;
 
+/* SiLU path A/B switch (probe kind 45): 1 = vector, 0 = scalar chain. */
+static int g_silu_vec = 1;
+
+/* Buffers of the last FFN call, for the SiLU profiling probe (kind 40/42). */
+static gbuf_t *g_ffn_last_g, *g_ffn_last_u;
+static int32_t g_ffn_last_mq;
+static volatile int g_prof_sink;
+
 /* tuning */
 /* tuning: measured optimum on this target (same as myelin/dsp/conv).  The
  * worker team is started lazily by the first split job. */
@@ -896,11 +904,318 @@ static inline int32_t requant_mid(int32_t pr, int32_t mq_mid)
     return (int32_t)v;
 }
 
-/* SiLU + int8 quantisation over an index range (scalar, 4x unrolled) */
+/* ---------------- SiLU vector path (HVX, v68) ----------------
+ *
+ * The scalar chain is bit-exact only with int64 products:
+ *   deq_wide   (acc*qm  + 2^15) >> 16
+ *   prod_p     (sv *zu  + 2^15) >> 16
+ *   requant_mid(pr *mq  + 2^27) >> 28
+ * v68 has no 32x32->64 vector multiply and no Q6_Vd_* ops at all, so each
+ * product is split into four 16x16 partial products that stay in int32:
+ *
+ *   a = ahi*2^16 + alo,  b = bhi*2^16 + blo   (ahi/bhi signed, alo/blo unsigned)
+ *   a*b = ahi*bhi*2^32 + (ahi*blo + alo*bhi)*2^16 + alo*blo
+ *
+ * ahi*bhi is small, alo*blo is exact as an *unsigned* 32-bit value (the
+ * rounding add never wraps), and the cross terms fit int32 while
+ * |a*b| <= 2^45 -- the per-call guard (silu_vec_guard) checks that bound on
+ * the live buffers; outside it the scalar loop takes over.
+ *
+ * The LUT part stays scalar: vgather raises a precise exception in this PD
+ * and v68 has no vector float, so there is no vector lookup to be had; it
+ * still costs ~27 of the 71 cycles/lane of the scalar chain (measured), the
+ * rest is the three int64 products.
+ */
+#define SILU_ZLIM   (8 * 65536)
+
+typedef struct { HVX_Vector hi, cross, low; } vsplit_t;
+
+static inline vsplit_t vsplit_mul(HVX_Vector a, HVX_Vector b)
+{
+    const HVX_Vector z   = Q6_V_vzero();
+    const HVX_Vector m16 = Q6_V_vsplat_R(0xffff);
+    HVX_Vector ahi = Q6_Vw_vasr_VwR(a, 16);
+    HVX_Vector alo = Q6_V_vand_VV(a, m16);
+    HVX_Vector bhi = Q6_Vw_vasr_VwR(b, 16);
+    HVX_Vector blo = Q6_V_vand_VV(b, m16);
+    vsplit_t s;
+    /* signed x signed (low halfword), unsigned x unsigned -> one vmpy each */
+    s.hi    = Q6_Vw_vmpyieacc_VwVwVh(z, ahi, bhi);
+    s.cross = Q6_Vw_vadd_VwVw(Q6_Vw_vmpyie_VwVuh(ahi, blo),
+                              Q6_Vw_vmpyieacc_VwVwVh(z, alo, bhi));
+    s.low   = Q6_Vw_vmpyie_VwVuh(alo, blo);      /* exact as unsigned */
+    return s;
+}
+
+/* (a*b + 32768) >> 16, floor semantics of the scalar code */
+static inline HVX_Vector vmul_q16_rnd(HVX_Vector a, HVX_Vector b)
+{
+    vsplit_t s = vsplit_mul(a, b);
+    HVX_Vector lo = Q6_Vw_vadd_VwVw(s.low, Q6_V_vsplat_R(32768));
+    HVX_Vector v  = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(s.hi, 16), s.cross);
+    return Q6_Vw_vadd_VwVw(v, Q6_Vuw_vlsr_VuwR(lo, 16));
+}
+
+/* (a*b) >> 16 (floor) */
+static inline HVX_Vector vmul_q16_floor(HVX_Vector a, HVX_Vector b)
+{
+    vsplit_t s = vsplit_mul(a, b);
+    HVX_Vector v = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(s.hi, 16), s.cross);
+    return Q6_Vw_vadd_VwVw(v, Q6_Vuw_vlsr_VuwR(s.low, 16));
+}
+
+/* Branch-free silu over the clamped argument; the LUT copy carries a sentinel
+ * in entry N so idx+1 is always in range (idx == N-1 returns LUT[N-1] because
+ * sentinel == LUT[N-1], exactly like the scalar early return). */
+static int32_t silu_lut_pad[SILU_LUT_N + 1] __attribute__((aligned(128)));
+
+static int silu_lut_ready;
+
+/* Called on the main thread before the workers enter silu_range(). */
+static void silu_lut_prep(void)
+{
+    if (silu_lut_ready) return;
+    memcpy(silu_lut_pad, silu_lut, sizeof(silu_lut));
+    silu_lut_pad[SILU_LUT_N] = silu_lut[SILU_LUT_N - 1];
+    silu_lut_ready = 1;
+}
+
+static inline int32_t silu_q16_off(int32_t off)
+{
+    int32_t idx = off >> 10;
+    int32_t frac = off & 1023;
+    int32_t a = silu_lut_pad[idx];
+    int32_t b = silu_lut_pad[idx + 1];
+    return a + (((b - a) * frac) >> 10);
+}
+
+/* silu_q16() lane-exact.  The 1025-entry LUT lookup stays scalar: v68 vgather
+ * raises a precise exception in this PD with its own base address in Bad VA
+ * (reproduced from a writable static table and from rodata, both 128-byte
+ * aligned), and v68 has no vector float.  The clamp and the offset are
+ * vectorised, the lookup is 2 L1 loads + 1 imul per lane. */
+static inline HVX_Vector vsilu_q16(HVX_Vector zq)
+{
+    union { HVX_Vector v; int32_t s[32]; } zin __attribute__((aligned(128)));
+    union { HVX_Vector v; int32_t s[32]; } zout __attribute__((aligned(128)));
+    const HVX_Vector v8 = Q6_V_vsplat_R(SILU_ZLIM);
+    int k;
+    zq = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(zq, Q6_Vw_vsub_VwVw(Q6_V_vzero(), v8)), v8);
+    zin.v = Q6_Vw_vadd_VwVw(zq, v8);            /* 0 .. 16*65536 */
+    for (k = 0; k < 32; k++) zout.s[k] = silu_q16_off(zin.s[k]);
+    return zout.v;
+}
+
+/* requant_mid() lane-exact: (pr*mq + 2^27) >> 28, clamp +-127 */
+static inline HVX_Vector vrequant_mid(HVX_Vector pr, HVX_Vector mq)
+{
+    HVX_Vector v = Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(vmul_q16_floor(pr, mq),
+                                                  Q6_V_vsplat_R(2048)), 12);
+    v = Q6_Vw_vmax_VwVw(v, Q6_V_vsplat_R(-127));
+    return Q6_Vw_vmin_VwVw(v, Q6_V_vsplat_R(127));
+}
+
+/* max |x| over 32-bit lanes (i0..i1, unaligned ends handled scalar) */
+static int32_t range_absmax(const int32_t *p, int i0, int i1)
+{
+    const HVX_Vector z = Q6_V_vzero();
+    HVX_Vector va = z;
+    int32_t t[32] __attribute__((aligned(128)));
+    int32_t m = 0;
+    int i = i0, j;
+    for (; i < i1 && (i & 31); i++) { int32_t v = p[i] < 0 ? -p[i] : p[i]; if (v > m) m = v; }
+    for (; i + 32 <= i1; i += 32) {
+        HVX_Vector v = *(const HVX_Vector *)(p + i);
+        va = Q6_Vw_vmax_VwVw(va, Q6_Vw_vmax_VwVw(v, Q6_Vw_vsub_VwVw(z, v)));
+    }
+    *(HVX_Vector *)t = va;
+    for (j = 0; j < 32; j++) if (t[j] > m) m = t[j];
+    for (; i < i1; i++) { int32_t v = p[i] < 0 ? -p[i] : p[i]; if (v > m) m = v; }
+    return m;
+}
+
+/* min and max over 32-bit lanes */
+static void range_minmax(const int32_t *p, int i0, int i1, int32_t *mn, int32_t *mx)
+{
+    HVX_Vector vx = Q6_V_vsplat_R(-0x7fffffff), vn = Q6_V_vsplat_R(0x7fffffff);
+    int32_t t[32] __attribute__((aligned(128)));
+    int i = i0, j;
+    for (; i < i1 && (i & 31); i++) {
+        if (p[i] > *mx) *mx = p[i];
+        if (p[i] < *mn) *mn = p[i];
+    }
+    for (; i + 32 <= i1; i += 32) {
+        HVX_Vector v = *(const HVX_Vector *)(p + i);
+        vx = Q6_Vw_vmax_VwVw(vx, v);
+        vn = Q6_Vw_vmin_VwVw(vn, v);
+    }
+    *(HVX_Vector *)t = vx;
+    for (j = 0; j < 32; j++) if (t[j] > *mx) *mx = t[j];
+    *(HVX_Vector *)t = vn;
+    for (j = 0; j < 32; j++) if (t[j] < *mn) *mn = t[j];
+    for (; i < i1; i++) {
+        if (p[i] > *mx) *mx = p[i];
+        if (p[i] < *mn) *mn = p[i];
+    }
+}
+
+/* One lane of the scalar chain, for heads/tails of a split range. */
+static inline int8_t silu_lane(int k, const gbuf_t *g, const gbuf_t *u, int32_t mq_mid)
+{
+    int32_t zg = deq_wide(g->acc[k], g->qm[k]);
+    int32_t zu = deq_wide(g_ffn.acc2[k], u->qm[k]);
+    int32_t pr = prod_p(silu_qk(zg, g->qshift), zu, u->qshift);
+    return (int8_t)requant_mid(pr, mq_mid);
+}
+
+/* Guards for the split multiply: the scalar chain is reproduced exactly while
+ * every product stays inside the int32 partial-product bounds. */
+static int silu_vec_guard(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
+                          int32_t mq_mid)
+{
+    int32_t ag = 0, qg = 0, qgn = 0, au = 0, qu = 0, qun = 0;
+    int64_t bound_zu, bound_pr;
+
+    if (!g_silu_vec) return 0;
+    if (g->qshift != 0 || u->qshift != 0) return 0;
+    if (mq_mid <= 0) return 0;
+    ag = range_absmax(g->acc, i0, i1);
+    au = range_absmax(g_ffn.acc2, i0, i1);
+    qgn = 0; qg = 0;
+    range_minmax(g->qm, i0, i1, &qgn, &qg);
+    qun = 0; qu = 0;
+    range_minmax(u->qm, i0, i1, &qun, &qu);
+    if (qgn < 0 || qun < 0) return 0;                 /* qm is a positive scale */
+    if ((int64_t)ag * (int64_t)qg > ((int64_t)1 << 45)) return 0;
+    if ((int64_t)au * (int64_t)qu > ((int64_t)1 << 45)) return 0;
+    bound_zu = ((int64_t)au * (int64_t)qu + 32768) >> 16;
+    bound_pr = ((int64_t)524271 * bound_zu + 32768) >> 16;
+    if (bound_pr * (int64_t)mq_mid > ((int64_t)1 << 46)) return 0;
+    return 1;
+}
+
+/* 32 lanes of the whole chain, word lanes; qshift == 0 only */
+static inline HVX_Vector silu_vec32(const int32_t *ag, const int32_t *qg,
+                                    const int32_t *au, const int32_t *qu,
+                                    HVX_Vector mq)
+{
+    HVX_Vector zg = vmul_q16_rnd(*(const HVX_Vector *)ag, *(const HVX_Vector *)qg);
+    HVX_Vector zu = vmul_q16_rnd(*(const HVX_Vector *)au, *(const HVX_Vector *)qu);
+    HVX_Vector pr = vmul_q16_rnd(vsilu_q16(zg), zu);
+    pr = Q6_Vw_vmax_VwVw(pr, Q6_V_vsplat_R(-0x7fffffff));
+    pr = Q6_Vw_vmin_VwVw(pr, Q6_V_vsplat_R(0x7fffffff));
+    return vrequant_mid(pr, mq);
+}
+
+/* Vector SiLU pass; returns 0 if the range must stay scalar. */
+static int silu_range_vec(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
+                          int32_t mq_mid)
+{
+    HVX_Vector mq = Q6_V_vsplat_R(mq_mid);
+    int i;
+
+    if (!silu_vec_guard(i0, i1, g, u, mq_mid)) return 0;
+
+    i = i0;
+    for (; i < i1 && (i & 31); i++) g_ffn.h[i] = silu_lane(i, g, u, mq_mid);
+
+    for (; i + 128 <= i1; i += 128) {
+        HVX_Vector r0 = silu_vec32(g->acc + i,      g->qm + i,
+                                   g_ffn.acc2 + i,      u->qm + i, mq);
+        HVX_Vector r1 = silu_vec32(g->acc + i + 32, g->qm + i + 32,
+                                   g_ffn.acc2 + i + 32, u->qm + i + 32, mq);
+        HVX_Vector r2 = silu_vec32(g->acc + i + 64, g->qm + i + 64,
+                                   g_ffn.acc2 + i + 64, u->qm + i + 64, mq);
+        HVX_Vector r3 = silu_vec32(g->acc + i + 96, g->qm + i + 96,
+                                   g_ffn.acc2 + i + 96, u->qm + i + 96, mq);
+        *(HVX_Vector *)(g_ffn.h + i) =
+            Q6_Vb_vpack_VhVh_sat(Q6_Vh_vpack_VwVw_sat(r3, r2),
+                                 Q6_Vh_vpack_VwVw_sat(r1, r0));
+    }
+    for (; i + 32 <= i1; i += 32) {
+        union { HVX_Vector v; int8_t b[128]; } p;
+        HVX_Vector r = silu_vec32(g->acc + i, g->qm + i,
+                                  g_ffn.acc2 + i, u->qm + i, mq);
+        p.v = Q6_Vb_vpack_VhVh_sat(Q6_V_vzero(),
+                                   Q6_Vh_vpack_VwVw_sat(Q6_V_vzero(), r));
+        memcpy(g_ffn.h + i, p.b, 32);
+    }
+    for (; i < i1; i++) g_ffn.h[i] = silu_lane(i, g, u, mq_mid);
+    return 1;
+}
+
+/* Skip-based scalar stage profile (probe kind 40): every variant runs the same
+ * store loop, one chain step is replaced by a trivial op.  Cost(step) is the
+ * difference from the full chain, so nothing can be optimised away. */
+#define SILU_PROF_LOOP(NAME, ZGE, ZUE, ZE, PRE, VE)                     \
+static void NAME(const gbuf_t *g, const gbuf_t *u, int32_t mq, int n)   \
+    __attribute__((noinline));                                          \
+static void NAME(const gbuf_t *g, const gbuf_t *u, int32_t mq, int n)   \
+{                                                                       \
+    volatile int32_t s = 0;                                             \
+    int k;                                                              \
+    for (k = 0; k < n; k++) {                                           \
+        int32_t zg = (ZGE), zu = (ZUE), z = (ZE), pr = (PRE);           \
+        int32_t v = (VE);                                               \
+        g_ffn.h[k] = (int8_t)v;                                         \
+        s += v;                                                         \
+    }                                                                   \
+    g_prof_sink = s;                                                    \
+}
+
+SILU_PROF_LOOP(silu_p_all,
+               deq_wide(g->acc[k], g->qm[k]),
+               deq_wide(g_ffn.acc2[k], u->qm[k]),
+               silu_qk(zg, 0),
+               prod_p(z, zu, 0),
+               requant_mid(pr, mq))
+SILU_PROF_LOOP(silu_p_nolut,
+               deq_wide(g->acc[k], g->qm[k]),
+               deq_wide(g_ffn.acc2[k], u->qm[k]),
+               zg,
+               prod_p(z, zu, 0),
+               requant_mid(pr, mq))
+SILU_PROF_LOOP(silu_p_noprod,
+               deq_wide(g->acc[k], g->qm[k]),
+               deq_wide(g_ffn.acc2[k], u->qm[k]),
+               silu_qk(zg, 0),
+               (z >> 1) + (zu >> 20),   /* both operands stay live */
+               requant_mid(pr, mq))
+SILU_PROF_LOOP(silu_p_noreq,
+               deq_wide(g->acc[k], g->qm[k]),
+               deq_wide(g_ffn.acc2[k], u->qm[k]),
+               silu_qk(zg, 0),
+               prod_p(z, zu, 0),
+               pr >> 10)
+SILU_PROF_LOOP(silu_p_nodeq,
+               g->acc[k],
+               g_ffn.acc2[k],
+               silu_qk(zg, 0),
+               prod_p(z, zu, 0),
+               requant_mid(pr, mq))
+
+static void silu_prof_run(int variant, const gbuf_t *g, const gbuf_t *u,
+                          int32_t mq, int n)
+{
+    switch (variant) {
+    case 0: silu_p_all(g, u, mq, n);   break;
+    case 1: silu_p_nolut(g, u, mq, n); break;
+    case 2: silu_p_noprod(g, u, mq, n); break;
+    case 3: silu_p_noreq(g, u, mq, n); break;
+    case 4: silu_p_nodeq(g, u, mq, n); break;
+    default: break;
+    }
+}
+
+/* SiLU + int8 quantisation over an index range (scalar fallback, 4x unrolled) */
 static void silu_range(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
                        int32_t mq_mid)
 {
-    int i4 = i0;
+    int i4;
+
+    if (silu_range_vec(i0, i1, g, u, mq_mid)) return;
+
+    i4 = i0;
     for (; i4 + 4 <= i1; i4 += 4) {
         int32_t hv[4];
         int t;
@@ -929,6 +1244,7 @@ static void run_split_silu(const gbuf_t *g, const gbuf_t *u, int32_t mq_mid)
 {
     int total = g_team.nwork + 1;
     int i;
+    silu_lut_prep();      /* before the workers can enter silu_range */
     if (g_threads < total) total = g_threads;
     if (total <= 1 || g->N < 2048) {
         silu_range(0, g->N, g, u, mq_mid);
@@ -1501,6 +1817,9 @@ static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen
         if (!g_ffn.acc2 || !g_ffn.h) return AEE_ENOMEMORY;
     }
     mq_mid = (int32_t)(4096.0f / d->sa);
+    g_ffn_last_g = g;
+    g_ffn_last_u = u;
+    g_ffn_last_mq = mq_mid;
 
     for (rep = 0; rep < reps; rep++) {
         /* 1: deinterleave + gate GEMV */
@@ -2336,6 +2655,164 @@ int lfmgemv_probe(int h, int kind, int arg, int *res, int resLen)
         res[3] = g_rows;
         res[5] = g_usepf;
         res[6] = g_threads;
+        break;
+    }
+    case 40: { /* scalar SiLU step profile on the last FFN buffers; arg = iters
+                 res[2..6] = pcycles/pass for full, no-LUT, no-prod, no-requant,
+                 no-deq; res[7] = full pass again (repeat) */
+        gbuf_t *g = g_ffn_last_g, *u = g_ffn_last_u;
+        int iters = arg > 0 ? arg : 16, st;
+        int n = g_ffn.n;
+        if (!g || !u || n <= 0 || !g_ffn.acc2 || !g_ffn.h) return AEE_EBADPARM;
+        for (st = 0; st < 5; st++) {
+            static const int slot[5] = { 2, 3, 5, 6, 7 };
+            uint64 c0 = HAP_perf_get_pcycles();
+            for (i = 0; i < iters; i++)
+                silu_prof_run(st, g, u, g_ffn_last_mq, n);
+            res[slot[st]] = (int)((HAP_perf_get_pcycles() - c0) / (unsigned)iters);
+        }
+        break;
+    }
+    case 42: { /* vector SiLU path: guard and full pass; arg = iters
+                 res[2] guard, res[3] pass, res[5] pass rc (1 = vector used) */
+        gbuf_t *g = g_ffn_last_g, *u = g_ffn_last_u;
+        int iters = arg > 0 ? arg : 16;
+        int n = g_ffn.n, rc = 0;
+        if (!g || !u || n <= 0) return AEE_EBADPARM;
+        {
+            uint64 c0 = HAP_perf_get_pcycles();
+            for (i = 0; i < iters; i++) {
+                sum += (uint32_t)silu_vec_guard(0, n, g, u, g_ffn_last_mq);
+                __asm__ __volatile__("" ::: "memory");
+            }
+            res[2] = (int)((HAP_perf_get_pcycles() - c0) / (unsigned)iters);
+        }
+        {
+            uint64 c0 = HAP_perf_get_pcycles();
+            for (i = 0; i < iters; i++)
+                rc = silu_range_vec(i == 0 ? 0 : 128, n, g, u, g_ffn_last_mq);
+            res[3] = (int)((HAP_perf_get_pcycles() - c0) / (unsigned)iters);
+        }
+        res[5] = rc;
+        break;
+    }
+    case 44: { /* SiLU vector A/B: split multiply, LUT grid, whole chain on
+                 adversarial buffers.  res[2] mul_rnd, res[3] mul_floor,
+                 res[4] LUT, res[5] chain, res[6] guard fallbacks, res[7] lanes */
+        gbuf_t *g = g_ffn_last_g, *u = g_ffn_last_u;
+        static const int32_t aval[18] = {
+            0, 1, -1, 32767, -32768, 65535, -65536, 65536, -65537,
+            1 << 20, -(1 << 20), (1 << 22), -(1 << 22),
+            12345, -54321, 999999, -999999, 0x3fffffff
+        };
+        int32_t va[32] __attribute__((aligned(128)));
+        int32_t vb[32] __attribute__((aligned(128)));
+        int32_t vo[32] __attribute__((aligned(128)));
+        int bad_rnd = 0, bad_flr = 0, bad_lut = 0, t, q;
+        uint32_t seed = 0x1234u;
+        int n = g_ffn.n;
+        int bad_chain = 0, fell = 0, lanes = 0;
+        int8_t *ref;
+
+        /* 1. the two split multiplies vs the int64 formulas, 64 x 32 lanes */
+        for (t = 0; t < 64; t++) {
+            for (i = 0; i < 32; i++) {
+                int32_t a = aval[(i + t) % 18];
+                seed = seed * 1103515245u + 12345u;
+                vb[i] = (int32_t)(seed >> 8) - (1 << 21);
+                if (a == 0x3fffffff) a = 1 << 22;
+                va[i] = a;
+            }
+            *(HVX_Vector *)vo = vmul_q16_rnd(*(HVX_Vector *)va, *(HVX_Vector *)vb);
+            for (i = 0; i < 32; i++) {
+                int32_t ex = (int32_t)(((int64_t)va[i] * vb[i] + 32768) >> 16);
+                if (vo[i] != ex) bad_rnd++;
+            }
+            *(HVX_Vector *)vo = vmul_q16_floor(*(HVX_Vector *)va, *(HVX_Vector *)vb);
+            for (i = 0; i < 32; i++) {
+                int32_t ex = (int32_t)(((int64_t)va[i] * vb[i]) >> 16);
+                if (vo[i] != ex) bad_flr++;
+            }
+        }
+        res[2] = bad_rnd;
+        res[3] = bad_flr;
+
+        /* 2. vsilu_q16 against silu_q16 on and around every LUT node */
+        for (t = 0; t < SILU_LUT_N; t++) {
+            for (q = 0; q < 4; q++) {
+                int32_t in[32] __attribute__((aligned(128)));
+                union { HVX_Vector v; int32_t s[32]; } out __attribute__((aligned(128)));
+                for (i = 0; i < 32; i++) {
+                    int idx = (t + i) % SILU_LUT_N;
+                    int32_t z = -SILU_ZLIM + idx * 1024;
+                    if (q == 1) z -= 1;
+                    if (q == 2) z += 1;
+                    if (q == 3) z += 1023;
+                    if (z > SILU_ZLIM) z = SILU_ZLIM;
+                    if (z < -SILU_ZLIM) z = -SILU_ZLIM;
+                    in[i] = z;
+                }
+                out.v = vsilu_q16(*(HVX_Vector *)in);
+                for (i = 0; i < 32; i++)
+                    if (out.s[i] != silu_q16(in[i])) bad_lut++;
+            }
+        }
+        res[5] = bad_lut;
+
+        /* 3. whole chain: scalar vs vector on adversarial live buffers */
+        ref = (ref = (int8_t *)memalign(128, (size_t)n + 128)) ? ref : 0;
+        if (!g || !u || n <= 0 || !ref) return AEE_EBADPARM;
+        for (t = 0; t < 6; t++) {
+            for (i = 0; i < n; i++) {
+                int32_t amax = 127 * 7 * 2048;
+                seed = seed * 1103515245u + 12345u;
+                switch (t) {
+                case 0:   /* everything saturates in both directions */
+                    g->acc[i] = (i & 1) ? amax : -amax;
+                    g_ffn.acc2[i] = (i & 2) ? amax : -amax;
+                    break;
+                case 1:   /* up < 0 everywhere -> mid at -127 */
+                    g->acc[i] = (int32_t)(seed >> 9);
+                    g_ffn.acc2[i] = -amax;
+                    break;
+                case 2:   /* near-zero gate and up */
+                    g->acc[i] = (int32_t)(seed >> 20) - 4;
+                    g_ffn.acc2[i] = (int32_t)(seed >> 22) - 2;
+                    break;
+                case 3:   /* gate on the LUT clamp and node boundaries */
+                    g->acc[i] = ((i % 5) == 0) ? (8 << 16) : -(8 << 16);
+                    g_ffn.acc2[i] = (int32_t)(seed >> 10) - (1 << 20);
+                    break;
+                case 4:   /* realistic full range, both signs */
+                    g->acc[i] = (int32_t)(seed >> 8) - (1 << 21);
+                    seed = seed * 1103515245u + 12345u;
+                    g_ffn.acc2[i] = (int32_t)(seed >> 8) - (1 << 21);
+                    break;
+                default:  /* small up, large gate (P near the clamp edges) */
+                    g->acc[i] = (int32_t)(seed >> 7) - (1 << 22);
+                    g_ffn.acc2[i] = ((i & 3) == 0) ? 0 : (int32_t)(seed >> 24) - 64;
+                    break;
+                }
+                g->qm[i] = 65536 + (int32_t)(seed & 1023);
+                u->qm[i] = 65536 + (int32_t)((seed >> 10) & 1023);
+            }
+            g_silu_vec = 0;
+            silu_range(0, n, g, u, g_ffn_last_mq);
+            memcpy(ref, g_ffn.h, (size_t)n);
+            g_silu_vec = 1;
+            if (!silu_range_vec(0, n, g, u, g_ffn_last_mq)) { fell++; continue; }
+            for (i = 0; i < n; i++) if (g_ffn.h[i] != ref[i]) bad_chain++;
+            lanes += n;
+        }
+        free(ref);
+        res[6] = bad_chain;
+        res[7] = fell;
+        (void)lanes;
+        break;
+    }
+    case 45: { /* SiLU path switch: arg 0 = scalar chain, 1 = vector */
+        g_silu_vec = arg ? 1 : 0;
+        res[2] = g_silu_vec;
         break;
     }
     default:
