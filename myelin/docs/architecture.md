@@ -32,7 +32,7 @@ myelin-npu
    ▼
 DSP: Hexagon CDSP v68, unsigned PD
    ├── int4/int8 GEMV, FFN, attention, shortconv   (/tmp/opencode/gemv, conv)
-   ├── HMX prefill (R&D)                            (/tmp/opencode/hmx4)
+   ├── HMX prefill (рецепт и тайл измерены; интеграция — в P2)  (/tmp/opencode/hmx4)
    └── staging KV, conv-состояние, kvarn commit
 ```
 

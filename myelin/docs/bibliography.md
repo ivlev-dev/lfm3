@@ -7,7 +7,7 @@
 |---|---|---|---|
 | **Hexagon V68 Programmer's Reference Manual**, 80-N2040-46 Rev B, 2020 | документ Qualcomm (локальной копии нет) | скалярное ядро, регистры, модель памяти, интринсики | закрытый документ; версия только для v68 |
 | **Hexagon V68 HVX Programmer's Reference Manual**, 80-N2040-47 Rev E, 2021 | `/tmp/opencode/docs/hvx-v68.pdf` (299 с.) | ISA HVX: `vrmpy`, `vlsr`, `vror`, `vshuffe/vshuffo`, `l2fetch`, выравнивание 128 Б, маски | описывает ISA, а не конкретные грабли прошивки; поведение `qurt_*` — вне него |
-| **Hexagon HMX PRM**, 80-N2040-62 | `/tmp/opencode/hmx.pdf`, `/tmp/opencode/hmx.txt` | кроутоны, `:deep`, `dC`, store `:after`, bias-блок, геометрия тайла | **написан для v73**: `cvt`/`:2x2` на v68 отсутствуют, пример §3.2 не собирается; раскладка int8 в PRM не документирована |
+| **Hexagon HMX PRM**, 80-N2040-62 | `/tmp/opencode/hmx.pdf`, `/tmp/opencode/hmx.txt` | кроутоны, `:deep`, `dC`, store `:after`, bias-блок, геометрия тайла | **Rev AA — это V81**: `cvt`/`:2x2` на v68 отсутствуют, пример §3.2 не собирается; раскладка int8 в PRM не документирована |
 | **Qualcomm QAIRT / QNN docs** | docs.qualcomm.com (QNN SDK, HTP backend) | модель графа (backend/device/context/graph/finalize/execute), поддерживаемые ops, квантование, context binary | онлайн-документация привязана к версии SDK; список ops для V68 неполный |
 | **llama.cpp, Hexagon backend + HMX PR #20693** | `/tmp/opencode/docs/hmx-llamacpp.diff` | открытая реализация HVX/HMX-пути, флаг `GGML_HEXAGON_USE_HMX`, структура вызовов | HMX-путь только для **v73+**; код в diff не является эталоном для v68 |
 | **htp-ops-lib** | github.com/haozixu/htp-ops-lib | примеры HMX/HVX-операторов для LLM (GEMM, attention) на Hexagon | ориентирован на v73+; лицензия/качество — проверять перед заимствованием |
@@ -24,16 +24,18 @@
 
 | Путь | Что внутри |
 |---|---|
-| `/tmp/opencode/gemv/` | int4 GEMV, FFN, attention, `README.md`, `*.c`, `ffn_raw.txt` |
+| `/tmp/opencode/gemv/` | int4 GEMV, FFN, attention, `README.md`, `*.c` |
+| `/tmp/opencode/ffn_raw.txt` | сырые прогоны FFN (разброс времени) |
 | `/tmp/opencode/conv/` | shortconv: `lfmconv_impl.c`, `conv_sim`, `conv_math.h` |
 | `/tmp/opencode/hmx4/` | HMX: `mx4_impl.c`, `REPORT*.md`, `FINAL*.md` |
-| `/tmp/opencode/qnn-study/` | дизассемблер скела: `hmx_syms.txt`, `groups.md`, `kernels.tsv`, `*.s`; полный `REPORT.md` — в работе |
+| `/tmp/opencode/qnn-study/` | дизассемблер скела: `hmx_syms.txt`, `groups.md`, `kernels.tsv`, `*.s`, `REPORT.md` |
 | `/tmp/opencode/android/qnn*.c` | стенды QNN: `qnnlayer.c`, `qnnblk.c`, `qnnarg.c`, `qnndump.c` |
 
 ## Чего в источниках нет
 
 * Документированной раскладки **int8**-кроутонов HMX для v68 (PRM покрывает
-  только fp16) — снимали экспериментально, S1 не закрыт.
+  только fp16) — снимали экспериментально; S1 закрыт 22.11.2026
+  (`REPORT18.md`: int8 побитово).
 * Официального описания `qurt_hvx_get_units`/поведения `qurt_thread_create` с
   HVX на потребительских прошивках — выяснено на стенде.
 * Публичных цифр QNN для LFM3 на V68 — все числа сняты нами.

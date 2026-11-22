@@ -12,10 +12,10 @@ Myelin — мобильный LLM-рантайм для Hexagon NPU (LFM3, Snapd
 | [dsp-kernels.md](dsp-kernels.md) | Наши DSP-ядра: int4-GEMV, FFN одним RPC, paged attention, shortconv, KV store/commit, SiLU; цифры и условия замеров |
 | [paged-kv.md](paged-kv.md) | Страницы по 32 токена, таблица страниц, radix-кэш на хосте, раскладка kvarn-страницы, staging-кольцо, инварианты и краевые случаи |
 | [hvx.md](hvx.md) | Внутренности HVX: контексты, потоки и стеки, `vrmpy`/`vsum`/`vshuff`, `l2fetch`, exp, грабли v68 |
-| [hmx.md](hmx.md) | Внутренности HMX: питание, 16-битные ячейки, раскладки, `:deep` на весах, MAC-геометрия, статус R&D |
+| [hmx.md](hmx.md) | Внутренности HMX: питание, раскладки fp16/int8, `:deep`, bias/scale, MAC-геометрия, грабли v68; статус — работает |
 | [qnn-notes.md](qnn-notes.md) | Что выяснено про QNN: сборка графа, ограничения V68, context binary, скорости, дизассемблер скела |
 | [measurements.md](measurements.md) | Сводная таблица замеров: APU для сравнения, телефон HVX/HMX/QNN, с датами и условиями |
-| [decisions.md](decisions.md) | ADR: почему «всё сами», paged KV, kvarn 4/2, `kv_pool = max_seqs`, HMX как R&D, UniFFI, in-app, SDK 37 |
+| [decisions.md](decisions.md) | ADR: почему «всё сами», paged KV, kvarn 4/2, `kv_pool = max_seqs`, HMX в prefill (ADR-010), UniFFI, in-app, SDK 37 |
 | [roadmap.md](roadmap.md) | Этапы P0…оптимизации с критериями приёмки и текущим статусом |
 | [bibliography.md](bibliography.md) | Источники (PRM, QNN, llama.cpp, htp-ops-lib, Android) и что из них взято |
 
@@ -26,8 +26,9 @@ Myelin — мобильный LLM-рантайм для Hexagon NPU (LFM3, Snapd
 * **в работе** — код/эксперимент начат, результат не закрыт.
 * **нет данных** — в доступных источниках цифры/факта нет; ничего не выдумываем.
 
-Все замеры телефона сняты на Snapdragon 888 (CDSP v68, 1.42 ГГц, unsigned PD),
-если не указано иное. Даты — по времени артефактов в `/tmp/opencode`.
+Все замеры телефона сняты на Snapdragon 888 (CDSP v68, unsigned PD), если не
+указано иное; 1.42 ГГц — допущение, на стенде не измерено (в HMX-замерах клок
+измерен как 1.13 ГГц). Даты — по времени артефактов в `/tmp/opencode`.
 
 ## Статус одной строкой
 
