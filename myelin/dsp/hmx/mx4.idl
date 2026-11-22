@@ -1,0 +1,149 @@
+#ifndef MX4_IDL
+#define MX4_IDL
+#include "AEEStdDef.idl"
+
+interface mx4 {
+   /* VTCM caps: r = {rc_total, page_size, page_count, rc_avail, avail_bytes,
+                     max_page, npages, hmx_unit_bits} */
+   long info(rout sequence<long> r);
+
+   /* Verified acquisition recipe only: acquire(hmx=1, vtcm=64K) -> lock ->
+      mxclracc -> unlock -> release.  r = {status, lock_rc, unlock_rc, vtcm_size,
+      ctx, 0, 0, 0} */
+   long recipe(rout sequence<long> r);
+
+   /* One HMX tile multiply stream: ncr activation croutons x ncr weight
+      croutons -> one 32x32 uint8 output tile.
+        act : ncr * 2048 bytes, already in HMX crouton layout (1 KB data + 1 KB
+              zero pad per 2 KB slot, slots 2 KB aligned)
+        wgt : same, ncr * 2048 bytes
+        ac  : activation control word (Rt)
+        wc  : weight control word (Rt)
+        store: 0 = :after:sat.ub = acc, 1 = :after:sat.uh = acc:2x1
+        variant bit0: activation uses the :cm (compact 8-bit) form
+                bit1: store uses :after:cm:sat.ub (compact) else :after:sat.ub
+        ops     bit0: issue the multiply, bit1: issue the acc store
+      raw = 2048 bytes of the VTCM output slot; info = {status, ac, wc, variant,
+      ncr, vtcm_bytes} */
+   long tile(in sequence<octet> act, in sequence<octet> wgt,
+             in long ac, in long wc, in long srt, in long variant, in long ops,
+             rout sequence<octet> raw, rout sequence<long> info);
+
+   /* Full tiled int8 GEMM with host-prepacked operands.
+        A : m32 * ncr * 2048 bytes   (activations, 32 rows per tile, padded)
+        B : n32 * ncr * 2048 bytes   (weights, 32 cols per tile, padded)
+        C : M * N bytes              (uint8 row-major result)
+      mode bit0: stage activations one M tile at a time (low VTCM footprint)
+      res = {status, us_hmx, us_full, us_stage, tiles, m32, n32, ncr,
+             vtcm_bytes, act_bytes, wgt_bytes, stage_kind} */
+   /* PRM section 3.2 example, verbatim (fp16 32x32x32), with configurable
+      spatial mask (0b11100 as in the doc).  raw = 2 KB of the result tile. */
+   long fp16ex(in long mask, rout sequence<octet> raw, rout sequence<long> info);
+
+   /* Store coverage probe: A=1, B=I (out = 1.0 everywhere), then `nst` stores
+      with explicit addresses/rt.  info = {status, filled, act_rt, wgt_rt, 0, 0} */
+   long cov(in long off0, in long step, in long nst, in long rt, in long form,
+            rout sequence<octet> raw, rout sequence<long> info);
+
+   /* fp16 accumulation test: A=1, B[n][k]=1 for k<cnt -> out = number summed */
+   long psum(in long cnt, rout sequence<octet> raw, rout sequence<long> info);
+
+   /* fp16 channel scan: A = delta(k,k0), B = all ones -> out = 1 if k0 is read */
+   long kscan(in long k0, rout sequence<octet> raw, rout sequence<long> info);
+
+   /* fp16 S1: A/B given by host (32x32 each), C = 32x32 result */
+   long cfg(in long pack, in long wrt);
+   long cfg2(in long art, in long wrt);
+   long dlprobe(rout sequence<long> r);
+   long qnn8(in long ncr, in long wstride, in long wgt_rt, in long astep,
+             rout sequence<octet> raw, rout sequence<long> info);
+   long s1q(in sequence<octet> A, in sequence<octet> B, in long wstride,
+            in long wgt_rt, rout sequence<octet> raw, rout sequence<long> info);
+   long s1f16(in sequence<octet> A, in sequence<octet> B,
+              rout sequence<octet> C, rout sequence<long> info);
+
+   /* fp16 clean probe: mode 0 -> A=2.0,B=I (expect 2.0 everywhere);
+      mode 1 -> A[s][c]=s+c/32, B=I  (value decodes to (s_read,c_read))       */
+   long amap2(in long mode, rout sequence<octet> raw, rout sequence<long> info);
+
+   /* fp16 identity maps: mode 0 -> A=c, B=I (expect out[s][n]=n)
+      mode 1 -> A=s, B[n][k]=(k==0) (expect out[s][n]=s) */
+   long idmap(in long mode, rout sequence<octet> raw, rout sequence<long> info);
+
+   /* Byte-position probe: zero both 2 KB tiles, put a single 1 at byte q of
+      the activation (side=0) or the weight tile (side=1), fill the other tile
+      with ones, run one multiply+store and return the output words.
+      out = {status, w0, w1, w2, w3}                                         */
+   long pos(in long side, in long q, in long ac, in long wc, rout sequence<long> vals);
+
+   /* VTCM diagnostics.  mode bit0: also run an HMX bias load + bias store
+      (an HMX *write* to VTCM that does not depend on the accumulator).
+      r = {status, vtcm_base, vtcm_size, scalar_readback, hmx_write_sum,
+           avail_bytes, page_size, hmx_bits} */
+   long probe(in long mode, rout sequence<long> r);
+
+   /* FP16 reference tile 32x32x32 (PRM-documented layout, qhblas encoding):
+      A = all ones, B = identity -> out[s][n] = 1.0 (s==n). raw = 2 KB out. */
+   long fp16(in sequence<octet> unused, rout sequence<octet> raw, rout sequence<long> info);
+
+   long gemm(in sequence<octet> A, in sequence<octet> B,
+             in long M, in long N, in long K, in long reps, in long mode,
+             rout sequence<octet> C, rout sequence<long> res);
+
+   /* qhl_hmx SDK reference path: [32xK] fp16 x [KxN] fp16 -> [32xN] fp16,
+      packed with qhblas_hmx_transfer_row/column_ahf and multiplied by
+      qhblas_hmx_matrix_matrix_mpy_ahf (arch<73 kernel).  N<=64, K in
+      32..256 step 32.
+      mode bit0 skip HMX power, bit1 skip mxclracc, bit2 skip HMX lock,
+           bit3 skip HVX lock, bit4 native N (else pad N to 64),
+           bit5 qurt_hmx_lock2(SHARED), bit6 hold HVX lock across HMX,
+           bit7 act mask 0x3C (else 0x7C)
+      info = {status, us_per_rep, lock_rc, act_ctrl, wgt_ctrl, ncr, power_rc,
+              mpy_rc, hvx_rc, pack_row_rc, vtcm_bytes, npad, pack_col_rc,
+              unlock_rc} */
+   long hmxref(in sequence<octet> A, in sequence<octet> B,
+               in long N, in long K, in long mode, in long reps,
+               rout sequence<octet> C, rout sequence<long> info);
+
+   /* Layout dump of the SDK packers: element *indices* are written as raw
+      fp16 bit patterns, packed, and returned.  side 0 = activation (bytes
+      32*K*2), side 1 = weights (bytes K*32*2, n=0..31 of the 64-wide tile).
+      info = {status, hvx_rc, pack_rc, bytes} */
+   long refdump(in long K, in long side, rout sequence<octet> raw,
+                rout sequence<long> info);
+
+   /* int8: A [32xK] uint8 row-major, B [NxK] int8 row-major (B[n][k]).
+      lay 3 = hw int8 (s>>2)*128 + 4*k + (s&3)   [64 spatial x 32 K, 2 KB]
+      wl  3 = (k>>2)*128 + 4*n + (k&3)           [32 K x 32 N, 1 KB]
+      wl  4 = same but 2 KB per 32 K (64 N, weight.b:deep)
+      art/wc  : control words as given (int8: 0x3FF / 1023)
+      srt     : 0 :after:sat.ub = acc   1 :after:sat.uh = acc:2x1
+                2 :after.ub = acc       3 :after.uh = acc:2x1
+      mul     : bit0 :deep on activation (dC in art), bit1 :deep on weight
+                (N>32: two stores, bias reload +0x100)
+      npair   : (act+2048, wgt+step) pairs issued before the store, 0 -> K/32
+      bscale  : int8 bias/scale low word (0x6000 == 1.0), 0 -> no bias load
+      mode    : bit0 skip HMX power, bit1 skip mxclracc, bit2 skip HMX lock,
+                bit3 qurt_hmx_lock2 instead of compute_resource_hmx_lock
+      info = {status, us, pcyc, art, wc, ncr, power_rc, lock_rc, hvx_rc,
+              srt, vtcm_bytes, mul, act_region, wgt_region} */
+   long i8(in sequence<octet> A, in sequence<octet> B, in long N, in long K,
+           in long lay, in long wl, in long art, in long wc, in long srt,
+           in long mul, in long npair, in long bscale, in long mode,
+           in long reps, rout sequence<octet> raw, rout sequence<long> info);
+
+   /* int8 GEMM with M spatial rows (1..64).  A = M*K bytes row major, B =
+      N*K bytes row major (B[n][k]), the rest as `i8` with mul=4 for the
+      :deep K accumulation.  raw = 2048 B (64 spatial x 32 N) or 4096 B for
+      N=64.  info = {status, us_total, pcyc, art, wc, ncr, power_rc, lock_rc,
+      hvx_rc, srt, vtcm_bytes, mul, act_region, wgt_region} */
+   long i8m(in sequence<octet> A, in sequence<octet> B, in long M, in long N,
+            in long K, in long lay, in long wl, in long art, in long wc,
+            in long srt, in long mul, in long bscale, in long mode,
+            in long reps, rout sequence<octet> raw, rout sequence<long> info);
+
+   /* DSP clock calibration: r = {pcycles, us, pcycles_per_us} */
+   long clk(rout sequence<long> r);
+};
+
+#endif /* MX4_IDL */

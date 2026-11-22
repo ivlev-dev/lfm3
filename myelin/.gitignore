@@ -1,1 +1,27 @@
 /target/
+
+# --- myelin/dsp: артефакты сборки стендов (Hexagon/FastRPC) ---
+/dsp/**/*.so
+/dsp/**/*.o
+/dsp/**/*.a
+/dsp/**/build/
+/dsp/**/target/
+
+# генераты qaic (создаются build.sh)
+/dsp/**/mx4.h
+/dsp/**/mx4_skel.c
+/dsp/**/mx4_stub.c
+/dsp/**/lfmgemv.h
+/dsp/**/lfmgemv_skel.c
+/dsp/**/lfmgemv_stub.c
+
+# host-бинарники стендов
+/dsp/hmx/mx4_test
+/dsp/hvx/lfmgemv_test
+/dsp/hvx/ab_test
+/dsp/hvx/ffn_test
+/dsp/hvx/attn_test
+/dsp/hvx/diag_test
+/dsp/hvx/probe_test
+/dsp/conv/conv_test
+/dsp/conv/conv_sim
