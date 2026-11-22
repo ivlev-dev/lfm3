@@ -100,7 +100,8 @@ static inline int32_t vsum_w(HVX_Vector v) {
  * Splits a into high/low 16 bits and truncates the low part to 8 bits,
  * error ~= (a & 0xff)*b/65536.  Negligible in the SiLU/exp path (b ~ 2^16),
  * but NOT for int8 requantisation with a small multiplier: b ~ 0.015 gives
- * ~4 LSB of 127.  pack_out_i8() below takes the product in 64 bits. */
+ * ~4 LSB of 127.  pack_out_i8() and requant_mid() below take the product in
+ * 64 bits. */
 static inline int32_t mulq16(int32_t a, int32_t b)
 {
     int32_t hi = a >> 16;
@@ -598,6 +599,24 @@ static inline int32_t silu_q16(int32_t zq)
     return a + (((b - a) * frac) >> 10);   /* |b-a|<2^13, frac<2^10 -> int32 */
 }
 
+/* Mid-buffer requant: pr is Q16 of the real product P = silu(gate)*up, and
+ * P/s_mid = pr*mq_mid/2^28 (mq_mid = 4096/s_mid).  The product must be taken
+ * in 64 bits.  The former `mulq16(pr >> 12, mq_mid)` resolves pr with a step
+ * of 2^12, i.e. P with a step of 1/16, which is 1/(16*s_mid) of a mid-buffer
+ * LSB: 5 LSB at the measured layer-0 scale s_mid = 0.0127, and it zeroes
+ * every lane with P < 16 outright.  Measured on the real LFM3-1.7B weights
+ * (myelin/dsp/hvx/silu_err_study.c, 24 tokens x 7680 lanes): literal mulq16
+ * leaves 100% of the lanes at 0, cos(y_ffn) = 0.47 vs 0.995 for this form;
+ * int64 on the already-shifted product is still 3-5 LSB / cos = 0.73.
+ * Same precision rule as pack_out_i8(). */
+static inline int32_t requant_mid(int32_t pr, int32_t mq_mid)
+{
+    int64_t v = ((int64_t)pr * (int64_t)mq_mid + ((int64_t)1 << 27)) >> 28;
+    if (v > 127) v = 127;
+    if (v < -127) v = -127;
+    return (int32_t)v;
+}
+
 /* SiLU + int8 quantisation over an index range (scalar, 4x unrolled) */
 static void silu_range(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
                        int32_t mq_mid)
@@ -611,10 +630,7 @@ static void silu_range(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
             int32_t zg = mulq16(g->acc[k], g->qp30[k] >> 14);
             int32_t zu = mulq16(g_ffn.acc2[k], u->qp30[k] >> 14);
             int32_t pr = mulq16(silu_q16(zg), zu);
-            int32_t v = mulq16(pr >> 12, mq_mid);
-            if (v > 127) v = 127;
-            if (v < -127) v = -127;
-            hv[t] = v;
+            hv[t] = requant_mid(pr, mq_mid);
         }
         g_ffn.h[i4 + 0] = (int8_t)hv[0];
         g_ffn.h[i4 + 1] = (int8_t)hv[1];
@@ -625,10 +641,7 @@ static void silu_range(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
         int32_t zg = mulq16(g->acc[i4], g->qp30[i4] >> 14);
         int32_t zu = mulq16(g_ffn.acc2[i4], u->qp30[i4] >> 14);
         int32_t pr = mulq16(silu_q16(zg), zu);
-        int32_t v = mulq16(pr >> 12, mq_mid);
-        if (v > 127) v = 127;
-        if (v < -127) v = -127;
-        g_ffn.h[i4] = (int8_t)v;
+        g_ffn.h[i4] = (int8_t)requant_mid(pr, mq_mid);
     }
 }
 

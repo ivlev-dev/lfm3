@@ -112,6 +112,11 @@ int main(int argc, char **argv)
     unsigned char *sbuf;
     int rounds = (argc > 1) ? atoi(argv[1]) : 3;
     const float s_mid = 0.0625f, s_out = 0.5f;
+    /* NOTE: sa = 1 for gate/up (below) means the dequantised gate value is Q0
+     * while silu_q16() expects Q16, so the synthetic stand's mid buffer comes
+     * out all-zero and the "FFN correctness" lines only prove DSP<->host
+     * bit-exactness.  The mid-buffer numerics are measured on the real GGUF
+     * weights in silu_err_study.c. */
 
     setvbuf(stdout, NULL, _IONBF, 0);
     if (enable_unsigned() != 0) { printf("unsigned PD failed\n"); return 10; }
@@ -292,11 +297,12 @@ int main(int argc, char **argv)
             int32_t zu = mulq16(accu[i], mark_q30(suw[i]) >> 14);
             int32_t sv = silu_q16(zg);
             int32_t pr = mulq16(sv, zu);
-            int32_t ps = pr >> 12;
-            int32_t hv = mulq16(ps, mq_mid);
-            if (hv > 127) hv = 127;
-            if (hv < -127) hv = -127;
-            h[i] = (int8_t)hv;
+            /* full-precision mid requant, same expression as requant_mid() in
+             * lfmgemv_impl.c (pr is Q16 of silu(g)*u, P/s_mid = pr*mq/2^28) */
+            int64_t hv64 = ((int64_t)pr * (int64_t)mq_mid + ((int64_t)1 << 27)) >> 28;
+            if (hv64 > 127) hv64 = 127;
+            if (hv64 < -127) hv64 = -127;
+            h[i] = (int8_t)hv64;
         }
 
         for (kk = 0; kk < n; kk++) {
