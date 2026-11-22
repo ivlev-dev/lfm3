@@ -269,6 +269,9 @@ struct ConvAcc {
     input: AbsMax,
     mix: AbsMax,
     y: AbsMax,
+    /// Per-channel absmax of `y`: the conv output is heavy-tailed, so one
+    /// scale for the buffer wastes most of the int8 range.
+    y_ch: Vec<f32>,
     out: AbsMax,
     weights: ConvWeights,
     state: Vec<f32>,
@@ -372,6 +375,7 @@ fn load_layers(model: &Path, spec: &ModelSpec, context: usize) -> Vec<LayerAcc> 
                     input: AbsMax::default(),
                     mix: AbsMax::default(),
                     y: AbsMax::default(),
+                    y_ch: vec![0.0f32; dims.hidden],
                     out: AbsMax::default(),
                     weights: ConvWeights {
                         in_proj: load_matrix(model, &format!("{prefix}.shortconv.in_proj.weight")),
@@ -563,6 +567,20 @@ fn run_attention(
     output
 }
 
+impl ConvAcc {
+    /// Per-channel `y` steps: the buffer is heavy-tailed, so each channel gets
+    /// its own int8 range and the out projection folds the table in.
+    fn y_scales(&self) -> Vec<f32> {
+        self.y_ch
+            .iter()
+            .map(|value| {
+                let step = value / ACT_TARGET;
+                if step > 0.0 { step } else { 1.0 }
+            })
+            .collect()
+    }
+}
+
 fn run_conv(conv: &mut ConvAcc, input: &[f32]) -> Vec<f32> {
     let hidden = input.len();
     let ksize = conv.ksize;
@@ -580,6 +598,7 @@ fn run_conv(conv: &mut ConvAcc, input: &[f32]) -> Vec<f32> {
             accumulator += weight * conv.state[lag * hidden + channel];
         }
         y[channel] = c[channel] * accumulator;
+        conv.y_ch[channel] = conv.y_ch[channel].max(y[channel].abs());
     }
     if ksize > 2 {
         conv.state.copy_within(hidden.., 0);
@@ -705,14 +724,19 @@ fn build_pack(
             // The shortconv buffers are the ones the DSP quantises to int8
             // inside the layer, so their tail costs resolution everywhere.
             let mix_scale = conv.mix.step_clipped(ACT_TARGET, 8.0);
-            let y_scale = conv.y.step_clipped(ACT_TARGET, 8.0);
+            // Per-channel `y` scales are opt-in: they help heavy-tail channels
+            // but amplify the conv's own rounding noise where |y| is tiny, and
+            // measured worse on LFM3 (0.456 vs 0.910 at layer 0).
+            let per_channel = std::env::var_os("MYELIN_PACK_PERCHANNEL").is_some();
+            let y_scales = conv.y_scales();
+            let y_scale = if per_channel { 1.0 } else { conv.y.step_clipped(ACT_TARGET, 8.0) };
             let taps: Vec<f32> = conv.weights.taps.data().to_vec();
-            let blob = shortconv::build(
-                &taps,
-                dims.hidden,
-                ActivationScales::cli(mix_scale, y_scale),
-            )
-            .expect("shortconv");
+            let scales = if per_channel {
+                ActivationScales::channels(mix_scale, y_scales.clone())
+            } else {
+                ActivationScales::cli(mix_scale, y_scale)
+            };
+            let blob = shortconv::build(&taps, dims.hidden, scales).expect("shortconv");
             let file = format!("conv_{index:02}.blob");
             conv_blobs.push((file.clone(), blob.blob.clone()));
             PackConv {
@@ -724,7 +748,7 @@ fn build_pack(
                 conv_file: file,
                 out_proj: pack_gemv(
                     &format!("conv_{index:02}_out"),
-                    y_scale,
+                    if per_channel { 1.0 } else { y_scale },
                     conv.out.step(ACT_TARGET),
                 ),
                 mix_scale,
@@ -893,12 +917,25 @@ fn pack_blobs(
         }
         if let (Some(conv), Some(pack_conv)) = (&layer.conv, &pack_layer.conv) {
             written += write_gemv(&args.out, &pack_conv.in_proj, &conv.weights.in_proj, "conv");
-            written += write_gemv(
-                &args.out,
-                &pack_conv.out_proj,
-                &conv.weights.out_proj,
-                "conv",
-            );
+            // Fold the per-channel `y` scales into the columns of the out
+            // projection, so the conv can quantise each channel to its own
+            // range while this matrix still sees a single activation scale.
+            if std::env::var_os("MYELIN_PACK_PERCHANNEL").is_some() {
+                let y_scales = conv.y_scales();
+                let matrix = &conv.weights.out_proj;
+                let n = matrix.n();
+                let k = matrix.data().len() / n;
+                let mut scaled = matrix.data().to_vec();
+                for row in 0..n {
+                    for col in 0..k {
+                        scaled[row * k + col] *= y_scales[col];
+                    }
+                }
+                let scaled = myelin_pack::Matrix::new(k, n, scaled).expect("scaled out_proj");
+                written += write_gemv(&args.out, &pack_conv.out_proj, &scaled, "conv");
+            } else {
+                written += write_gemv(&args.out, &pack_conv.out_proj, &conv.weights.out_proj, "conv");
+            }
         }
         if let (Some(attention), Some(pack_attention)) = (&layer.attention, &pack_layer.attention) {
             written += write_gemv(

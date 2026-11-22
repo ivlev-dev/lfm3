@@ -95,6 +95,10 @@ pub struct ActivationScales {
     pub s_bc: f32,
     /// Scale of the int8 conv output `y`.
     pub s_y: f32,
+    /// Per-channel `y` scales. When present, `s_y` is only a fallback and the
+    /// out projection must fold the same table into its columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s_y_channels: Option<Vec<f32>>,
     /// Where the values came from: `"cli"` or `"stand_default"`.
     pub source: String,
 }
@@ -105,6 +109,17 @@ impl ActivationScales {
         Self {
             s_bc,
             s_y,
+            s_y_channels: None,
+            source: "cli".to_string(),
+        }
+    }
+
+    /// Per-channel `y` scales from a per-channel calibration.
+    pub fn channels(s_bc: f32, s_y_channels: Vec<f32>) -> Self {
+        Self {
+            s_bc,
+            s_y: 1.0,
+            s_y_channels: Some(s_y_channels),
             source: "cli".to_string(),
         }
     }
@@ -114,6 +129,7 @@ impl ActivationScales {
         Self {
             s_bc: STAND_S_BC,
             s_y: STAND_S_Y,
+            s_y_channels: None,
             source: "stand_default".to_string(),
         }
     }
@@ -267,11 +283,11 @@ pub fn build(taps: &[f32], h: usize, scales: ActivationScales) -> Result<ConvBlo
         for (tap, &w) in row.iter().enumerate() {
             tap_codes[channel * TAPS + tap] = quantize_tap(w, scale);
         }
-        let k = conv_k(
-            f64::from(max_abs),
-            f64::from(scales.s_bc),
-            f64::from(scales.s_y),
-        );
+        let s_y = scales
+            .s_y_channels
+            .as_ref()
+            .map_or(scales.s_y, |v| v[channel]);
+        let k = conv_k(f64::from(max_abs), f64::from(scales.s_bc), f64::from(s_y));
         if k > kmax {
             kmax = k;
         }
@@ -279,13 +295,13 @@ pub fn build(taps: &[f32], h: usize, scales: ActivationScales) -> Result<ConvBlo
 
     let ksh = pick_ksh(kmax);
     let mut kq = Vec::with_capacity(h);
-    for &max_abs in &tap_max_abs {
+    for (channel, &max_abs) in tap_max_abs.iter().enumerate() {
+        let s_y = scales
+            .s_y_channels
+            .as_ref()
+            .map_or(scales.s_y, |v| v[channel]);
         kq.push(make_kq(
-            conv_k(
-                f64::from(max_abs),
-                f64::from(scales.s_bc),
-                f64::from(scales.s_y),
-            ),
+            conv_k(f64::from(max_abs), f64::from(scales.s_bc), f64::from(s_y)),
             ksh,
         ));
     }
