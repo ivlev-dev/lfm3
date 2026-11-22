@@ -639,6 +639,8 @@ pub mod exec {
         Conv = 4,
         Dump = 5,
         Ffn16 = 6,
+        Conv16 = 7,
+        Gemv16 = 8,
     }
 
     fn put_i32(out: &mut [u8], offset: usize, value: i32) {
@@ -727,6 +729,52 @@ pub mod exec {
             command.src_len = len;
             command.dst_off = dst_off;
             command.dst_len = len;
+            command
+        }
+
+        /// Shortconv with a 16-bit `y` buffer (int16 codes, 256x finer).
+        #[allow(clippy::too_many_arguments)]
+        pub const fn conv16(
+            handle: i32,
+            h: i32,
+            ksh: i32,
+            slot: i32,
+            counter: i32,
+            tbl_off: i32,
+            src_off: i32,
+            dst_off: i32,
+        ) -> Self {
+            let mut command = Self::empty(Op::Conv16);
+            command.h[0] = handle;
+            command.args[0] = h;
+            command.args[1] = ksh;
+            command.args[2] = slot;
+            command.args[3] = counter;
+            command.tbl_off = tbl_off;
+            command.src_off = src_off;
+            command.src_len = 3 * h;
+            command.dst_off = dst_off;
+            command.dst_len = 2 * h;
+            command
+        }
+
+        /// GEMV over int16 activations: `src_len` is a byte count.
+        pub const fn gemv16(
+            handle: i32,
+            reps: i32,
+            src_off: i32,
+            src_bytes: i32,
+            dst_off: i32,
+            dst_len: i32,
+        ) -> Self {
+            let mut command = Self::empty(Op::Gemv16);
+            command.h[0] = handle;
+            command.args[0] = 1;
+            command.args[1] = reps;
+            command.src_off = src_off;
+            command.src_len = src_bytes;
+            command.dst_off = dst_off;
+            command.dst_len = dst_len;
             command
         }
 

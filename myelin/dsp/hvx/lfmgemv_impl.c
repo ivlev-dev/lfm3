@@ -2453,6 +2453,65 @@ int lfmgemv_set_scale(int h, const unsigned char *scales, int scalesLen)
     return 0;
 }
 
+/* ---------------- GEMV with 16-bit activations ---------------- */
+/* The int8 kernel is reused: a16 = 128*hi + lo, so
+ *   dot(w, a16) = 128*dot(w, hi) + dot(w, lo).
+ * Two passes over the same weights, one combined int8-equivalent result. */
+static int32_t *g_acc2;
+static int      g_acc2_n;
+static int8_t  *g_hi, *g_lo;
+static int      g_hi_n;
+
+static int gemv16_impl(int h, const int16_t *a16, int K, int8_t *dst, int N)
+{
+    gbuf_t *b;
+    int8_t *hi, *lo;
+    int32_t bhi, blo, i;
+
+    if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
+    b = &g_buf[h];
+    if (!b->w || !b->qp) return AEE_EBADPARM;
+    if (K != b->K || N != b->N) return AEE_EBADPARM;
+    if (g_acc2_n < N) {
+        free(g_acc2);
+        g_acc2 = (int32_t *)memalign(128, (size_t)N * sizeof(int32_t));
+        g_acc2_n = N;
+        if (!g_acc2) { g_acc2_n = 0; return AEE_ENOMEMORY; }
+    }
+    if (g_hi_n < K) {
+        free(g_hi); free(g_lo);
+        g_hi = (int8_t *)memalign(128, (size_t)K + 128);
+        g_lo = (int8_t *)memalign(128, (size_t)K + 128);
+        g_hi_n = K;
+        if (!g_hi || !g_lo) { g_hi_n = 0; return AEE_ENOMEMORY; }
+    }
+    hi = g_hi;
+    lo = g_lo;
+
+    for (i = 0; i < K; i++) {
+        int32_t v = a16[i];
+        int32_t h8 = (v + 64) >> 7;
+        if (h8 > 127) h8 = 127;
+        if (h8 < -127) h8 = -127;
+        hi[i] = (int8_t)h8;
+        lo[i] = (int8_t)(v - (h8 << 7));
+    }
+
+    deinterleave(hi, b->ae, b->ao, K);
+    bhi = -8 * sum_act_i8(hi, K);
+    run_split_m1(b, b->ae, b->ao, bhi, b->acc);
+    deinterleave(lo, b->ae, b->ao, K);
+    blo = -8 * sum_act_i8(lo, K);
+    run_split_m1(b, b->ae, b->ao, blo, g_acc2);
+
+    for (i = 0; i < N; i++) {
+        int64_t c = ((int64_t)128 * (int64_t)b->acc[i]) + (int64_t)g_acc2[i];
+        b->acc[i] = (int32_t)((c + 128) >> 8);
+    }
+    pack_out_i8(b->acc, b->qp, dst, N);
+    return 0;
+}
+
 static int gemv_impl(int h, int M, const unsigned char *act, int actLen, int reps,
                      unsigned char *dst, int dstLen, int *times, int timesLen,
                      int use_resident)
@@ -3190,7 +3249,7 @@ int lfmgemv_release_buf(int h)
 #define LFM_CMD_MAX       256
 
 enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
-       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5, LFM_CMD_FFN16 = 6 };
+       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5, LFM_CMD_FFN16 = 6, LFM_CMD_CONV16 = 7, LFM_CMD_GEMV16 = 8 };
 enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
 enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
 
@@ -3278,6 +3337,27 @@ static void xconv_dot(const int8_t *hi, const int8_t *lo, const int8_t *wq,
         HVX_Vector r  = Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(ah, 8), al);
         *(HVX_Vector *)(res + (size_t)g * 32) = r;
     }
+}
+
+/* 16-bit variant of conv_glue: eight more fractional bits before the clamp,
+ * so a shortconv output that is ~7x smaller than steady state (the ring is
+ * only partly filled on the first tokens) still keeps its resolution. */
+static inline int16_t conv_glue16(int32_t out32, int c8, int32_t kq, int ksh)
+{
+    int64_t v = (int64_t)((out32 >> 1) * (int32_t)c8) * (int64_t)kq;
+    v += (int64_t)1 << (ksh - 10);
+    v >>= (ksh - 9);
+    if (v > 32767) v = 32767;
+    if (v < -32767) v = -32767;
+    return (int16_t)v;
+}
+
+static void xconv_pack_y16(const int32_t *res, const int8_t *c, const int32_t *kq,
+                           int ksh, int16_t *y, int H)
+{
+    int ch;
+    for (ch = 0; ch < H; ch++)
+        y[ch] = conv_glue16(res[2 * ch] + res[2 * ch + 1], c[ch], kq[ch], ksh);
 }
 
 static void xconv_pack_y(const int32_t *res, const int8_t *c, const int32_t *kq,
@@ -3386,7 +3466,7 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
     uint8_t *dp = 0;
     int rc, reps, n;
 
-    if (c->type > LFM_CMD_FFN16) return AEE_EBADPARM;
+    if (c->type > LFM_CMD_GEMV16) return AEE_EBADPARM;
     rc = lfm_src_ptr(c, out, outLen, &sp);
     if (rc != 0) return rc;
     rc = lfm_dst_ptr(c, out, outLen, &dp);
@@ -3468,6 +3548,45 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
         if (!lfm_range_ok(c->src_off, c->src_len, g_scratch_bytes)) return AEE_EBADPARM;
         memcpy(out + c->dst_off, g_scratch + c->src_off, (size_t)c->src_len);
         return 0;
+    case LFM_CMD_GEMV16:
+        if ((c->src_len & 1) != 0) return AEE_EBADPARM;
+        return gemv16_impl(c->h0, (const int16_t *)sp, c->src_len / 2, dp, c->dst_len);
+    case LFM_CMD_CONV16: {
+        gbuf_t *cb;
+        int H = c->a0, ksh = c->a1, slot = c->a2, ctr = c->a3;
+        const int8_t *wq8;
+        const int32_t *kq;
+        int8_t *st, *hi, *lo;
+        size_t need, st_bytes;
+        int p;
+        if (c->rt_base >= 0) {
+            if (rt == 0 || c->rt_base >= rt_n) return AEE_EBADPARM;
+            ctr = rt[c->rt_base];
+        }
+        if (c->h0 < 0 || c->h0 >= MAXBUF) return AEE_EBADPARM;
+        cb = &g_buf[c->h0];
+        if (!cb->used || !cb->w) return AEE_EBADPARM;
+        if (H < 16 || (H & 15) != 0 || H > 16384) return AEE_EBADPARM;
+        if (ksh < 10 || ksh > 40) return AEE_EBADPARM;
+        if (slot < 0 || slot >= 8) return AEE_EBADPARM;
+        need = (size_t)8 * H * 8 + (size_t)4 * H;
+        if (cb->wbytes < need) return AEE_EBADPARM;
+        if (c->src_len != 3 * H || c->dst_len != 2 * H) return AEE_EBADPARM;
+        st_bytes = (size_t)2 * H * 8 * (slot + 1);
+        if (!lfm_range_ok(c->tbl_off, (int)st_bytes, g_scratch_bytes)) return AEE_EBADPARM;
+        rc = lfm_conv_res_ensure(2 * H);
+        if (rc != 0) return rc;
+        wq8 = (const int8_t *)cb->w;
+        kq = (const int32_t *)(cb->w + (size_t)8 * H * 8);
+        st = (int8_t *)g_scratch + c->tbl_off + (size_t)slot * 2 * H * 8;
+        hi = st;
+        lo = st + (size_t)H * 8;
+        p = ctr & 7;
+        xconv_bx_write(hi, lo, p, (const int8_t *)sp, (const int8_t *)sp + 2 * H, H);
+        xconv_dot(hi, lo, wq8 + (size_t)p * (H / 16) * 128, g_conv_res, H / 16);
+        xconv_pack_y16(g_conv_res, (const int8_t *)sp + H, kq, ksh, (int16_t *)dp, H);
+        return 0;
+    }
     case LFM_CMD_CONV: {
         gbuf_t *b;
         int H = c->a0, ksh = c->a1, slot = c->a2, ctr = c->a3;

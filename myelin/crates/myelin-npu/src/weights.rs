@@ -1730,6 +1730,8 @@ impl ResidentWeights {
                 return Err(error);
             }
         }
+        // The conv writes 16-bit `y` (CONV16): its codes are 256x finer, so the
+        // out projection sees `s_y / 256` instead of `s_y`.
         match self.upload_packed(&plan.out_proj, plan.y_scale, plan.out_scale, state) {
             Ok(image) => images.push(image),
             Err(error) => {
