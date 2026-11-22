@@ -584,6 +584,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfm-npu-ref"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "lfm-domain",
+ "thiserror",
+]
+
+[[package]]
 name = "lfm-quant"
 version = "0.1.0"
 dependencies = [
@@ -715,6 +724,7 @@ dependencies = [
  "clap",
  "half",
  "lfm-gguf",
+ "lfm-npu-ref",
  "lfm-quant",
  "serde",
  "serde_json",

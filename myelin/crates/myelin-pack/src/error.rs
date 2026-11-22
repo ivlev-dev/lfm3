@@ -58,4 +58,12 @@ pub enum PackError {
         actual: f64,
         threshold: f64,
     },
+    #[error("shortconv blob is invalid: {0}")]
+    Shortconv(String),
+    #[error("kv page image is invalid: {0}")]
+    KvPage(String),
+    #[error("kvarn page is invalid: {0}")]
+    Kvarn(String),
+    #[error("raw input file is invalid: {0}")]
+    RawInput(String),
 }

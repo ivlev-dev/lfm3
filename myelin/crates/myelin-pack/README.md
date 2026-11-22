@@ -1,16 +1,23 @@
-# myelin-pack — GGUF → int8 HMX crownstone
+# myelin-pack — форматы весов для DSP и HMX
 
-Утилита и библиотека: берёт один тензор из GGUF (`dims = [K, N]`, `N` —
-выходные каналы), квантует его в симметричный int8 с **построчными** (по
-выходному каналу) масштабами, укладывает в кроустоны HMX `weight.b` (1 КиБ
-на тайл 32×32) и собирает 256-байтовые bias/scale-блоки, без которых
-int8-store на устройстве пишет нули.
+Утилита и библиотека: берёт тензоры из GGUF и собирает три бинарных формата,
+которые читает конкретный код, а не «примерно похожий»:
 
-Главное — встроенная проверка качества: blob распаковывается обратно, и
-считаются `cos` по каждому каналу и по тензору, `max |Δ|` в единицах
-масштаба канала и доля насыщенных значений.
+1. **HMX int8 crownstone** — один тензор (`dims = [K, N]`, `N` — выходные
+   каналы) в симметричный int8 с построчными масштабами, кроустоны `weight.b`
+   (1 КиБ на тайл 32×32) и 256-байтовые bias/scale-блоки;
+2. **shortconv blob** — 13 conv-слоёв LFM3 в образ команды `CONV` DSP-ядра
+   (`myelin/dsp/hvx/lfmgemv_impl.c`): 8 фаз повёрнутых int8-тапов + `kq[H]`;
+3. **KV-страницы** — образы K/KT/V для paged attention того же ядра, плюс
+   эталонный кодек `kvarn` (K4/V2, K4/V4), который DSP **не** читает.
 
-Раскладка взята из эмпирики на устройстве:
+Главное — встроенная проверка качества: каждый blob распаковывается обратно,
+и считаются `cos` по каналам/токенам и по тензору, `max |Δ|` в единицах
+масштаба и доля насыщенных значений. Для shortconv дополнительно есть
+**побайтовая сверка с C-кодом стенда** (`tests/c/conv_blob_ref.c`), для
+`kvarn` — побитовая сверка с `lfm-npu-ref::kvarn`.
+
+Раскладка crownstone взята из эмпирики на устройстве:
 `myelin/dsp/hmx/research/REPORT18.md` (§3, int8) и
 `myelin/dsp/qnn-reverse/REPORT.md` (§2.5, bias/scale). Загрузчик GGUF не
 дублируется: используется `lfm-gguf`, де-квантование — `lfm-quant`.
@@ -25,7 +32,7 @@ cargo build --release -p myelin-pack
 ./target/release/myelin-pack list \
   --model ../models/LFM3-1.7B-Q4_K_M.gguf --filter attn_k
 
-# упаковать тензор, положить blob и manifest, посчитать качество
+# упаковать тензор в HMX-кроустон, положить blob и manifest, посчитать качество
 ./target/release/myelin-pack pack \
   --model ../models/LFM3-1.7B-Q4_K_M.gguf \
   --tensor blk.2.attn_k.weight \
@@ -36,6 +43,40 @@ cargo build --release -p myelin-pack
 ./target/release/myelin-pack verify \
   --blob /tmp/attn_k.mpk --manifest /tmp/attn_k.json \
   --model ../models/LFM3-1.7B-Q4_K_M.gguf
+
+# shortconv-слой -> blob для команды CONV
+./target/release/myelin-pack conv \
+  --model ../models/LFM3-1.7B-Q4_K_M.gguf --layer 0 \
+  --out /tmp/conv0.blob --manifest /tmp/conv0.json \
+  --s-bc 0.04 --s-y 0.09          # калибровка слоя; без них — значения стенда
+
+# проверка shortconv: структура + пересборка из GGUF побайтово
+./target/release/myelin-pack conv-verify \
+  --blob /tmp/conv0.blob --manifest /tmp/conv0.json \
+  --model ../models/LFM3-1.7B-Q4_K_M.gguf --layer 0
+
+# KV-страница -> K/KT/V для команды ATTN (row = то, что использует exec)
+./target/release/myelin-pack kv --in /tmp/page.f32 \
+  --heads 4 --layout row --v-scale channel \
+  --out-k /tmp/k.bin --out-kt /tmp/kt.bin --out-v /tmp/v.bin \
+  --manifest /tmp/kv.json
+
+# то же из тензора GGUF (первые heads*tokens*128 значений) — для замеров
+./target/release/myelin-pack kv \
+  --model ../models/LFM3-1.7B-Q4_K_M.gguf --tensor blk.12.attn_k.weight \
+  --heads 4 --out-k /tmp/k.bin --out-kt /tmp/kt.bin --out-v /tmp/v.bin \
+  --manifest /tmp/kv.json --values-out /tmp/page.f32
+
+./target/release/myelin-pack kv-verify --manifest /tmp/kv.json \
+  --k /tmp/k.bin --kt /tmp/kt.bin --v /tmp/v.bin --in /tmp/page.f32
+./target/release/myelin-pack kv-unpack --manifest /tmp/kv.json \
+  --k /tmp/k.bin --kt /tmp/kt.bin --v /tmp/v.bin --out /tmp/decoded.f32
+
+# эталонный kvarn (DSP его не читает): упаковка/распаковка одной страницы
+./target/release/myelin-pack kv --in /tmp/page.f32 --heads 4 \
+  --format kvarn-k4v2 --out /tmp/page.kvarn --manifest /tmp/kvarn.json
+./target/release/myelin-pack kv-unpack --manifest /tmp/kvarn.json \
+  --page /tmp/page.kvarn --out /tmp/decoded.f32
 ```
 
 `pack` по умолчанию требует `cos_total >= 0.999` (порог меняется
@@ -46,7 +87,8 @@ cargo build --release -p myelin-pack
 `--rows N` читает только первые `N` выходных каналов — удобно для быстрых
 проверок больших матриц; качество считается по срезу.
 
-В библиотеке: `myelin_pack::pack_gguf(path, tensor, max_rows, options)`.
+В библиотеке: `myelin_pack::pack_gguf(path, tensor, max_rows, options)`,
+`shortconv::build`, `kvpage::build`, `kvarn::commit`.
 
 ## Формат blob (версия 1)
 
@@ -146,7 +188,7 @@ K-чанка лежат в одном 2-КиБ диапазоне `weight.b:deep
   `:after:sat.ub` пишет 2 КБ на 64 spatial, поэтому буфер выхода должен
   быть выровнен на 2 КБ (ограничение адресации store, не формата blob).
 
-## Качество
+## Качество crownstone
 
 Метрики на канал: `cos`, `max |Δ|`, `max |Δ| / s_w`, доля кодов `±127`,
 `rms` и `peak/rms` (для диагностики тяжёлых хвостов). Порог приёмки —
@@ -173,6 +215,186 @@ K-чанка лежат в одном 2-КиБ диапазоне `weight.b:deep
 `max |Δ|/s` в норме. Если такие каналы станут проблемой, нужен второй
 уровень масштабов по K (сейчас формат и ядро его не используют).
 
+## Shortconv: blob для команды `CONV`
+
+`myelin-pack conv` собирает ровно тот образ, который читает `LFM_CMD_CONV` в
+`myelin/dsp/hvx/lfmgemv_impl.c` и заполняет `conv_blob_build()` в
+`myelin/dsp/hvx/exec_main.c` (идентичная математика — `conv_init()` в
+`myelin/dsp/conv/lfmconv_impl.c`). Вход — тензор LFM3
+`blk.N.shortconv.conv.weight` (`K=7`, `N=H`, F32, строка канала = 7 тапов).
+
+| смещение | размер | поле |
+|---:|---:|---|
+| 0 | 64·H | 8 фаз: `[phase][H/16][16 каналов][8 байт]` |
+| 64·H | 4·H | `kq[H]`, int32 little endian |
+
+Фаза `p = ctr & 7` — кольцевой слот нового сэмпла. Внутри фазы вектор `g`
+(128 Б) — каналы `16g..16g+15`, по 8 байт на канал; байт `s` канала `c`
+хранит тап `(s - p - 2) & 7`, тап 7 — неиспользуемый слот, всегда 0.
+`wq1[ch][tap] = clamp(round(w / sw), ±127)`, `sw = max|w| / 127` (для
+полностью нулевого канала `m = 1`).
+
+`kq`: `K_ch = max|w| · s_bc³ / (127 · s_y)`,
+`kq[ch] = trunc(K_ch · 2^(ksh-2) + 0.5)`, `ksh` один на слой
+(`conv_pick_ksh`, потолок 40). На реальных LFM3 `ksh` упирается в 40 — это
+нормально: множитель `kq` компенсирует сдвиг, переполнения нет
+(`|out32| ≤ 7·127·16129`, произведение берётся в int64).
+
+`s_bc`/`s_y` — калибровочные масштабы слоя (`bcx` и выхода conv). В GGUF их
+нет, поэтому они входные; без `--s-bc/--s-y` берутся значения стенда
+`exec_main.c` (0.01 / 0.05), CLI это печатает, а manifest записывает
+`activation_scales.source = "stand_default"`. Для рантайма передавайте
+калибровку явно.
+
+Manifest (`conv-verify` сверяет всё это с blob):
+
+* `wq8_base`/`wq8_bytes`/`kq_base`/`kq_bytes`/`blob_bytes`, `blob_fnv1a64`;
+* `ksh`, `activation_scales`, `tap_scales_f32[H]`, `tap_max_abs[H]`,
+  `kq_q16[H]`;
+* `command`: `op = "CONV"`, `blob_arg = "h0"`, `h`, `ksh`, `src_len = 3H`,
+  `dst_len = H`, `ring_state_bytes_per_slot = 2H·8`, `ring_slots = 8` —
+  ровно то, что нужно положить в команду `exec`-списка
+  (`myelin/crates/myelin-npu/src/method.rs`, `Command::conv`).
+
+### Побитовая сверка с C
+
+`tests/c/conv_blob_ref.c` содержит `conv_blob_build()` **дословно** из
+`myelin/dsp/hvx/exec_main.c`, а `conv_math.h` подключается из
+`myelin/dsp/conv` (файл не копируется — дрейф формул сразу ловится):
+
+```sh
+cc -std=c99 -O2 -I myelin/dsp/conv \
+   myelin/crates/myelin-pack/tests/c/conv_blob_ref.c -o /tmp/conv_blob_ref
+
+myelin-pack conv --model models/LFM3-1.7B-Q4_K_M.gguf --layer 0 \
+  --out /tmp/a.blob --manifest /tmp/a.json --s-bc 0.01 --s-y 0.05 \
+  --taps-out /tmp/taps.f32
+/tmp/conv_blob_ref 2048 0.01 0.05 /tmp/taps.f32 /tmp/b.blob
+cmp /tmp/a.blob /tmp/b.blob        # совпадает побайтово, включая kq и ksh
+```
+
+Проверено на синтетике (H = 16/32/48/2048, разные `s_bc/s_y`, нулевые и
+экстремальные каналы) и на реальных слоях 0/5/23 LFM3. Тест
+`tests/shortconv.rs::blob_matches_c_reference_*` делает это автоматически
+(пропускается, если нет `cc` или `myelin/dsp/conv`).
+
+### Качество на реальных слоях
+
+`--s-bc 0.04 --s-y 0.09`, релизная сборка, все 13 conv-слоёв:
+
+| слой | cos (весь) | cos канала min | max\|Δ\|/s | насыщение |
+|---|---:|---:|---:|---:|
+| 0 | 0.999985 | 0.999966 | 0.5000 | 14.34 % |
+| 1 | 0.999989 | 0.999966 | 0.5000 | 14.88 % |
+| 3 | 0.999989 | 0.999966 | 0.5000 | 14.30 % |
+| 5 | 0.999988 | 0.999970 | 0.5000 | 14.31 % |
+| 7 | 0.999988 | 0.999967 | 0.5000 | 14.31 % |
+| 9 | 0.999989 | 0.999968 | 0.5000 | 14.31 % |
+| 11 | 0.999988 | 0.999966 | 0.5000 | 14.29 % |
+| 13 | 0.999990 | 0.999966 | 0.5000 | 14.36 % |
+| 15 | 0.999986 | 0.999965 | 0.5000 | 14.30 % |
+| 17 | 0.999986 | 0.999967 | 0.5000 | 14.29 % |
+| 19 | 0.999986 | 0.999966 | 0.5000 | 14.29 % |
+| 21 | 0.999985 | 0.999966 | 0.5000 | 14.29 % |
+| 23 | 0.999985 | 0.999968 | 0.5000 | 14.33 % |
+
+`max |Δ|` = ровно полшага int8, `cos` канала ≥ 0.999965. Насыщение ~14.3 %
+(≈ 2050 из 2048·7) — это **по одному тапу на канал**: масштаб канала
+`max|w|/127` по построению кладёт глобальный максимум в код ±127. В отличие
+от crownstone, это не потеря точности.
+
+## KV-страницы: образы для `ATTN`
+
+Ядро paged attention (`attn_core` в `lfmgemv_impl.c`) читает **не** `kvarn`:
+
+* **K** — int4 offset-8 на размерность: `nibble = q + 8`, `q ∈ [-7, 7]`,
+  младший ниббл — чётная размерность. Масштаб — **per-token** Q16 `i32`
+  (`kt`), ядро считает `score = mulq16((dot - 8·Σq) << 8, kt)`, то есть
+  `k_real = code · kt / 65536`. Per-channel масштаба K в образе нет: ядро
+  предполагает, что он «свёрнут в q» на хосте, а текущий
+  `DspBackend::attention_layer` этого не делает. Поэтому пакер пишет только
+  per-token масштаб — он самодостаточен. `kt = round(max|k|/7 · 65536)`,
+  ограничение `kt ≤ 4 194 303` (`|k| ≤ 448`), иначе переполнение `mulq16`.
+* **V** — int8 на размерность, без масштаба в образе: PV-проход считает
+  `out = Σ p_t · v[t] / Σ p_t`. Токены смешиваются, поэтому масштаб V обязан
+  быть **константой по токенам**; per-token V-масштаб в этом формате
+  математически невозможен. Пакер пишет либо `--v-scale channel` (по
+  умолчанию: 128 значений на голову, хост умножает `out[head·128 + d]`), либо
+  `--v-scale global` (один скаляр на образ — если у рантайма только скалярный
+  `out_scale`). Правило записано в manifest (`command.out_scale_rule`).
+
+Две раскладки (`--layout`):
+
+* `row` — head-grouped, 128 Б на токен: 64 Б кодов + 64 Б нулей; её
+  использует `exec` (`g_attn_tm = 0`), `slot = tbl[pos>>5]<<5 | (pos&31)`;
+  размер K на голову `slots·128`, V — `slots·128`, KT — `slots·4`.
+* `page` — token-major: K `[head][page][g<16][128]`,
+  `byte = code(8g+2j) | code(8g+2j+1)<<4` в `4·token + j`; V
+  `[head][page][4096]`, `byte at g·1024 + c·128 + 4·d + j = V[32g+d][4c+j]`.
+  Размеры: K `pages·2048` на голову, V `pages·4096`.
+
+Кодирование K идёт по эффективному `kt/65536` (а не по «сырому» `max/7`),
+поэтому код и масштаб всегда согласованы. Последняя страница может быть
+неполной (`--tokens 1..32`): хвост зануляется, `kt` там 0, ядро эти слоты не
+читает (`tok0..tok1` ограничены `pos+1`).
+
+Ограничения геометрии — из ядра: `head_dim = 128`, страница 32 токена,
+`ATTN_KV = 4` головы (пакер допускает 1..16 для тестов и будущих ядер,
+манифест пишет фактическое число).
+
+Manifest: размеры и шаги каждой секции (`bytes`, `view_bytes`,
+`bytes_per_head`, `head_stride`, `page_stride`, `token_stride`, `encoding`),
+`layout`, `v_scale_mode`, таблицы `k_scales_q16[heads·slots]` и
+`v_scales_f32` (1 или `heads·128`), FNV-1a 64 каждой секции, поля команды
+`ATTN`. Этого достаточно, чтобы рантайм построил views без чтения C-кода.
+
+`view_bytes` — то, что надо отдать в `alloc_buf`/`alloc_view`. Для row это
+равно размеру файла. Для token-major K ядро считает шаг головы как
+`wbytes / (ATTN_KV · 2)`, поэтому view обязан быть `heads · slots · 128` Б —
+вдвое больше данных (ровно как `kbytes` в `attn_main.c`); сам файл при этом
+содержит только `heads · pages · 2048` Б, рантайм резервирует view на
+`view_bytes`. V и KT в token-major дополнительных байт не требуют
+(`slots · 128` и `slots · 4` на голову).
+
+### Качество на реальных данных
+
+Реальных KV-активаций без прогона модели нет; ниже — страница из первых
+4·32·128 значений тензора `attn_k` (тяжёлые хвосты весов, честный стресс для
+int4), `--v-scale channel`:
+
+| источник | K cos (весь) | K cos min токена | V cos | K max\|Δ\|/s |
+|---|---:|---:|---:|---:|
+| `blk.2.attn_k.weight` | 0.992656 | 0.981833 | 0.999985 | 0.500 |
+| `blk.12.attn_k.weight` | 0.991193 | 0.977140 | 0.999981 | 0.500 |
+| `blk.22.attn_k.weight` | 0.992801 | 0.985530 | 0.999981 | 0.500 |
+
+Int4 на токен даёт cos ≈ 0.99 (теоретический предел 4 бит на гауссовых
+данных ≈ 0.9977; тяжёлые хвосты весов ниже). V int8 — практически без
+потерь. На настоящих пост-RoPE K/V числа будут другими: их надо снять на
+устройстве после того, как проекции K/V начнут писать в кэш.
+
+## kvarn: эталон, к DSP не подключён
+
+`kvarn` (K 4 бита / V 2 или 4 бита, вращение Адамара, per-channel `ka`/`vc`,
+per-token `kc`/`vb`/`vbz`) реализован в `src/kvarn.rs` как порт
+`crates/lfm-npu-ref/src/kvarn.rs` и проверен **побитово** против эталона:
+`tests/kvpage.rs::kvarn_matches_reference_bit_for_bit` сравнивает `kcode`,
+`vcode`, все f16-таблицы и `decode_k`/`decode_v` для обеих вариантов на
+нескольких страницах. Ни одно DSP-ядро этот формат не читает; CLI пишет его
+отдельным файлом (`--format kvarn-k4v2|kvarn-k4v4 --out page.kvarn`) с
+манифестом `kvarn-page`, чтобы кодек можно было использовать как оракул.
+
+На той же реальной странице (`blk.2.attn_k`, 32×128, после
+`lfm_tq_rot_fwd`), метрики по декоду и обратному вращению:
+
+| вариант | K cos mean / min | V cos mean / min |
+|---|---:|---:|
+| `kvarn-k4v2` | 0.985884 / 0.965027 | 0.894386 / 0.828706 |
+| `kvarn-k4v4` | 0.985884 / 0.965027 | 0.994888 / 0.992308 |
+
+V 2 бита на тяжёлых хвостах весов даёт ~0.89 (четыре уровня); на равномерных
+данных эталон показывает ≥ 0.93. Это свойство формата, а не порта.
+
 ## int4 (`weight.n`) — не реализовано
 
 Осознанно. Из `qnn-reverse/REPORT.md` известно: 4-битный тайл = 512 Б,
@@ -186,6 +408,8 @@ K-чанка лежат в одном 2-КиБ диапазоне `weight.b:deep
 
 ## Ограничения
 
+Crownstone:
+
 * Пакер не знает масштаб активации: на устройстве эффективный множитель
   `s_w[n]` умножается на масштаб uint8-активации, рантайм должен учесть его
   сам (у fp16-пути так же).
@@ -196,12 +420,44 @@ K-чанка лежат в одном 2-КиБ диапазоне `weight.b:deep
 * Раскладка весов и bias-блока подтверждена для int8 на HMX v68;
   fp16-путь и int4 этим крейтом не покрываются.
 
+Shortconv:
+
+* `s_bc`/`s_y` — калибровка, а не свойство тензора: blob, собранный с
+  другими масштабами, имеет другой `kq`/`ksh` (и другой хвост blob’а).
+  Manifest хранит использованные значения, `conv-verify` пересобирает blob
+  именно с ними.
+* Без `--s-bc/--s-y` берутся значения стенда `exec_main.c` (0.01/0.05).
+  Они заведомо не равны калибровке конкретного рантайма, поэтому `ksh`/`kq`
+  будут другими: blob валиден и побитово воспроизводим, но согласован только
+  с масштабами, записанными в manifest. Для реального рантайма передавайте
+  калибровку явно.
+
+KV:
+
+* Формат K — per-token int4. Per-channel масштаб K в образе отсутствует
+  (ядро ожидает, что он свёрнут в `q`, но `DspBackend` этого не делает);
+  на K/V с сильным разбросом амплитуд по каналам это ограничивает точность
+  (cos ≈ 0.99 на весах, см. таблицу).
+* V per-token масштаб невозможен: PV смешивает токены. По умолчанию
+  per-channel (`--v-scale channel`), и рантайм обязан применить 128-широкий
+  масштаб после attention; `--v-scale global` даёт один скаляр для
+  современного скалярного `out_scale`.
+* `|k| ≤ 448` (иначе `kt` не влезает в Q16 так, чтобы `mulq16` не
+  переполнился); большие значения отвергаются с ошибкой.
+* Реальных KV-активаций в репозитории нет: метрики сняты на строках
+  `attn_k`, а не на пост-RoPE K/V прогона модели.
+
+kvarn:
+
+* Эталон, не подключён ни к одному DSP-ядру; нужен как оракул для будущего
+  порта.
+
 ## Тесты
 
 ```sh
 cd myelin
 cargo fmt -p myelin-pack -- --check
-cargo clippy -p myelin-pack --all-targets
+cargo clippy -p myelin-pack --all-targets -- -D warnings
 cargo test -p myelin-pack
 ```
 
@@ -212,3 +468,13 @@ cargo test -p myelin-pack
   Q6_K (`blk.0.ffn_down.weight`, K=7680), порог `cos >= 0.999`, нулевые
   padding-каналы, JSON-раундтрип manifest. Без файла модели тесты
   пропускаются с сообщением.
+* `tests/shortconv.rs` — геометрия фаз/слотов, `kq`/`ksh`, нули и `±max`,
+  H не кратна 16, NaN/Inf и плохие масштабы, manifest и порча blob’а,
+  CLI `conv`/`conv-verify`; **побайтовая сверка с C** на синтетике и на
+  слоях 0/5/23 (пропуск без `cc`), метрики на реальных слоях.
+* `tests/kvpage.rs` — обе раскладки дают одинаковый декод, cos/max|Δ|/насыщение,
+  неполная последняя страница (нули и `kt = 0`), все-нули, предел `kt`,
+  отказ на NaN/Inf и плохой геометрии, manifest и порча каждой секции,
+  CLI `kv`/`kv-verify`/`kv-unpack`, **побитовая сверка `kvarn` с
+  `lfm-npu-ref`** для K4V2/K4V4 (коды, все f16-таблицы, декод), реальная
+  страница из `attn_k`.

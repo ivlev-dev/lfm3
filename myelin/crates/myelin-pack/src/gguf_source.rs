@@ -151,3 +151,40 @@ fn dequant_row(ggml_type: GgmlType, bytes: &[u8], k: usize, tensor: &str) -> Res
 fn gguf_error(error: impl std::fmt::Display) -> PackError {
     PackError::Gguf(error.to_string())
 }
+
+/// Load the first `count` f32 values of a tensor, row-major after dequantisation.
+///
+/// Only the rows that cover `count` values are read, so a large FFN tensor can
+/// supply a small KV page without materialising the whole matrix.
+pub fn load_f32_prefix(path: &Path, tensor: &str, count: usize) -> Result<(Vec<f32>, SourceInfo)> {
+    if count == 0 {
+        return Err(PackError::EmptyMatrix { k: 0, n: 0 });
+    }
+    let file = GgufFile::open(path).map_err(gguf_error)?;
+    let info = file
+        .tensor(tensor)
+        .ok_or_else(|| PackError::TensorNotFound(tensor.to_string()))?;
+    if info.dims.len() != 2 {
+        return Err(PackError::TensorNotMatrix {
+            name: tensor.to_string(),
+            dims: info.dims.len(),
+        });
+    }
+    let k = usize::try_from(info.dims[0])
+        .map_err(|_| PackError::Gguf(format!("tensor `{tensor}` k overflows usize")))?;
+    if k == 0 {
+        return Err(PackError::EmptyMatrix { k, n: 0 });
+    }
+    drop(file);
+    let rows = count.div_ceil(k);
+    let (matrix, source) = load_matrix(path, tensor, Some(rows))?;
+    if matrix.data().len() < count {
+        return Err(PackError::Gguf(format!(
+            "tensor `{tensor}` has {} f32 values, need {count}",
+            matrix.data().len()
+        )));
+    }
+    let mut data = matrix.data().to_vec();
+    data.truncate(count);
+    Ok((data, source))
+}
