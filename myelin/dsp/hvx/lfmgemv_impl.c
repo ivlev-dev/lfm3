@@ -40,7 +40,7 @@ typedef void *Address;
 #define MAXBUF 256
 
 /* one host mapping, many views (alloc_view): 0 = model arena, 1 = spare */
-#define MAXARENA 4
+#define MAXARENA 160
 
 typedef struct {
     uint8_t *base;      /* DSP virtual address of the mapping */

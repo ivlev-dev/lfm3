@@ -42,6 +42,9 @@ use myelin_pack::shortconv::{self, ActivationScales};
 use myelin_pack::{Matrix, PackMeta};
 
 const ACT_TARGET: f32 = 110.0;
+/// Tail clip for calibration: anything beyond this many standard deviations
+/// only costs resolution for the rest of the tensor.
+const CLIP_SIGMA: f32 = 8.0;
 
 struct Args {
     model: PathBuf,
@@ -82,11 +85,13 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-/// Running maximum of the tensors one layer quantises.
+/// Running maximum (and second moment) of the tensors one layer quantises.
 #[derive(Default, Debug, Clone, Copy)]
 struct AbsMax {
     value: f32,
     samples: usize,
+    squares: f64,
+    values: usize,
 }
 
 impl AbsMax {
@@ -94,14 +99,42 @@ impl AbsMax {
         self.samples += 1;
         for value in values {
             self.value = self.value.max(value.abs());
+            self.squares += f64::from(*value) * f64::from(*value);
+            self.values += 1;
+        }
+    }
+
+    /// RMS of every sample seen so far.
+    fn rms(&self) -> f32 {
+        if self.values == 0 {
+            return 0.0;
+        }
+        (self.squares / self.values as f64).sqrt() as f32
+    }
+
+    /// `absmax`, but clipped at `sigma_clip` standard deviations.
+    ///
+    /// A single outlier channel sets the whole tensor's step when the scale
+    /// follows `absmax`, and the rest of the tensor then uses one or two of
+    /// the seven available bits (the shortconv `y` buffer really did have an
+    /// RMS of 2.5 codes out of 127). Clipping the tail trades a little error
+    /// on the outliers for several extra bits everywhere else, which is what
+    /// the cosine is dominated by.
+    fn robust_max(&self, sigma_clip: f32) -> f32 {
+        let rms = self.rms();
+        if rms > 0.0 && self.value > sigma_clip * rms {
+            sigma_clip * rms
+        } else {
+            self.value
         }
     }
 
     /// Real units per int8 code that map the observed range onto `target`
     /// of the 127 signed codes.
     fn step(&self, target: f32) -> f32 {
-        if self.value > 0.0 && self.value.is_finite() {
-            self.value / target
+        let range = self.robust_max(CLIP_SIGMA);
+        if range > 0.0 && range.is_finite() {
+            range / target
         } else {
             1.0
         }

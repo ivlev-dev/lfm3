@@ -4,7 +4,6 @@
 //! way), so the core exposes a narrow object-safe trait and this module
 //! implements it for the real and mock transports.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use myelin_core::backend::dsp::{DspCall, DspError, DspExecutor, DspHandle, ExecResult, ExecRun};
@@ -108,62 +107,61 @@ fn run_exec_on<T: Transport + ?Sized>(
     result
 }
 
-/// One long-lived arena holding every command list we have seen.
+/// Command-list mappings, keyed by exact bytes.
 ///
-/// The skeleton has four arena slots, a token touches ~70 distinct lists, and
-/// mapping an arena costs ~2.2 ms on this device, so a mapping per list would
-/// dominate the token. `exec` takes a `cmd_off`, so all lists can share one
-/// arena: each distinct list is appended once, the arena is mapped once, and
-/// later calls pass the list's offset. Lists never change between tokens (the
-/// CONV counter travels in `rt[]`), which matters because the DSP caches
-/// mapped pages: an in-place rewrite would be invisible to it.
-const LIST_ARENA_BYTES: usize = 1 << 20;
-
-struct ListArena {
-    shared: SharedBuffer,
-    handle: DspHandle,
+/// The skeleton holds `MAXARENA` mappings per PD (raised to 160 for the full
+/// model), and a token touches ~70 distinct lists. Mapping costs ~2.2 ms on
+/// this device, so each list is mapped once and reused for the whole
+/// generation; the list bytes are immutable while mapped, which is exactly
+/// what makes the reuse safe (the DSP caches mapped pages).
+struct MappedList {
+    list: Vec<u8>,
+    /// Owns the rpcmem buffer: the arena is only valid while this lives.
+    _shared: SharedBuffer,
     arena: i32,
-    next: usize,
-    offsets: HashMap<Vec<u8>, i32>,
+    handle: DspHandle,
 }
 
-impl ListArena {
-    fn map<T: Transport + ?Sized>(transport: &T, handle: DspHandle) -> Result<Self, DspError> {
-        let mut shared = transport
-            .alloc_shared(LIST_ARENA_BYTES)
-            .map_err(DspError::from)?;
-        shared.as_mut_slice().fill(0);
-        let arena = map_arena(transport, handle, &shared, LIST_ARENA_BYTES as i32)?;
-        Ok(Self {
-            shared,
-            handle,
-            arena,
-            next: 0,
-            offsets: HashMap::new(),
-        })
+#[derive(Default)]
+struct ListCache {
+    entries: Vec<MappedList>,
+}
+
+const LIST_CACHE: usize = 128;
+
+impl ListCache {
+    fn lock(cache: &Mutex<Self>) -> std::sync::MutexGuard<'_, Self> {
+        cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn offset_for(&mut self, list: &[u8]) -> Result<i32, DspError> {
-        if let Some(offset) = self.offsets.get(list) {
-            return Ok(*offset);
+    fn find(&self, handle: DspHandle, list: &[u8]) -> Option<i32> {
+        self.entries
+            .iter()
+            .find(|entry| entry.handle == handle && entry.list == list)
+            .map(|entry| entry.arena)
+    }
+
+    fn arena_for<T: Transport + ?Sized>(
+        &mut self,
+        transport: &T,
+        handle: DspHandle,
+        list: &[u8],
+    ) -> Result<i32, DspError> {
+        if let Some(arena) = self.find(handle, list) {
+            return Ok(arena);
         }
-        let start = (self.next + 15) & !15;
-        let end = start + list.len();
-        if end > LIST_ARENA_BYTES {
-            return Err(DspError::Other(format!(
-                "exec list arena exhausted: {} distinct lists, {} bytes",
-                self.offsets.len(),
-                self.next
-            )));
+        if self.entries.len() == LIST_CACHE {
+            let evicted = self.entries.remove(0);
+            unmap_arena(transport, evicted.handle, evicted.arena);
         }
-        self.shared.as_mut_slice()[start..end].copy_from_slice(list);
-        sync_shared(&self.shared, true, true).map_err(|error| DspError::Other(error.to_string()))?;
-        sync_shared(&self.shared, false, true).map_err(|error| DspError::Other(error.to_string()))?;
-        self.next = end;
-        let offset = i32::try_from(start)
-            .map_err(|_| DspError::Other("exec list offset does not fit i32".to_owned()))?;
-        self.offsets.insert(list.to_vec(), offset);
-        Ok(offset)
+        let (shared, arena) = map_list(transport, handle, list, None)?;
+        self.entries.push(MappedList {
+            list: list.to_vec(),
+            _shared: shared,
+            arena,
+            handle,
+        });
+        Ok(arena)
     }
 }
 
@@ -347,7 +345,7 @@ impl_executor!(crate::cdsprpc::Cdsprpc);
 /// first token. `DspBackend` drives this adapter on the device.
 pub struct Executor {
     transport: Arc<dyn Transport>,
-    exec_arenas: Mutex<Option<ListArena>>,
+    exec_arenas: Mutex<ListCache>,
     /// `MYELIN_TRACE` diagnostics: host microseconds in arena setup and in the
     /// `exec` round trip itself.
     trace_map_micros: std::sync::atomic::AtomicI64,
@@ -377,7 +375,7 @@ impl Executor {
     pub fn new(transport: Arc<dyn Transport>) -> Self {
         Self {
             transport,
-            exec_arenas: Mutex::new(None),
+            exec_arenas: Mutex::new(ListCache::default()),
             trace_map_micros: std::sync::atomic::AtomicI64::new(0),
             trace_call_micros: std::sync::atomic::AtomicI64::new(0),
             trace_calls: std::sync::atomic::AtomicI64::new(0),
@@ -387,7 +385,9 @@ impl Executor {
     fn traced_exec(&self, handle: DspHandle, request: ExecRun<'_>) -> Result<ExecResult, DspError> {
         use std::sync::atomic::Ordering;
         let map_started = std::time::Instant::now();
-        let (shared, arena) = map_list(self.transport.as_ref(), handle, request.list, None)?;
+        let mut cache = ListCache::lock(&self.exec_arenas);
+        let arena = cache.arena_for(self.transport.as_ref(), handle, request.list)?;
+        drop(cache);
         self.trace_map_micros
             .fetch_add(map_started.elapsed().as_micros() as i64, Ordering::Relaxed);
         let call_started = std::time::Instant::now();
@@ -395,8 +395,6 @@ impl Executor {
         self.trace_call_micros
             .fetch_add(call_started.elapsed().as_micros() as i64, Ordering::Relaxed);
         self.trace_calls.fetch_add(1, Ordering::Relaxed);
-        drop(shared);
-        unmap_arena(self.transport.as_ref(), handle, arena);
         result
     }
 }
