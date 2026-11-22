@@ -16,10 +16,14 @@
  * 10.. RPC failure (matches the other stands).
  *
  * Build: see build.sh (needs HEXAGON_SDK_ROOT and ANDROID_NDK_ROOT).
- * Run on device: ./conv_test [H] [ntok] [reps]
- *   H    = channels (default 2048, multiple of 16)
- *   ntok = tokens per pass (default 12)
- *   reps = full passes over the token sequence (default 3; pass 1 is checked)
+ * Run on device: ./conv_test [H] [ntok] [reps] [rows] [threads] [pf_kb] [usepf]
+ *   H       = channels (default 2048, multiple of 16)
+ *   ntok    = tokens per pass (default 12)
+ *   reps    = full passes over the token sequence (default 3; pass 1 is checked)
+ *   rows    = GEMV rows per iteration, 1|2 (default 2)
+ *   threads = HVX contexts used by the GEMV worker team (default 2)
+ *   pf_kb   = l2fetch window in KB (default 32)
+ *   usepf   = 0 disables l2fetch (default 1)
  */
 #include "lfmgemv.h"
 #include "conv_ref.h"
@@ -101,10 +105,16 @@ int main(int argc, char **argv)
     int H    = (argc > 1) ? atoi(argv[1]) : 2048;
     int ntok = (argc > 2) ? atoi(argv[2]) : 12;
     int reps = (argc > 3) ? atoi(argv[3]) : 3;
+    int g_rows = (argc > 4) ? atoi(argv[4]) : 2;
+    int g_thr  = (argc > 5) ? atoi(argv[5]) : 2;
+    int g_pf   = (argc > 6) ? atoi(argv[6]) : 32;
+    int g_usepf= (argc > 7) ? atoi(argv[7]) : 1;
     const int layer = 0, slot = 0;
     int hi = -1, ho = -1, rc, t, rep, ch;
-    int times[8];
+    int times[16];
     int64_t t_in = 0, t_conv = 0, t_out = 0, t_bx = 0, t_dot = 0, t_glue = 0;
+    int64_t t_in_deint = 0, t_in_kern = 0, t_in_pack = 0, t_out_deint = 0;
+    int64_t t_out_kern = 0, t_out_pack = 0, t_fb = 0;
     double wall_sum = 0.0, wall_min = 1e18;
     int calls = 0;
 
@@ -126,7 +136,10 @@ int main(int argc, char **argv)
     if (H < 16 || (H & 15)) { printf("H must be a multiple of 16\n"); return 1; }
     if (ntok < 1) ntok = 1;
     if (reps < 1) reps = 1;
-    printf("conv stand: H=%d ntok=%d reps=%d\n", H, ntok, reps);
+    if (g_rows < 1) g_rows = 1;
+    if (g_thr < 1) g_thr = 1;
+    printf("conv stand: H=%d ntok=%d reps=%d tune: rows=%d threads=%d pf=%dKB usepf=%d\n",
+           H, ntok, reps, g_rows, g_thr, g_pf, g_usepf ? 1 : 0);
 
     if (enable_unsigned() != 0) { printf("unsigned PD failed\n"); return 10; }
 
@@ -183,7 +196,7 @@ int main(int argc, char **argv)
                        m.s_y, m.s_out, m.sw_out);
     if (rc != 0) { printf("upload out_proj rc=%d\n", rc); return 11; }
 
-    cfg = (unsigned char *)malloc(16 + (size_t)H * CONV_KSIZE * sizeof(float));
+    cfg = (unsigned char *)malloc(32 + (size_t)H * CONV_KSIZE * sizeof(float));
     if (!cfg) { printf("cfg alloc failed\n"); return 1; }
     {
         int nslots = 1;
@@ -192,7 +205,12 @@ int main(int argc, char **argv)
         memcpy(cfg + 8, &m.s_bc, 4);
         memcpy(cfg + 12, &m.s_y, 4);
         memcpy(cfg + 16, m.cw, (size_t)H * CONV_KSIZE * sizeof(float));
-        rc = lfmgemv_conv_init(layer, cfg, 16 + H * CONV_KSIZE * (int)sizeof(float));
+        {
+            int tune[4] = { g_pf, g_rows, g_usepf, g_thr };
+            memcpy(cfg + 16 + (size_t)H * CONV_KSIZE * sizeof(float), tune, 16);
+        }
+        rc = lfmgemv_conv_init(layer, cfg,
+                               32 + H * CONV_KSIZE * (int)sizeof(float));
         if (rc != 0) { printf("conv_init rc=%d\n", rc); return 12; }
     }
     printf("weights uploaded, conv layer %d initialised (ksh=%d)\n", layer, W.ksh);
@@ -209,13 +227,16 @@ int main(int argc, char **argv)
         for (t = 0; t < ntok; t++) {
             double t0 = now_us(), wall;
             rc = lfmgemv_conv(layer, hi, ho, (const unsigned char *)(m.tok + (size_t)t * H),
-                              H, 1, slot, 1, (unsigned char *)dev_out, H, times, 8);
+                              H, 1, slot, 1, (unsigned char *)dev_out, H, times, 16);
             wall = now_us() - t0;
             if (rc != 0) { printf("conv tok=%d rc=%d\n", t, rc); return 14; }
             wall_sum += wall;
             if (wall < wall_min) wall_min = wall;
             t_in += times[1]; t_conv += times[2]; t_out += times[3];
             t_bx += times[4]; t_dot += times[5]; t_glue += times[6];
+            t_in_deint += times[8];  t_in_kern += times[9];  t_in_pack += times[10];
+            t_out_deint += times[11]; t_out_kern += times[12]; t_out_pack += times[13];
+            t_fb = times[15];            /* jobs the team had to redo */
             calls++;
 
             if (rep == 0) {
@@ -245,6 +266,22 @@ int main(int argc, char **argv)
            calls, (double)(t_in + t_conv + t_out) / calls,
            (double)t_in / calls, (double)t_conv / calls, (double)t_out / calls,
            (double)t_bx / calls, (double)t_dot / calls, (double)t_glue / calls);
+    {
+        double in_b = 3.0 * H * (H / 2.0), out_b = 1.0 * H * (H / 2.0);
+        double in_mac = 3.0 * H * H, out_mac = 1.0 * H * H;
+        printf("in_proj  split: deint=%.0f kern=%.0f pack=%.0f us  (%.2f GB/s, %.1f GMAC/s)\n",
+               (double)t_in_deint / calls, (double)t_in_kern / calls,
+               (double)t_in_pack / calls,
+               in_b / ((double)t_in_kern / calls * 1e3),
+               in_mac / ((double)t_in_kern / calls * 1e3));
+        printf("out_proj split: deint=%.0f kern=%.0f pack=%.0f us  (%.2f GB/s, %.1f GMAC/s)"
+               "  team_fallbacks=%d\n",
+               (double)t_out_deint / calls, (double)t_out_kern / calls,
+               (double)t_out_pack / calls,
+               out_b / ((double)t_out_kern / calls * 1e3),
+               out_mac / ((double)t_out_kern / calls * 1e3),
+               (int)t_fb);
+    }
     printf("host wall per layer: min=%.1f avg=%.1f us\n",
            wall_min, wall_sum / (calls ? calls : 1));
 

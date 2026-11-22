@@ -16,7 +16,12 @@ int lfm_bridge_shape(int h, int *N, int *K, int *is_int8, int *has_scale);
 
 /* One full GEMV for M = 1|2|4: deinterleave -> int4 dot -> int8 pack.
  * act = M*K int8, out = M*N int8 (buffer must have a Q16 scale table).
- * t[3] (optional) receives microseconds for deinterleave / matmul / pack. */
+ * t[4] (optional) receives microseconds for deinterleave / matmul / pack and
+ * the matmul pcycle delta. */
 int lfm_bridge_gemv(int h, int M, const int8_t *act, int8_t *out, int *t);
+
+/* Worker-team jobs that had to be recomputed on the main thread (0 = the
+ * team published every result; see team_join()). */
+int lfm_bridge_team_fallbacks(void);
 
 #endif /* LFMCONV_BRIDGE_H */

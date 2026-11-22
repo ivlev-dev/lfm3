@@ -67,7 +67,10 @@ interface lfmgemv {
 
    /* bcx = in_proj(act); bx=b*x; depthwise conv k=7 + state; y=c*conv;
       out = out_proj(y).  act = M*H int8, outp = M*H int8 (M = 1|2|4).
-      times = {total, in_proj, conv_all, out_proj, bx, dot, glue, M} in us */
+      times = {total, in_proj, conv_all, out_proj, bx, dot, glue, M} in us;
+      if the host passes 16 slots, 8..13 are {in deint, in gemv, in pack,
+      out deint, out gemv, out pack} us, 14 = in gemv pcycles,
+      15 = worker-team jobs the caller had to recompute (0 = clean). */
    long conv(in long layer, in long hi, in long ho, in sequence<octet> act,
              in long M, in long slot, in long reps, rout sequence<octet> outp,
              rout sequence<long> times);

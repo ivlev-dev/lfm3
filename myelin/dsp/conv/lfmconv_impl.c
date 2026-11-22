@@ -165,7 +165,16 @@ int lfmgemv_conv_init(int layer, const unsigned char *cfg, int cfgLen)
     if (cfgLen < 16 + H * CONV_TAPS * (int)sizeof(float)) return AEE_EBADPARM;
 
     if ((rc = conv_scratch(H)) != 0) return rc;
-    lfm_bridge_tune(8, 1, 1, -1);        /* l2fetch 8 KB, prefetch on */
+    /* optional tuning tail after the conv weights: {pf_kb, rows, usepf, threads} */
+    {
+        /* measured optimum on XQ-BC72 (see README): 32 KB l2fetch window,
+         * 2 rows per iteration, 2 HVX contexts.  Under 2 contexts the GEMV
+         * runs at 20 GB/s vs 12.3 at one, and in_proj drops 542 -> 344 us. */
+        int tune[4] = { 32, 2, 1, 2 };
+        int wtail = 16 + H * CONV_TAPS * (int)sizeof(float);
+        if (cfgLen >= wtail + 16) memcpy(tune, cfg + wtail, 16);
+        lfm_bridge_tune(tune[0], tune[1], tune[2] ? 1 : 0, tune[3]);
+    }
 
     L = &g_cl[layer];
     if (L->ready && L->H != H) return AEE_EBADPARM;   /* conv_free() first */
@@ -263,6 +272,7 @@ int lfmgemv_conv(int layer, int hi, int ho, const unsigned char *act, int actLen
     conv_layer_t *L;
     int n, k, i8, hs, rc;
     int t_in = 0, t_conv = 0, t_out = 0, t_bx = 0, t_dot = 0, t_glue = 0;
+    int ti[4] = { 0, 0, 0, 0 }, to[4] = { 0, 0, 0, 0 };
     int r, m;
 
     if (layer < 0 || layer >= CONV_LAYERS) return AEE_EBADPARM;
@@ -287,6 +297,7 @@ int lfmgemv_conv(int layer, int hi, int ho, const unsigned char *act, int actLen
         /* --- in_proj for all M tokens in one weight pass --- */
         rc = lfm_bridge_gemv(hi, M, (const int8_t *)act, g_bcx, bt);
         if (rc != 0) return rc;
+        for (m = 0; m < 4; m++) ti[m] += bt[m];
         t1 = HAP_perf_get_time_us(); t_in += (int)(t1 - t0); t0 = t1;
 
         /* --- conv stage, token by token (the state is sequential) --- */
@@ -316,6 +327,7 @@ int lfmgemv_conv(int layer, int hi, int ho, const unsigned char *act, int actLen
         /* --- out_proj for all M tokens --- */
         rc = lfm_bridge_gemv(ho, M, g_y, (int8_t *)outp, bt);
         if (rc != 0) return rc;
+        for (m = 0; m < 4; m++) to[m] += bt[m];
         t1 = HAP_perf_get_time_us(); t_out += (int)(t1 - t0);
     }
 
@@ -328,6 +340,16 @@ int lfmgemv_conv(int layer, int hi, int ho, const unsigned char *act, int actLen
         times[5] = t_dot / reps;
         times[6] = t_glue / reps;
         times[7] = M;
+        if (timesLen >= 16) {
+            times[8]  = ti[0] / reps;    /* in_proj deinterleave */
+            times[9]  = ti[1] / reps;    /* in_proj GEMV kernel  */
+            times[10] = ti[2] / reps;    /* in_proj pack        */
+            times[11] = to[0] / reps;    /* out_proj deinterleave */
+            times[12] = to[1] / reps;    /* out_proj GEMV kernel  */
+            times[13] = to[2] / reps;    /* out_proj pack        */
+            times[14] = ti[3] / reps;    /* in_proj kernel pcycles */
+            times[15] = lfm_bridge_team_fallbacks();   /* recomputed jobs */
+        }
     }
     return 0;
 }
