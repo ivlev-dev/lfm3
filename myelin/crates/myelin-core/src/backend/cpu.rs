@@ -549,6 +549,21 @@ fn tensor<'a>(file: &'a GgufFile, name: &str) -> Result<&'a TensorInfo, RuntimeE
         .ok_or_else(|| RuntimeError::MissingTensor(name.to_owned()))
 }
 
+/// `MYELIN_CPU_INT4=1` rounds every weight matrix to per-row int4 after
+/// dequantisation, i.e. exactly what `myelin-pack` stores for the DSP. It is
+/// the control experiment for "is the remaining error the DSP path or the
+/// 4-bit weight format itself".
+fn quantize_int4_rows(data: &mut [f32], n: usize, k: usize) {
+    for row in 0..n {
+        let values = &mut data[row * k..(row + 1) * k];
+        let max = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let step = if max > 0.0 { max / 7.0 } else { 1.0 };
+        for value in values.iter_mut() {
+            *value = (*value / step).round().clamp(-8.0, 7.0) * step;
+        }
+    }
+}
+
 fn load_matrix(
     file: &GgufFile,
     name: &str,
@@ -570,7 +585,10 @@ fn load_matrix(
     let bytes = file
         .tensor_bytes(name)
         .map_err(|error| RuntimeError::Gguf(error.to_string()))?;
-    let data = dequantize(info, bytes, count)?;
+    let mut data = dequantize(info, bytes, count)?;
+    if std::env::var_os("MYELIN_CPU_INT4").is_some() && rows > 0 {
+        quantize_int4_rows(&mut data, rows, cols);
+    }
     Ok(Matrix { rows, cols, data })
 }
 

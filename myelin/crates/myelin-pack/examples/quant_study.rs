@@ -57,6 +57,32 @@ fn signs(k: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Per-column-block scales shared by every row: `s_b` is the max over the
+/// whole 256-column block. The kernel is unchanged because the block scale is
+/// folded into the activation instead of the accumulator.
+fn quant_colblock(values: &[f32], n: usize, k: usize, block: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut out = vec![0.0f32; values.len()];
+    let mut scales = vec![0.0f32; k.div_ceil(block)];
+    for (index, scale) in scales.iter_mut().enumerate() {
+        let start = index * block;
+        let end = (start + block).min(k);
+        let mut max = 0.0f32;
+        for row in 0..n {
+            for value in &values[row * k + start..row * k + end] {
+                max = max.max(value.abs());
+            }
+        }
+        *scale = if max > 0.0 { max / 7.0 } else { 1.0 };
+    }
+    for row in 0..n {
+        for kk in 0..k {
+            let scale = scales[kk / block];
+            out[row * k + kk] = (values[row * k + kk] / scale).round().clamp(-8.0, 7.0) * scale;
+        }
+    }
+    (out, scales)
+}
+
 fn quant_row(row: &[f32], block: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; row.len()];
     for (dst_chunk, src_chunk) in out.chunks_mut(block).zip(row.chunks(block)) {
@@ -92,7 +118,7 @@ fn main() {
     ];
     let block: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(32);
     println!("block = {block}");
-    println!("{:40} {:>8} {:>8} {:>8} {:>8}", "tensor", "perrow", "had+row", "block", "had+blk");
+    println!("{:40} {:>8} {:>8} {:>8} {:>8} {:>8}", "tensor", "perrow", "had+row", "block", "had+blk", "colblk");
     for name in tensors {
         let (matrix, _info) = gguf_source::load_matrix(path, name, None).expect("matrix");
         let (n, k) = (matrix.n(), matrix.k());
@@ -149,13 +175,24 @@ fn main() {
             cos(&values[..k], &wq_row),
             cos(&values[..k], &wq_blk)
         );
+        let (qcol, scales) = quant_colblock(&values, n, k, block);
+        let mut xscaled = vec![0.0f32; k];
+        for kk in 0..k {
+            xscaled[kk] = x[kk] * scales[kk / block];
+        }
+        let mut colblk = vec![0.0f32; n];
+        for row in 0..n {
+            let w = &qcol[row * k..(row + 1) * k];
+            colblk[row] = w.iter().zip(&xscaled).map(|(a, b)| a * b).sum::<f32>();
+        }
         println!(
-            "{:40} {:>8.5} {:>8.5} {:>8.5} {:>8.5}",
+            "{:40} {:>8.5} {:>8.5} {:>8.5} {:>8.5} {:>8.5}",
             name.rsplit('.').nth(1).unwrap_or(name),
             cos(&reference, &perrow),
             cos(&reference, &hadrow),
             cos(&reference, &blk32),
-            cos(&reference, &hadblk)
+            cos(&reference, &hadblk),
+            cos(&reference, &colblk)
         );
     }
 }

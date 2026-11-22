@@ -45,6 +45,8 @@ const ACT_TARGET: f32 = 110.0;
 /// Tail clip for calibration: anything beyond this many standard deviations
 /// only costs resolution for the rest of the tensor.
 const CLIP_SIGMA: f32 = 8.0;
+/// Crest factor above which a tensor is treated as outlier-dominated.
+const OUTLIER_CREST: f32 = 16.0;
 
 struct Args {
     model: PathBuf,
@@ -122,7 +124,11 @@ impl AbsMax {
     /// the cosine is dominated by.
     fn robust_max(&self, sigma_clip: f32) -> f32 {
         let rms = self.rms();
-        if rms > 0.0 && self.value > sigma_clip * rms {
+        // Only tamp down genuine outlier tensors. The shortconv `y` buffer has
+        // a crest factor of ~44 (one channel dominates) and gains five bits
+        // from clipping; FFN activations sit near 10 and lose accuracy when
+        // clipped, so they keep their absmax.
+        if rms > 0.0 && self.value > OUTLIER_CREST * rms {
             sigma_clip * rms
         } else {
             self.value
