@@ -33,6 +33,7 @@ pub mod hvx;
 pub mod layer_fixture;
 pub mod method;
 pub mod mock;
+pub mod model_pack;
 pub mod transport;
 pub mod weights;
 
@@ -50,9 +51,9 @@ pub use method::{
 pub use mock::{MockCall, MockReply, MockTransport, RecordedCall};
 pub use transport::{Call, Handle, SharedBuffer, SharedOwner, Transport};
 pub use weights::{
-    AttentionParams, AttentionPlan, FfnPlan, LayerPlan, LoadStrategy, PackedTensor, ResidentImage,
-    ResidentWeights, StageKind, WeightBudget, WeightError, WeightPlan, WeightPlanBuilder,
-    WeightStats, LOAD_CHUNK,
+    AttentionFullPlan, AttentionParams, AttentionPlan, ConvPlan, FfnPlan, LayerPlan, LmHeadPlan,
+    LoadStrategy, PackedMatrix, PackedTensor, ResidentImage, ResidentWeights, StageKind,
+    WeightBudget, WeightError, WeightPlan, WeightPlanBuilder, WeightStats, LOAD_CHUNK,
 };
 
 #[cfg(target_os = "android")]

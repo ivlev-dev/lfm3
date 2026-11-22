@@ -5,10 +5,10 @@
 //! DSP port: weights are the same values the device will hold, only the storage
 //! layout differs.
 
-use lfm_gguf::{GgmlType, GgufFile, TensorInfo};
-use lfm_quant;
+use lfm_gguf::{GgufFile, TensorInfo};
 
 use crate::backend::{AttentionCall, Backend, BackendError, NormSlot, NormWeights};
+use crate::dequant;
 use crate::kv::KvCache;
 use crate::ops::{self, RopeTable};
 use crate::spec::{AttentionKind, LayerSpec, ModelSpec};
@@ -591,51 +591,14 @@ fn load_vector(file: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>, Runt
 }
 
 fn dequantize(info: &TensorInfo, bytes: &[u8], count: usize) -> Result<Vec<f32>, RuntimeError> {
-    let values = match info.ggml_type {
-        GgmlType::F32 => bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect::<Vec<_>>(),
-        GgmlType::F16 => bytes
-            .chunks_exact(2)
-            .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
-            .collect::<Vec<_>>(),
-        GgmlType::BF16 => bytes
-            .chunks_exact(2)
-            .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
-            .collect::<Vec<_>>(),
-        GgmlType::Q4_K => lfm_quant::dequant_row_q4_k(bytes, count)
-            .map_err(|error| RuntimeError::Gguf(format!("{}: {error}", info.name)))?,
-        GgmlType::Q6_K => lfm_quant::dequant_row_q6_k(bytes, count)
-            .map_err(|error| RuntimeError::Gguf(format!("{}: {error}", info.name)))?,
-        GgmlType::Q8_0 => {
-            if count % 32 != 0 {
-                return Err(RuntimeError::Gguf(format!(
-                    "{}: Q8_0 length {count} is not a multiple of 32",
-                    info.name
-                )));
-            }
-            let mut out = Vec::with_capacity(count);
-            for block in bytes.chunks_exact(34) {
-                let mut values = [0u8; 34];
-                values.copy_from_slice(block);
-                out.extend_from_slice(&lfm_quant::dequant_q8_0(&values));
-            }
-            out
-        }
-        other => {
-            return Err(RuntimeError::UnsupportedTensorType {
-                name: info.name.clone(),
-                ggml_type: format!("{other:?}"),
-            });
-        }
-    };
-    if values.len() != count {
-        return Err(RuntimeError::Gguf(format!(
-            "{}: dequantized {} values, expected {count}",
-            info.name,
-            values.len()
-        )));
-    }
-    Ok(values)
+    dequant::dequantize_row(info.ggml_type, &info.name, bytes, count).map_err(|message| match info
+        .ggml_type
+        .type_size()
+    {
+        Some(_) => RuntimeError::Gguf(message),
+        None => RuntimeError::UnsupportedTensorType {
+            name: info.name.clone(),
+            ggml_type: format!("{:?}", info.ggml_type),
+        },
+    })
 }

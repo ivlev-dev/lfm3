@@ -63,6 +63,11 @@ impl Model {
         self.backend.name()
     }
 
+    /// Backend-specific detail of the last failure, when there is one.
+    pub fn backend_diagnostic(&self) -> Option<String> {
+        self.backend.diagnostic()
+    }
+
     /// Start a fresh sequence that can hold `max_context` tokens.
     pub fn session(&mut self, max_context: usize) -> Result<Session<'_>, RuntimeError> {
         Session::new(&mut *self.backend, self.spec.clone(), max_context)
@@ -178,6 +183,11 @@ impl<'a> Session<'a> {
         &self.spec
     }
 
+    /// Backend-specific detail of the last failure, when there is one.
+    pub fn backend_diagnostic(&self) -> Option<String> {
+        self.backend.diagnostic()
+    }
+
     /// Pages used by one attention layer, useful for scheduler diagnostics.
     pub fn pages_used(&self, layer: usize) -> Option<usize> {
         self.kv.get(layer)?.as_ref().map(PagedKvCache::pages_used)
@@ -200,6 +210,19 @@ impl<'a> Session<'a> {
 
     /// Feed a prompt, returning the logits of its last token.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, RuntimeError> {
+        self.prefill_with(tokens, &mut |_, _| {})
+    }
+
+    /// Feed a prompt, reporting the residual stream after every layer.
+    ///
+    /// The hook sees each layer's output in order; it exists so a device run
+    /// can dump the same tensors the host oracle produces and bisect the first
+    /// layer that diverges.
+    pub fn prefill_with(
+        &mut self,
+        tokens: &[u32],
+        on_layer: &mut dyn FnMut(usize, &[f32]),
+    ) -> Result<Vec<f32>, RuntimeError> {
         if tokens.is_empty() {
             return Err(RuntimeError::InvalidArgument(
                 "prompt must contain at least one token".to_owned(),
@@ -213,7 +236,7 @@ impl<'a> Session<'a> {
         }
         let mut logits = Vec::new();
         for token in tokens {
-            logits = self.step(*token)?;
+            logits = self.step_with(*token, on_layer)?;
         }
         Ok(logits)
     }
@@ -223,15 +246,35 @@ impl<'a> Session<'a> {
         self.step(token)
     }
 
+    /// Feed one decoded token, reporting the residual stream after every layer.
+    pub fn decode_with(
+        &mut self,
+        token: u32,
+        on_layer: &mut dyn FnMut(usize, &[f32]),
+    ) -> Result<Vec<f32>, RuntimeError> {
+        self.step_with(token, on_layer)
+    }
+
     /// Greedy or sampled generation from `prompt`.
     pub fn generate(
         &mut self,
         prompt: &[u32],
         config: &GenerateConfig,
+        on_token: impl FnMut(u32),
+    ) -> Result<Generation, RuntimeError> {
+        self.generate_with(prompt, config, on_token, &mut |_, _| {})
+    }
+
+    /// Generation with a per-layer hook, used by the device trace path.
+    pub fn generate_with(
+        &mut self,
+        prompt: &[u32],
+        config: &GenerateConfig,
         mut on_token: impl FnMut(u32),
+        on_layer: &mut dyn FnMut(usize, &[f32]),
     ) -> Result<Generation, RuntimeError> {
         let mut sampler = Sampler::new(config.sampling)?;
-        let mut logits = self.prefill(prompt)?;
+        let mut logits = self.prefill_with(prompt, on_layer)?;
         let mut tokens = Vec::with_capacity(config.max_tokens);
         let mut stop_reason = StopReason::Length;
         while tokens.len() < config.max_tokens {
@@ -249,7 +292,7 @@ impl<'a> Session<'a> {
             if tokens.len() == config.max_tokens {
                 break;
             }
-            logits = self.step(token)?;
+            logits = self.step_with(token, on_layer)?;
         }
         Ok(Generation {
             tokens,
@@ -258,6 +301,14 @@ impl<'a> Session<'a> {
     }
 
     fn step(&mut self, token: u32) -> Result<Vec<f32>, RuntimeError> {
+        self.step_with(token, &mut |_, _| {})
+    }
+
+    fn step_with(
+        &mut self,
+        token: u32,
+        on_layer: &mut dyn FnMut(usize, &[f32]),
+    ) -> Result<Vec<f32>, RuntimeError> {
         if self.position >= self.max_context {
             return Err(RuntimeError::ContextOverflow {
                 position: self.position,
@@ -359,6 +410,7 @@ impl<'a> Session<'a> {
                 *merged += normalized;
             }
             std::mem::swap(&mut x, &mut merged);
+            on_layer(layer, &x);
         }
 
         backend.rms_norm(NormWeights::Output, &x, &mut normed)?;

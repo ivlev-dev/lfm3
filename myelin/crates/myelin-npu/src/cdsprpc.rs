@@ -118,7 +118,13 @@ impl Default for CdsprpcConfig {
             shell: "fastrpc_shell_unsigned_3".to_owned(),
             map_attributes: FASTRPC_ATTR_KEEP_MAP,
             rpcmem_heap: RPCMEM_HEAP_ID_SYSTEM,
-            rpcmem_flags: 1, // RPCMEM_DEFAULT_FLAGS (ION_FLAG_CACHED)
+            // Uncached on purpose. Cached buffers would need
+            // `DMA_BUF_IOCTL_SYNC` around every CPU access, but the fds that
+            // `rpcmem_to_fd` hands out on this kernel are not dma-bufs
+            // (`ENOTTY`), so there is no way to flush them. Measured CPU fill
+            // rate is 10-15 GB/s uncached versus 9-12 cached, i.e. the flag
+            // does not cost us anything here.
+            rpcmem_flags: 0,
         }
     }
 }

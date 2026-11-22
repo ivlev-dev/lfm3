@@ -10,12 +10,12 @@ build = "build.rs"
 [dependencies]
 myelin-core.workspace = true
 myelin-pack.workspace = true
+lfm-gguf = { path = "../../../crates/infra-gguf" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-lfm-gguf = { path = "../../../crates/infra-gguf" }
 half = "2"
 
 [lib]

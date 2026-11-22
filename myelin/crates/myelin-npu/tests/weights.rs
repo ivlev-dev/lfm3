@@ -11,8 +11,8 @@ use myelin_core::backend::dsp::{DspBackend, DspError, DspExecutor, DspHandle};
 use myelin_core::{Backend, BackendError, ModelSpec};
 use myelin_npu::method::method_id;
 use myelin_npu::weights::{
-    AttentionParams, AttentionPlan, FfnPlan, PackedTensor, ResidentImage, ResidentWeights,
-    StageKind, WeightBudget, WeightError, WeightPlan,
+    AttentionFullPlan, AttentionParams, AttentionPlan, ConvPlan, FfnPlan, PackedMatrix,
+    PackedTensor, ResidentImage, ResidentWeights, StageKind, WeightBudget, WeightError, WeightPlan,
 };
 use myelin_npu::{Executor, MockReply, MockTransport, Transport, TransportError};
 use myelin_pack::manifest::PackMeta;
@@ -64,12 +64,17 @@ fn packed(name: &str, k: usize, n: usize, seed: u64) -> PackedTensor {
     PackedTensor::from_pack(name, &result).expect("packed tensor")
 }
 
+fn matrix_of(name: &str, k: usize, n: usize, seed: u64) -> PackedMatrix {
+    PackedMatrix::from_tensor(packed(name, k, n, seed)).expect("packed matrix")
+}
+
 fn ffn(k: usize, n: usize, seed: u64) -> FfnPlan {
     FfnPlan::new(
-        packed("gate", k, n, seed),
-        packed("up", k, n, seed + 1),
-        packed("down", n, k, seed + 2),
-        2.0,
+        matrix_of("gate", k, n, seed),
+        matrix_of("up", k, n, seed + 1),
+        matrix_of("down", n, k, seed + 2),
+        0.5,
+        1.0,
         0.5,
         1,
     )
@@ -93,6 +98,7 @@ fn allocator(mock: &MockTransport, first: i32) -> Arc<AtomicI32> {
 
 struct Bench {
     mock: MockTransport,
+    transport: Arc<dyn Transport>,
     executor: Arc<dyn DspExecutor>,
     handle: DspHandle,
 }
@@ -100,10 +106,11 @@ struct Bench {
 fn bench() -> Bench {
     let mock = MockTransport::new();
     let transport: Arc<dyn Transport> = Arc::new(mock.clone());
-    let executor: Arc<dyn DspExecutor> = Arc::new(Executor::new(transport));
+    let executor: Arc<dyn DspExecutor> = Arc::new(Executor::new(Arc::clone(&transport)));
     let handle = executor.open("lfmgemv").expect("open");
     Bench {
         mock,
+        transport,
         executor,
         handle,
     }
@@ -131,14 +138,13 @@ fn read_i32(bytes: &[u8]) -> i32 {
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-fn expected_scale_payload(tensor: &PackedTensor, act: f32, out: f32) -> Vec<u8> {
-    let manifest = tensor.manifest();
+fn expected_scale_payload(tensor: &PackedMatrix, act: f32, out: f32) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend_from_slice(&(manifest.n_padded as i32).to_le_bytes());
-    payload.extend_from_slice(&(manifest.k_padded as i32).to_le_bytes());
+    payload.extend_from_slice(&(tensor.n_padded() as i32).to_le_bytes());
+    payload.extend_from_slice(&(tensor.k_padded() as i32).to_le_bytes());
     payload.extend_from_slice(&act.to_le_bytes());
     payload.extend_from_slice(&out.to_le_bytes());
-    for scale in &manifest.scales.scale_f32 {
+    for scale in tensor.scales() {
         payload.extend_from_slice(&scale.to_le_bytes());
     }
     payload
@@ -184,8 +190,8 @@ fn ffn_upload_matches_the_stand_order() {
             shapes[index].prim_in,
             [
                 &handle.to_le_bytes()[..],
-                &(tensor.manifest().n_padded as i32).to_le_bytes()[..],
-                &(tensor.manifest().k_padded as i32).to_le_bytes()[..],
+                &(tensor.n_padded() as i32).to_le_bytes()[..],
+                &(tensor.k_padded() as i32).to_le_bytes()[..],
                 &1i32.to_le_bytes()[..],
             ]
             .concat()
@@ -194,11 +200,11 @@ fn ffn_upload_matches_the_stand_order() {
         assert_eq!(read_i32(&loads[index].prim_in[4..8]), 0);
         assert_eq!(
             read_i32(&loads[index].prim_in[8..12]) as usize,
-            tensor.blob().len(),
+            tensor.weights().len(),
             "load_buf packs dataLen as _primIn[3]"
         );
         assert_eq!(loads[index].in_bufs.len(), 1);
-        assert_eq!(loads[index].in_bufs[0], tensor.blob());
+        assert_eq!(loads[index].in_bufs[0], tensor.weights());
         assert_eq!(read_i32(&scales[index].prim_in[0..4]), handle);
         assert_eq!(
             read_i32(&scales[index].prim_in[4..8]) as usize,
@@ -207,12 +213,13 @@ fn ffn_upload_matches_the_stand_order() {
         );
         assert_eq!(
             scales[index].in_bufs[0],
-            expected_scale_payload(tensor, 2.0, 0.5)
+            expected_scale_payload(
+                tensor,
+                if index < 2 { 0.5 * 65536.0 } else { 1.0 },
+                if index < 2 { 1.0 } else { 0.5 },
+            )
         );
-        assert_eq!(
-            scales[index].in_bufs[0].len(),
-            16 + 4 * tensor.manifest().n_padded
-        );
+        assert_eq!(scales[index].in_bufs[0].len(), 16 + 4 * tensor.n_padded());
     }
 
     let stats = planner.stats();
@@ -264,7 +271,7 @@ fn loads_follow_the_configured_chunking_and_offsets() {
             );
             let start = chunk * 64 * 1024;
             let end = (start + 64 * 1024).min(tensor.len());
-            assert_eq!(call.in_bufs[0], &tensor.blob()[start..end]);
+            assert_eq!(call.in_bufs[0], &tensor.weights()[start..end]);
         }
     }
     let stats = planner.stats();
@@ -286,7 +293,7 @@ fn attach_strategy_is_rejected_explicitly() {
     match error {
         WeightError::UnsupportedStrategy { strategy, reason } => {
             assert_eq!(strategy, myelin_npu::LoadStrategy::Attach);
-            assert!(reason.contains("attach_in"));
+            assert!(reason.contains("shared buffers"));
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -651,7 +658,16 @@ fn real_lfm3_ffn_gate_footprint() {
     let gate_bytes = gate.len();
     let layer_bytes = gate_bytes + up.len() + down.len();
     let chunks = gate.load_calls() + up.load_calls() + down.load_calls();
-    let layer = FfnPlan::new(gate, up, down, 2.0, 0.5, 1).expect("ffn plan");
+    let layer = FfnPlan::new(
+        PackedMatrix::from_tensor(gate).expect("gate"),
+        PackedMatrix::from_tensor(up).expect("up"),
+        PackedMatrix::from_tensor(down).expect("down"),
+        0.5,
+        1.0,
+        0.5,
+        1,
+    )
+    .expect("ffn plan");
 
     let bench = bench();
     allocator(&bench.mock, 1);
@@ -679,4 +695,190 @@ fn real_lfm3_ffn_gate_footprint() {
         3,
         "one alloc_buf per matrix"
     );
+}
+
+fn int4_matrix(name: &str, n_padded: usize, k_padded: usize, seed: u8) -> PackedMatrix {
+    let weights = (0..n_padded * (k_padded / 2))
+        .map(|index| (index as u8).wrapping_add(seed))
+        .collect();
+    let scales = (0..n_padded).map(|row| 0.001 * (row + 1) as f32).collect();
+    PackedMatrix::new(name, n_padded, k_padded, weights, scales).expect("packed matrix")
+}
+
+#[test]
+fn plan_over_budget_is_refused_before_any_allocation() {
+    let gate = int4_matrix("gate", 32, 256, 1);
+    let up = int4_matrix("up", 32, 256, 2);
+    let down = int4_matrix("down", 256, 32, 3);
+    let layer = FfnPlan::new(gate, up, down, 0.5, 1.0, 0.5, 1).expect("ffn plan");
+    let bytes = layer.bytes();
+    let plan = WeightPlan::builder(WeightBudget::new(bytes - 1))
+        .ffn(0, layer)
+        .build();
+    match plan.check_budget() {
+        Err(WeightError::PlanOverBudget {
+            bytes: need,
+            budget,
+        }) => {
+            assert_eq!(need, bytes);
+            assert_eq!(budget, bytes - 1);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn attach_strategy_maps_ion_buffers_and_frees_them() {
+    let bench = bench();
+    let next = Arc::new(AtomicI32::new(40));
+    let counter = Arc::clone(&next);
+    bench.mock.set_handler(method_id::ALLOC_IN, move |_| {
+        Ok(MockReply {
+            prim_out: counter
+                .fetch_add(1, Ordering::SeqCst)
+                .to_le_bytes()
+                .to_vec(),
+            ..Default::default()
+        })
+    });
+    bench
+        .mock
+        .set_handler(method_id::SET_SHAPE, |_| Ok(MockReply::default()));
+    bench
+        .mock
+        .set_handler(method_id::SET_SCALE, |_| Ok(MockReply::default()));
+    bench
+        .mock
+        .set_handler(method_id::RELEASE_BUF, |_| Ok(MockReply::default()));
+
+    let gate = int4_matrix("gate", 32, 256, 1);
+    let up = int4_matrix("up", 32, 256, 2);
+    let down = int4_matrix("down", 256, 32, 3);
+    let layer = FfnPlan::new(gate, up, down, 0.5, 1.0, 0.5, 1).expect("ffn plan");
+    let bytes = layer.bytes();
+    let plan = WeightPlan::builder(WeightBudget::new(bytes))
+        .ffn(0, layer)
+        .build();
+    let planner = ResidentWeights::with_ion(
+        Arc::clone(&bench.executor),
+        bench.handle,
+        plan,
+        Arc::clone(&bench.transport),
+    );
+
+    let stage = planner.ffn_stage(0).expect("ffn stage");
+    assert_eq!((stage.gate, stage.up, stage.down), (40, 41, 42));
+    assert!(bench.mock.live_bytes() >= bytes, "ION buffers stay alive");
+    assert_eq!(bench.calls(method_id::ALLOC_IN).len(), 3);
+    assert!(bench.calls(method_id::ALLOC_BUF).is_empty());
+    assert!(bench.calls(method_id::LOAD_BUF).is_empty());
+    assert_eq!(planner.stats().strategy, myelin_npu::LoadStrategy::Attach);
+
+    // The gate/up payload carries the FFN Q16 protocol; down the mid->out one.
+    let scales = bench.calls(method_id::SET_SCALE);
+    let gate_sa = f32::from_le_bytes(scales[0].in_bufs[0][8..12].try_into().unwrap());
+    let gate_so = f32::from_le_bytes(scales[0].in_bufs[0][12..16].try_into().unwrap());
+    let down_sa = f32::from_le_bytes(scales[2].in_bufs[0][8..12].try_into().unwrap());
+    let down_so = f32::from_le_bytes(scales[2].in_bufs[0][12..16].try_into().unwrap());
+    assert_eq!(gate_sa, 0.5 * 65536.0);
+    assert_eq!(gate_so, 1.0);
+    assert_eq!(down_sa, 1.0);
+    assert_eq!(down_so, 0.5);
+
+    drop(planner);
+    assert_eq!(bench.mock.live_bytes(), 0, "ION buffers are released");
+    assert_eq!(bench.calls(method_id::RELEASE_BUF).len(), 3);
+}
+
+#[test]
+fn conv_stage_exposes_the_planned_scales() {
+    let bench = bench();
+    allocator(&bench.mock, 60);
+    let plan = ConvPlan::new(
+        int4_matrix("in", 96, 256, 1),
+        ResidentImage::new("conv", vec![0u8; 256]).expect("image"),
+        int4_matrix("out", 32, 256, 2),
+        2.0,
+        0.25,
+        0.5,
+        0.125,
+        20,
+        1,
+        4096,
+    )
+    .expect("conv plan");
+    let bytes = plan.bytes();
+    let plan = WeightPlan::builder(bytes).conv(3, plan).build();
+    let planner = bench.planner(plan);
+    let stage = planner.conv_stage(3).expect("conv stage");
+    assert_eq!(stage.in_proj, 60);
+    assert_eq!(stage.out_proj, 62);
+    assert_eq!(stage.ksh, 20);
+    assert_eq!(stage.act_scale, 0.5);
+    assert_eq!(stage.mix_scale, 0.25);
+    assert_eq!(stage.y_scale, 0.5);
+    assert_eq!(stage.out_scale, 0.125);
+    assert_eq!(stage.state_off, 4096);
+}
+
+#[test]
+fn full_attention_stage_orders_caches_before_projections() {
+    let bench = bench();
+    allocator(&bench.mock, 70);
+    let caches = AttentionPlan::new(
+        ResidentImage::new("k", vec![0u8; 256]).expect("k"),
+        ResidentImage::new("kt", vec![0u8; 128]).expect("kt"),
+        ResidentImage::new("v", vec![0u8; 256]).expect("v"),
+        None,
+        AttentionParams {
+            q_scale: 1.0,
+            out_scale: 1.0 / 4096.0,
+            reps: 1,
+            cache_pages: 1,
+            preprojected: true,
+        },
+    )
+    .expect("caches");
+    let plan = AttentionFullPlan::new(
+        caches,
+        int4_matrix("q", 32, 256, 1),
+        int4_matrix("k", 32, 256, 2),
+        int4_matrix("v", 32, 256, 3),
+        int4_matrix("o", 256, 32, 4),
+        None,
+        vec![1.0, 1.0],
+        vec![1.0, 1.0],
+        2.0,
+        0.5,
+        0.25,
+        0.125,
+        1.0,
+        16.0,
+        1.0 / 4096.0,
+        0.75,
+        0.0625,
+        myelin_core::backend::VQuant::Channel(vec![0.5, 0.5]),
+        1,
+    )
+    .expect("attention plan");
+    let bytes = plan.bytes();
+    let plan = WeightPlan::builder(bytes).attention_full(2, plan).build();
+    let planner = bench.planner(plan);
+    let stage = planner.attention_full_stage(2).expect("attention stage");
+    assert_eq!(stage.caches.keys, 70);
+    assert_eq!(stage.caches.key_scales, 71);
+    assert_eq!(stage.caches.values, 72);
+    assert_eq!(stage.query, 73);
+    assert_eq!(stage.key, 74);
+    assert_eq!(stage.value, 75);
+    assert_eq!(stage.output, 76);
+    assert!(stage.gate.is_none());
+    assert_eq!(stage.act_scale, 0.5);
+    assert_eq!(stage.o_act_scale, 1.0 / 0.75);
+    assert_eq!(stage.out_scale, 0.0625);
+    assert_eq!(stage.attn_q_scale, 16.0);
+    match &stage.v_quant {
+        myelin_core::backend::VQuant::Channel(scales) => assert_eq!(scales, &[0.5, 0.5]),
+        other => panic!("unexpected V quantisation {other:?}"),
+    }
 }

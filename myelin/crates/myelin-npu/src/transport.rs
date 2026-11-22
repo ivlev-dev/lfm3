@@ -129,6 +129,66 @@ impl Drop for SharedBuffer {
     }
 }
 
+/// `DMA_BUF_IOCTL_SYNC` flags (`linux/dma-buf.h`).
+#[cfg(target_os = "android")]
+mod dma_buf {
+    pub const SYNC_READ: u64 = 1;
+    pub const SYNC_WRITE: u64 = 2;
+    pub const SYNC_START: u64 = 0;
+    pub const SYNC_END: u64 = 4;
+    /// `_IOW('b', 2, struct dma_buf_sync)` with an 8-byte payload.
+    pub const IOCTL_SYNC: libc::c_ulong = 0x4008_6202;
+}
+
+/// Begin or end a host mapping of a shared buffer around CPU access.
+///
+/// rpcmem allocations are cached (`ION_FLAG_CACHED`), and the DSP maps the
+/// same dma-buf. Weights written by the CPU are not visible to the device
+/// until the cache is flushed, exactly like the C stands do it
+/// (`attach_main.c:dma_sync`, `exec_main.c:dma_sync`). On the host this is a
+/// no-op: the mock transport uses plain memory.
+pub fn sync_shared(buffer: &SharedBuffer, start: bool, write: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        #[repr(C)]
+        struct DmaBufSync {
+            flags: u64,
+        }
+        let mut flags = if start {
+            dma_buf::SYNC_START
+        } else {
+            dma_buf::SYNC_END
+        };
+        if write {
+            flags |= dma_buf::SYNC_WRITE;
+        } else {
+            flags |= dma_buf::SYNC_READ;
+        }
+        let arg = DmaBufSync { flags };
+        // SAFETY: the fd is a live dma-buf and `arg` matches the ioctl layout.
+        // Android's bionic declares `ioctl` with an `int` request; the constant
+        // is a `c_ulong` on the host toolchains, so let inference pick the
+        // target's request type.
+        let code = unsafe { libc::ioctl(buffer.fd(), dma_buf::IOCTL_SYNC as _, &arg) };
+        if code != 0 {
+            let error = std::io::Error::last_os_error();
+            // `ENOTTY` means the fd is not a dma-buf, which is what we get from
+            // `rpcmem_to_fd` on this kernel. Our buffers are allocated uncached
+            // (see `CdsprpcConfig::rpcmem_flags`), so there is nothing to flush.
+            if error.raw_os_error() == Some(libc::ENOTTY) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (buffer, start, write);
+        Ok(())
+    }
+}
+
 // SAFETY: the allocation is plain memory; the owner's release path is
 // thread-safe (`SharedOwner: Send + Sync`).
 unsafe impl Send for SharedBuffer {}

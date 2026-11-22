@@ -244,6 +244,19 @@ fn attention_call_sees_monotonic_positions() {
 }
 
 #[test]
+fn layer_hook_sees_every_layer_in_order() {
+    let mut model = scripted_model(vec![3; 8]);
+    let mut session = model.session(16).expect("session");
+    let mut seen = Vec::new();
+    let mut hook = |layer: usize, values: &[f32]| {
+        assert_eq!(values.len(), 8);
+        seen.push(layer);
+    };
+    session.prefill_with(&[1, 2], &mut hook).expect("prefill");
+    assert_eq!(seen, vec![0, 1, 0, 1]);
+}
+
+#[test]
 fn dsp_backend_is_selectable_but_fails_typed() {
     let spec = ScriptedBackend::new(vec![0]).spec.clone();
     let mut model = Model::from_backend(spec.clone(), Box::new(myelin_core::DspBackend::new(spec)))

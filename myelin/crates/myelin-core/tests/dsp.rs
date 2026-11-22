@@ -21,7 +21,7 @@ fn dsp_backend_reports_missing_transport() {
         } => {
             assert_eq!(backend, "dsp");
             assert_eq!(operation, "embed");
-            assert!(reason.contains("FastRPC"));
+            assert!(reason.contains("host tensors"));
         }
         other => panic!("unexpected error {other:?}"),
     }

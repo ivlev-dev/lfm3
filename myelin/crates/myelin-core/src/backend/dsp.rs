@@ -22,7 +22,8 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::{AttentionCall, Backend, BackendError, NormWeights};
+use super::host::HostWeights;
+use super::{AttentionCall, Backend, BackendError, LmHeadStage, NormWeights};
 use crate::kv::KvCache;
 use crate::spec::{AttentionKind, ModelSpec};
 
@@ -164,6 +165,25 @@ pub trait StageProvider: Send + Sync {
     fn ffn_stage(&mut self, layer: usize) -> Result<FfnStage, StageError>;
     /// Load (or reuse) the resident attention state of `layer`.
     fn attention_stage(&mut self, layer: usize) -> Result<AttentionStage, StageError>;
+    /// Load (or reuse) a resident short-convolution stage of `layer`.
+    ///
+    /// The default rejects the request, so a planner that only knows FFN and
+    /// paged-attention caches keeps working unchanged.
+    fn conv_stage(&mut self, _layer: usize) -> Result<ConvStage, StageError> {
+        Err(StageError::Unknown(
+            "the weight provider has no short-convolution stage".to_owned(),
+        ))
+    }
+    /// Load (or reuse) a fully wired attention layer (projections + caches).
+    fn attention_full_stage(&mut self, _layer: usize) -> Result<AttentionFullStage, StageError> {
+        Err(StageError::Unknown(
+            "the weight provider has no full attention stage".to_owned(),
+        ))
+    }
+    /// Resident vocabulary projection, when the provider stages one.
+    fn lm_head_stage(&mut self) -> Result<Option<LmHeadStage>, StageError> {
+        Ok(None)
+    }
     /// Release every resident buffer. Must be idempotent.
     fn release_all(&mut self);
 }
@@ -567,8 +587,13 @@ const SCRATCH_CY: i32 = 12288;
 const CONV_STATE_BASE: i32 = 1 << 20;
 const CONV_STATE_STRIDE: i32 = 1 << 18;
 
-/// Scratch arena the backend reserves for `exec` (4 MiB).
-pub const EXEC_SCRATCH_BYTES: u32 = 4 << 20;
+/// Scratch arena the backend reserves for `exec` (8 MiB).
+///
+/// The CONV ring of layer `N` lives at [`conv_state_offset`], `1 MiB + N *
+/// 256 KiB`; the deepest LFM3 conv layer is 23, so the arena must reach
+/// `1 MiB + 24 * 256 KiB = 7 MiB`. The attention block table and the
+/// intermediate int8 buffers sit in the first 16 KiB.
+pub const EXEC_SCRATCH_BYTES: u32 = 8 << 20;
 
 /// Persistent `CONV` ring-state offset for `layer`.
 ///
@@ -883,7 +908,10 @@ pub struct DspBackend {
     conv_counters: Vec<i32>,
     scratch_ready: bool,
     exec_micros: i64,
+    exec_host_micros: i64,
     weights: Option<Box<dyn StageProvider>>,
+    host: Option<HostWeights>,
+    lm_head: Option<LmHeadStage>,
     last_error: Option<DspError>,
     last_exec_times: Option<[i32; 8]>,
 }
@@ -894,6 +922,9 @@ const MISSING_FFN_STAGE: &str =
     "FastRPC FFN weights are not staged; call DspBackend::stage_ffn first";
 const MISSING_ATTENTION_STAGE: &str =
     "FastRPC attention caches are not staged; call DspBackend::stage_attention first";
+const MISSING_LM_HEAD_STAGE: &str =
+    "FastRPC vocabulary projection is not staged; attach a StageProvider with `lm_head_stage`";
+const MISSING_HOST: &str = "host tensors are not attached; call DspBackend::attach_host first";
 
 impl DspBackend {
     /// Adopt a validated spec without a transport.
@@ -912,7 +943,10 @@ impl DspBackend {
             conv_counters: vec![0; layers],
             scratch_ready: false,
             exec_micros: 0,
+            exec_host_micros: 0,
             weights: None,
+            host: None,
+            lm_head: None,
             last_error: None,
             last_exec_times: None,
         }
@@ -982,6 +1016,34 @@ impl DspBackend {
     /// Whether an on-demand weight provider is attached.
     pub fn has_weight_provider(&self) -> bool {
         self.weights.is_some()
+    }
+
+    /// Attach the host-resident tensors: token embedding, RMSNorm weights and
+    /// the material for the parity-mode vocabulary projection.
+    ///
+    /// `embed` and `rms_norm` need these; the DSP layer calls do not. A model
+    /// file that only exercises the device graph can stay without them, in
+    /// which case the two host operations fail with a typed error.
+    pub fn attach_host(&mut self, host: HostWeights) -> Result<(), BackendError> {
+        if host.layer_count() != self.spec.dims.layers {
+            return Err(BackendError::Model(format!(
+                "host weights describe {} layers, model has {}",
+                host.layer_count(),
+                self.spec.dims.layers
+            )));
+        }
+        self.host = Some(host);
+        Ok(())
+    }
+
+    /// Host tensors, when attached.
+    pub fn host_weights(&self) -> Option<&HostWeights> {
+        self.host.as_ref()
+    }
+
+    /// Mutable host tensors, for the head-mode switch.
+    pub fn host_weights_mut(&mut self) -> Option<&mut HostWeights> {
+        self.host.as_mut()
     }
 
     /// DSP microseconds spent in `exec` since the last call, summed over the
@@ -1269,12 +1331,22 @@ impl DspBackend {
             }
         }
         let Some(stage) = self.conv.get(layer).copied().flatten() else {
-            return Err(unsupported(
-                "conv_layer",
-                "FastRPC conv weights are not staged; call DspBackend::stage_conv first",
-            ));
+            let stage = self.load_conv_stage(layer)?;
+            return self.conv_layer_with_stage(layer, stage, x, state, out);
         };
-        stage.validate()?;
+        self.conv_layer_with_stage(layer, stage, x, state, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conv_layer_with_stage(
+        &mut self,
+        layer: usize,
+        stage: ConvStage,
+        x: &[f32],
+        _state: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let dims = self.spec.dims;
         self.last_error = None;
         let counter = *self
             .conv_counters
@@ -1732,7 +1804,10 @@ impl DspBackend {
             rt,
             out_len,
         };
-        match executor.exec(handle, request) {
+        let host_started = std::time::Instant::now();
+        let result = executor.exec(handle, request);
+        self.exec_host_micros += host_started.elapsed().as_micros() as i64;
+        match result {
             Ok(result) => {
                 self.last_error = None;
                 self.exec_micros += i64::from(result.times[0]);
@@ -1817,10 +1892,92 @@ impl DspBackend {
             Err(error) => Err(self.stage_failure("attention_layer", error)),
         }
     }
+
+    fn load_conv_stage(&mut self, layer: usize) -> Result<ConvStage, BackendError> {
+        let loaded = match self.weights.as_mut() {
+            Some(provider) => provider.conv_stage(layer),
+            None => {
+                return Err(unsupported(
+                    "conv_layer",
+                    "FastRPC conv weights are not staged; call DspBackend::stage_conv first",
+                ));
+            }
+        };
+        match loaded {
+            Ok(stage) => {
+                stage.validate()?;
+                let layers = self.conv.len();
+                let slot = self.conv.get_mut(layer).ok_or_else(|| {
+                    BackendError::Model(format!(
+                        "layer {layer} is outside the model ({layers} layers)"
+                    ))
+                })?;
+                *slot = Some(stage);
+                Ok(stage)
+            }
+            Err(error) => Err(self.stage_failure("conv_layer", error)),
+        }
+    }
+
+    /// Ask the provider for a fully wired attention layer.
+    ///
+    /// `Ok(None)` means the provider does not stage projections, so the
+    /// backend falls back to the pre-projected attention entry point.
+    fn load_attention_full_stage(
+        &mut self,
+        layer: usize,
+    ) -> Result<Option<AttentionFullStage>, BackendError> {
+        let loaded = match self.weights.as_mut() {
+            Some(provider) => provider.attention_full_stage(layer),
+            None => return Ok(None),
+        };
+        match loaded {
+            Ok(stage) => {
+                stage.validate(&self.spec.dims)?;
+                let layers = self.attention_full.len();
+                let slot = self.attention_full.get_mut(layer).ok_or_else(|| {
+                    BackendError::Model(format!(
+                        "layer {layer} is outside the model ({layers} layers)"
+                    ))
+                })?;
+                *slot = Some(stage.clone());
+                self.attention[layer] = Some(stage.caches);
+                Ok(Some(stage))
+            }
+            Err(StageError::Unknown(_)) => Ok(None),
+            Err(error) => Err(self.stage_failure("attention_layer", error)),
+        }
+    }
+
+    fn load_lm_head_stage(&mut self) -> Result<LmHeadStage, BackendError> {
+        if let Some(stage) = self.lm_head {
+            return Ok(stage);
+        }
+        let loaded = match self.weights.as_mut() {
+            Some(provider) => provider.lm_head_stage(),
+            None => return Err(unsupported("lm_head", MISSING_LM_HEAD_STAGE)),
+        };
+        match loaded {
+            Ok(Some(stage)) => {
+                stage.validate()?;
+                self.lm_head = Some(stage);
+                Ok(stage)
+            }
+            Ok(None) => Err(unsupported("lm_head", MISSING_LM_HEAD_STAGE)),
+            Err(error) => Err(self.stage_failure("lm_head", error)),
+        }
+    }
 }
 
 impl Drop for DspBackend {
     fn drop(&mut self) {
+        if std::env::var_os("MYELIN_TRACE").is_some() {
+            eprintln!(
+                "dsp exec totals: dsp {:.1} ms, host {:.1} ms",
+                self.exec_micros as f64 / 1000.0,
+                self.exec_host_micros as f64 / 1000.0
+            );
+        }
         // Resident buffers must go back before `DspLink` closes the handle.
         if let Some(provider) = self.weights.as_mut() {
             provider.release_all();
@@ -1896,23 +2053,25 @@ impl Backend for DspBackend {
         &self.spec
     }
 
-    fn embed(&mut self, _token: u32, _out: &mut [f32]) -> Result<(), BackendError> {
-        Err(unsupported(
-            "embed",
-            "FastRPC: embedding lookup is not staged as a resident DSP buffer",
-        ))
+    fn embed(&mut self, token: u32, out: &mut [f32]) -> Result<(), BackendError> {
+        let host = self
+            .host
+            .as_ref()
+            .ok_or_else(|| unsupported("embed", MISSING_HOST))?;
+        host.embed(token, out)
     }
 
     fn rms_norm(
         &mut self,
-        _weights: NormWeights,
-        _x: &[f32],
-        _out: &mut [f32],
+        weights: NormWeights,
+        x: &[f32],
+        out: &mut [f32],
     ) -> Result<(), BackendError> {
-        Err(unsupported(
-            "rms_norm",
-            "FastRPC: resident RMSNorm weights are not staged on the DSP",
-        ))
+        let host = self
+            .host
+            .as_ref()
+            .ok_or_else(|| unsupported("rms_norm", MISSING_HOST))?;
+        host.norm(weights, x, out)
     }
 
     fn ffn_layer(&mut self, layer: usize, x: &[f32], out: &mut [f32]) -> Result<(), BackendError> {
@@ -1977,6 +2136,11 @@ impl Backend for DspBackend {
         if let Some(stage) = self.attention_full.get(call.layer).cloned().flatten() {
             return self.attention_layer_full(&stage, call, kv, out);
         }
+        if self.weights.is_some() {
+            if let Some(stage) = self.load_attention_full_stage(call.layer)? {
+                return self.attention_layer_full(&stage, call, kv, out);
+            }
+        }
         self.attention_layer_preprojected(call, kv, out)
     }
 
@@ -1990,15 +2154,72 @@ impl Backend for DspBackend {
         DspBackend::conv_layer(self, layer, x, state, out)
     }
 
-    fn lm_head(&mut self, _x: &[f32], _logits: &mut [f32]) -> Result<(), BackendError> {
-        Err(unsupported(
-            "lm_head",
-            "FastRPC: the vocabulary projection is not staged as a resident GEMV",
-        ))
+    fn lm_head(&mut self, x: &[f32], logits: &mut [f32]) -> Result<(), BackendError> {
+        let dims = self.spec.dims;
+        if x.len() != dims.hidden {
+            return Err(BackendError::Shape {
+                operation: "dsp lm_head input",
+                expected: dims.hidden,
+                got: x.len(),
+            });
+        }
+        if logits.len() != dims.vocab {
+            return Err(BackendError::Shape {
+                operation: "dsp lm_head logits",
+                expected: dims.vocab,
+                got: logits.len(),
+            });
+        }
+        if self
+            .host
+            .as_ref()
+            .is_some_and(|host| host.head_mode() == super::host::HeadMode::Host)
+        {
+            let host = self.host.as_ref().expect("host mode implies host weights");
+            host.lm_head(x, logits)?;
+            self.last_error = None;
+            return Ok(());
+        }
+        let stage = self.load_lm_head_stage()?;
+        self.last_error = None;
+        let act = quantize(x, 1.0 / stage.input_scale);
+        let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
+        list.push(
+            exec::Command::gemv(
+                stage.gemv,
+                1,
+                stage.reps,
+                SCRATCH_ACT,
+                dims.hidden as i32,
+                0,
+                stage.rows as i32,
+            )
+            .with_dst(exec::dst::OUT, 0),
+        );
+        let result = self.run_exec(&list, &act, &[], stage.rows)?;
+        if result.out.len() != stage.rows {
+            return Err(unsupported(
+                "lm_head",
+                "exec returned the wrong logits length",
+            ));
+        }
+        for (dst, &code) in logits.iter_mut().zip(&result.out) {
+            *dst = (code as i8) as f32 * stage.output_scale;
+        }
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), BackendError> {
         self.reset_session()
+    }
+
+    fn diagnostic(&self) -> Option<String> {
+        let error = self.last_error.as_ref()?;
+        let times = self
+            .last_exec_times
+            .map(|times| format!("{times:?}"))
+            .unwrap_or_else(|| "no times".to_owned());
+        Some(format!("{error}; exec times {times}"))
     }
 }
 

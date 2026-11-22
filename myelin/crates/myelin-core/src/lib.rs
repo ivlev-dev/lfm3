@@ -15,6 +15,7 @@
 
 pub mod arch;
 pub mod backend;
+pub mod dequant;
 pub mod engine;
 pub mod error;
 pub mod gguf;
@@ -27,7 +28,8 @@ pub mod tokenizer;
 
 pub use arch::{build_spec, detect, Arch};
 pub use backend::{
-    AttentionCall, Backend, BackendError, CpuBackend, DspBackend, NormSlot, NormWeights,
+    AttentionCall, Backend, BackendError, CpuBackend, DspBackend, EmbeddingRows, HeadMode,
+    HostWeights, LayerNorms, NormSlot, NormWeights, StageProvider,
 };
 pub use engine::{Engine, StepOut};
 pub use error::{CoreError, RuntimeError};

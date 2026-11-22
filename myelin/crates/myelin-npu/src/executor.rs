@@ -4,7 +4,8 @@
 //! way), so the core exposes a narrow object-safe trait and this module
 //! implements it for the real and mock transports.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use myelin_core::backend::dsp::{DspCall, DspError, DspExecutor, DspHandle, ExecResult, ExecRun};
 
@@ -13,7 +14,7 @@ use crate::method::{
     long_len, method_id, octet_len, ExecWire, MapArenaWire, ReserveScratchScalars,
     UnmapArenaScalars, TIMES_VALUES,
 };
-use crate::transport::{Call, SharedBuffer, Transport};
+use crate::transport::{sync_shared, Call, SharedBuffer, Transport};
 
 impl From<TransportError> for DspError {
     fn from(error: TransportError) -> Self {
@@ -100,95 +101,79 @@ fn run_exec_on<T: Transport + ?Sized>(
     handle: DspHandle,
     request: ExecRun<'_>,
 ) -> Result<ExecResult, DspError> {
-    let (shared, arena) = map_list(transport, handle, request.list)?;
-    let result = exec_mapped(transport, handle, arena, &request);
+    let (shared, arena) = map_list(transport, handle, request.list, None)?;
+    let result = exec_mapped(transport, handle, arena, 0, &request);
     drop(shared);
     unmap_arena(transport, handle, arena);
     result
 }
 
-/// One mapped command list. The list bytes are immutable while mapped (the
-/// DSP caches every mapped page, so rewriting it in place is invisible to the
-/// DSP), which is exactly why a cache can reuse the mapping when the bytes and
-/// the handle match.
-struct MappedList {
-    list: Vec<u8>,
-    /// Owns the rpcmem buffer; the arena is only valid while this lives.
-    _shared: SharedBuffer,
-    arena: i32,
-    handle: DspHandle,
-}
-
-/// Mapped exec lists, keyed by exact bytes and handle.
+/// One long-lived arena holding every command list we have seen.
 ///
-/// One token touches a handful of stable lists: the conv list, the attention
-/// projection list, the ATTN list, the o_proj list and the FFN list. None of
-/// them changes between tokens once the CONV counter travels in `rt[]`, so
-/// after the first token `map_arena`/`unmap_arena` disappear from the hot
-/// path. Lists that do change are remapped and the oldest mapping is evicted;
-/// the cap keeps the DSP arena table small.
-#[derive(Default)]
-struct ExecArenaCache {
-    entries: Vec<MappedList>,
+/// The skeleton has four arena slots, a token touches ~70 distinct lists, and
+/// mapping an arena costs ~2.2 ms on this device, so a mapping per list would
+/// dominate the token. `exec` takes a `cmd_off`, so all lists can share one
+/// arena: each distinct list is appended once, the arena is mapped once, and
+/// later calls pass the list's offset. Lists never change between tokens (the
+/// CONV counter travels in `rt[]`), which matters because the DSP caches
+/// mapped pages: an in-place rewrite would be invisible to it.
+const LIST_ARENA_BYTES: usize = 1 << 20;
+
+struct ListArena {
+    shared: SharedBuffer,
+    handle: DspHandle,
+    arena: i32,
+    next: usize,
+    offsets: HashMap<Vec<u8>, i32>,
 }
 
-const EXEC_ARENA_CACHE: usize = 8;
-
-impl ExecArenaCache {
-    fn lock(cache: &Mutex<Self>) -> MutexGuard<'_, Self> {
-        cache.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn find(&self, handle: DspHandle, list: &[u8]) -> Option<i32> {
-        self.entries
-            .iter()
-            .find(|entry| entry.handle == handle && entry.list == list)
-            .map(|entry| entry.arena)
-    }
-
-    fn arena_for<T: Transport + ?Sized>(
-        &mut self,
-        transport: &T,
-        handle: DspHandle,
-        list: &[u8],
-    ) -> Result<i32, DspError> {
-        if let Some(arena) = self.find(handle, list) {
-            return Ok(arena);
-        }
-        if self.entries.len() == EXEC_ARENA_CACHE {
-            let evicted = self.entries.remove(0);
-            unmap_arena(transport, evicted.handle, evicted.arena);
-        }
-        let (shared, arena) = map_list(transport, handle, list)?;
-        self.entries.push(MappedList {
-            list: list.to_vec(),
-            _shared: shared,
-            arena,
+impl ListArena {
+    fn map<T: Transport + ?Sized>(transport: &T, handle: DspHandle) -> Result<Self, DspError> {
+        let mut shared = transport
+            .alloc_shared(LIST_ARENA_BYTES)
+            .map_err(DspError::from)?;
+        shared.as_mut_slice().fill(0);
+        let arena = map_arena(transport, handle, &shared, LIST_ARENA_BYTES as i32)?;
+        Ok(Self {
+            shared,
             handle,
-        });
-        Ok(arena)
+            arena,
+            next: 0,
+            offsets: HashMap::new(),
+        })
+    }
+
+    fn offset_for(&mut self, list: &[u8]) -> Result<i32, DspError> {
+        if let Some(offset) = self.offsets.get(list) {
+            return Ok(*offset);
+        }
+        let start = (self.next + 15) & !15;
+        let end = start + list.len();
+        if end > LIST_ARENA_BYTES {
+            return Err(DspError::Other(format!(
+                "exec list arena exhausted: {} distinct lists, {} bytes",
+                self.offsets.len(),
+                self.next
+            )));
+        }
+        self.shared.as_mut_slice()[start..end].copy_from_slice(list);
+        sync_shared(&self.shared, true, true).map_err(|error| DspError::Other(error.to_string()))?;
+        sync_shared(&self.shared, false, true).map_err(|error| DspError::Other(error.to_string()))?;
+        self.next = end;
+        let offset = i32::try_from(start)
+            .map_err(|_| DspError::Other("exec list offset does not fit i32".to_owned()))?;
+        self.offsets.insert(list.to_vec(), offset);
+        Ok(offset)
     }
 }
 
-/// Round the list to the 128-byte alignment `map_arena` requires, copy it into
-/// rpcmem and map it once.
-fn map_list<T: Transport + ?Sized>(
+/// Register `shared` with the skeleton and return the arena handle.
+fn map_arena<T: Transport + ?Sized>(
     transport: &T,
     handle: DspHandle,
-    list: &[u8],
-) -> Result<(SharedBuffer, i32), DspError> {
-    let nbytes = list.len().max(1).div_ceil(128) * 128;
-    let nbytes = i32::try_from(nbytes).map_err(|_| {
-        DspError::Other(format!(
-            "exec list of {} bytes does not fit a 32-bit IDL field",
-            list.len()
-        ))
-    })?;
-    let mut shared = transport
-        .alloc_shared(nbytes as usize)
-        .map_err(DspError::from)?;
-    shared.as_mut_slice()[..list.len()].copy_from_slice(list);
-
+    shared: &SharedBuffer,
+    nbytes: i32,
+) -> Result<i32, DspError> {
     // `map_arena` writes the arena handle through `rout long` (prim_out).
     let mut arena_bytes = [0u8; 4];
     let prim = MapArenaWire {
@@ -208,7 +193,36 @@ fn map_list<T: Transport + ?Sized>(
             out_bufs: &mut no_out,
         },
     )?;
-    Ok((shared, i32::from_le_bytes(arena_bytes)))
+    Ok(i32::from_le_bytes(arena_bytes))
+}
+
+/// Round the list to the 128-byte alignment `map_arena` requires, copy it into
+/// rpcmem and map it once.
+fn map_list<T: Transport + ?Sized>(
+    transport: &T,
+    handle: DspHandle,
+    list: &[u8],
+    reuse: Option<SharedBuffer>,
+) -> Result<(SharedBuffer, i32), DspError> {
+    let nbytes = list.len().max(1).div_ceil(128) * 128;
+    let nbytes = i32::try_from(nbytes).map_err(|_| {
+        DspError::Other(format!(
+            "exec list of {} bytes does not fit a 32-bit IDL field",
+            list.len()
+        ))
+    })?;
+    let mut shared = match reuse {
+        Some(buffer) if buffer.len() >= nbytes as usize => buffer,
+        _ => transport
+            .alloc_shared(nbytes as usize)
+            .map_err(DspError::from)?,
+    };
+    shared.as_mut_slice()[..list.len()].copy_from_slice(list);
+    // The command list is read by the DSP from the mapped dma-buf; flush it.
+    sync_shared(&shared, true, true).map_err(|error| DspError::Other(error.to_string()))?;
+    sync_shared(&shared, false, true).map_err(|error| DspError::Other(error.to_string()))?;
+    let arena = map_arena(transport, handle, &shared, nbytes)?;
+    Ok((shared, arena))
 }
 
 fn unmap_arena<T: Transport + ?Sized>(transport: &T, handle: DspHandle, arena: i32) {
@@ -228,18 +242,19 @@ fn unmap_arena<T: Transport + ?Sized>(transport: &T, handle: DspHandle, arena: i
     );
 }
 
-/// `exec` against an already mapped arena.
+/// `exec` against an already mapped arena, at `cmd_off`.
 fn exec_mapped<T: Transport + ?Sized>(
     transport: &T,
     handle: DspHandle,
     arena: i32,
+    cmd_off: i32,
     request: &ExecRun<'_>,
 ) -> Result<ExecResult, DspError> {
     let mut out = vec![0u8; request.out_len];
     let mut times = [0i32; TIMES_VALUES];
     let prim = ExecWire {
         ah: arena,
-        cmd_off: 0,
+        cmd_off,
         n_cmds: i32::try_from(request.commands)
             .map_err(|_| DspError::Other("exec command count does not fit i32".to_owned()))?,
         act_len: octet_len(request.act.len())
@@ -270,20 +285,6 @@ fn exec_mapped<T: Transport + ?Sized>(
     }
     exec?;
     Ok(ExecResult { out, times })
-}
-
-/// Cached path: the arena stays mapped for the whole generation.
-fn run_exec_cached<T: Transport + ?Sized>(
-    transport: &T,
-    cache: &Mutex<ExecArenaCache>,
-    handle: DspHandle,
-    request: ExecRun<'_>,
-) -> Result<ExecResult, DspError> {
-    // Held across `exec` on purpose: the mapping must outlive the call, and
-    // the DSP runs one command list at a time anyway.
-    let mut cache = ExecArenaCache::lock(cache);
-    let arena = cache.arena_for(transport, handle, request.list)?;
-    exec_mapped(transport, handle, arena, &request)
 }
 
 fn rt_to_bytes(values: &[i32]) -> Vec<u8> {
@@ -346,15 +347,57 @@ impl_executor!(crate::cdsprpc::Cdsprpc);
 /// first token. `DspBackend` drives this adapter on the device.
 pub struct Executor {
     transport: Arc<dyn Transport>,
-    exec_arenas: Mutex<ExecArenaCache>,
+    exec_arenas: Mutex<Option<ListArena>>,
+    /// `MYELIN_TRACE` diagnostics: host microseconds in arena setup and in the
+    /// `exec` round trip itself.
+    trace_map_micros: std::sync::atomic::AtomicI64,
+    trace_call_micros: std::sync::atomic::AtomicI64,
+    trace_calls: std::sync::atomic::AtomicI64,
+}
+
+impl Drop for Executor {
+    fn drop(&mut self) {
+        if std::env::var_os("MYELIN_TRACE").is_none() {
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        eprintln!(
+            "exec transport: {} calls, arena {:.1} ms, invoke {:.1} ms ({:.2} ms/call)",
+            self.trace_calls.load(Ordering::Relaxed),
+            self.trace_map_micros.load(Ordering::Relaxed) as f64 / 1000.0,
+            self.trace_call_micros.load(Ordering::Relaxed) as f64 / 1000.0,
+            self.trace_call_micros.load(Ordering::Relaxed) as f64
+                / 1000.0
+                / self.trace_calls.load(Ordering::Relaxed).max(1) as f64
+        );
+    }
 }
 
 impl Executor {
     pub fn new(transport: Arc<dyn Transport>) -> Self {
         Self {
             transport,
-            exec_arenas: Mutex::new(ExecArenaCache::default()),
+            exec_arenas: Mutex::new(None),
+            trace_map_micros: std::sync::atomic::AtomicI64::new(0),
+            trace_call_micros: std::sync::atomic::AtomicI64::new(0),
+            trace_calls: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    fn traced_exec(&self, handle: DspHandle, request: ExecRun<'_>) -> Result<ExecResult, DspError> {
+        use std::sync::atomic::Ordering;
+        let map_started = std::time::Instant::now();
+        let (shared, arena) = map_list(self.transport.as_ref(), handle, request.list, None)?;
+        self.trace_map_micros
+            .fetch_add(map_started.elapsed().as_micros() as i64, Ordering::Relaxed);
+        let call_started = std::time::Instant::now();
+        let result = exec_mapped(self.transport.as_ref(), handle, arena, 0, &request);
+        self.trace_call_micros
+            .fetch_add(call_started.elapsed().as_micros() as i64, Ordering::Relaxed);
+        self.trace_calls.fetch_add(1, Ordering::Relaxed);
+        drop(shared);
+        unmap_arena(self.transport.as_ref(), handle, arena);
+        result
     }
 }
 
@@ -376,7 +419,7 @@ impl DspExecutor for Executor {
     }
 
     fn exec(&self, handle: DspHandle, request: ExecRun<'_>) -> Result<ExecResult, DspError> {
-        run_exec_cached(self.transport.as_ref(), &self.exec_arenas, handle, request)
+        self.traced_exec(handle, request)
     }
 }
 
