@@ -25,7 +25,7 @@ myelin-core
    └── engine.rs       детерминированный движок-заглушка (splitmix64)
    ▼
 myelin-npu
-   └── NpuBackend trait + MockBackend (FastRPC-транспорт ещё не подключён)
+   └── NpuBackend trait + MockBackend; FastRPC-клиент в крейте (FFI пока mock)
 
 ── граница процесса/домена (план) ──────────────────────────────
    FastRPC (qaic stub/skel, libcdsprpc.so)
@@ -33,7 +33,7 @@ myelin-npu
 DSP: Hexagon CDSP v68, unsigned PD
    ├── int4/int8 GEMV, FFN, attention, shortconv   (/tmp/opencode/gemv, conv)
    ├── HMX prefill (рецепт и тайл измерены; интеграция — в P2)  (/tmp/opencode/hmx4)
-   │     compute-only 376.8 мкс, со стейджингом весов 7319 мкс (REPORT19)
+   │     compute-only 376.8 мкс, со стейджингом весов 3180–3219 мкс (REPORT20)
    └── staging KV, conv-состояние, kvarn commit
 ```
 
@@ -47,7 +47,7 @@ DSP-порт обязан повторить.
 | Крейт | Роль | Что внутри | Статус |
 |---|---|---|---|
 | `myelin-core` | модель как данные | `ModelSpec`, `GgufMeta`, `Arch`, `Engine` | спецификация и валидация готовы; GGUF-парсер и математика — заглушки |
-| `myelin-npu` | транспорт к NPU | `NpuBackend { prepare, step, reset }`, `MockBackend` | только mock |
+| `myelin-npu` | транспорт к NPU | `NpuBackend { prepare, step, reset }`, `MockBackend`, FastRPC-клиент, загрузчик весов | FFI использует mock; FastRPC-клиент имеет два бага: `remote_handle64_*` → `AEE_EBADPARM` (нужны 32-битные) и `load_buf` → `AEE_EBADPARM` (REPORT20 §3.2) |
 | `myelin-ffi` | два фронта | `runtime.rs`, `uniffi_api.rs`, `capi.rs`, `myelin.udl`, `include/myelin.h` | работает на заглушке |
 | `lfm-npu-ref` (lfm3) | оракул контрактов | `abi.rs`, `layout.rs`, `kvarn.rs` | готов, покрыт тестами |
 | DSP-артефакты (`/tmp/opencode`) | ядра | `lfmgemv`, `mx4`, `lfmconv` | измерены отдельно, в рантайм не вкомпонованы |
@@ -152,6 +152,12 @@ ABI, UniFFI, JNA, упаковку `.so` и lifecycle на телефоне бе
 является быстрым путём. Расхождение host-эталона и DSP-порта — баг, а не
 оптимизация.
 
+Цена границы процесса (REPORT20 §3, §7): пустой FastRPC-вызов — 118–165 мкс
+(min/median), 1 МиБ — 479–861 мкс; `load_buf` 256 КиБ / 1 МиБ / 4 МиБ —
+0.36 / 0.45 / 0.62 ГБ/с. Для слоя из 183 блоков по 256 КиБ это **106.6 мс**
+против 1.9 мс счёта, поэтому загрузчик весов должен идти через zero-copy
+(`attach_out`, ION) или блоками ≥4 МиБ, а не через копию в DSP-heap.
+
 ## 5. C ABI
 
 `crates/myelin-ffi/include/myelin.h` — источник истины для C-потребителей.
@@ -230,7 +236,9 @@ Gradle: `compileSdk = 37`, `compileSdkMinor = 1`, `buildTools 37.0.0`,
 * GGUF: `Engine::load` проверяет только magic `GGUF`; парсер метаданных — следующий этап.
 * Математика движка: `splitmix64`, без attention/conv/FFN.
 * Сэмплинг: валидируется и игнорируется, всегда 5 токенов.
-* NPU: `MockBackend`; `MYELIN_BACKEND_NPU` → ошибка.
+* NPU: FFI отдаёт `MYELIN_ERR_BACKEND`; в крейте `myelin-npu` FastRPC-клиент уже
+  есть, но к FFI не подключён и упирается в `remote_handle64_*` и `load_buf`
+  (`AEE_EBADPARM`, REPORT20 §3.2).
 * Токенизатор и chat template: едут в спеке, не применяются.
 * MoE: вариант есть, исполнения нет.
 * Публикация AAR/Maven: вне этапа.

@@ -12,7 +12,7 @@ Myelin — мобильный LLM-рантайм для Hexagon NPU (LFM3, Snapd
 | [dsp-kernels.md](dsp-kernels.md) | Наши DSP-ядра: int4-GEMV, FFN одним RPC, paged attention, shortconv, KV store/commit, SiLU; цифры и условия замеров |
 | [paged-kv.md](paged-kv.md) | Страницы по 32 токена, таблица страниц, radix-кэш на хосте, раскладка kvarn-страницы, staging-кольцо, инварианты и краевые случаи |
 | [hvx.md](hvx.md) | Внутренности HVX: контексты, потоки и стеки, `vrmpy`/`vsum`/`vshuff`, `l2fetch`, exp, грабли v68 |
-| [hmx.md](hmx.md) | Внутренности HMX: питание, раскладки fp16/int8, `:deep`, bias/scale, MAC-геометрия, грабли v68; работает, но prefill упирается в доставку весов |
+| [hmx.md](hmx.md) | Внутренности HMX: питание, раскладки fp16/int8/int4, `:deep`, bias/scale, MAC-геометрия, грабли v68; работает, prefill упирается в копирование весов |
 | [qnn-notes.md](qnn-notes.md) | Что выяснено про QNN: сборка графа, ограничения V68, context binary, скорости, дизассемблер скела |
 | [measurements.md](measurements.md) | Сводная таблица замеров: APU для сравнения, телефон HVX/HMX/QNN, с датами и условиями |
 | [decisions.md](decisions.md) | ADR: почему «всё сами», paged KV, kvarn 4/2, `kv_pool = max_seqs`, HMX в prefill (ADR-010), UniFFI, in-app, SDK 37 |
@@ -27,11 +27,13 @@ Myelin — мобильный LLM-рантайм для Hexagon NPU (LFM3, Snapd
 * **нет данных** — в доступных источниках цифры/факта нет; ничего не выдумываем.
 
 Все замеры телефона сняты на Snapdragon 888 (CDSP v68, unsigned PD), если не
-указано иное; 1.42 ГГц — допущение, на стенде не измерено (в HMX-замерах клок
-измерен как 1.13 ГГц). Даты — по времени артефактов в `/tmp/opencode`.
+указано иное; клок CDSP измерен 1132–1421 pcycles/µs (1.13–1.42 ГГц, DVFS
+гуляет), даты — по времени артефактов в `/tmp/opencode`.
 
 ## Статус одной строкой
 
 Каркас рантайма (Rust + C ABI + UniFFI + APK-демо) собран и работает на
 заглушке; DSP-ядра (int4 GEMV, FFN, attention, shortconv) написаны и измерены
-отдельно от рантайма; транспорт FastRPC в `myelin-npu` ещё не подключён.
+отдельно от рантайма; FFN и shortconv прошли первые прогоны на устройстве.
+FastRPC-клиент в `myelin-npu` написан (с двумя багами, REPORT20 §3.2), но FFI
+пока использует mock.
