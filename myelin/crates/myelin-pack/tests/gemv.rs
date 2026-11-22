@@ -340,7 +340,9 @@ fn matches_c_reference_on_real_tensors() {
         (2, "attn_o"),
     ] {
         let name = gemv::tensor_for_role(layer, role).expect("role");
-        let (source, _) = gguf_source::load_matrix(&model, &name, Some(8)).expect("load");
+        // attn_k is compared in full; the rest keep the test fast.
+        let rows = if role == "attn_k" { None } else { Some(8) };
+        let (source, _) = gguf_source::load_matrix(&model, &name, rows).expect("load");
         compare_with_c(&name, &source);
     }
 }
