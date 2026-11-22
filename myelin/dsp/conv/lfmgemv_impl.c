@@ -40,7 +40,8 @@ typedef struct {
     int      nvec;      /* K/256 : 128-byte weight vectors per row */
     uint8_t *w;         /* N*K/2 bytes, 128B aligned */
     int32_t *qp;        /* N Q16 dequant multipliers (low16), or NULL -> int32 out */
-    int32_t *qp30;      /* N Q30 multipliers (ffn gate/up dequant, scalar path) */
+    int32_t *qm;        /* N Q16.16 multipliers m/2^k (ffn gate/up dequant) */
+    int      qshift;    /* k: dequantised gate/up is Q(16-k), see deq_wide() */
     int32_t *acc;       /* 4*N int32 scratch (M<=4) */
     int8_t  *ae, *ao;   /* 8*(K/2+128) scratch, 128B aligned */
     size_t   wbytes;
@@ -102,14 +103,59 @@ static inline int32_t vsum_w(HVX_Vector v) {
  * but NOT for int8 requantisation with a small multiplier: b ~ 0.015 gives
  * ~4 LSB of 127.  pack_out_i8() and requant_mid() below take the product in
  * 64 bits.
- * The low partial product must be signed: silu_range() calls this with a
- * negative b (= up), and the old unsigned form returned ~2^24 for it, which
- * put every lane with up < 0 at +127 in the mid buffer. */
+ * The low partial product must be signed: the old unsigned form returned
+ * ~2^24 for a negative b and put every such lane at +127 in the mid buffer.
+ * The gate/up dequant no longer uses this helper (deq_wide/prod_p take the
+ * product in 64 bits); exp/attention still do, and the regression gate in
+ * ffn_sim keeps the old unsigned form. */
 static inline int32_t mulq16(int32_t a, int32_t b)
 {
     int32_t hi = a >> 16;
     uint32_t lo = ((uint32_t)a >> 8) & 0xFFu;
     return hi * b + (int32_t)(((int64_t)lo * (int64_t)b) >> 8);
+}
+
+/* Gate/up dequantiser with a dynamic range wider than Q16.
+ *
+ * m = sw*sa/so is the real per-row multiplier before the fixed-point scale:
+ * for the LFM3 int4 per-row absmax/7 format m = sw*s_in*2^16 measured at
+ * 6..215, and for int8 absmax/127 at 0.3..12.  A Q16 multiplier clamps at
+ * 1.0 (the old bug: every int4 row lost the factor), and a Q30 int32 field
+ * cannot hold m > 2 either.
+ *
+ * The kernel stores m/2^k as Q16.16 (int32, so m/2^k < 32768) and takes the
+ * product in 64 bits:
+ *     z = (acc*qm + 2^15) >> 16 = acc*m/2^k,   scale 2^(16-k).
+ * k is picked per buffer by set_scale() from the worst-case accumulator
+ * |acc| <= 127*|w|max*K and the largest m, such that z <= 2^30 (2x int32
+ * headroom) -- see deq_shift_for().  On the LFM3 tensors k = 0 (int4:
+ * 2.1e6 * 216 = 4.5e8 < 2^30), so no resolution is spent; silu_qk() still
+ * accepts Q(16-k) for shapes that need a widening shift. */
+static inline int32_t deq_wide(int32_t acc, int32_t qm)
+{
+    return (int32_t)(((int64_t)acc * (int64_t)qm + 32768) >> 16);
+}
+
+/* Smallest k with 127*|w|max*K*mmax/2^k <= 2^30 and mmax/2^k < 2^15. */
+static inline int deq_shift_for(double mmax, int K, int wbits)
+{
+    double bound = (double)(1 << wbits) * 127.0 * (double)K;
+    int k = 0;
+    while (k < 8 &&
+           (bound * mmax / (double)(1u << k) > 1073741824.0 ||
+            mmax / (double)(1u << k) > 32767.0))
+        k++;
+    return k;
+}
+
+/* product of a Q16 SiLU value and a Q(16-k) up value -> Q16 P */
+static inline int32_t prod_p(int32_t sv, int32_t zu, int k)
+{
+    int64_t v = (int64_t)sv * (int64_t)zu + ((int64_t)1 << (15 - k));
+    v >>= (16 - k);
+    if (v > 0x7fffffffLL) v = 0x7fffffffLL;
+    if (v < -0x7fffffffLL) v = -0x7fffffffLL;
+    return (int32_t)v;
 }
 
 static int32_t sum_act_i8(const int8_t *a, int K) {
@@ -602,6 +648,27 @@ static inline int32_t silu_q16(int32_t zq)
     return a + (((b - a) * frac) >> 10);   /* |b-a|<2^13, frac<2^10 -> int32 */
 }
 
+/* SiLU for an argument in Q(16-k), k in [0,8]; k = 0 is exactly silu_q16().
+ * The LUT argument grid is 1/64, i.e. 1024 in Q16 and 1024>>k in Q(16-k),
+ * so idx/frac just move to a coarser fixed-point scale. */
+static inline int32_t silu_qk(int32_t zq, int k)
+{
+    int32_t lim, step, off, idx, frac, a, b;
+
+    if (k <= 0) return silu_q16(zq);
+    lim  = 8 << (16 - k);
+    step = 1024 >> k;
+    if (zq > lim) zq = lim;
+    if (zq < -lim) zq = -lim;
+    off = zq + lim;
+    idx = off >> (10 - k);
+    frac = off & (step - 1);
+    if (idx >= SILU_LUT_N - 1) return silu_lut[SILU_LUT_N - 1];
+    a = silu_lut[idx];
+    b = silu_lut[idx + 1];
+    return a + (((b - a) * frac) >> (10 - k));
+}
+
 /* Mid-buffer requant: pr is Q16 of the real product P = silu(gate)*up, and
  * P/s_mid = pr*mq_mid/2^28 (mq_mid = 4096/s_mid).  The product must be taken
  * in 64 bits.  The former `mulq16(pr >> 12, mq_mid)` resolves pr with a step
@@ -630,9 +697,9 @@ static void silu_range(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
         int t;
         for (t = 0; t < 4; t++) {
             int k = i4 + t;
-            int32_t zg = mulq16(g->acc[k], g->qp30[k] >> 14);
-            int32_t zu = mulq16(g_ffn.acc2[k], u->qp30[k] >> 14);
-            int32_t pr = mulq16(silu_q16(zg), zu);
+            int32_t zg = deq_wide(g->acc[k], g->qm[k]);
+            int32_t zu = deq_wide(g_ffn.acc2[k], u->qm[k]);
+            int32_t pr = prod_p(silu_qk(zg, g->qshift), zu, u->qshift);
             hv[t] = requant_mid(pr, mq_mid);
         }
         g_ffn.h[i4 + 0] = (int8_t)hv[0];
@@ -641,9 +708,9 @@ static void silu_range(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
         g_ffn.h[i4 + 3] = (int8_t)hv[3];
     }
     for (; i4 < i1; i4++) {
-        int32_t zg = mulq16(g->acc[i4], g->qp30[i4] >> 14);
-        int32_t zu = mulq16(g_ffn.acc2[i4], u->qp30[i4] >> 14);
-        int32_t pr = mulq16(silu_q16(zg), zu);
+        int32_t zg = deq_wide(g->acc[i4], g->qm[i4]);
+        int32_t zu = deq_wide(g_ffn.acc2[i4], u->qm[i4]);
+        int32_t pr = prod_p(silu_qk(zg, g->qshift), zu, u->qshift);
         g_ffn.h[i4] = (int8_t)requant_mid(pr, mq_mid);
     }
 }
@@ -1186,7 +1253,7 @@ static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen
     if (use_resident) {
         if (!d->out_ptr || d->out_bytes < d->N) return AEE_EBADPARM;
     } else if (dstLen != d->N) return AEE_EBADPARM;
-    if (!g->qp || !u->qp || !d->qp || !d->sa) return AEE_EBADPARM;
+    if (!g->qp || !u->qp || !d->qp || !g->qm || !u->qm || !d->sa) return AEE_EBADPARM;
     if (mid && midLen != g->N) return AEE_EBADPARM;
     if (reps < 1) reps = 1;
 
@@ -1434,13 +1501,13 @@ int lfmgemv_set_shape(int h, int N, int K, int with_scale)
     b->K = K;
     b->nvec = K / 256;
     half = (size_t)(K / 2) + 128;
-    free(b->acc); free(b->ae); free(b->ao); free(b->qp); free(b->qp30);
+    free(b->acc); free(b->ae); free(b->ao); free(b->qp); free(b->qm);
     b->acc  = (int32_t *)memalign(128, (size_t)4 * N * sizeof(int32_t));
     b->ae   = (int8_t *)memalign(128, 8 * half);
     b->ao   = (int8_t *)memalign(128, 8 * half);
     b->qp   = (with_scale & 1) ? (int32_t *)memalign(128, (size_t)N * sizeof(int32_t)) : 0;
-    b->qp30 = (with_scale & 1) ? (int32_t *)memalign(128, (size_t)N * sizeof(int32_t)) : 0;
-    if (!b->acc || !b->ae || !b->ao || ((with_scale & 1) && (!b->qp || !b->qp30))) return AEE_ENOMEMORY;
+    b->qm   = (with_scale & 1) ? (int32_t *)memalign(128, (size_t)N * sizeof(int32_t)) : 0;
+    if (!b->acc || !b->ae || !b->ao || ((with_scale & 1) && (!b->qp || !b->qm))) return AEE_ENOMEMORY;
     set_perf();
     return 0;
 }
@@ -1468,23 +1535,34 @@ int lfmgemv_set_scale(int h, const unsigned char *scales, int scalesLen)
     memcpy(&K, scales + 4, 4);
     memcpy(&sa, scales + 8, 4);
     memcpy(&so, scales + 12, 4);
-    if (N != b->N || K != b->K || scalesLen < 16 + 4 * N || !b->qp) return AEE_EBADPARM;
+    if (N != b->N || K != b->K || scalesLen < 16 + 4 * N || !b->qp || !b->qm) return AEE_EBADPARM;
     b->sa = sa;
     b->so = so;
     sw = (const float *)(scales + 16);
+    {
+        double mmax = 0.0;
+        for (i = 0; i < N; i++) {
+            double m = (double)sw[i] * (double)sa / (double)so;
+            if (m > mmax) mmax = m;
+        }
+        /* gate/up need the wide (int64) dequant; down stays below 1 and uses
+         * qp.  k is 0 whenever the worst-case product fits 2^30. */
+        b->qshift = deq_shift_for(mmax, K, b->w8 ? 7 : 3);
+    }
     for (i = 0; i < N; i++) {
-        float m = sw[i] * sa / so;
+        float m = sw[i] * sa / so;          /* exactly the old pack_out field */
+        double md = (double)sw[i] * (double)sa / (double)so;
         unsigned q;
+        int64_t qm;
+        qm = (int64_t)((md / (double)(1u << b->qshift)) * 65536.0 + 0.5);
+        if (qm > 0x7fffffffLL) qm = 0x7fffffffLL;
+        if (qm < 0) qm = 0;
+        b->qm[i] = (int32_t)qm;
         if (m < 0.0f) m = 0.0f;
         if (m > 0.99997f) m = 0.99997f;
         q = (unsigned)(m * 65536.0f + 0.5f);
         if (q > 65535u) q = 65535u;
         b->qp[i] = (int32_t)(q | (q << 16));
-        {
-            int64_t q30 = (int64_t)((double)m * 1073741824.0 + 0.5);
-            if (q30 > 0x7fffffffLL) q30 = 0x7fffffffLL;
-            b->qp30[i] = (int32_t)q30;
-        }
     }
     return 0;
 }
@@ -1991,7 +2069,7 @@ int lfmgemv_release_buf(int h)
     if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
     free(g_buf[h].w);
     free(g_buf[h].qp);
-    free(g_buf[h].qp30);
+    free(g_buf[h].qm);
     free(g_buf[h].acc);
     free(g_buf[h].ae);
     free(g_buf[h].ao);

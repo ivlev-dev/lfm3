@@ -142,12 +142,12 @@ static void softmax_f32(double *v, int n)
 }
 
 /*
- * Run `ntok` tokens through the stack; capture the FFN input of layers
- * l0, l1, l2 into cap[slot][t][H].  top1 (optional) gets the lm_head argmax of
- * the last token (ties/NaN not handled: sanity check only).
+ * Run `ntok` tokens through the stack; capture the FFN input of every layer L
+ * into cap[L*ntok + t][H].  top1 (optional) gets the lm_head argmax of the last
+ * token (ties/NaN not handled: sanity check only).
  */
 static int lfm_forward(const lfm_t *s, const uint32_t *tok, int ntok,
-                       int l0, int l1, int l2, float *cap, int *top1)
+                       float *cap, int *top1)
 {
     int L, t, i, h;
     const int H = s->H, FFN = s->FFN, D = s->D;
@@ -171,7 +171,6 @@ static int lfm_forward(const lfm_t *s, const uint32_t *tok, int ntok,
     float *x0 = calloc((size_t)H, 4);
     float *onorm = calloc((size_t)H, 4);
     float *logit = NULL;
-    int want[3] = { l0, l1, l2 };
     int rc = -1;
 
     if (!x || !res || !nrm || !blk || !mrg || !tmp || !q || !k || !v || !gat ||
@@ -183,7 +182,6 @@ static int lfm_forward(const lfm_t *s, const uint32_t *tok, int ntok,
                      (int)temb->type, x);
         for (L = 0; L < s->NL; L++) {
             lw_t w;
-            int slot;
             if (lw_load(&w, s, L) != 0) { lw_free(&w); goto out; }
             memcpy(res, x, (size_t)H * 4);
             f32_rmsnorm(x, w.an, H, eps, nrm);
@@ -255,9 +253,8 @@ static int lfm_forward(const lfm_t *s, const uint32_t *tok, int ntok,
             f32_rmsnorm(blk, w.pan, H, eps, tmp);
             for (i = 0; i < H; i++) mrg[i] = res[i] + tmp[i];
             f32_rmsnorm(mrg, w.fnn, H, eps, nrm);
-            for (slot = 0; slot < 3; slot++)
-                if (want[slot] == L)
-                    memcpy(cap + ((size_t)slot * ntok + t) * H, nrm, (size_t)H * 4);
+            if (cap)
+                memcpy(cap + ((size_t)L * ntok + t) * H, nrm, (size_t)H * 4);
 
             f32_matvec(w.fu, FFN, H, nrm, fu);
             f32_matvec(w.fg, FFN, H, nrm, fg);

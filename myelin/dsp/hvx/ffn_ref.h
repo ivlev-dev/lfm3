@@ -8,8 +8,10 @@
  * GEMV -> int8 out.  Three models of the same computation:
  *
  *   ffn_int_mid()/ffn_int_out()
- *       the DSP pipeline, expression for expression (mulq16, the SiLU LUT,
- *       requant_mid, pack_out_i8), so a device run must match bit for bit;
+ *       the DSP pipeline, expression for expression (deq_wide, silu_qk,
+ *       prod_p, requant_mid, pack_out_i8), so a device run must match bit for
+ *       bit; ffn_int_mid_mode() adds the two legacy dequantisers used only by
+ *       the regression gates.
  *   ffn_ref_token(..., quantised=0)
  *       f32 arithmetic on the *dequantised* int4 weights with the original
  *       activation, i.e. the truth for the numerics of that layer;
@@ -18,14 +20,17 @@
  *       against it isolates the mid-buffer requant from the activation int8
  *       step.
  *
- * Units.  silu_q16() takes Q16, so the gate/up dequantiser must produce
- *     zg = g * 2^16,   g = acc * sw * s_in,
- * which lfmgemv_set_scale() gets by passing sa = 65536*s_in, so = 1:
- *     m = sw*sa/so = sw*s_in*2^16,   zg = mulq16(acc, (m*2^30)>>14).
- * The multiplier is Q16 and clamps at 0.99997, so a usable gate/up weight
- * scale must satisfy sw*s_in < 1.5e-5.  ffn_model_synth() picks its scales
- * inside that range (the kernel contract); ffn_calibrate() reports and fails
- * on a clamped row instead of silently producing a degenerate mid buffer.
+ * Units.  silu_q16() takes Q16 of the real gate, and the gate/up dequantiser
+ * has to keep
+ *     g = acc * sw * s_in = acc * m / 2^16,
+ * with m = sw*sa/so (sa = 65536*s_in, so = 1) -- the same m as the kernel.
+ * On real LFM3 weights m is 0.3..12 for int8 and 6..215 for int4 per-row
+ * scales, so a Q16 multiplier clamps and a Q30 int32 field overflows.  The
+ * kernel therefore stores m/2^k as Q16.16 and takes acc*m in 64 bits:
+ *     z = acc*m/2^k = g*2^(16-k)   (deq_wide(), k <= 8).
+ * k is chosen from the worst-case |acc| <= 127*|w|max*K and the largest m so
+ * that z stays below 2^30; on the LFM3 tensors it is 0.  silu_qk() consumes
+ * Q(16-k) directly (k = 0 is bit-identical to silu_q16).
  *
  * The down projection reuses the mid buffer, so its dequantiser sees an int8
  * activation with scale s_mid: sa = s_mid, so = s_out,
@@ -54,6 +59,8 @@ typedef struct {
     int      K, NH, ntok;
     uint8_t *wg, *wu, *wd;         /* int4 packed, row-major [N][K/2] */
     float   *swg, *swu, *swd;      /* per-row weight scales */
+    int32_t *qmg, *qmu;            /* Q16.16 m/2^k for gate/up */
+    int      kg, ku;               /* widening shift of the gate/up dequant */
     float   *x;                    /* [ntok][K] real input */
     int8_t  *x8;                   /* [ntok][K] quantised input */
     int32_t *accg, *accu, *accd;   /* [NH]/[NH]/[K] scratch */
@@ -90,6 +97,59 @@ static inline int32_t ffn_silu_q16(int32_t zq)
     return a + (((b - a) * frac) >> 10);
 }
 
+/* SiLU in Q(16-k): the arg grid is 1/64 = 1024 in Q16 and 1024>>k in
+ * Q(16-k).  k = 0 is bit-identical to ffn_silu_q16(). */
+static inline int32_t ffn_silu_qk(int32_t zq, int k)
+{
+    int32_t lim, step, off, idx, frac, a, b;
+    if (k <= 0) return ffn_silu_q16(zq);
+    lim  = 8 << (16 - k);
+    step = 1024 >> k;
+    if (zq > lim) zq = lim;
+    if (zq < -lim) zq = -lim;
+    off = zq + lim;
+    idx = off >> (10 - k);
+    frac = off & (step - 1);
+    if (idx >= SILU_LUT_N - 1) return silu_lut[SILU_LUT_N - 1];
+    a = silu_lut[idx];
+    b = silu_lut[idx + 1];
+    return a + (((b - a) * frac) >> (10 - k));
+}
+
+/* mirror of deq_wide()/deq_shift_for() in lfmgemv_impl.c */
+static inline int32_t ffn_deq_wide(int32_t acc, int32_t qm)
+{
+    return (int32_t)(((int64_t)acc * (int64_t)qm + 32768) >> 16);
+}
+
+static inline int ffn_deq_shift(double mmax, int K, int wbits)
+{
+    double bound = (double)(1 << wbits) * 127.0 * (double)K;
+    int k = 0;
+    while (k < 8 &&
+           (bound * mmax / (double)(1u << k) > 1073741824.0 ||
+            mmax / (double)(1u << k) > 32767.0))
+        k++;
+    return k;
+}
+
+static inline int32_t ffn_qm_of(double m, int k)
+{
+    int64_t q = (int64_t)(m / (double)(1u << k) * 65536.0 + 0.5);
+    if (q > 0x7fffffffLL) q = 0x7fffffffLL;
+    if (q < 0) q = 0;
+    return (int32_t)q;
+}
+
+static inline int32_t ffn_prod_q16(int32_t sv, int32_t zu, int k)
+{
+    int64_t v = (int64_t)sv * (int64_t)zu + ((int64_t)1 << (15 - k));
+    v >>= (16 - k);
+    if (v > 0x7fffffffLL) v = 0x7fffffffLL;
+    if (v < -0x7fffffffLL) v = -0x7fffffffLL;
+    return (int32_t)v;
+}
+
 /* mid-buffer requant, same expression as requant_mid() in lfmgemv_impl.c:
  * pr is Q16 of P, mq_mid = 4096/s_mid, P/s_mid = pr*mq_mid/2^28.  The
  * product is taken in 64 bits -- the regression this stand guards. */
@@ -101,7 +161,8 @@ static inline int32_t ffn_requant_mid(int32_t pr, int32_t mq_mid)
     return (int32_t)v;
 }
 
-/* mirror of lfmgemv_set_scale(): Q30 multiplier for the scalar SiLU path */
+/* mirror of lfmgemv_set_scale(): Q30 multiplier for the scalar SiLU path
+ * (legacy Q16 format, kept only for the regression gates) */
 static inline int32_t ffn_q30_of(float m)
 {
     int64_t q;
@@ -110,6 +171,22 @@ static inline int32_t ffn_q30_of(float m)
     q = (int64_t)((double)m * 1073741824.0 + 0.5);
     if (q > 0x7fffffffLL) q = 0x7fffffffLL;
     return (int32_t)q;
+}
+
+/* legacy gate/up dequant: Q16 multiplier clamped at 0.99997, then mulq16 */
+static inline int32_t ffn_deq_legacy(int32_t acc, double m)
+{
+    return ffn_mulq16(acc, ffn_q30_of((float)m) >> 14);
+}
+
+/* the pre-9892795 low partial product: lo is uint32_t, so a negative b is
+ * converted to unsigned and the lane blows up to ~2^24 instead of going
+ * negative.  Regression gate only. */
+static inline int32_t ffn_mulq16_unsigned(int32_t a, int32_t b)
+{
+    int32_t hi = a >> 16;
+    uint32_t lo = ((uint32_t)a >> 8) & 0xFFu;
+    return hi * b + (int32_t)(((uint32_t)lo * (uint32_t)b) >> 8);
 }
 
 /* mirror of lfmgemv_set_scale(): Q16 multiplier used by pack_out_i8() */
@@ -277,6 +354,8 @@ static inline int ffn_model_alloc(ffn_model_t *m, int K, int NH, int ntok)
     m->swg = (float *)malloc((size_t)NH * sizeof(float));
     m->swu = (float *)malloc((size_t)NH * sizeof(float));
     m->swd = (float *)malloc((size_t)K * sizeof(float));
+    m->qmg = (int32_t *)calloc((size_t)NH, sizeof(int32_t));
+    m->qmu = (int32_t *)calloc((size_t)NH, sizeof(int32_t));
     m->x   = (float *)malloc((size_t)ntok * K * sizeof(float));
     m->x8  = (int8_t *)malloc((size_t)ntok * K);
     m->accg = (int32_t *)malloc((size_t)NH * sizeof(int32_t));
@@ -284,6 +363,7 @@ static inline int ffn_model_alloc(ffn_model_t *m, int K, int NH, int ntok)
     m->accd = (int32_t *)malloc((size_t)K * sizeof(int32_t));
     m->p    = (float *)malloc((size_t)NH * sizeof(float));
     if (!m->wg || !m->wu || !m->wd || !m->swg || !m->swu || !m->swd ||
+        !m->qmg || !m->qmu ||
         !m->x || !m->x8 || !m->accg || !m->accu || !m->accd || !m->p) {
         return -1;
     }
@@ -295,6 +375,7 @@ static inline void ffn_model_free(ffn_model_t *m)
 {
     free(m->wg); free(m->wu); free(m->wd);
     free(m->swg); free(m->swu); free(m->swd);
+    free(m->qmg); free(m->qmu);
     free(m->x); free(m->x8);
     free(m->accg); free(m->accu); free(m->accd); free(m->p);
     memset(m, 0, sizeof(*m));
@@ -302,11 +383,12 @@ static inline void ffn_model_free(ffn_model_t *m)
 
 /* Synthetic layer with representative numbers:
  *   - input: uniform in [-amp_t, amp_t], amp_t varies per token;
- *   - gate/up: the physical Q16 multiplier m = sw*s_in*2^16 is chosen in
- *     [0.35, 0.90], i.e. inside the range the kernel can represent.  That is
- *     the point of the rebuilt stand: with m < 1 the dequantised gate is a
- *     real Q16 value, not the Q0 the old one happened to produce. */
-static inline int ffn_model_synth(ffn_model_t *m, int K, int NH, int ntok, uint32_t seed)
+ *   - gate/up: the physical multiplier m = sw*s_in*2^16 is chosen in
+ *     [m_lo, m_hi].  The default spans 0.35..2.6, i.e. both sides of the old
+ *     Q16 clamp, so the same stand exercises the old bug and the wide path.
+ *   - int4 codes, so the accumulator bound is 8*127*K. */
+static inline int ffn_model_synth_scaled(ffn_model_t *m, int K, int NH, int ntok,
+                                         uint32_t seed, float m_lo, float m_hi)
 {
     uint32_t st = seed ^ 0xabcdef01u;
     int t, i, r;
@@ -330,8 +412,8 @@ static inline int ffn_model_synth(ffn_model_t *m, int K, int NH, int ntok, uint3
     m->s_in = amax / (float)FFN_CAL_TARGET;
 
     for (r = 0; r < NH; r++) {
-        float mg = 0.35f + 0.55f * (float)(r % 17) / 16.0f;
-        float mu = 0.35f + 0.55f * (float)((r * 7) % 13) / 12.0f;
+        float mg = m_lo + (m_hi - m_lo) * (float)(r % 17) / 16.0f;
+        float mu = m_lo + (m_hi - m_lo) * (float)((r * 7) % 13) / 12.0f;
         m->swg[r] = mg / (m->s_in * FFN_Q16_ONE);
         m->swu[r] = mu / (m->s_in * FFN_Q16_ONE);
     }
@@ -339,6 +421,11 @@ static inline int ffn_model_synth(ffn_model_t *m, int K, int NH, int ntok, uint3
     for (r = 0; r < K; r++)
         m->swd[r] = 1.10e-3f + (float)(r % 9) * 2.0e-5f;
     return 0;
+}
+
+static inline int ffn_model_synth(ffn_model_t *m, int K, int NH, int ntok, uint32_t seed)
+{
+    return ffn_model_synth_scaled(m, K, NH, ntok, seed, 0.35f, 2.60f);
 }
 
 /* ------------------------------------------------------------------ */
@@ -372,21 +459,39 @@ static inline void ffn_gate_up_acc(const ffn_model_t *m, int t)
     }
 }
 
-/* the SiLU stage exactly as silu_range(); p_out = P as the kernel produced it */
-static inline void ffn_int_mid(const ffn_model_t *m, int t, int8_t *mid, float *p_out)
+/* the SiLU stage exactly as silu_range(); p_out = P as the kernel produced it.
+ * mode 0 = wide dequant (the kernel), 1 = legacy Q16+clamp (signed low
+ * product), 2 = legacy Q16+clamp with the pre-fix unsigned low product.
+ * The two legacy modes exist only for the regression gates. */
+static inline void ffn_int_mid_mode(const ffn_model_t *m, int t, int8_t *mid,
+                                    float *p_out, int mode)
 {
     int32_t mq_mid = (int32_t)(4096.0f / m->s_mid);
     int r;
     ffn_gate_up_acc(m, t);
     for (r = 0; r < m->NH; r++) {
-        float mg = m->swg[r] * m->s_in * FFN_Q16_ONE;
-        float mu = m->swu[r] * m->s_in * FFN_Q16_ONE;
-        int32_t zg = ffn_mulq16(m->accg[r], ffn_q30_of(mg) >> 14);
-        int32_t zu = ffn_mulq16(m->accu[r], ffn_q30_of(mu) >> 14);
-        int32_t pr = ffn_mulq16(ffn_silu_q16(zg), zu);
+        double mg = (double)m->swg[r] * (double)m->s_in * (double)FFN_Q16_ONE;
+        double mu = (double)m->swu[r] * (double)m->s_in * (double)FFN_Q16_ONE;
+        int32_t zg, zu, pr;
+        if (mode == 0) {
+            zg = ffn_deq_wide(m->accg[r], m->qmg[r]);
+            zu = ffn_deq_wide(m->accu[r], m->qmu[r]);
+            pr = ffn_prod_q16(ffn_silu_qk(zg, m->kg), zu, m->ku);
+        } else {
+            zg = ffn_deq_legacy(m->accg[r], mg);
+            zu = ffn_deq_legacy(m->accu[r], mu);
+            pr = (mode == 2)
+                ? ffn_mulq16_unsigned(ffn_silu_q16(zg), zu)
+                : ffn_mulq16(ffn_silu_q16(zg), zu);
+        }
         mid[r] = (int8_t)ffn_requant_mid(pr, mq_mid);
         if (p_out) p_out[r] = (float)((double)pr / 65536.0);
     }
+}
+
+static inline void ffn_int_mid(const ffn_model_t *m, int t, int8_t *mid, float *p_out)
+{
+    ffn_int_mid_mode(m, t, mid, p_out, 0);
 }
 
 /* down GEMV + pack_out_i8, exactly as ffn_impl() does after SiLU */
@@ -450,8 +555,10 @@ static inline void ffn_ref_token(const ffn_model_t *m, int t, float *out, float 
 typedef struct {
     float s_in, s_mid, s_out;
     float gate_absmax, up_absmax, p_absmax;   /* real units */
-    float zg_absmax;                          /* Q16 units, as the kernel sees it */
-    int   g_clamped, u_clamped, d_clamped;    /* rows hitting the Q16 multiplier clamp */
+    float zg_absmax;                          /* |g| in Q16 units (z << k) */
+    float z_g_max, z_u_max;                   /* max |acc*m|, int32 units */
+    int   kg, ku;                             /* widening shifts */
+    int   g_clamped, u_clamped, d_clamped;    /* rows the old Q16 format clamps */
     float m_g_min, m_g_max, m_d_min, m_d_max;
     int32_t mq_mid, acc_dmax;
     double worst_row;                         /* max_r m_d*acc_max[r] */
@@ -464,9 +571,10 @@ static inline int ffn_calibrate(ffn_model_t *m, ffn_calib_t *ci)
     int8_t *mid_all = NULL;
     int32_t *acc_max = NULL;
     float pmax = 0.0f, gmax = 0.0f, umax = 0.0f, zgmax = 0.0f;
+    float zgm = 0.0f, zum = 0.0f;
     float mg_min = 1e30f, mg_max = 0.0f, md_min = 1e30f, md_max = 0.0f;
     int32_t gmaxacc = 0;
-    double need = 0.0;
+    double need = 0.0, mmaxg = 0.0, mmaxu = 0.0;
     int t, r, i, rc = -1;
 
     memset(ci, 0, sizeof(*ci));
@@ -482,24 +590,45 @@ static inline int ffn_calibrate(ffn_model_t *m, ffn_calib_t *ci)
     ffn_quantize_x(m);
     ci->s_in = m->s_in;
 
+    /* ---- multipliers and their widening shifts (per buffer, as the kernel) */
+    for (r = 0; r < m->NH; r++) {
+        double mg = (double)m->swg[r] * (double)m->s_in * (double)FFN_Q16_ONE;
+        double mu = (double)m->swu[r] * (double)m->s_in * (double)FFN_Q16_ONE;
+        if (mg > mmaxg) mmaxg = mg;
+        if (mu > mmaxu) mmaxu = mu;
+        if (mg < mg_min) mg_min = (float)mg;
+        if (mg > mg_max) mg_max = (float)mg;
+        if (mg > FFN_Q16_CLAMP) ci->g_clamped++;
+        if (mu > FFN_Q16_CLAMP) ci->u_clamped++;
+    }
+    m->kg = ffn_deq_shift(mmaxg, m->K, 3);       /* int4 codes, |w| <= 8 */
+    m->ku = ffn_deq_shift(mmaxu, m->K, 3);
+    for (r = 0; r < m->NH; r++) {
+        double mg = (double)m->swg[r] * (double)m->s_in * (double)FFN_Q16_ONE;
+        double mu = (double)m->swu[r] * (double)m->s_in * (double)FFN_Q16_ONE;
+        m->qmg[r] = ffn_qm_of(mg, m->kg);
+        m->qmu[r] = ffn_qm_of(mu, m->ku);
+    }
+    ci->kg = m->kg;
+    ci->ku = m->ku;
+    ci->m_g_min = mg_min;
+    ci->m_g_max = mg_max;
+
     /* ---- s_mid from the measured P = silu(gate)*up range ---- */
     for (t = 0; t < m->ntok; t++) {
         ffn_gate_up_acc(m, t);
         for (r = 0; r < m->NH; r++) {
-            float mg = m->swg[r] * m->s_in * FFN_Q16_ONE;
-            float mu = m->swu[r] * m->s_in * FFN_Q16_ONE;
             double g = (double)m->accg[r] * (double)m->swg[r] * (double)m->s_in;
             double u = (double)m->accu[r] * (double)m->swu[r] * (double)m->s_in;
             double pv = fabs(ffn_silu_f32(g) * u);
-            int32_t zg = ffn_mulq16(m->accg[r], ffn_q30_of(mg) >> 14);
-            if (mg > FFN_Q16_CLAMP) ci->g_clamped++;
-            if (mu > FFN_Q16_CLAMP) ci->u_clamped++;
-            if (mg < mg_min) mg_min = mg;
-            if (mg > mg_max) mg_max = mg;
+            int32_t zg = ffn_deq_wide(m->accg[r], m->qmg[r]);
+            int32_t zu = ffn_deq_wide(m->accu[r], m->qmu[r]);
             if (pv > pmax) pmax = pv;
             if (fabs(g) > gmax) gmax = (float)fabs(g);
             if (fabs(u) > umax) umax = (float)fabs(u);
-            if (fabs((double)zg) > zgmax) zgmax = (float)fabs((double)zg);
+            if (fabs((double)zg) > zgm) zgm = (float)fabs((double)zg);
+            if (fabs((double)zu) > zum) zum = (float)fabs((double)zu);
+            if (fabs(g) * 65536.0 > zgmax) zgmax = (float)(fabs(g) * 65536.0);
             if (g > 8.0 || g < -8.0) ci->silu_clamp++;
         }
     }
@@ -511,8 +640,8 @@ static inline int ffn_calibrate(ffn_model_t *m, ffn_calib_t *ci)
     ci->up_absmax = umax;
     ci->p_absmax = pmax;
     ci->zg_absmax = zgmax;
-    ci->m_g_min = mg_min;
-    ci->m_g_max = mg_max;
+    ci->z_g_max = zgm;
+    ci->z_u_max = zum;
 
     /* ---- mid buffer for every token, then s_out from the accumulator ---- */
     mid_all = (int8_t *)malloc((size_t)m->ntok * m->NH);

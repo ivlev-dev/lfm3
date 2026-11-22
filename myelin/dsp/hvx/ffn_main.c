@@ -3,18 +3,19 @@
  * SiLU(gate)*up -> int8 mid -> down int4 GEMV, one RPC per layer.
  *
  * The numerics are shared with ffn_sim.c through ffn_ref.h: the host model is
- * the DSP pipeline expression for expression (mulq16, the SiLU LUT,
- * requant_mid, pack_out_i8), and the truth is the same dequantised int4
- * weights in f32.  Checks per token:
+ * the DSP pipeline expression for expression (the wide Q16.16 dequantiser,
+ * silu_qk, requant_mid, pack_out_i8), and the truth is the same dequantised
+ * int4 weights in f32.  Checks per token:
  *   - device mid/out vs the integer model       : must be bit-exact
  *   - cos / max_abs_err of mid and out vs f32   : numerics, not bit-exactness
  *   - int8 saturation of mid and out
- *   - scales: the gate/up Q16 multiplier is reported and must stay unclamped
+ *   - dequant: m = sw*s_in*2^16 is reported with its widening shift k; the
+ *     old Q16 clamp is gone, so m > 1 is expected on int4 tensors
  *
- * Scale protocol (see ffn_ref.h): gate/up get sa = s_in*65536, so = 1 so the
- * dequantised gate is Q16, which is what silu_q16() expects; down gets
- * sa = s_mid, so = s_out.  s_mid and s_out are calibrated on the host from
- * the measured P = silu(gate)*up range and the down accumulator range.
+ * Scale protocol (see ffn_ref.h): gate/up get sa = s_in*65536, so = 1;
+ * down gets sa = s_mid, so = s_out.  s_mid and s_out are calibrated on the
+ * host from the measured P = silu(gate)*up range and the down accumulator
+ * range.
  *
  * Exit code: 0 pass, 1 allocation/calibration failure, 2 threshold failure,
  * 10.. RPC failure (matches the other stands).
@@ -114,13 +115,14 @@ int main(int argc, char **argv)
            ci.s_in, ci.s_mid, ci.mq_mid, ci.s_out);
     printf("real ranges: |gate|=%.4f |up|=%.4f |P|=%.4f   |zg| max=%.0f (Q16 units)\n",
            ci.gate_absmax, ci.up_absmax, ci.p_absmax, ci.zg_absmax);
-    printf("Q16 multipliers: m_gate=[%.4f..%.4f] m_down=[%.4f..%.4f] clamps g=%d u=%d d=%d\n",
+    printf("dequant: m_gate=[%.4f..%.4f] m_down=[%.4f..%.4f] k_gate=%d k_up=%d"
+           " (old Q16 would clamp g=%d u=%d, down=%d)\n",
            ci.m_g_min, ci.m_g_max, ci.m_d_min, ci.m_d_max,
-           ci.g_clamped, ci.u_clamped, ci.d_clamped);
-    printf("down: acc_max=%d worst m_d*acc_max=%.1f (<= 127)\n",
+           ci.kg, ci.ku, ci.g_clamped, ci.u_clamped, ci.d_clamped);
+    printf("down: acc_max=%d worst m_d*acc_max=%.1f\n",
            ci.acc_dmax, ci.worst_row);
-    if (ci.zg_absmax < ZG_MIN_Q16 || ci.g_clamped || ci.u_clamped || ci.d_clamped) {
-        printf("stand is not usable: SiLU input is not Q16 or a Q16 multiplier is clamped\n");
+    if (ci.zg_absmax < ZG_MIN_Q16 || ci.d_clamped) {
+        printf("stand is not usable: SiLU input is not Q16 or the down multiplier clamps\n");
         return 1;
     }
 

@@ -241,7 +241,7 @@ static void f32_rmsnorm(const float *v, const float *w, int n, float eps, float 
     for (i = 0; i < n; i++) out[i] = v[i] * inv * w[i];
 }
 
-static double f32_cosine(const float *a, const float *b, int n)
+__attribute__((unused)) static double f32_cosine(const float *a, const float *b, int n)
 {
     double d = 0.0, na = 0.0, nb = 0.0; int i;
     for (i = 0; i < n; i++) {

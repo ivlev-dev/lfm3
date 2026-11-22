@@ -1,34 +1,33 @@
 /*
- * Real-weights study of the FFN layer: does the quantised gate/up -> SiLU ->
- * int8 mid -> down path stay numerically meaningful on the LFM3 tensors?
+ * Real-weights study of the FFN layer: does the wide gate/up dequant keep the
+ * quantised path numerically meaningful on every LFM3-1.7B layer?
  *
- * Input:  the real layer-0 FFN input, built exactly as in silu_err_study.c
- *         (token_embd -> attn_norm -> shortconv -> post_attention_norm ->
- *         ffn_norm) for real token ids.  The same real vector is used for
- *         every probed layer; only the layer's ffn_gate/ffn_up/ffn_down
- *         tensors change.
+ * Input:  the real FFN input of every layer, from one full f32 forward pass
+ *         (token_embd -> ... -> ffn_norm, mirror of backend/cpu.rs).
  * Truth:  f32 on the *dequantised* weights of the same format, so the number
- *         isolates the integer pipeline from the weight quantisation.  The
- *         cost of the weight quantisation itself is printed separately
- *         (f32 on the original GGUF weights vs f32 on the dequantised ones,
- *         same activation).
+ *         isolates the integer pipeline from the weight quantisation.
  *
- * Two weight formats are measured per layer:
- *   int8  per-row absmax/127 -- the format for which the ~0.995 ceiling
- *         quoted for int8 mid + int8 weights holds.  The gate/up Q16
- *         multiplier is m = sw*s_in*2^16 (see ffn_ref.h); for int8 it stays
- *         below the 0.99997 clamp.
- *   int4  per-row absmax/7  -- what lfmgemv_ffn() consumes today.  The same
- *         multiplier comes out ~6x over the clamp on every row, i.e. the
- *         dequantiser cannot represent the gate in Q16 at all; the study
- *         simulates the clamped kernel (that is what the DSP would do) so the
- *         size of the resulting error is visible.
+ * Two weight formats per layer:
+ *   int8 per-row absmax/127 -- m = sw*s_in*2^16 is 0.3..12, the old Q16
+ *         multiplier clamped on the deep layers;
+ *   int4 per-row absmax/7   -- m is 6..215, the old kernel clamped every row.
+ *
+ * Dequant (kernel format, see ffn_ref.h / lfmgemv_impl.c):
+ *   qm = Q16.16(m/2^k),  z = (acc*qm + 2^15) >> 16 = g*2^(16-k),
+ *   k chosen from 127*|w|max*K*mmax so z fits int32 with 2x headroom
+ *   (ffn_deq_shift); silu_qk(z,k) consumes Q(16-k).  On these tensors k = 0.
  *
  * Scales: s_in = absmax(ffn_in)/110, s_mid = absmax(P)/127,
  *         s_out = max_r(swd*s_mid*acc_max[r])/110   (same rules as ffn_sim).
  *
+ * Regression gates: for layers 0/12/23 the same int4 path is run with the old
+ * Q16+clamp dequant and with the pre-fix unsigned mulq16; both must fail
+ * (cos < 0.99, and the unsigned bug must saturate ~half of the mid buffer).
+ *
  * Build:  cc -O2 -o ffn_real_study ffn_real_study.c -lm
  * Run:    ./ffn_real_study ../../../models/LFM3-1.7B-Q4_K_M.gguf [ntok]
+ *
+ * Exit code: 0 pass, 1 allocation/forward failure, 2 threshold failure.
  */
 #include "ffn_ref.h"
 #include "gguf_f32.h"
@@ -36,32 +35,26 @@
 
 #define HID 2048
 #define INT 7680
-#define MAX_TOK 64
+#define NL  24
+#define MAX_TOK 32
 
-/* one probed layer: original f32 rows + per-row int8 and int4 codes */
+#define PASS_COS     0.99
+#define PASS_SAT_PCT 5.0
+
+/* one probed layer: per-row int8 and int4 codes (the f32 rows are freed after
+ * packing, so the study holds ~3x int8 weights instead of ~10x f32) */
 typedef struct {
     int      K, NH;
-    float   *wg, *wu, *wd;                  /* original GGUF dequantised f32 */
     uint8_t *qg8, *qu8, *qd8;               /* offset-128 codes */
     float   *sg8, *su8, *sd8;
     uint8_t *qg4, *qu4, *qd4;               /* offset-8 packed nibbles */
     float   *sg4, *su4, *sd4;
 } layer_t;
 
-static double dot_f32_row(const float *w, const float *x, int k)
-{
-    double s = 0.0;
-    int i;
-    for (i = 0; i < k; i++) s += (double)w[i] * (double)x[i];
-    return s;
-}
-
 static int layer_alloc(layer_t *L, int K, int NH)
 {
     memset(L, 0, sizeof(*L));
     L->K = K; L->NH = NH;
-    L->wg = malloc((size_t)NH * K * 4); L->wu = malloc((size_t)NH * K * 4);
-    L->wd = malloc((size_t)K * NH * 4);
     L->qg8 = malloc((size_t)NH * K);    L->qu8 = malloc((size_t)NH * K);
     L->qd8 = malloc((size_t)K * NH);
     L->sg8 = malloc((size_t)NH * 4);    L->su8 = malloc((size_t)NH * 4);
@@ -70,14 +63,12 @@ static int layer_alloc(layer_t *L, int K, int NH)
     L->qd4 = malloc((size_t)K * NH / 2);
     L->sg4 = malloc((size_t)NH * 4);    L->su4 = malloc((size_t)NH * 4);
     L->sd4 = malloc((size_t)K * 4);
-    return (L->wg && L->wu && L->wd && L->qg8 && L->qu8 && L->qd8 &&
-            L->sg8 && L->su8 && L->sd8 && L->qg4 && L->qu4 && L->qd4 &&
-            L->sg4 && L->su4 && L->sd4) ? 0 : -1;
+    return (L->qg8 && L->qu8 && L->qd8 && L->sg8 && L->su8 && L->sd8 &&
+            L->qg4 && L->qu4 && L->qd4 && L->sg4 && L->su4 && L->sd4) ? 0 : -1;
 }
 
 static void layer_free(layer_t *L)
 {
-    free(L->wg); free(L->wu); free(L->wd);
     free(L->qg8); free(L->qu8); free(L->qd8);
     free(L->sg8); free(L->su8); free(L->sd8);
     free(L->qg4); free(L->qu4); free(L->qd4);
@@ -110,7 +101,7 @@ static int32_t dot_i8(const uint8_t *row, const int8_t *act, int k)
     return s;
 }
 
-/* f32 dot with the dequantised int8 row */
+/* f32 dot with the dequantised down row */
 static double dot_i8_f32(const uint8_t *row, const float *act, int k, double sw)
 {
     double s = 0.0;
@@ -132,11 +123,10 @@ static double dot_i4_f32(const uint8_t *row, const float *act, int k, double sw)
     return s * sw;
 }
 
-/* result of one integer pipeline run for one format */
 typedef struct {
-    double  cos_out, cos_out_min, cos_mid, cos_ideal, max_out;
-    double  m_g_min, m_g_max, m_d_min, m_d_max;
-    int     g_clamped, d_clamped, zero_out, gshift, deq64;
+    double  cos_out, cos_out_min, cos_mid, cos_p, cos_down, cos_ideal, max_out;
+    double  m_g_min, m_g_max, m_d_min, m_d_max, z_g_max, z_u_max;
+    int     k_g, k_u, old_clamp_g, old_clamp_u, d_clamped, zero_out;
     int32_t acc_dmax, mq_mid;
     double  worst_row;
     double  sat_mid, sat_out;
@@ -165,273 +155,244 @@ static void pct4(double *v, int n, double *p50, double *p90, double *p99, double
     *mx = m;
 }
 
-/* gate/up dequant as the kernel does it (Q16 multiplier, mulq16), or the
- * 64-bit variant (no clamp, no 8-bit truncation) used as a what-if */
-static inline int32_t deq_acc(int32_t acc, double m, int shift, int deq64)
-{
-    if (deq64) {
-        int64_t q30 = (int64_t)llround(m * 1073741824.0);
-        return (int32_t)(((int64_t)acc * q30 + ((int64_t)1 << 29)) >> 30);
-    }
-    return ffn_mulq16(acc, ffn_q30_of((float)(m / (double)(1u << shift))) >> 14);
-}
-
-static inline int32_t silu_of(int32_t zg, int shift, int deq64)
-{
-    return ffn_silu_q16(deq64 ? zg : (zg << shift));
-}
-
-static inline int32_t prod_p(int32_t sv, int32_t zu, int shift, int deq64)
-{
-    if (deq64) return (int32_t)(((int64_t)sv * (int64_t)zu + 32768) >> 16);
-    return ffn_mulq16(sv, zu) << shift;
-}
-
 /*
- * Run one format of one layer.  x8[t][K] is the quantised input, s_in its
- * scale.  The pipeline is the DSP one expression for expression; a clamped
- * Q16 multiplier is used as clamped, which is what the DSP would do.
+ * Run one format of one layer.  deq_mode 0 is the kernel's wide dequantiser;
+ * 1 is the old Q16+clamp with the signed low product, 2 the old code with the
+ * unsigned low product (regression gates).
  */
-static int run_layer(const layer_t *L, int mode, const int8_t *x8, int ntok,
-                     double s_in, int gshift, int deq64, int cal, run_t *R)
+static int run_layer(const layer_t *L, int mode, int deq_mode, const int8_t *x8,
+                     int ntok, double s_in, run_t *R)
 {
-    int K = L->K, NH = L->NH;
-    int32_t *accg = malloc((size_t)NH * 4), *accu = malloc((size_t)NH * 4);
-    int8_t *mid = malloc((size_t)NH), *midi = malloc((size_t)NH);
-    int32_t *acc_max = calloc((size_t)K, 4);
+    const int K = L->K, NH = L->NH;
+    int32_t *accg = malloc((size_t)ntok * NH * 4);
+    int32_t *accu = malloc((size_t)ntok * NH * 4);
+    int32_t *accd = malloc((size_t)ntok * K * 4);
+    int8_t *mid = malloc((size_t)ntok * NH);
+    int8_t *midi = malloc((size_t)ntok * NH);
     float *P = malloc((size_t)ntok * NH * 4);
-    float *yq = malloc((size_t)K * 4), *yref = malloc((size_t)K * 4);
-    int8_t *out8 = malloc((size_t)K);
+    int32_t *qmg = malloc((size_t)NH * 4), *qmu = malloc((size_t)NH * 4);
+    int32_t *acc_max = calloc((size_t)K, 4);
     double *lsbv = malloc((size_t)ntok * NH * sizeof(double));
     double *errv = malloc((size_t)ntok * K * sizeof(double));
-    double pmax = 0.0;
-    int t, r, i, nl = 0, ne = 0;
+    int8_t *out8 = malloc((size_t)K);
+    double pmax = 0.0, gmax = 0.0, umax = 0.0, mmaxg = 0.0, mmaxu = 0.0;
+    double mg_min = 1e30, mg_max = 0.0, md_min = 1e30, md_max = 0.0;
+    double zgm = 0.0, zum = 0.0, need = 0.0;
+    int t, r, nl = 0, ne = 0, kg, ku;
 
-    if (!accg || !accu || !mid || !midi || !acc_max || !P || !yq || !yref ||
-        !out8 || !lsbv || !errv) return -1;
+    if (!accg || !accu || !accd || !mid || !midi || !P || !qmg || !qmu ||
+        !acc_max || !lsbv || !errv || !out8) {
+        free(accg); free(accu); free(accd); free(mid); free(midi); free(P);
+        free(qmg); free(qmu); free(acc_max); free(lsbv); free(errv); free(out8);
+        return -1;
+    }
     memset(R, 0, sizeof(*R));
     R->ntok = ntok;
-    R->gshift = gshift;
-    R->deq64 = deq64;
 
-    /* ---- P on the dequantised weights and the quantised input ---- */
+    /* ---- multipliers, shift and per-row Q16.16 fields ---- */
+    for (r = 0; r < NH; r++) {
+        double mg = (mode == 8) ? (double)L->sg8[r] * s_in * 65536.0
+                                : (double)L->sg4[r] * s_in * 65536.0;
+        double mu = (mode == 8) ? (double)L->su8[r] * s_in * 65536.0
+                                : (double)L->su4[r] * s_in * 65536.0;
+        if (mg < mg_min) mg_min = mg;
+        if (mg > mg_max) mg_max = mg;
+        if (mg > mmaxg) mmaxg = mg;
+        if (mu > mmaxu) mmaxu = mu;
+        if (mg > FFN_Q16_CLAMP) R->old_clamp_g++;
+        if (mu > FFN_Q16_CLAMP) R->old_clamp_u++;
+    }
+    kg = ffn_deq_shift(mmaxg, K, mode == 8 ? 7 : 3);
+    ku = ffn_deq_shift(mmaxu, K, mode == 8 ? 7 : 3);
+    R->k_g = kg; R->k_u = ku;
+    for (r = 0; r < NH; r++) {
+        double mg = (mode == 8) ? (double)L->sg8[r] * s_in * 65536.0
+                                : (double)L->sg4[r] * s_in * 65536.0;
+        double mu = (mode == 8) ? (double)L->su8[r] * s_in * 65536.0
+                                : (double)L->su4[r] * s_in * 65536.0;
+        qmg[r] = ffn_qm_of(mg, kg);
+        qmu[r] = ffn_qm_of(mu, ku);
+    }
+    R->m_g_min = mg_min;
+    R->m_g_max = mg_max;
+
+    /* ---- gate/up accumulators and the f32 truth P on the same weights ---- */
     for (t = 0; t < ntok; t++) {
+        const int8_t *at = x8 + (size_t)t * K;
+        int32_t bias = (mode == 8) ? 0 : -8 * ffn_sum_i8(at, K);
         for (r = 0; r < NH; r++) {
             double g, u;
+            int32_t ag, au;
             if (mode == 8) {
-                double sg = 0.0, su = 0.0;
-                const uint8_t *rg = L->qg8 + (size_t)r * K;
-                const uint8_t *ru = L->qu8 + (size_t)r * K;
-                for (i = 0; i < K; i++) {
-                    sg += (double)((int)rg[i] - 128) * (double)x8[(size_t)t * K + i];
-                    su += (double)((int)ru[i] - 128) * (double)x8[(size_t)t * K + i];
-                }
-                g = sg * (double)L->sg8[r] * s_in;
-                u = su * (double)L->su8[r] * s_in;
+                ag = dot_i8(L->qg8 + (size_t)r * K, at, K);
+                au = dot_i8(L->qu8 + (size_t)r * K, at, K);
+                g = (double)ag * (double)L->sg8[r] * s_in;
+                u = (double)au * (double)L->su8[r] * s_in;
             } else {
-                double sg = 0.0, su = 0.0;
-                const uint8_t *rg = L->qg4 + (size_t)r * (K / 2);
-                const uint8_t *ru = L->qu4 + (size_t)r * (K / 2);
-                for (i = 0; i < K; i += 2) {
-                    uint8_t b = rg[i >> 1];
-                    sg += (double)((int)(b & 0xf) - 8) * (double)x8[(size_t)t * K + i];
-                    sg += (double)((int)(b >> 4) - 8) * (double)x8[(size_t)t * K + i + 1];
-                    b = ru[i >> 1];
-                    su += (double)((int)(b & 0xf) - 8) * (double)x8[(size_t)t * K + i];
-                    su += (double)((int)(b >> 4) - 8) * (double)x8[(size_t)t * K + i + 1];
-                }
-                g = sg * (double)L->sg4[r] * s_in;
-                u = su * (double)L->su4[r] * s_in;
+                ag = ffn_dot_i4(L->qg4 + (size_t)r * (K / 2), at, K, bias);
+                au = ffn_dot_i4(L->qu4 + (size_t)r * (K / 2), at, K, bias);
+                g = (double)ag * (double)L->sg4[r] * s_in;
+                u = (double)au * (double)L->su4[r] * s_in;
             }
+            accg[(size_t)t * NH + r] = ag;
+            accu[(size_t)t * NH + r] = au;
             P[(size_t)t * NH + r] = (float)(ffn_silu_f32(g) * u);
-            if (fabs((double)P[(size_t)t * NH + r]) > pmax) pmax = fabs((double)P[(size_t)t * NH + r]);
+            if (fabs((double)P[(size_t)t * NH + r]) > pmax)
+                pmax = fabs((double)P[(size_t)t * NH + r]);
+            if (fabs(g) > gmax) gmax = fabs(g);
+            if (fabs(u) > umax) umax = fabs(u);
         }
     }
-    if (!(pmax > 0.0)) return -1;
-    if (cal == 0) {
-        /* absmax/127: what silu_err_study used */
-        R->s_mid = (float)(pmax / 127.0);
-    } else {
-        /* p99.9 / 110: 13 % headroom, clips the 0.1 % tail instead of spending
-         * the whole int8 range on one outlier lane */
-        double *ap = malloc((size_t)ntok * NH * sizeof(double));
-        int n = 0;
-        for (t = 0; t < ntok; t++)
-            for (r = 0; r < NH; r++) ap[n++] = fabs((double)P[(size_t)t * NH + r]);
-        qsort(ap, (size_t)n, sizeof(double), cmp_d);
-        R->s_mid = (float)(ap[(int)(0.999 * (double)(n - 1))] / FFN_CAL_TARGET);
-        free(ap);
+    if (!(pmax > 0.0)) { free(accg); /* keep the early exit simple */
+        free(accu); free(accd); free(mid); free(midi); free(P); free(qmg);
+        free(qmu); free(acc_max); free(lsbv); free(errv); free(out8);
+        return -1;
     }
     R->p_absmax = pmax;
+    R->s_mid = (float)(pmax / 127.0);
     R->mq_mid = (int32_t)(4096.0f / R->s_mid);
 
-    /* ---- integer mid buffer, then s_out from the down accumulator ---- */
-    R->m_g_min = R->m_d_min = 1e30;
+    /* ---- integer mid, LSB error, down accumulators ---- */
     for (t = 0; t < ntok; t++) {
-        int32_t bias = 0;
-        if (mode == 4) {
-            int32_t s = 0;
-            for (i = 0; i < K; i++) s += x8[(size_t)t * K + i];
-            bias = -8 * s;
-        }
+        int8_t *mt = mid + (size_t)t * NH;
+        double dmid = 0.0, da = 0.0, dbb = 0.0;
+        double dp = 0.0, pa = 0.0, pb = 0.0;
+        int32_t biasd;
         for (r = 0; r < NH; r++) {
-            double mg, mu;
+            double mg = (mode == 8) ? (double)L->sg8[r] * s_in * 65536.0
+                                    : (double)L->sg4[r] * s_in * 65536.0;
+            double mu = (mode == 8) ? (double)L->su8[r] * s_in * 65536.0
+                                    : (double)L->su4[r] * s_in * 65536.0;
+            int32_t ag = accg[(size_t)t * NH + r];
+            int32_t au = accu[(size_t)t * NH + r];
             int32_t zg, zu, pr;
-            if (mode == 8) {
-                accg[r] = dot_i8(L->qg8 + (size_t)r * K, x8 + (size_t)t * K, K);
-                accu[r] = dot_i8(L->qu8 + (size_t)r * K, x8 + (size_t)t * K, K);
-                mg = (double)L->sg8[r] * s_in * 65536.0;
-                mu = (double)L->su8[r] * s_in * 65536.0;
+            long ideal;
+            double d;
+            if (deq_mode == 0) {
+                zg = ffn_deq_wide(ag, qmg[r]);
+                zu = ffn_deq_wide(au, qmu[r]);
+                pr = ffn_prod_q16(ffn_silu_qk(zg, kg), zu, ku);
+                if (fabs((double)zg) > zgm) zgm = fabs((double)zg);
+                if (fabs((double)zu) > zum) zum = fabs((double)zu);
             } else {
-                accg[r] = ffn_dot_i4(L->qg4 + (size_t)r * (K / 2), x8 + (size_t)t * K, K, bias);
-                accu[r] = ffn_dot_i4(L->qu4 + (size_t)r * (K / 2), x8 + (size_t)t * K, K, bias);
-                mg = (double)L->sg4[r] * s_in * 65536.0;
-                mu = (double)L->su4[r] * s_in * 65536.0;
+                zg = ffn_deq_legacy(ag, mg);
+                zu = ffn_deq_legacy(au, mu);
+                pr = (deq_mode == 2)
+                    ? ffn_mulq16_unsigned(ffn_silu_q16(zg), zu)
+                    : ffn_mulq16(ffn_silu_q16(zg), zu);
             }
-            if (mg > FFN_Q16_CLAMP) R->g_clamped++;
-            if (mg < R->m_g_min) R->m_g_min = mg;
-            if (mg > R->m_g_max) R->m_g_max = mg;
-            zg = deq_acc(accg[r], mg, gshift, deq64);
-            zu = deq_acc(accu[r], mu, gshift, deq64);
-            pr = prod_p(silu_of(zg, gshift, deq64), zu, gshift, deq64);
-            mid[r] = (int8_t)ffn_requant_mid(pr, R->mq_mid);
+            mt[r] = (int8_t)ffn_requant_mid(pr, R->mq_mid);
+            {
+                double pv = (double)pr / 65536.0;
+                double pt = (double)P[(size_t)t * NH + r];
+                dp += pv * pt; pa += pv * pv; pb += pt * pt;
+            }
+
+            ideal = lrint(P[(size_t)t * NH + r] / R->s_mid);
+            if (ideal > 127) ideal = 127;
+            if (ideal < -127) ideal = -127;
+            midi[(size_t)t * NH + r] = (int8_t)ideal;
+            d = fabs((double)mt[r] - (double)ideal);
+            lsbv[nl++] = d;
+            dmid += (double)mt[r] * (double)R->s_mid * (double)P[(size_t)t * NH + r];
+            da += (double)mt[r] * (double)R->s_mid * (double)mt[r] * (double)R->s_mid;
+            dbb += (double)P[(size_t)t * NH + r] * (double)P[(size_t)t * NH + r];
         }
+        R->cos_mid += (da > 0.0 && dbb > 0.0) ? dmid / (sqrt(da) * sqrt(dbb)) : 0.0;
+        R->cos_p += (pa > 0.0 && pb > 0.0) ? dp / (sqrt(pa) * sqrt(pb)) : 0.0;
+
+        biasd = -8 * ffn_sum_i8(mt, NH);
         for (r = 0; r < K; r++) {
             int32_t a;
             if (mode == 8) {
-                a = dot_i8(L->qd8 + (size_t)r * NH, mid, NH);
+                a = dot_i8(L->qd8 + (size_t)r * NH, mt, NH);
             } else {
-                int32_t s = 0;
-                for (i = 0; i < NH; i++) s += mid[i];
-                a = ffn_dot_i4(L->qd4 + (size_t)r * (NH / 2), mid, NH, -8 * s);
+                a = ffn_dot_i4(L->qd4 + (size_t)r * (NH / 2), mt, NH, biasd);
             }
+            accd[(size_t)t * K + r] = a;
             if (a < 0) a = -a;
             if (a > acc_max[r]) acc_max[r] = a;
         }
     }
+
+    /* ---- s_out from the down accumulator, as the device calibrates it ---- */
     {
-        double need = 0.0;
+        double need0 = 0.0;
         for (r = 0; r < K; r++) {
             double swd = (mode == 8) ? (double)L->sd8[r] : (double)L->sd4[r];
             double s = swd * (double)R->s_mid * (double)acc_max[r] / FFN_CAL_TARGET;
-            if (s > need) need = s;
+            if (s > need0) need0 = s;
             if (acc_max[r] > R->acc_dmax) R->acc_dmax = acc_max[r];
         }
-        if (!(need > 0.0)) {          /* the clamped path produced an all-zero mid */
-            R->zero_out = 1;
-            need = 1.0;
-        }
+        if (!(need0 > 0.0)) { R->zero_out = 1; need0 = 1.0; }
+        need = need0;
         R->s_out = (float)need;
     }
 
-    /* ---- evaluate: cos/maxerr/LSB/saturation vs the f32 truth ---- */
+    /* ---- isolate the stages: mid -> down -> int8 out ---- */
     for (t = 0; t < ntok; t++) {
-        double dout = 0.0, da = 0.0, dbb = 0.0, dmid = 0.0;
-        int32_t bias = 0;
-        if (mode == 4) {
-            int32_t s = 0;
-            for (i = 0; i < K; i++) s += x8[(size_t)t * K + i];
-            bias = -8 * s;
-        }
-        for (r = 0; r < NH; r++) {
-            int32_t zg, zu, pr;
-            double mg, mu;
-            if (mode == 8) {
-                accg[r] = dot_i8(L->qg8 + (size_t)r * K, x8 + (size_t)t * K, K);
-                accu[r] = dot_i8(L->qu8 + (size_t)r * K, x8 + (size_t)t * K, K);
-                mg = (double)L->sg8[r] * s_in * 65536.0;
-                mu = (double)L->su8[r] * s_in * 65536.0;
-            } else {
-                accg[r] = ffn_dot_i4(L->qg4 + (size_t)r * (K / 2), x8 + (size_t)t * K, K, bias);
-                accu[r] = ffn_dot_i4(L->qu4 + (size_t)r * (K / 2), x8 + (size_t)t * K, K, bias);
-                mg = (double)L->sg4[r] * s_in * 65536.0;
-                mu = (double)L->su4[r] * s_in * 65536.0;
-            }
-            zg = deq_acc(accg[r], mg, gshift, deq64);
-            zu = deq_acc(accu[r], mu, gshift, deq64);
-            pr = prod_p(silu_of(zg, gshift, deq64), zu, gshift, deq64);
-            mid[r] = (int8_t)ffn_requant_mid(pr, R->mq_mid);
-            {
-                long ideal = lrintf(P[(size_t)t * NH + r] / R->s_mid);
-                double d;
-                if (ideal > 127) ideal = 127;
-                if (ideal < -127) ideal = -127;
-                d = fabs((double)mid[r] - (double)ideal);
-                lsbv[nl++] = d;
-                midi[r] = (int8_t)ideal;
-            }
-            dmid += (double)mid[r] * (double)R->s_mid * (double)P[(size_t)t * NH + r];
-            da += (double)mid[r] * (double)R->s_mid * (double)mid[r] * (double)R->s_mid;
-            dbb += (double)P[(size_t)t * NH + r] * (double)P[(size_t)t * NH + r];
-        }
-        R->cos_mid += (da > 0.0 && dbb > 0.0) ? dmid / (sqrt(da) * sqrt(dbb)) : 0.0;
-        /* format ceiling: the same down path with ideally rounded mid */
-        {
-            double di = 0.0, ai = 0.0, bi = 0.0;
-            int32_t bias_i = 0;
-            if (mode == 4) for (i = 0; i < NH; i++) bias_i += midi[i];
-            bias_i *= -8;
-            for (r = 0; r < K; r++) {
-                double swd = (mode == 8) ? (double)L->sd8[r] : (double)L->sd4[r];
-                int32_t acc = (mode == 8) ? dot_i8(L->qd8 + (size_t)r * NH, midi, NH)
-                    : ffn_dot_i4(L->qd4 + (size_t)r * (NH / 2), midi, NH, bias_i);
-                double y = (double)acc * swd * (double)R->s_mid;
-                double t2 = (mode == 8)
-                    ? dot_i8_f32(L->qd8 + (size_t)r * NH, P + (size_t)t * NH, NH, swd)
-                    : dot_i4_f32(L->qd4 + (size_t)r * (NH / 2), P + (size_t)t * NH, NH, swd);
-                di += y * t2; ai += y * y; bi += t2 * t2;
-            }
-            R->cos_ideal += (ai > 0.0 && bi > 0.0) ? di / (sqrt(ai) * sqrt(bi)) : 0.0;
-        }
-
-        /* down projection: kernel dot + pack_out_i8 */
-        {
-            int32_t s = 0;
-            if (mode == 4) for (i = 0; i < NH; i++) s += mid[i];
-            for (r = 0; r < K; r++) {
-                int32_t acc = (mode == 8)
-                    ? dot_i8(L->qd8 + (size_t)r * NH, mid, NH)
-                    : ffn_dot_i4(L->qd4 + (size_t)r * (NH / 2), mid, NH, -8 * s);
-                double swd = (mode == 8) ? (double)L->sd8[r] : (double)L->sd4[r];
-                double md = swd * (double)R->s_mid / (double)R->s_out;
-                int64_t v = ((int64_t)acc * (int64_t)ffn_qp16_of((float)md) + 32768) >> 16;
-                if (v > 127) v = 127;
-                if (v < -127) v = -127;
-                out8[r] = (int8_t)v;
-            }
-        }
-        dout = 0.0; da = 0.0; dbb = 0.0;
+        const int8_t *it = midi + (size_t)t * NH;
+        double cd = 0.0, ci = 0.0, ad = 0.0, ai = 0.0, bb = 0.0;
+        int32_t bi = -8 * ffn_sum_i8(it, NH);
         for (r = 0; r < K; r++) {
             double swd = (mode == 8) ? (double)L->sd8[r] : (double)L->sd4[r];
             double y = (mode == 8)
                 ? dot_i8_f32(L->qd8 + (size_t)r * NH, P + (size_t)t * NH, NH, swd)
                 : dot_i4_f32(L->qd4 + (size_t)r * (NH / 2), P + (size_t)t * NH, NH, swd);
-            double ym = (double)out8[r] * (double)R->s_out;
-            yref[r] = (float)y;
-            yq[r] = (float)ym;
+            double yd = (double)accd[(size_t)t * K + r] * swd * (double)R->s_mid;
+            int32_t acci = (mode == 8)
+                ? dot_i8(L->qd8 + (size_t)r * NH, it, NH)
+                : ffn_dot_i4(L->qd4 + (size_t)r * (NH / 2), it, NH, bi);
+            double yi = (double)acci * swd * (double)R->s_mid;
+            cd += yd * y; ad += yd * yd; bb += y * y;
+            ci += yi * y; ai += yi * yi;
+        }
+        R->cos_down += (ad > 0.0 && bb > 0.0) ? cd / (sqrt(ad) * sqrt(bb)) : 0.0;
+        R->cos_ideal += (ai > 0.0 && bb > 0.0) ? ci / (sqrt(ai) * sqrt(bb)) : 0.0;
+    }
+    R->cos_down /= ntok;
+    R->cos_ideal /= ntok;
+
+    /* ---- evaluate: out int8 vs f32 truth, cos, saturation ---- */
+    for (t = 0; t < ntok; t++) {
+        const int8_t *mt = mid + (size_t)t * NH;
+        double dout = 0.0, da = 0.0, dbb = 0.0;
+        int sm = 0, so = 0;
+        for (r = 0; r < K; r++) {
+            int32_t acc = accd[(size_t)t * K + r];
+            double swd = (mode == 8) ? (double)L->sd8[r] : (double)L->sd4[r];
+            double md = swd * (double)R->s_mid / (double)R->s_out;
+            double y, ym;
+            int64_t v = ((int64_t)acc * (int64_t)ffn_qp16_of((float)md) + 32768) >> 16;
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            out8[r] = (int8_t)v;
+            y = (mode == 8)
+                ? dot_i8_f32(L->qd8 + (size_t)r * NH, P + (size_t)t * NH, NH, swd)
+                : dot_i4_f32(L->qd4 + (size_t)r * (NH / 2), P + (size_t)t * NH, NH, swd);
+            ym = (double)out8[r] * (double)R->s_out;
             dout += ym * y;
             da += ym * ym;
             dbb += y * y;
             errv[ne++] = fabs(ym - y);
+            if (out8[r] >= 127 || out8[r] <= -127) so++;
         }
         {
             double c = (da > 0.0 && dbb > 0.0) ? dout / (sqrt(da) * sqrt(dbb)) : 0.0;
             R->cos_out += c;
             if (t == 0 || c < R->cos_out_min) R->cos_out_min = c;
         }
-        {
-            int sm = 0, so = 0;
-            for (r = 0; r < NH; r++) if (mid[r] >= 127 || mid[r] <= -127) sm++;
-            for (r = 0; r < K; r++) if (out8[r] >= 127 || out8[r] <= -127) so++;
-            R->sat_mid += 100.0 * sm / NH;
-            R->sat_out += 100.0 * so / K;
-        }
+        for (r = 0; r < NH; r++) if (mt[r] >= 127 || mt[r] <= -127) sm++;
+        R->sat_mid += 100.0 * sm / NH;
+        R->sat_out += 100.0 * so / K;
     }
     R->cos_out /= ntok;
     R->cos_mid /= ntok;
-    R->cos_ideal /= ntok;
+    R->cos_p /= ntok;
     R->sat_mid /= ntok;
     R->sat_out /= ntok;
+    R->z_g_max = zgm;
+    R->z_u_max = zum;
     pct4(lsbv, nl, &R->lsb_p50, &R->lsb_p90, &R->lsb_p99, &R->lsb_max);
     pct4(errv, ne, &R->err_p50, &R->err_p90, &R->err_p99, &R->err_max);
     R->max_out = R->err_max;
@@ -442,42 +403,90 @@ static int run_layer(const layer_t *L, int mode, const int8_t *x8, int ntok,
         double md = swd * (double)R->s_mid / (double)R->s_out;
         double wr = md * (double)acc_max[r];
         if (md > FFN_Q16_CLAMP) R->d_clamped++;
-        if (md < R->m_d_min) R->m_d_min = md;
-        if (md > R->m_d_max) R->m_d_max = md;
+        if (md < md_min) md_min = md;
+        if (md > md_max) md_max = md;
         if (wr > R->worst_row) R->worst_row = wr;
     }
+    R->m_d_min = md_min;
+    R->m_d_max = md_max;
 
-    free(accg); free(accu); free(mid); free(midi); free(acc_max);
-    free(P); free(yq); free(yref); free(out8); free(lsbv); free(errv);
+    free(accg); free(accu); free(accd); free(mid); free(midi); free(P);
+    free(qmg); free(qmu); free(acc_max); free(lsbv); free(errv); free(out8);
     return 0;
 }
 
-/* smallest gate-output widening k such that every row's dequant multiplier
- * fits the Q16 clamp; the DSP kernel has no such field today -- this is the
- * host simulation of what a per-buffer `mbits` would buy. */
-static int gate_shift_for(const layer_t *L, int mode, double s_in, double target)
+static void print_table(const char *title, const run_t *R)
 {
-    double m = 0.0;
-    int i, k = 0;
-    for (i = 0; i < L->NH; i++) {
-        double sw = (mode == 8) ? (double)L->sg8[i] : (double)L->sg4[i];
-        double v = sw * s_in * 65536.0;
-        if (v > m) m = v;
+    int li;
+    printf("\n%s\n", title);
+    printf("%-3s %-9s %-9s %-9s %-9s %-9s %-9s %-7s %-7s %-7s %-7s %-7s %-8s %-3s %-9s\n",
+           "lay", "cos_avg", "cos_min", "cos_mid", "cos_P", "cos_dn", "cos_id",
+           "LSB50", "LSB99", "LSBmax", "satM%", "satO%", "m_max", "k", "clamp0/old");
+    for (li = 0; li < NL; li++) {
+        printf("%-3d %-9.6f %-9.6f %-9.6f %-9.6f %-9.6f %-9.6f %-7.2f %-7.2f %-7.0f"
+               " %-7.2f %-7.2f %-8.3f %-3d %d/%d\n",
+               li, R[li].cos_out, R[li].cos_out_min, R[li].cos_mid, R[li].cos_p,
+               R[li].cos_down, R[li].cos_ideal,
+               R[li].lsb_p50, R[li].lsb_p99, R[li].lsb_max,
+               R[li].sat_mid, R[li].sat_out, R[li].m_g_max, R[li].k_g,
+               0, R[li].old_clamp_g);
     }
-    while (m / (double)(1u << k) > target) k++;
-    return k;
+}
+
+/* pool a per-token run into a per-layer summary */
+static void merge_run(run_t *a, const run_t *b)
+{
+    int n = a->ntok;
+    double den = (double)(n + 1);
+    a->cos_out = (a->cos_out * n + b->cos_out) / den;
+    a->cos_mid = (a->cos_mid * n + b->cos_mid) / den;
+    a->cos_p = (a->cos_p * n + b->cos_p) / den;
+    a->cos_down = (a->cos_down * n + b->cos_down) / den;
+    a->cos_ideal = (a->cos_ideal * n + b->cos_ideal) / den;
+    a->sat_mid = (a->sat_mid * n + b->sat_mid) / den;
+    a->sat_out = (a->sat_out * n + b->sat_out) / den;
+    if (n == 0 || b->cos_out_min < a->cos_out_min) a->cos_out_min = b->cos_out_min;
+    if (b->max_out > a->max_out) a->max_out = b->max_out;
+    if (b->err_p99 > a->err_p99) a->err_p99 = b->err_p99;
+    if (b->lsb_p50 > a->lsb_p50) a->lsb_p50 = b->lsb_p50;
+    if (b->lsb_p90 > a->lsb_p90) a->lsb_p90 = b->lsb_p90;
+    if (b->lsb_p99 > a->lsb_p99) a->lsb_p99 = b->lsb_p99;
+    if (b->lsb_max > a->lsb_max) a->lsb_max = b->lsb_max;
+    if (b->err_max > a->err_max) a->err_max = b->err_max;
+    if (b->z_g_max > a->z_g_max) a->z_g_max = b->z_g_max;
+    if (b->z_u_max > a->z_u_max) a->z_u_max = b->z_u_max;
+    if (b->m_g_max > a->m_g_max) a->m_g_max = b->m_g_max;
+    if (a->m_g_min <= 0.0 || b->m_g_min < a->m_g_min) a->m_g_min = b->m_g_min;
+    if (b->m_d_max > a->m_d_max) a->m_d_max = b->m_d_max;
+    if (a->m_d_min <= 0.0 || b->m_d_min < a->m_d_min) a->m_d_min = b->m_d_min;
+    if (b->worst_row > a->worst_row) a->worst_row = b->worst_row;
+    if (b->acc_dmax > a->acc_dmax) a->acc_dmax = b->acc_dmax;
+    if (b->p_absmax > a->p_absmax) a->p_absmax = b->p_absmax;
+    if (b->old_clamp_g > a->old_clamp_g) a->old_clamp_g = b->old_clamp_g;
+    if (b->old_clamp_u > a->old_clamp_u) a->old_clamp_u = b->old_clamp_u;
+    if (b->d_clamped > a->d_clamped) a->d_clamped = b->d_clamped;
+    if (b->k_g > a->k_g) a->k_g = b->k_g;
+    if (b->k_u > a->k_u) a->k_u = b->k_u;
+    a->mq_mid = b->mq_mid;
+    a->s_mid = b->s_mid;
+    a->s_out = b->s_out;
+    a->ntok = n + 1;
 }
 
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "../../../models/LFM3-1.7B-Q4_K_M.gguf";
-    int ntok = argc > 2 ? atoi(argv[2]) : 8;
-    const int lay[3] = { 0, 12, 23 };
+    int ntok = argc > 2 ? atoi(argv[2]) : 4;
+    static const int regress_layers[3] = { 0, 12, 23 };
+    run_t t8[NL], t4[NL], b8[NL], b4[NL], lg1, lg2;
     lfm_t spec;
     uint32_t *tok;
     float *cap;
     int top1 = -1;
-    int i, t, slot;
+    int li, i, t, rc = 0, have_regress = 0, regress_ok = 1;
+    int pass_cos = 1, worst8_li = -1, worst8m_li = -1, worst4_li = -1, worst4m_li = -1;
+    double worst8 = 2.0, worst8min = 2.0, worst4 = 2.0, worst4min = 2.0;
+    double worstb8 = 2.0, worstb8min = 2.0, worstb4 = 2.0, worstb4min = 2.0;
     uint32_t st = 20240517u;
 
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -487,7 +496,6 @@ int main(int argc, char **argv)
     if (!tok) { printf("oom\n"); return 1; }
 
     gguf_open(path);
-    /* optional explicit token ids: ./ffn_real_study model.gguf N id0 id1 ... */
     if (argc > 4) {
         int n = argc - 3;
         if (n > ntok) n = ntok;
@@ -500,167 +508,213 @@ int main(int argc, char **argv)
         }
     }
 
-    lfm_init(&spec, 24, HID, INT, 16, 4, 128, 256, 128000);
-    cap = malloc((size_t)3 * ntok * HID * 4);
+    lfm_init(&spec, NL, HID, INT, 16, 4, 128, 256, 128000);
+    cap = malloc((size_t)NL * ntok * HID * 4);
     if (!cap) { printf("oom\n"); return 1; }
-    printf("real FFN study: %s, %d tokens\n", path, ntok);
-    printf("input: full 24-layer f32 forward (mirror of backend/cpu.rs); "
-           "FFN inputs captured at layers %d/%d/%d\n", lay[0], lay[1], lay[2]);
-    if (lfm_forward(&spec, tok, ntok, lay[0], lay[1], lay[2], cap, &top1) != 0) {
+    printf("real FFN study: %s, %d tokens, all %d layers\n", path, ntok, NL);
+    printf("input: full f32 forward (mirror of backend/cpu.rs); FFN input "
+           "captured before every ffn_gate/up\n");
+    if (lfm_forward(&spec, tok, ntok, cap, &top1) != 0) {
         printf("forward failed\n");
         return 1;
     }
-    printf("lm_head argmax of the last token = %d; reproduce the full-stack check "
-           "with 5 explicit ids:\n  ./ffn_real_study <model> 5 597 5205 302 3980 355"
-           "  -> expect 4741 (\" Paris\")\n", top1);
+    printf("lm_head argmax of the last token = %d\n", top1);
 
-    for (slot = 0; slot < 3; slot++) {
+    for (li = 0; li < NL; li++) {
         char nm[64];
-        int li = lay[slot], li_c = lay[slot];
         const tinfo_t *tg, *tu, *td;
         layer_t Ly;
-        run_t R8, R4, R8w, R8i, R8p;
-        int k8;
-        double s_in = 0.0, cos_w8 = 0.0, cos_w4 = 0.0;
+        float *wg, *wu, *wd;
         int8_t *x8;
-        float *P = malloc((size_t)INT * 4);
-        float *yorig = malloc((size_t)HID * 4);
-        float *ydeq = malloc((size_t)HID * 4);
-        int rc;
+        double rms = 0.0, amax = 0.0;
 
-        /* ---- real input of this layer: s_in from its own absmax ---- */
-        x8 = malloc((size_t)ntok * HID);
-        if (!x8) { printf("oom\n"); return 1; }
-        {
-            double amax = 0.0, rms = 0.0;
-            for (i = 0; i < ntok * HID; i++) {
-                double v = fabs((double)cap[((size_t)slot * ntok * HID) + i]);
+        /* ---- this layer's real inputs ---- */
+        for (t = 0; t < ntok; t++) {
+            const float *src = cap + ((size_t)li * ntok + t) * HID;
+            for (i = 0; i < HID; i++) {
+                double v = fabs((double)src[i]);
                 if (v > amax) amax = v;
                 rms += v * v;
             }
-            s_in = amax / FFN_CAL_TARGET;
-            printf("\nlayer %d: ffn_in rms=%.4f absmax=%.4f -> s_in=%.6g\n",
-                   li, sqrt(rms / (ntok * HID)), amax, s_in);
         }
-        for (t = 0; t < ntok; t++)
-            for (i = 0; i < HID; i++) {
-                long q = lrintf(cap[((size_t)slot * ntok + t) * HID + i] / (float)s_in);
-                if (q > 127) q = 127;
-                if (q < -127) q = -127;
-                x8[(size_t)t * HID + i] = (int8_t)q;
-            }
+        if (!(amax > 0.0)) { printf("layer %d: zero input\n", li); rc = 1; break; }
+        x8 = malloc((size_t)ntok * HID);
+        if (!x8) { printf("oom\n"); rc = 1; break; }
 
-        snprintf(nm, sizeof(nm), "blk.%d.ffn_gate.weight", li_c); tg = gguf_find(nm);
-        snprintf(nm, sizeof(nm), "blk.%d.ffn_up.weight", li_c);   tu = gguf_find(nm);
-        snprintf(nm, sizeof(nm), "blk.%d.ffn_down.weight", li_c); td = gguf_find(nm);
-
-        if (layer_alloc(&Ly, HID, INT) != 0 || !P || !yorig || !ydeq) {
-            printf("oom\n");
-            return 1;
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_gate.weight", li); tg = gguf_find(nm);
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_up.weight", li);   tu = gguf_find(nm);
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_down.weight", li); td = gguf_find(nm);
+        wg = gguf_matrix(tg, INT, HID);
+        wu = gguf_matrix(tu, INT, HID);
+        wd = gguf_matrix(td, HID, INT);
+        if (!wg || !wu || !wd || layer_alloc(&Ly, HID, INT) != 0) {
+            printf("layer %d: load/alloc failed\n", li);
+            free(wg); free(wu); free(wd); free(x8);
+            rc = 1; break;
         }
-        Ly.wg = gguf_matrix(tg, INT, HID);
-        Ly.wu = gguf_matrix(tu, INT, HID);
-        Ly.wd = gguf_matrix(td, HID, INT);
         for (i = 0; i < INT; i++) {
-            Ly.sg8[i] = pack_i8_row(Ly.qg8 + (size_t)i * HID, Ly.wg + (size_t)i * HID, HID);
-            Ly.su8[i] = pack_i8_row(Ly.qu8 + (size_t)i * HID, Ly.wu + (size_t)i * HID, HID);
+            Ly.sg8[i] = pack_i8_row(Ly.qg8 + (size_t)i * HID, wg + (size_t)i * HID, HID);
+            Ly.su8[i] = pack_i8_row(Ly.qu8 + (size_t)i * HID, wu + (size_t)i * HID, HID);
             Ly.sg4[i] = ffn_pack_i4_row(Ly.qg4 + (size_t)i * (HID / 2),
-                                        Ly.wg + (size_t)i * HID, HID);
+                                        wg + (size_t)i * HID, HID);
             Ly.su4[i] = ffn_pack_i4_row(Ly.qu4 + (size_t)i * (HID / 2),
-                                        Ly.wu + (size_t)i * HID, HID);
+                                        wu + (size_t)i * HID, HID);
         }
         for (i = 0; i < HID; i++) {
-            Ly.sd8[i] = pack_i8_row(Ly.qd8 + (size_t)i * INT, Ly.wd + (size_t)i * INT, INT);
+            Ly.sd8[i] = pack_i8_row(Ly.qd8 + (size_t)i * INT, wd + (size_t)i * INT, INT);
             Ly.sd4[i] = ffn_pack_i4_row(Ly.qd4 + (size_t)i * (INT / 2),
-                                        Ly.wd + (size_t)i * INT, INT);
+                                        wd + (size_t)i * INT, INT);
         }
-        {
-            double wr = 0.0, wa = 0.0;
-            for (i = 0; i < INT * HID; i++) {
-                double v = fabs((double)Ly.wg[i]);
-                wr += v * v;
-                if (v > wa) wa = v;
-            }
-            printf("  gate weights: rms=%.5f absmax=%.5f -> row int4 sw ~ %.5f, "
-                   "int8 sw ~ %.6f\n", sqrt(wr / ((double)INT * HID)), wa,
-                   wa / 7.0, wa / 127.0);
-        }
+        free(wg); free(wu); free(wd);
 
-        /* weight-quantisation cost: f32 on dequantised vs f32 on the original */
+        printf("layer %2d: ffn_in rms=%.4f absmax=%.4f  tok_absmax:",
+               li, sqrt(rms / ((double)ntok * HID)), amax);
         for (t = 0; t < ntok; t++) {
-            const float *xr = cap + ((size_t)slot * ntok + t) * HID;
-            for (i = 0; i < INT; i++) {
-                double g = dot_f32_row(Ly.wg + (size_t)i * HID, xr, HID);
-                double u = dot_f32_row(Ly.wu + (size_t)i * HID, xr, HID);
-                P[i] = (float)(ffn_silu_f32(g) * u);
-            }
-            for (i = 0; i < HID; i++)
-                yorig[i] = (float)dot_f32_row(Ly.wd + (size_t)i * INT, P, INT);
-            for (i = 0; i < HID; i++)
-                ydeq[i] = (float)dot_i8_f32(Ly.qd8 + (size_t)i * INT, P, INT, Ly.sd8[i]);
-            cos_w8 += f32_cosine(yorig, ydeq, HID);
-            for (i = 0; i < HID; i++)
-                ydeq[i] = (float)dot_i4_f32(Ly.qd4 + (size_t)i * (INT / 2), P, INT, Ly.sd4[i]);
-            cos_w4 += f32_cosine(yorig, ydeq, HID);
+            const float *src = cap + ((size_t)li * ntok + t) * HID;
+            float ta = 0.0f;
+            for (i = 0; i < HID; i++) { float v = fabsf(src[i]); if (v > ta) ta = v; }
+            printf(" %.3f", ta);
         }
-        cos_w8 /= ntok;
-        cos_w4 /= ntok;
-        free(P); free(yorig); free(ydeq);
+        printf("\n");
 
-        k8 = gate_shift_for(&Ly, 8, s_in, 0.9);
-        rc = run_layer(&Ly, 8, x8, ntok, s_in, 0, 0, 0, &R8);
-        if (rc != 0) { printf("run int8 failed\n"); return 1; }
-        rc = run_layer(&Ly, 4, x8, ntok, s_in, 0, 0, 0, &R4);
-        if (rc != 0) { printf("run int4 failed\n"); return 1; }
-        rc = run_layer(&Ly, 8, x8, ntok, s_in, k8, 0, 0, &R8w);
-        if (rc != 0) { printf("run int8 wide failed\n"); return 1; }
-        rc = run_layer(&Ly, 8, x8, ntok, s_in, 0, 1, 0, &R8i);
-        if (rc != 0) { printf("run int8 int64 failed\n"); return 1; }
-        rc = run_layer(&Ly, 8, x8, ntok, s_in, 0, 1, 1, &R8p);
-        if (rc != 0) { printf("run int8 int64 p999 failed\n"); return 1; }
+        /* ---- per-token calibration: each token gets its own s_in/s_mid, so
+         * the number isolates the dequant from a batch-wide scale outlier ---- */
+        memset(&t8[li], 0, sizeof(t8[li]));
+        memset(&t4[li], 0, sizeof(t4[li]));
+        memset(&lg1, 0, sizeof(lg1));
+        memset(&lg2, 0, sizeof(lg2));
+        for (t = 0; t < ntok; t++) {
+            const float *src = cap + ((size_t)li * ntok + t) * HID;
+            double s_in = 0.0;
+            run_t tmp;
+            for (i = 0; i < HID; i++) {
+                double v = fabs((double)src[i]);
+                if (v > s_in) s_in = v;
+            }
+            s_in /= FFN_CAL_TARGET;
+            for (i = 0; i < HID; i++) {
+                long q = lrintf(src[i] / (float)s_in);
+                if (q > 127) q = 127;
+                if (q < -127) q = -127;
+                x8[i] = (int8_t)q;
+            }
+            if (run_layer(&Ly, 8, 0, x8, 1, s_in, &tmp) != 0) {
+                printf("layer %d tok %d: int8 run failed\n", li, t);
+                rc = 1; break;
+            }
+            merge_run(&t8[li], &tmp);
+            if (run_layer(&Ly, 4, 0, x8, 1, s_in, &tmp) != 0) {
+                printf("layer %d tok %d: int4 run failed\n", li, t);
+                rc = 1; break;
+            }
+            merge_run(&t4[li], &tmp);
+            if (li == regress_layers[0] || li == regress_layers[1] ||
+                li == regress_layers[2]) {
+                if (run_layer(&Ly, 4, 1, x8, 1, s_in, &tmp) != 0) {
+                    printf("layer %d tok %d: regression run failed\n", li, t);
+                    rc = 1; break;
+                }
+                merge_run(&lg1, &tmp);
+                if (run_layer(&Ly, 4, 2, x8, 1, s_in, &tmp) != 0) {
+                    printf("layer %d tok %d: regression run failed\n", li, t);
+                    rc = 1; break;
+                }
+                merge_run(&lg2, &tmp);
+            }
+        }
+        if (rc != 0) { layer_free(&Ly); free(x8); break; }
 
-        printf("  weight quantisation alone (f32 weights vs dequantised, same "
-               "activation): int8 cos=%.6f  int4 cos=%.6f\n", cos_w8, cos_w4);
+        /* ---- device-like check: one s_in/s_mid shared by the whole batch ---- */
+        if (ntok > 0) {
+            double s_in_b = amax / FFN_CAL_TARGET;
+            for (t = 0; t < ntok; t++) {
+                const float *src = cap + ((size_t)li * ntok + t) * HID;
+                for (i = 0; i < HID; i++) {
+                    long q = lrintf(src[i] / (float)s_in_b);
+                    if (q > 127) q = 127;
+                    if (q < -127) q = -127;
+                    x8[(size_t)t * HID + i] = (int8_t)q;
+                }
+            }
+            if (run_layer(&Ly, 8, 0, x8, ntok, s_in_b, &b8[li]) != 0 ||
+                run_layer(&Ly, 4, 0, x8, ntok, s_in_b, &b4[li]) != 0) {
+                printf("layer %d: batch run failed\n", li);
+                rc = 1; layer_free(&Ly); free(x8); break;
+            }
+        }
 
-        printf("\n  int8 weights (per-row absmax/127):\n");
-        printf("    m_gate=[%.4f..%.4f] clamps=%d  m_down=[%.5f..%.5f] clamps=%d\n",
-               R8.m_g_min, R8.m_g_max, R8.g_clamped, R8.m_d_min, R8.m_d_max, R8.d_clamped);
-        printf("    s_mid=%.6g mq_mid=%d s_out=%.6g (acc_max=%d, worst m*acc=%.1f)\n",
-               R8.s_mid, R8.mq_mid, R8.s_out, R8.acc_dmax, R8.worst_row);
-        printf("    cos(out)=%.6f (min tok %.6f) cos(mid)=%.6f  ideal-mid ceiling=%.6f  sat mid/out=%.2f%%/%.2f%%\n",
-               R8.cos_out, R8.cos_out_min, R8.cos_mid, R8.cos_ideal, R8.sat_mid, R8.sat_out);
-        printf("    mid LSB p50/p90/p99/max = %.2f/%.2f/%.2f/%.0f\n",
-               R8.lsb_p50, R8.lsb_p90, R8.lsb_p99, R8.lsb_max);
-        printf("    out err p50/p90/p99/max = %.5g/%.5g/%.5g/%.5g\n",
-               R8.err_p50, R8.err_p90, R8.err_p99, R8.err_max);
+        if (li == regress_layers[0] || li == regress_layers[1] ||
+            li == regress_layers[2]) {
+            have_regress = 1;
+            printf("  regress lay %2d int4: old Q16+clamp cos=%.6f min=%.6f satM=%.2f%% | "
+                   "old unsigned cos=%.6f min=%.6f satM=%.2f%%\n",
+                   li, lg1.cos_out, lg1.cos_out_min, lg1.sat_mid,
+                   lg2.cos_out, lg2.cos_out_min, lg2.sat_mid);
+            if (!(lg1.cos_out < PASS_COS || lg1.sat_mid > PASS_SAT_PCT)) regress_ok = 0;
+            if (!(lg2.cos_out < PASS_COS && lg2.sat_mid > 20.0)) regress_ok = 0;
+        }
 
-        printf("\n  int4 weights (per-row absmax/7, what lfmgemv_ffn consumes):\n");
-        printf("    m_gate=[%.3f..%.3f] clamps=%d/%d rows -> Q16 multiplier sits at the clamp\n",
-               R4.m_g_min, R4.m_g_max, R4.g_clamped, R4.ntok * INT);
-        printf("    cos(out)=%.6f cos(mid)=%.6f  sat mid/out=%.2f%%/%.2f%%\n",
-               R4.cos_out, R4.cos_mid, R4.sat_mid, R4.sat_out);
-        printf("    mid LSB p50/p90/p99/max = %.2f/%.2f/%.2f/%.0f\n",
-               R4.lsb_p50, R4.lsb_p90, R4.lsb_p99, R4.lsb_max);
-        printf("    m_down=[%.5f..%.5f] clamps=%d  s_out worst m*acc=%.1f%s\n",
-               R4.m_d_min, R4.m_d_max, R4.d_clamped, R4.worst_row,
-               R4.zero_out ? "  [mid all zero: no signal reaches down]" : "");
-
-        printf("\n  simulated wide gate output (host only, kernel would need a "
-               "per-buffer shift; int8 at Q%d):\n", 16 - k8);
-        printf("    int8: m_gate max=%.3f / 2^%d  cos(out)=%.6f  mid LSB p99=%.0f\n",
-               R8w.m_g_max, k8, R8w.cos_out, R8w.lsb_p99);
-        printf("  int8 + 64-bit gate/up dequant, no Q16 clamp (host only):\n");
-        printf("    absmax/127 mid cal: cos(out)=%.6f (min tok %.6f) cos(mid)=%.6f  ideal-mid ceiling=%.6f  LSB p50/p99/max=%.2f/%.0f/%.0f\n",
-               R8i.cos_out, R8i.cos_out_min, R8i.cos_mid, R8i.cos_ideal,
-               R8i.lsb_p50, R8i.lsb_p99, R8i.lsb_max);
-        printf("    p99.9/110 mid cal : cos(out)=%.6f cos(mid)=%.6f  LSB p50/p99/max=%.2f/%.0f/%.0f"
-               "  s_mid=%.6g\n", R8p.cos_out, R8p.cos_mid, R8p.lsb_p50, R8p.lsb_p99,
-               R8p.lsb_max, R8p.s_mid);
-
-        free(x8);
         layer_free(&Ly);
+        free(x8);
+    }
+
+    if (rc == 0) {
+        print_table("int8 weights (per-row absmax/127), wide dequant",
+                    t8);
+        print_table("int4 weights (per-row absmax/7), wide dequant",
+                    t4);
+
+        for (li = 0; li < NL; li++) {
+            if (t8[li].cos_out < worst8) { worst8 = t8[li].cos_out; worst8_li = li; }
+            if (t8[li].cos_out_min < worst8min) { worst8min = t8[li].cos_out_min; worst8m_li = li; }
+            if (t4[li].cos_out < worst4) { worst4 = t4[li].cos_out; worst4_li = li; }
+            if (t4[li].cos_out_min < worst4min) { worst4min = t4[li].cos_out_min; worst4m_li = li; }
+            if (t8[li].cos_out < PASS_COS || t8[li].cos_out_min < PASS_COS ||
+                t4[li].cos_out < PASS_COS || t4[li].cos_out_min < PASS_COS ||
+                t8[li].sat_mid > PASS_SAT_PCT || t8[li].sat_out > PASS_SAT_PCT ||
+                t4[li].sat_mid > PASS_SAT_PCT || t4[li].sat_out > PASS_SAT_PCT)
+                pass_cos = 0;
+        }
+        printf("\nper-token scales: worst int8 cos(avg)=%.6f (lay %d) cos(min-token)=%.6f (lay %d)\n",
+               worst8, worst8_li, worst8min, worst8m_li);
+        printf("per-token scales: worst int4 cos(avg)=%.6f (lay %d) cos(min-token)=%.6f (lay %d)\n",
+               worst4, worst4_li, worst4min, worst4m_li);
+        for (li = 0; li < NL; li++) {
+            if (b8[li].cos_out < worstb8) worstb8 = b8[li].cos_out;
+            if (b8[li].cos_out_min < worstb8min) worstb8min = b8[li].cos_out_min;
+            if (b4[li].cos_out < worstb4) worstb4 = b4[li].cos_out;
+            if (b4[li].cos_out_min < worstb4min) worstb4min = b4[li].cos_out_min;
+        }
+        printf("one scale per batch: worst int8 cos(avg)=%.6f cos(min-token)=%.6f\n",
+               worstb8, worstb8min);
+        printf("one scale per batch: worst int4 cos(avg)=%.6f cos(min-token)=%.6f\n",
+               worstb4, worstb4min);
+        printf("layers below %.2f with one batch scale: int8", PASS_COS);
+        for (li = 0; li < NL; li++)
+            if (b8[li].cos_out_min < PASS_COS) printf(" %d(%.4f)", li, b8[li].cos_out_min);
+        printf(" | int4");
+        for (li = 0; li < NL; li++)
+            if (b4[li].cos_out_min < PASS_COS) printf(" %d(%.4f)", li, b4[li].cos_out_min);
+        printf("\n");
+        printf("regression gates: %s\n",
+               (have_regress && regress_ok) ? "both old formats rejected"
+                                            : "FAILED (old format was not rejected)");
+        {
+            int n8 = 0, n4 = 0;
+            for (li = 0; li < NL; li++) {
+                if (t8[li].cos_out_min >= PASS_COS) n8++;
+                if (t4[li].cos_out_min >= PASS_COS) n4++;
+            }
+            printf("\nper-token min-token >= %.2f: %d/%d layers int8, %d/%d layers int4\n",
+                   PASS_COS, n8, NL, n4, NL);
+        }
+        printf("%s (need: cos(out) >= %.3f on every layer and token, int8 and "
+               "int4; saturation <= %.1f%%; both regression gates rejected)\n",
+               (pass_cos && have_regress && regress_ok) ? "REAL SIM OK" : "REAL SIM FAIL",
+               PASS_COS, PASS_SAT_PCT);
+        if (!(pass_cos && have_regress && regress_ok)) rc = 2;
     }
 
     free(tok); free(cap);
-    return 0;
+    return rc;
 }
