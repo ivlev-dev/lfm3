@@ -1,0 +1,4 @@
+# артефакты локального QEMU-стенда
+/build/
+/osam.cfg
+/q6ss.cfg
