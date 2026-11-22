@@ -730,6 +730,17 @@ pub mod exec {
             command
         }
 
+        /// Debug: copy `len` bytes of handle `handle`'s weight buffer.
+        pub const fn dump_handle(handle: i32, src_off: i32, dst_off: i32, len: i32) -> Self {
+            let mut command = Self::empty(Op::Dump);
+            command.h[0] = handle;
+            command.src_off = src_off;
+            command.src_len = len;
+            command.dst_off = dst_off;
+            command.dst_len = len;
+            command
+        }
+
         pub const fn gemv(
             h: i32,
             m: i32,
@@ -1438,18 +1449,28 @@ impl DspBackend {
                     *flag = true;
                 }
                 let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
-                list.push(exec::Command::dump(SCRATCH_BCX, 0, 3 * hidden));
-                list.push(exec::Command::dump(SCRATCH_CY, 3 * hidden, hidden));
-                match self.run_exec(&list, &[], &[], (4 * hidden) as usize) {
+                list.push(exec::Command::dump_handle(stage.in_proj, 0, 0, 256));
+                list.push(exec::Command::dump(SCRATCH_ACT, 256, hidden));
+                list.push(exec::Command::dump(SCRATCH_BCX, 256 + hidden, 3 * hidden));
+                list.push(exec::Command::dump(SCRATCH_CY, 256 + 4 * hidden, hidden));
+                match self.run_exec(&list, &[], &[], (256 + 5 * hidden) as usize) {
                   Ok(dump) => {
-                    let split = (3 * hidden) as usize;
+                    let h = hidden as usize;
+                    let _ = std::fs::write(
+                        format!("/data/local/tmp/conv_w_{layer}.bin"),
+                        &dump.out[..256],
+                    );
+                    let _ = std::fs::write(
+                        format!("/data/local/tmp/conv_act_{layer}.bin"),
+                        &dump.out[256..256 + h],
+                    );
                     let _ = std::fs::write(
                         format!("/data/local/tmp/conv_bcx_{layer}.bin"),
-                        &dump.out[..split],
+                        &dump.out[256 + h..256 + 4 * h],
                     );
                     let _ = std::fs::write(
                         format!("/data/local/tmp/conv_cy_{layer}.bin"),
-                        &dump.out[split..],
+                        &dump.out[256 + 4 * h..],
                     );
                   }
                   Err(error) => eprintln!("conv dump failed: {error}"),

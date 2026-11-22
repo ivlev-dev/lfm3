@@ -411,9 +411,7 @@ fn dump_vector(variable: &str, values: &[f32]) {
                     )));
                 }
             }
-            if position_now == 0 {
-                Self::dump_vector("MYELIN_DUMP_BLOCK1", &output);
-            }
+            Self::dump_vector("MYELIN_DUMP_BLOCK1", &output);
             backend.rms_norm(
                 NormWeights::Layer {
                     layer,
@@ -434,9 +432,7 @@ fn dump_vector(variable: &str, values: &[f32]) {
                 &mut normed,
             )?;
             backend.ffn_layer(layer, &normed, &mut output)?;
-            if position_now == 0 {
-                Self::dump_vector("MYELIN_DUMP_BLOCK2", &output);
-            }
+            Self::dump_vector("MYELIN_DUMP_BLOCK2", &output);
             backend.rms_norm(
                 NormWeights::Layer {
                     layer,

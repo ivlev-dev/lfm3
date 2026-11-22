@@ -3451,11 +3451,21 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
                          pos, seq, window, areps, dp, c->dst_len, 0, 0);
     }
     case LFM_CMD_DUMP:
-        /* Debug only: copy a scratch range into the OUT sequence so the host
-           can compare kernel intermediates with its own model. */
+        /* Debug only: copy a scratch range (or a handle's weight prefix when
+           h0 >= 0) into the OUT sequence so the host can compare kernel
+           inputs with its own model. */
+        if (!lfm_range_ok(c->dst_off, c->src_len, (size_t)outLen)) return AEE_EBADPARM;
+        if (c->h0 >= 0) {
+            gbuf_t *db;
+            if (c->h0 >= MAXBUF) return AEE_EBADPARM;
+            db = &g_buf[c->h0];
+            if (!db->used || !db->w) return AEE_EBADPARM;
+            if (!lfm_range_ok(c->src_off, c->src_len, db->wbytes)) return AEE_EBADPARM;
+            memcpy(out + c->dst_off, db->w + c->src_off, (size_t)c->src_len);
+            return 0;
+        }
         if (c->src != LFM_SRC_SCRATCH) return AEE_EBADPARM;
         if (!lfm_range_ok(c->src_off, c->src_len, g_scratch_bytes)) return AEE_EBADPARM;
-        if (!lfm_range_ok(c->dst_off, c->src_len, (size_t)outLen)) return AEE_EBADPARM;
         memcpy(out + c->dst_off, g_scratch + c->src_off, (size_t)c->src_len);
         return 0;
     case LFM_CMD_CONV: {
