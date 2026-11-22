@@ -30,6 +30,33 @@ static int enable_unsigned(void)
     return remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &um, (uint32_t)sizeof(um));
 }
 
+/* Prints the DSP attention step ring only when a call fails (or ATTN_TRACE=1).
+ * Stages: 1 publish, 2 worker wake, 3 hvx_lock, 4 pass1, 5 pass2, 6 syncht,
+ * 7 unlock, 8 done_seq, 9 sem_up, 10 join, 11 range recomputed on main. */
+static void dump_trace(const char *why)
+{
+    static const char *nm[] = { "?", "publish", "wake", "hvx_lock", "pass1",
+                                "pass2", "syncht", "unlock", "done_seq",
+                                "sem_up", "join", "recompute" };
+    int st[8], ev[8], j, count;
+
+    lfmgemv_probe(-1, 32, 0, st, 8);
+    count = st[0] < 64 ? st[0] : 64;
+    printf("attention trace (%s): %d events, workers=%d, fallbacks=%d\n",
+           why, st[0], st[2], st[1]);
+    for (j = 0; j < count; j += 8) {
+        lfmgemv_probe(-1, 31, (st[0] - count + j) & 63, ev, 8);
+        {
+            int i;
+            for (i = 0; i < 8 && j + i < count; i++) {
+                int stage = (ev[i] >> 8) & 0xff, arg = ev[i] & 0xff;
+                printf("  %2d: %-10s arg=%d\n", j + i,
+                       (stage >= 1 && stage <= 11) ? nm[stage] : "?", arg);
+            }
+        }
+    }
+}
+
 #define HQ   16
 #define KVH  4
 #define D    128
@@ -78,7 +105,7 @@ int main(int argc, char **argv)
     int slots = pages * PAGE;
     int pos = slots - 1, seq = slots;
     int hk = -1, hkt = -1, hv = -1, rc, i, qh, t, k, r;
-    int times[8], info[8];
+    int times[12], info[8];
     size_t kbytes = (size_t)KVH * slots * 128;         /* int4 packed + 64B pad */
     size_t ktbytes = (size_t)KVH * slots * 4;          /* Q16 per-token scales */
     size_t vbytes = (size_t)KVH * slots * D;           /* int8 */
@@ -240,8 +267,9 @@ int main(int argc, char **argv)
         }
         if ((rc = lfmgemv_load_buf(hkt, 0, (uint8_t *)KT, (int)ktbytes)) != 0) { printf("load KT rc=%d\n", rc); return 12; }
     }
-    /* correctness pass always single-threaded; thread count applies to timing */
-    lfmgemv_probe(-1, 8, 8 | (2 << 8) | (1 << 16) | (1 << 24), times, 8);
+    /* correctness runs with the requested thread count: on 2 contexts the
+       four kv heads are split main/worker, and each head is independent */
+    lfmgemv_probe(-1, 8, 8 | (2 << 8) | (1 << 16) | (threads << 24), times, 8);
     lfmgemv_probe(-1, 27, tm, times, 8);
     printf("kernel: %s, K layout: %s\n", tm ? "token-major" : "head-grouped",
            tm ? "transposed" : "row-major");
@@ -285,8 +313,8 @@ int main(int argc, char **argv)
         }
         /* run on DSP and compare */
         rc = lfmgemv_attn(hk, hkt, hv, 0, (const unsigned char *)q8, HQ * D,
-                          tbl, pages, pos, seq, win, 1, (unsigned char *)out32, HQ * D * 4, times, 8);
-        if (rc != 0) { printf("attn rc=%d\n", rc); return 13; }
+                          tbl, pages, pos, seq, win, 1, (unsigned char *)out32, HQ * D * 4, times, 12);
+        if (rc != 0) { dump_trace("correctness"); printf("attn rc=%d\n", rc); return 13; }
         {
             int dbg[8], z, hd2;
             {
@@ -382,9 +410,9 @@ int main(int argc, char **argv)
             double t0 = now_us();
             rc = lfmgemv_attn(hk, hkt, hv, 0, (const unsigned char *)q8, HQ * D,
                               tbl, pages, pos, seq, win, reps, (unsigned char *)out32,
-                              HQ * D * 4, times, 8);
+                              HQ * D * 4, times, 12);
             { double w = now_us() - t0; if (w < wmin) wmin = w; }
-            if (rc != 0) { printf("attn timing rc=%d\n", rc); break; }
+            if (rc != 0) { dump_trace("timing"); printf("attn timing rc=%d\n", rc); break; }
             if (times[0] < kmin) kmin = times[0];
             usleep(20000);
         }
@@ -392,7 +420,9 @@ int main(int argc, char **argv)
                kmin, wmin, times[1], times[2], times[3]);
         printf("        phase: QK^T=%d us  exp+PV=%d us  (tokens=%d)\n",
                times[5], times[6], times[4]);
-        printf("        %.0f us / 1k tokens\n", 1000.0 * kmin / n);
+        printf("        %.0f us / 1k tokens  team_fallbacks=%d\n",
+               1000.0 * kmin / n, times[8]);
+        if (getenv("ATTN_TRACE")) dump_trace("timing");
     }
     lfmgemv_team_info(info, 8);
     printf("team: created=%d hvx_units=%d\n", info[3], info[6]);
@@ -401,7 +431,7 @@ int main(int argc, char **argv)
         lfmgemv_probe(-1, 26, 1, times, 8);
         rc = lfmgemv_attn(hk, hkt, hv, 0, (const unsigned char *)q8, HQ * D,
                           tbl, pages, pos, seq, win, 3, (unsigned char *)out32,
-                          HQ * D * 4, times, 8);
+                          HQ * D * 4, times, 12);
         printf("pwl exp: kernel=%d us (tokens=%d)\n", times[0], times[4]);
     }
     lfmgemv_release_buf(hk); lfmgemv_release_buf(hkt); lfmgemv_release_buf(hv);

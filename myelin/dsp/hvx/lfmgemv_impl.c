@@ -560,6 +560,35 @@ typedef struct {
     int32_t   uq[ATTN_HQ][16][2]; /* per-head, per-dim-group multiplier words */
 } actx_t;
 
+/* ---------------- attention step trace ----------------
+ * The worker used to die silently on a second HVX context (rc=78, no clue
+ * where).  Job boundaries now leave a small ring of (stage, arg) words that
+ * the host reads only when a call fails: overhead is a dozen integer stores
+ * per attention call, nothing in the inner loops. */
+#define ATR_PUB   1   /* main: jobs published  (arg = threads)   */
+#define ATR_WAKE  2   /* worker: sem_down       (arg = idx)      */
+#define ATR_LOCK  3   /* worker: hvx_lock       (arg = idx)      */
+#define ATR_P1    4   /* pass 1 done            (arg = k-group)  */
+#define ATR_P2    5   /* pass 2 done            (arg = k-group)  */
+#define ATR_SYN   6   /* worker: mem_syncht     (arg = idx)      */
+#define ATR_UNL   7   /* worker: hvx_unlock     (arg = idx)      */
+#define ATR_DONE  8   /* worker: done_seq       (arg = idx)      */
+#define ATR_SEM   9   /* worker: sem_up(done)   (arg = idx)      */
+#define ATR_JOIN 10   /* main: join ok          (arg = idx)      */
+#define ATR_FB   11   /* main: range recomputed (arg = idx)      */
+
+static volatile int g_atr_stage[64];
+static volatile int g_atr_arg[64];
+static volatile int g_atr_i;
+
+static inline void atr(int stage, int arg)
+{
+    int i = g_atr_i & 63;
+    g_atr_stage[i] = stage;
+    g_atr_arg[i] = arg;
+    g_atr_i = (g_atr_i + 1) & 1023;
+}
+
 /* ---------------- HVX worker team ---------------- */
 
 typedef struct {
@@ -609,6 +638,7 @@ static void team_kick(int total)
 {
     int i;
     for (i = 1; i < total; i++) g_team.job[i].seq++;
+    if (total > 1 && g_team.job[1].kind == 2) atr(ATR_PUB, total);
     __sync_synchronize();
     for (i = 1; i < total; i++) qurt_sem_up(&g_team.w[i].go);
 }
@@ -630,8 +660,10 @@ static void team_join(int total)
         unsigned spin = 0;
         qurt_sem_down(&g_team.w[i].done);
         while (j->done_seq != j->seq && ++spin < (1u << 20)) __sync_synchronize();
+        if (j->kind == 2 && j->done_seq == j->seq) atr(ATR_JOIN, i);
         if (j->done_seq != j->seq) {
             g_team_fallbacks++;
+            if (j->kind == 2) atr(ATR_FB, i);
             if (j->kind == 0)
                 gemv_rows_m1_k2048_range(j->b, j->ae, j->ao, j->bias, j->r0, j->r1, j->acc);
             else if (j->kind == 1)
@@ -643,7 +675,10 @@ static void team_join(int total)
                     if (j->ctx) attn_group_tm((actx_t *)j->ctx, kg);
                     else        attn_group(kg);
                 }
+                atr(ATR_SYN, i);
+                qurt_mem_syncht();
                 qurt_hvx_unlock();
+                atr(ATR_UNL, i);
             }
         }
     }
@@ -674,7 +709,9 @@ static void worker_body(thw_t *w)
         {
             if (j->kind == 2) {
                 int kg;
+                atr(ATR_WAKE, w->idx);
                 qurt_hvx_lock(QURT_HVX_MODE_128B);
+                atr(ATR_LOCK, w->idx);
                 if (j->ctx) {
                     /* fully local context: nothing but the job is shared */
                     for (kg = j->r0; kg < j->r1; kg++) attn_group_tm((actx_t *)j->ctx, kg);
@@ -698,8 +735,10 @@ static void worker_body(thw_t *w)
         }
         __sync_synchronize();
         j->done_seq = j->seq;          /* result published: see team_join() */
+        if (j->kind == 2) atr(ATR_DONE, w->idx);
         __sync_synchronize();
         qurt_sem_up(&w->done);
+        if (j->kind == 2) atr(ATR_SEM, w->idx);
     }
 }
 
@@ -1184,6 +1223,7 @@ static void attn_group_tm(actx_t *ctx, int kh)
         }
         for (h2 = 0; h2 < 4; h2++) best[h2] = besth[h2];
     }
+    atr(ATR_P1, kh);
     if (g_pc_on) { pc1 = HAP_perf_get_pcycles(); g_pc_qk += pc1 - pc0; pc0 = pc1; }
 
     /* ---- pass 2: token-major PV.  V is stored transposed per 32-token page:
@@ -1276,6 +1316,7 @@ static void attn_group_tm(actx_t *ctx, int kh)
         ctx->ls[qh] = lsum;
         ctx->mx[qh] = mx;
     }
+    atr(ATR_P2, kh);
     if (g_pc_on) { pc1 = HAP_perf_get_pcycles(); g_pc_pv += pc1 - pc0; }
 }
 
@@ -1665,6 +1706,7 @@ int lfmgemv_attn(int hk, int hkt, int hv, int hvs, const unsigned char *q, int q
         times[5] = (int)((g_pc_qk / reps) / 1420);   /* QK^T phase, us */
         times[6] = (int)((g_pc_pv / reps) / 1420);   /* exp + PV, us */
         times[7] = reps;
+        if (timesLen >= 9) times[8] = g_team_fallbacks;
     }
     return 0;
 }
@@ -2112,6 +2154,20 @@ int lfmgemv_probe(int h, int kind, int arg, int *res, int resLen)
     }
     case 30: { /* retired (multipliers now live in the local context) */
         return AEE_EBADPARM;
+    }
+    case 31: { /* attention step trace: arg = first slot (0..63), 8 events */
+        int b0 = arg & 63;
+        for (i = 0; i < 8; i++) {
+            int k2 = (b0 + i) & 63;
+            res[i] = (g_atr_stage[k2] << 8) | (g_atr_arg[k2] & 0xff);
+        }
+        return 0;    /* skip the epilogue that would clobber res[0..4] */
+    }
+    case 32: { /* trace state: [0]=written, [1]=team fallbacks, [2]=workers */
+        res[0] = g_atr_i & 1023;
+        res[1] = g_team_fallbacks;
+        res[2] = g_team.nwork;
+        return 0;    /* skip the epilogue that would clobber res[0..4] */
     }
     case 29: { /* dump 8 scores: arg = head*4096 + t (after an attn call) */
         int hd2 = arg / 4096, tt = arg % 4096;
