@@ -123,7 +123,7 @@ mod android {
         )
         .dst;
 
-        let mut out = check("alloc_shared(4 KiB)", transport.alloc_shared(4096));
+        let out = check("alloc_shared(4 KiB)", transport.alloc_shared(4096));
         check(
             "attach_out(fd, 512)",
             client.attach_out(handle, out.fd(), N),
@@ -146,5 +146,108 @@ mod android {
 
         check("release_buf", client.release_buf(handle));
         check("close", client.close());
+    }
+
+    /// Zero-copy *input* weights: the same int4 bytes in an rpcmem buffer,
+    /// mapped by `alloc_in` instead of copied by `load_buf`, must produce the
+    /// same int8 GEMV output. Mirrors `attach_test` (C stand) on the Rust
+    /// transport.
+    #[test]
+    #[ignore = "requires a phone with libcdsprpc.so and liblfmgemv_skel.so"]
+    fn real_fastrpc_attach_in_zero_copy_weights() {
+        let transport = transport();
+        let mut client = HvxClient::open(Arc::clone(&transport) as Arc<dyn Transport>, MODULE)
+            .expect("open lfmgemv");
+
+        const N: i32 = 512;
+        const K: i32 = 256;
+        let bytes = (N * K / 2) as usize;
+        let weights: Vec<u8> = (0..bytes)
+            .map(|index| {
+                let low = ((index % 7) + 4) as u8;
+                let high = (((index + 3) % 7) + 4) as u8;
+                (high << 4) | low
+            })
+            .collect();
+        let act = vec![1u8; K as usize];
+        let scales = scale_words(N, K);
+
+        // heap path: the reference
+        let heap = check("alloc_buf(64 KiB)", client.alloc_buf(bytes));
+        check("set_shape(512, 256, 1)", client.set_shape(heap, N, K, 1));
+        check("load_buf weights", client.load_buf(heap, 0, &weights));
+        check("set_scale(heap)", client.set_scale(heap, &scales));
+        let reference = check(
+            "gemv (heap reference)",
+            client.gemv(myelin_npu::GemvRequest {
+                scalars: myelin_npu::GemvScalars {
+                    h: heap,
+                    m: 1,
+                    reps: 1,
+                },
+                act: &act,
+                dst_len: N as usize,
+            }),
+        )
+        .dst;
+
+        // zero-copy: weights live in the shared buffer, alloc_in maps the fd
+        let mut shared = check("alloc_shared(64 KiB)", transport.alloc_shared(bytes));
+        shared.as_mut_slice().copy_from_slice(&weights);
+        let fd = shared.fd();
+        let attached = check("alloc_in(fd, 64 KiB)", client.alloc_in(fd, bytes as i32));
+        check(
+            "set_shape(512, 256, 1) attached",
+            client.set_shape(attached, N, K, 1),
+        );
+        check("set_scale(attached)", client.set_scale(attached, &scales));
+        let got = check(
+            "gemv (attached weights)",
+            client.gemv(myelin_npu::GemvRequest {
+                scalars: myelin_npu::GemvScalars {
+                    h: attached,
+                    m: 1,
+                    reps: 1,
+                },
+                act: &act,
+                dst_len: N as usize,
+            }),
+        )
+        .dst;
+        assert_eq!(got, reference, "attach_in weights mismatch");
+
+        // a second call must read the same pages again
+        let again = check(
+            "gemv (attached, second call)",
+            client.gemv(myelin_npu::GemvRequest {
+                scalars: myelin_npu::GemvScalars {
+                    h: attached,
+                    m: 1,
+                    reps: 1,
+                },
+                act: &act,
+                dst_len: N as usize,
+            }),
+        )
+        .dst;
+        assert_eq!(again, reference, "attach_in second call mismatch");
+
+        check("detach_in", client.detach_in(attached));
+        check("release_buf attached", client.release_buf(attached));
+        check("release_buf heap", client.release_buf(heap));
+        check("close", client.close());
+    }
+
+    fn scale_words(n: i32, k: i32) -> Vec<u8> {
+        let mut scales = Vec::with_capacity(16 + 4 * n as usize);
+        scales.extend_from_slice(&n.to_le_bytes());
+        scales.extend_from_slice(&k.to_le_bytes());
+        scales.extend_from_slice(&1.0f32.to_le_bytes());
+        scales.extend_from_slice(&1.0f32.to_le_bytes());
+        scales.resize(16 + 4 * n as usize, 0);
+        for scale in scales[16..].chunks_exact_mut(4) {
+            scale.copy_from_slice(&1.0f32.to_le_bytes());
+        }
+        scales
     }
 }

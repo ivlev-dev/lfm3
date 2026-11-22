@@ -39,6 +39,12 @@ pub mod method_id {
     pub const TEAM_INFO: u32 = 12;
     /// `release_buf(in long h)`
     pub const RELEASE_BUF: u32 = 13;
+    /// `attach_in(in long h, in long fd, in long nbytes)`
+    pub const ATTACH_IN: u32 = 14;
+    /// `detach_in(in long h)`
+    pub const DETACH_IN: u32 = 15;
+    /// `alloc_in(in long fd, in long nbytes, rout long h)`
+    pub const ALLOC_IN: u32 = 16;
 }
 
 macro_rules! scalar_pack {
@@ -149,9 +155,18 @@ scalar_pack!(AttachOutScalars {
 scalar_pack!(DetachOutScalars { h: i32 } size = 4);
 scalar_pack!(ReleaseBufScalars { h: i32 } size = 4);
 scalar_pack!(TeamInfoScalars { len: i32 } size = 4);
+scalar_pack!(AttachInScalars {
+    h: i32,
+    fd: i32,
+    nbytes: i32
+} size = 12);
+scalar_pack!(DetachInScalars { h: i32 } size = 4);
+scalar_pack!(AllocInScalars { fd: i32, nbytes: i32 } size = 8);
+scalar_pack!(AllocInOut { h: i32 } size = 4);
 
 /// `sizeof(_primIn)` per method, in method-ID order (`lfmgemv_stub.c`).
-pub const PRIM_IN_SIZES: [usize; 14] = [4, 16, 12, 8, 24, 16, 32, 12, 4, 20, 28, 48, 4, 4];
+pub const PRIM_IN_SIZES: [usize; 17] =
+    [4, 16, 12, 8, 24, 16, 32, 12, 4, 20, 28, 48, 4, 4, 12, 4, 8];
 
 /// Number of i32 values in the stand's `times[]` sequence.
 pub const TIMES_VALUES: usize = 8;
@@ -171,7 +186,11 @@ const _: () = {
     assert!(std::mem::size_of::<AttnWire>() == PRIM_IN_SIZES[11]);
     assert!(std::mem::size_of::<TeamInfoScalars>() == PRIM_IN_SIZES[12]);
     assert!(std::mem::size_of::<ReleaseBufScalars>() == PRIM_IN_SIZES[13]);
+    assert!(std::mem::size_of::<AttachInScalars>() == PRIM_IN_SIZES[14]);
+    assert!(std::mem::size_of::<DetachInScalars>() == PRIM_IN_SIZES[15]);
+    assert!(std::mem::size_of::<AllocInScalars>() == PRIM_IN_SIZES[16]);
     assert!(std::mem::size_of::<AllocBufOut>() == 4);
+    assert!(std::mem::size_of::<AllocInOut>() == 4);
 };
 
 /// `sequence<octet>` length in elements (one element is one byte).

@@ -61,9 +61,10 @@ pub enum LoadStrategy {
     /// Zero-copy: the weights stay in a host ION buffer that the DSP maps
     /// directly, so neither the host marshaller nor the PD copies them.
     ///
-    /// This requires an `attach-in` style method on the skeleton; `attach_out`
-    /// only maps *output* buffers (see [`crate::hvx::HvxClient::attach_out`]),
-    /// so the current `lfmgemv` IDL rejects this strategy with
+    /// The skeleton has the methods (see
+    /// [`crate::hvx::HvxClient::attach_in`] and
+    /// [`crate::hvx::HvxClient::alloc_in`]); what this planner still lacks is
+    /// ownership of the ION arena, so the strategy is rejected with
     /// [`WeightError::UnsupportedStrategy`] instead of falling back silently.
     Attach,
 }
@@ -850,8 +851,9 @@ impl ResidentWeights {
         if self.strategy == LoadStrategy::Attach {
             return Err(WeightError::UnsupportedStrategy {
                 strategy: self.strategy,
-                reason: "`lfmgemv.attach_out` maps output buffers only; the skeleton has no \
-                         attach-in method that would let the DSP read host ION weights in place",
+                reason: "`lfmgemv.attach_in`/`alloc_in` map host ION weights in place, but the \
+                         weight planner does not own an ION arena yet: it would have to keep the \
+                         SharedBuffer alive and pass its fd for every unit",
             });
         }
         let bytes = self.plan.unit_bytes(key).ok_or(WeightError::Missing {

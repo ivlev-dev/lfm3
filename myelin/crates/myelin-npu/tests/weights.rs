@@ -286,7 +286,7 @@ fn attach_strategy_is_rejected_explicitly() {
     match error {
         WeightError::UnsupportedStrategy { strategy, reason } => {
             assert_eq!(strategy, myelin_npu::LoadStrategy::Attach);
-            assert!(reason.contains("attach_out"));
+            assert!(reason.contains("attach_in"));
         }
         other => panic!("unexpected {other:?}"),
     }

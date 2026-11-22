@@ -8,10 +8,11 @@ use std::sync::Arc;
 use crate::error::TransportError;
 use crate::method::FfnScalars;
 use crate::method::{
-    decode_i32s, long_len, method_id, octet_len, AllocBufScalars, AttachOutScalars, AttnRequest,
-    AttnResponse, AttnWire, DetachOutScalars, FfnRequest, FfnResidentWire, FfnResponse, FfnWire,
-    GemvRequest, GemvResidentWire, GemvResponse, GemvWire, LoadBufWire, ReleaseBufScalars,
-    SetScaleWire, SetShapeScalars, TeamInfoScalars, TIMES_VALUES,
+    decode_i32s, long_len, method_id, octet_len, AllocBufScalars, AllocInScalars, AttachInScalars,
+    AttachOutScalars, AttnRequest, AttnResponse, AttnWire, DetachInScalars, DetachOutScalars,
+    FfnRequest, FfnResidentWire, FfnResponse, FfnWire, GemvRequest, GemvResidentWire, GemvResponse,
+    GemvWire, LoadBufWire, ReleaseBufScalars, SetScaleWire, SetShapeScalars, TeamInfoScalars,
+    TIMES_VALUES,
 };
 use crate::transport::{Call, Handle, Transport};
 
@@ -320,6 +321,58 @@ impl HvxClient {
             in_bufs: &[],
             out_bufs: &mut no_out,
         })
+    }
+
+    /// Map a host rpcmem/DMA-buf fd as the *weights* of `h` (zero-copy input).
+    ///
+    /// The DSP reads the buffer in place, so the handle no longer holds a heap
+    /// copy. The host owns cache maintenance: write and flush the weights
+    /// before this call. The mapping is refreshed only by
+    /// [`HvxClient::detach_in`] + `attach_in`: rewriting the pages in place
+    /// afterwards is not visible to the DSP (it keeps its own cached view).
+    pub fn attach_in(&self, h: i32, fd: i32, nbytes: i32) -> Result<(), TransportError> {
+        let prim = AttachInScalars { h, fd, nbytes }.to_bytes();
+        let mut prim_out: [u8; 0] = [];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::ATTACH_IN,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        })
+    }
+
+    /// Drop the weight mapping made by [`HvxClient::attach_in`].
+    pub fn detach_in(&self, h: i32) -> Result<(), TransportError> {
+        let prim = DetachInScalars { h }.to_bytes();
+        let mut prim_out: [u8; 0] = [];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::DETACH_IN,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        })
+    }
+
+    /// Create a weight handle backed only by the host fd: no DSP heap copy.
+    ///
+    /// This is the path for models larger than the DSP heap; `set_shape` and
+    /// `set_scale` then work exactly as after [`HvxClient::alloc_buf`].
+    pub fn alloc_in(&self, fd: i32, nbytes: i32) -> Result<i32, TransportError> {
+        let prim = AllocInScalars { fd, nbytes }.to_bytes();
+        let mut out = [0u8; 4];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::ALLOC_IN,
+            prim_in: &prim,
+            prim_out: &mut out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        })?;
+        Ok(i32::from_le_bytes(out))
     }
 
     /// Worker-team information (`8` values in the stand).
