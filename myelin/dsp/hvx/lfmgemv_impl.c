@@ -25,6 +25,7 @@
 #include <qurt_thread.h>
 #include <qurt_sem.h>
 #include <qurt_hvx.h>
+#include <qurt_memory.h>
 
 #include "silu_lut.h"
 #include "exptab.h"
@@ -61,10 +62,12 @@ typedef struct {
 static ffn_t g_ffn;
 
 /* tuning */
-static int g_pf_kb   = 0;   /* l2fetch lookahead in KB (0 = off) */
-static int g_rows    = 1;   /* rows per iteration in the specialised kernel */
-static int g_usepf   = 0;
-static int g_threads = 1;   /* row-range split across threads */
+/* tuning: measured optimum on this target (same as myelin/dsp/conv).  The
+ * worker team is started lazily by the first split job. */
+static int g_pf_kb   = 32;  /* l2fetch lookahead in KB (0 = off) */
+static int g_rows    = 2;   /* rows per iteration in the specialised kernel */
+static int g_usepf   = 1;
+static int g_threads = 2;   /* row-range split across threads */
 static int g_attn_tm = 0;
 static const int32_t *g_dbg_scores;   /* for probe 28/29 */
 static int g_dbg_n;   /* 0 = head-grouped (correct), 1 = token-major (experimental) */
@@ -463,17 +466,73 @@ static void gemv_rows_m4(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
 }
 
 /* dequant int32 -> int8. qv[i] holds the Q16 multiplier (any halfword).
- * The product is taken in 64 bits: mulq16(acc,q) resolves acc with a step of
- * 256, so its int8 error is (acc & 0xff)*m -- fine when m ~ 1, but ~4 LSB of
- * 127 when m ~ 0.015 (the FFN down / out_proj layers).  Kept bit-exact with
- * conv_pack_i8() in myelin/dsp/conv/conv_math.h (the host reference must
- * match the DSP).
- * Scalar on purpose: N is 2k..8k, ~8 cycles/element = 15..45 us, and the
- * vector vmpyiewh form turned out to be numerically unreliable here. */
+ * The reference expression is 64-bit: ((int64)acc*q + 32768) >> 16, clamped to
+ * +-127 (conv_pack_i8() in myelin/dsp/conv/conv_math.h, and the host models).
+ * mulq16(acc,q) resolves acc with a step of 256, i.e. ~4 LSB of 127 at
+ * m ~ 0.015, so that shortcut is not allowed.
+ *
+ * Vector form: q <= 65535 fits an unsigned halfword, so
+ *   vmpyie(Vu.w, Vv.uh) ->  acc*q  (exact 32-bit product)
+ * is bit-identical to the 64-bit product as long as |acc|*q < 2^30; the
+ * rounding add and the arithmetic shift then give the same value as the
+ * scalar code.  The guard is computed once per call from max|acc| and max q
+ * (both cheap: N/32 vector ops); when it fails (m near 1 with a large
+ * accumulator, e.g. some FFN down matrices) the scalar 64-bit loop runs.
+ * Same code as in myelin/dsp/conv/lfmgemv_impl.c, where 196 us became 16. */
 static void pack_out_i8(const int32_t *acc, const int32_t *qv, int8_t *out, int n)
 {
-    int i;
-    for (i = 0; i < n; i++) {
+    HVX_Vector qmask = Q6_V_vsplat_R(0xffff);
+    HVX_Vector vrnd  = Q6_V_vsplat_R(32768);
+    HVX_Vector vlo   = Q6_V_vsplat_R(-127);
+    HVX_Vector vhi   = Q6_V_vsplat_R(127);
+    int32_t amax = 0, qmax = 0, t32[32] __attribute__((aligned(128)));
+    int i, j, fast;
+    {
+        HVX_Vector vmax = Q6_V_vzero(), vmin = Q6_V_vzero(), vq = Q6_V_vzero();
+        for (i = 0; i + 32 <= n; i += 32) {
+            HVX_Vector a = *(const HVX_Vector *)(acc + i);
+            HVX_Vector q = Q6_V_vand_VV(*(const HVX_Vector *)(qv + i), qmask);
+            vmax = Q6_Vw_vmax_VwVw(vmax, a);
+            vmin = Q6_Vw_vmin_VwVw(vmin, a);
+            vq   = Q6_Vw_vmax_VwVw(vq, q);
+        }
+        *(HVX_Vector *)t32 = vmax;
+        for (j = 0; j < 32; j++) if (t32[j] > amax) amax = t32[j];
+        *(HVX_Vector *)t32 = vmin;
+        for (j = 0; j < 32; j++) if (-t32[j] > amax) amax = -t32[j];
+        *(HVX_Vector *)t32 = vq;
+        for (j = 0; j < 32; j++) if (t32[j] > qmax) qmax = t32[j];
+    }
+    /* acc/qv are 128 B aligned by set_shape(); the output pointer is not
+     * (FastRPC hands us an arbitrary byte offset), so it is checked here. */
+    fast = ((int64_t)amax * (int64_t)qmax <= (int64_t)1 << 30)
+        && (((uintptr_t)out & 127u) == 0);
+
+    i = 0;
+    if (fast) {
+        for (; i + 128 <= n; i += 128) {
+            HVX_Vector r0, r1, r2, r3;
+            /* qv holds q in both halfwords, so the odd-halfword form is exact */
+            r0 = Q6_Vw_vmpyie_VwVuh(*(const HVX_Vector *)(acc + i + 0),
+                                     *(const HVX_Vector *)(qv + i + 0));
+            r1 = Q6_Vw_vmpyie_VwVuh(*(const HVX_Vector *)(acc + i + 32),
+                                     *(const HVX_Vector *)(qv + i + 32));
+            r2 = Q6_Vw_vmpyie_VwVuh(*(const HVX_Vector *)(acc + i + 64),
+                                     *(const HVX_Vector *)(qv + i + 64));
+            r3 = Q6_Vw_vmpyie_VwVuh(*(const HVX_Vector *)(acc + i + 96),
+                                     *(const HVX_Vector *)(qv + i + 96));
+            r0 = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(r0, vrnd), 16), vlo), vhi);
+            r1 = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(r1, vrnd), 16), vlo), vhi);
+            r2 = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(r2, vrnd), 16), vlo), vhi);
+            r3 = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(Q6_Vw_vasr_VwR(Q6_Vw_vadd_VwVw(r3, vrnd), 16), vlo), vhi);
+            /* vpack writes its *second* operand into the low half of the
+             * result, i.e. vpack(Vhi, Vlo) -- verified in hexagon-sim. */
+            *(HVX_Vector *)(out + i) =
+                Q6_Vb_vpack_VhVh_sat(Q6_Vh_vpack_VwVw_sat(r3, r2),
+                                     Q6_Vh_vpack_VwVw_sat(r1, r0));
+        }
+    }
+    for (; i < n; i++) {
         int32_t q = (int32_t)((uint32_t)qv[i] & 0xffffu);
         int64_t v = ((int64_t)acc[i] * (int64_t)q + 32768) >> 16;
         if (v > 127) v = 127;
@@ -513,11 +572,13 @@ typedef struct {
 } thw_t;
 
 typedef struct {
+    volatile unsigned seq;   /* publication handshake, see team_kick()/team_join() */
     int           kind;      /* 0 = gemv rows, 1 = silu range, 2 = attention groups */
     const gbuf_t *b;
     const int8_t *ae, *ao;
     int32_t       bias;
     int           r0, r1;
+    volatile int  done_seq;
     int32_t      *acc;
     void         *ctx;       /* attention context (kind 2) */
 } m1job_t;
@@ -533,12 +594,60 @@ typedef struct {
 } team_t;
 
 static team_t g_team;
+static int    g_team_warm;   /* workers have run one (empty) job */
 
 static void worker_body(thw_t *w) __attribute__((noinline));
 static void silu_range(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
                        int32_t mq_mid);
 static void attn_group(int kh);
 static void attn_group_tm(actx_t *ctx, int kh);
+
+/* Publish the jobs written by the caller and kick the workers.  The extra
+ * sequence bump makes the handshake in worker_body() independent of any
+ * ordering assumption about qurt_sem_up(). */
+static void team_kick(int total)
+{
+    int i;
+    for (i = 1; i < total; i++) g_team.job[i].seq++;
+    __sync_synchronize();
+    for (i = 1; i < total; i++) qurt_sem_up(&g_team.w[i].go);
+}
+
+static int g_team_fallbacks;   /* jobs the team did not publish (see below) */
+
+/* Wait until worker i has published the *result* of the job we kicked.  The
+ * done_seq store happens in the worker after the kernel and its syncht, so
+ * this also catches a premature qurt_sem_down() wakeup (observed on this
+ * target: the caller started reading acc[] with the worker's range still in
+ * progress and got ~960 stale rows).  If a worker still has not published
+ * after a bounded spin, its rows are recomputed on the main thread: the
+ * result stays correct and the event is counted (team_info/times). */
+static void team_join(int total)
+{
+    int i;
+    for (i = 1; i < total; i++) {
+        m1job_t *j = &g_team.job[i];
+        unsigned spin = 0;
+        qurt_sem_down(&g_team.w[i].done);
+        while (j->done_seq != j->seq && ++spin < (1u << 20)) __sync_synchronize();
+        if (j->done_seq != j->seq) {
+            g_team_fallbacks++;
+            if (j->kind == 0)
+                gemv_rows_m1_k2048_range(j->b, j->ae, j->ao, j->bias, j->r0, j->r1, j->acc);
+            else if (j->kind == 1)
+                silu_range(j->r0, j->r1, j->b, (const gbuf_t *)j->ae, j->bias);
+            else if (j->kind == 2) {
+                int kg;
+                qurt_hvx_lock(QURT_HVX_MODE_128B);
+                for (kg = j->r0; kg < j->r1; kg++) {
+                    if (j->ctx) attn_group_tm((actx_t *)j->ctx, kg);
+                    else        attn_group(kg);
+                }
+                qurt_hvx_unlock();
+            }
+        }
+    }
+}
 
 /* thin, non-HVX entry: creating a thread whose entry prologue touches HVX
  * registers makes qurt_thread_create fail with -1 on this target */
@@ -550,12 +659,19 @@ void team_worker(void *a)
 static void worker_body(thw_t *w)
 {
     for (;;) {
+        m1job_t *j;
         qurt_sem_down(&w->go);
+        __sync_synchronize();          /* publish the job written by the caller */
         if (w->shutdown) break;
+        /* Wait for the sequence number of *this* job.  Without the explicit
+         * handshake the first job after team_start() was sometimes not
+         * visible to the worker on this target: it then ran with the stale
+         * (zero) range and the caller's rows stayed untouched. */
+        j = &g_team.job[w->idx];
+        while (j->seq == j->done_seq) __sync_synchronize();
         /* lock per job: holding a context for the thread's lifetime blocks
          * other workers when there are fewer contexts than threads */
         {
-            m1job_t *j = &g_team.job[w->idx];
             if (j->kind == 2) {
                 int kg;
                 qurt_hvx_lock(QURT_HVX_MODE_128B);
@@ -565,15 +681,24 @@ static void worker_body(thw_t *w)
                 } else {
                     for (kg = j->r0; kg < j->r1; kg++) attn_group(kg);
                 }
+                qurt_mem_syncht();
                 qurt_hvx_unlock();
             } else if (j->kind == 1) {
                 silu_range(j->r0, j->r1, j->b, (const gbuf_t *)j->ae, j->bias);
             } else {
                 qurt_hvx_lock(QURT_HVX_MODE_128B);
                 gemv_rows_m1_k2048_range(j->b, j->ae, j->ao, j->bias, j->r0, j->r1, j->acc);
+                /* drain the HVX store queue before publishing the result:
+                 * qurt_hvx_unlock() alone does not, and a reader on another
+                 * thread can then see stale acc[] rows (measured: the tail of
+                 * the worker's range was 0/old on the fast vectorised pack). */
+                qurt_mem_syncht();
                 qurt_hvx_unlock();
             }
         }
+        __sync_synchronize();
+        j->done_seq = j->seq;          /* result published: see team_join() */
+        __sync_synchronize();
         qurt_sem_up(&w->done);
     }
 }
@@ -586,8 +711,11 @@ static int team_start(int ntotal)
     if (ntotal < 2) return 0;
     {
         int units = (int)((qurt_hvx_get_units() >> 8) & 0xFF);
-        /* leave one HVX context for the main thread */
+        /* leave one HVX context for the main thread, and never create more
+         * worker threads than contexts: measured 3-4 threads on 2 contexts
+         * are *slower* (13.8-14.6 GB/s vs 20.0) */
         if (units > 1 && ntotal - 1 > units - 1) ntotal = units;
+        if (units >= 1 && ntotal > units + 1) ntotal = units + 1;
         if (ntotal > 4) ntotal = 4;
     }
     if (ntotal > 8) ntotal = 8;
@@ -634,6 +762,21 @@ static void run_split_m1(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
     int i;
 
     if (g_threads > 1 && g_team.state == 0) team_start(g_threads);
+    /* Let every worker run once (empty job, no stores) before the first real
+     * job, so its HVX context exists before we depend on it.  Correctness does
+     * not rely on this: team_join() verifies each result and recomputes the
+     * range if the worker did not publish it. */
+    if (!g_team_warm && g_team.nwork > 0) {
+        int i;
+        g_team_warm = 1;
+        for (i = 1; i <= g_team.nwork; i++) {
+            m1job_t *jw = &g_team.job[i];
+            jw->kind = 0; jw->b = b; jw->ae = ae; jw->ao = ao;
+            jw->bias = 0; jw->r0 = 0; jw->r1 = 0; jw->acc = acc;
+        }
+        team_kick(g_team.nwork + 1);
+        team_join(g_team.nwork + 1);
+    }
     total = g_team.nwork + 1;
     if (g_threads < total) total = g_threads;
     if (total <= 1 || b->N < 512) {
@@ -649,12 +792,13 @@ static void run_split_m1(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
         g_team.job[i].acc = acc;
     }
     g_team.job[total - 1].r1 = b->N;
-    for (i = 1; i < total; i++) qurt_sem_up(&g_team.w[i].go);
+    team_kick(total);
     {
         m1job_t *j = &g_team.job[0];
         gemv_rows_m1_k2048_range(j->b, j->ae, j->ao, j->bias, j->r0, j->r1, j->acc);
     }
-    for (i = 1; i < total; i++) qurt_sem_down(&g_team.w[i].done);
+    team_join(total);
+    __sync_synchronize();
 }
 
 /* ---------------- SiLU (integer, LUT + linear interpolation) ---------------- */
@@ -763,9 +907,9 @@ static void run_split_silu(const gbuf_t *g, const gbuf_t *u, int32_t mq_mid)
         j->r1 = i1;
         j->acc = 0;
     }
-    for (i = 1; i < total; i++) qurt_sem_up(&g_team.w[i].go);
+    team_kick(total);
     silu_range(0, (int)((int64_t)g->N / total), g, u, mq_mid);
-    for (i = 1; i < total; i++) qurt_sem_down(&g_team.w[i].done);
+    team_join(total);
 }
 
 
@@ -1358,6 +1502,7 @@ static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen
         times[5] = (int)(ph[4] / reps);   /* pack        */
         times[6] = g->N;
         times[7] = d->N;
+        if (timesLen >= 9) times[8] = g_team_fallbacks;
     }
     return 0;
 }
@@ -1481,11 +1626,11 @@ int lfmgemv_attn(int hk, int hkt, int hv, int hvs, const unsigned char *q, int q
                     j->r1 = (int)((int64_t)ATTN_KV * (i + 1) / total);
                     j->ctx = g_attn_tm ? (void *)&ctx : 0;
                 }
-                for (i = 1; i < total; i++) qurt_sem_up(&g_team.w[i].go);
+                team_kick(total);
                 for (i = g_team.job[0].r0; i < g_team.job[0].r1; i++) {
                     if (g_attn_tm) attn_group_tm(&ctx, i); else attn_group(i);
                 }
-                for (i = 1; i < total; i++) qurt_sem_down(&g_team.w[i].done);
+                team_join(total);
                 g_pc_on = 1;
             }
         }
@@ -1534,8 +1679,7 @@ int lfmgemv_team_info(int *res, int resLen)
     res[4] = g_threads;
     res[5] = g_team.thr_rc;
     res[6] = (int)((qurt_hvx_get_units() >> 8) & 0xFF);
-    res[6] = g_rows;
-    res[7] = g_usepf;
+    res[7] = g_rows;
     return 0;
 }
 
@@ -2130,6 +2274,8 @@ int lfmgemv_probe(int h, int kind, int arg, int *res, int resLen)
         g_threads = (arg >> 24) & 0xff;
         if (g_threads < 1) g_threads = 1;
         if (g_rows < 1) g_rows = 1;
+        if (g_rows > 2) g_rows = 2;      /* 3+ rows are not implemented */
+        if (g_threads > 4) g_threads = 4;
         res[2] = g_pf_kb;
         res[3] = g_rows;
         res[5] = g_usepf;

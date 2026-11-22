@@ -87,10 +87,11 @@ static int upload_matrix(int *h, const uint8_t *w, int nbytes,
 int main(int argc, char **argv)
 {
     int hg = -1, hu = -1, hd = -1, rc, i, r, round, t;
-    int times[8], info[8];
+    int times[12], info[8];
     size_t wb = (size_t)NH * (K / 2);
     int rounds = (argc > 1) ? atoi(argv[1]) : 3;
     int ntok = (argc > 2) ? atoi(argv[2]) : 4;
+    int pin_thr = (argc > 4) ? atoi(argv[4]) : 0;   /* 0 = no pin */
     ffn_model_t m;
     ffn_calib_t ci;
     float *yref = NULL, *ppipe = NULL;
@@ -149,6 +150,13 @@ int main(int argc, char **argv)
     if (rc != 0) { printf("upload down rc=%d\n", rc); return 11; }
     printf("handles g=%d u=%d d=%d (%.1f MB total int4)\n", hg, hu, hd, 3.0 * wb / 1e6);
 
+    /* pinned tuning: the sweep below would start the worker team, so it is
+     * skipped.  pf 32 KB, 2 rows -- the measured default. */
+    if (pin_thr >= 1) {
+        lfmgemv_probe(hg, 8, 32 | (2 << 8) | (1 << 16) | (pin_thr << 24), times, 12);
+        printf("pinned tuning: pf=32KB rows=2 threads=%d (sweep skipped)\n", pin_thr);
+    }
+
     /* ---- team info ---- */
     if (lfmgemv_team_info(info, 8) == 0)
         printf("team before start: state=%d hvx_rc=%d mode=%d created=%d threads=%d\n",
@@ -172,10 +180,11 @@ int main(int argc, char **argv)
     }
 
     /* ---- 1. multi-context sweep on the gate matrix ---- */
-    printf("\n%-6s %-12s %10s %9s %9s\n", "thr", "config", "us", "GB/s", "GMAC/s");
+    if (pin_thr < 1)
     {
         static const int TH[] = { 1, 2, 4, 8 };
         double best[4];
+        printf("\n%-6s %-12s %10s %9s %9s\n", "thr", "config", "us", "GB/s", "GMAC/s");
         for (t = 0; t < 4; t++) best[t] = 1e18;
         for (round = 0; round < rounds; round++) {
             for (i = 0; i < 4; i++) {
@@ -197,7 +206,7 @@ int main(int argc, char **argv)
     }
 
     /* ---- 2. correctness of the three GEMMs (int32, bit exact) ---- */
-    lfmgemv_probe(hg, 8, 8 | (2 << 8) | (1 << 16) | (2 << 24), times, 8);
+    lfmgemv_probe(hg, 8, 32 | (2 << 8) | (1 << 16) | ((pin_thr >= 1 ? pin_thr : 2) << 24), times, 8);
     ffn_int_mid(&m, 0, mid_ref, NULL);   /* activation for the down GEMM check */
     {
         struct { int h; const uint8_t *w; const int8_t *act; int n; int k; const char *nm; } m3[] = {
@@ -258,16 +267,17 @@ int main(int argc, char **argv)
 
         /* timing on token 0 */
         for (kk = 0; kk < n; kk++) {
-            double t0 = now_us();
+            double t0 = now_us(), w;
             rc = lfmgemv_ffn(hg, hu, hd, (const unsigned char *)m.x8, K, 1,
                              (unsigned char *)dst_out, K, (unsigned char *)mid_out, NH,
-                             times, 8);
-            {
-                double w = now_us() - t0;
-                if (w < wallmin) wallmin = w;
-                wallsum += w;
-            }
+                             times, 12);
+            w = now_us() - t0;
             if (rc != 0) { printf("ffn rc=%d\n", rc); return 17; }
+            if (w < wallmin) wallmin = w;
+            wallsum += w;
+            printf("  call %d: wall=%6.0f us  dsp=%4d us  [g=%d u=%d s=%d d=%d p=%d]"
+                   "  fallbacks=%d\n", kk, w, times[0], times[1], times[2], times[3],
+                   times[4], times[5], times[8]);
             if ((double)times[0] < bestffn) bestffn = times[0];
             usleep(20000);
         }
@@ -282,7 +292,7 @@ int main(int argc, char **argv)
 
             rc = lfmgemv_ffn(hg, hu, hd, (const unsigned char *)(m.x8 + (size_t)t * K), K, 1,
                              (unsigned char *)dst_out, K, (unsigned char *)mid_out, NH,
-                             times, 8);
+                             times, 12);
             if (rc != 0) { printf("ffn tok=%d rc=%d\n", t, rc); return 17; }
             for (r = 0; r < NH; r++) {
                 int d = (int)mid_out[r] - (int)mid_ref[r];
@@ -332,9 +342,10 @@ int main(int argc, char **argv)
                 && 100.0 * clip_mid / (double)cnt <= PASS_SAT_PCT
                 && 100.0 * clip_out / (double)cnt <= PASS_SAT_PCT;
         }
-        printf("FFN layer (1 RPC): %.2f ms  [gate=%.2f up=%.2f silu=%.2f down=%.2f pack=%.2f ms]\n",
+        printf("FFN layer (1 RPC): %.2f ms  [gate=%.2f up=%.2f silu=%.2f down=%.2f pack=%.2f ms]"
+               "  team_fallbacks=%d\n",
                wallmin / 1000.0, times[1] / 1e3, times[2] / 1e3, times[3] / 1e3,
-               times[4] / 1e3, times[5] / 1e3);
+               times[4] / 1e3, times[5] / 1e3, times[8]);
         printf("FFN host wall: min=%.0f us avg=%.0f us over %d calls\n", wallmin, wallsum / n, n);
         printf("QNN reference for the same layer: 3 x 1.37 = 4.11 ms\n");
         (void)bestffn;
@@ -348,7 +359,7 @@ int main(int argc, char **argv)
                     double t0 = now_us();
                     rc = lfmgemv_ffn(hg, hu, hd, (const unsigned char *)m.x8, K, rp[z],
                                      (unsigned char *)dst_out, K, (unsigned char *)mid_out, NH,
-                                     times, 8);
+                                     times, 12);
                     { double w = now_us() - t0; if (kk == 0 || w < bb) bb = w; }
                     usleep(15000);
                 }
@@ -376,13 +387,13 @@ int main(int argc, char **argv)
 
             /* reference result via the ordinary rout path */
             lfmgemv_ffn(hg, hu, hd, (const unsigned char *)m.x8, K, 1,
-                        (unsigned char *)dst_out, K, (unsigned char *)mid_out, NH, times, 8);
+                        (unsigned char *)dst_out, K, (unsigned char *)mid_out, NH, times, 12);
             memcpy(ref_out, dst_out, K);
 
             for (kk = 0; kk < 12; kk++) {
                 double t0 = now_us();
                 rc2 = lfmgemv_ffn_resident(hg, hu, hd, (const unsigned char *)m.x8, K, 1,
-                                           0, 0, times, 8);
+                                           0, 0, times, 12);
                 { double w = now_us() - t0; if (w < wmin) wmin = w; wsum += w; }
                 if (rc2 != 0) { printf("ffn_resident rc=%d\n", rc2); break; }
                 usleep(20000);
