@@ -2286,6 +2286,49 @@ int lfmgemv_load_buf(int h, int off, const unsigned char *data, int dataLen)
     return 0;
 }
 
+/* One token into all kv heads: 12 load_buf calls collapse into one RPC.
+ *
+ * Row layout of the attention kernel (see attn_group):
+ *   K  [head][slot][128]  - 64 useful int4 bytes, upper 64 bytes zero;
+ *   KT [head][slot][4]    - int32 Q16 scale;
+ *   V  [head][slot][128]  - signed int8.
+ * k/kt/v carry `heads` rows each, in head order, so the host builds three
+ * contiguous vectors and the DSP scatters them at head * slots + slot. */
+int lfmgemv_kv_write(int hk, int hkt, int hv, int slots, int slot,
+                     const unsigned char *k, int kLen,
+                     const unsigned char *kt, int ktLen,
+                     const unsigned char *v, int vLen)
+{
+    gbuf_t *bk, *bt, *bv;
+    int heads, i;
+
+    if (hk < 0 || hkt < 0 || hv < 0 || hk >= MAXBUF || hkt >= MAXBUF || hv >= MAXBUF)
+        return AEE_EBADPARM;
+    if (!k || !kt || !v) return AEE_EBADPARM;
+    bk = &g_buf[hk];
+    bt = &g_buf[hkt];
+    bv = &g_buf[hv];
+    if (!bk->used || !bt->used || !bv->used) return AEE_EBADPARM;
+    if (!bk->w || !bt->w || !bv->w) return AEE_EBADPARM;
+    if (slots < 1 || slot < 0 || slot >= 32 || slot >= slots) return AEE_EBADPARM;
+    if (kLen <= 0 || (kLen & 63) != 0 || ktLen < 0 || (ktLen & 3) != 0 ||
+        vLen < 0 || (vLen & 127) != 0)
+        return AEE_EBADPARM;
+    heads = kLen / 64;
+    if (heads != ktLen / 4 || heads != vLen / 128) return AEE_EBADPARM;
+    for (i = 0; i < heads; i++) {
+        size_t row = (size_t)i * (size_t)slots + (size_t)slot;
+        size_t ko = row * 128, to = row * 4, vo = row * 128;
+        if (ko + 128 > bk->wbytes || to + 4 > bt->wbytes || vo + 128 > bv->wbytes)
+            return AEE_EBADPARM;
+        memcpy(bk->w + ko, k + (size_t)i * 64, 64);
+        memset(bk->w + ko + 64, 0, 64);
+        memcpy(bt->w + to, kt + (size_t)i * 4, 4);
+        memcpy(bv->w + vo, v + (size_t)i * 128, 128);
+    }
+    return 0;
+}
+
 int lfmgemv_set_scale(int h, const unsigned char *scales, int scalesLen)
 {
     gbuf_t *b;
@@ -3091,7 +3134,8 @@ typedef struct {
  *         rt_base >= 0; src int8[16*128] -> dst int32[16*128];
  *         block table at tbl_h (weights view, int32) or scratch[tbl_off]
  *   CONV  h0=quantised shortconv blob (8 phases wq8, then kq[H]); a0=H,
- *         a1=ksh, a2=slot, a3=token counter; src int8[3H] -> dst int8[H];
+ *         a1=ksh, a2=slot, a3=token counter (or rt[rt_base] when
+ *         rt_base >= 0); src int8[3H] -> dst int8[H];
  *         ring state at scratch[tbl_off], 2*H*8 bytes per slot
  */
 typedef struct {
@@ -3234,6 +3278,21 @@ static int lfm_conv_res_ensure(int words)
     return g_conv_res ? 0 : AEE_ENOMEMORY;
 }
 
+int lfmgemv_reset_state(int flags)
+{
+    int f = (flags == 0) ? 3 : flags;
+
+    if (f & ~3) return AEE_EBADPARM;
+    /* The CONV ring states live in g_scratch; zeroing it is exactly the
+       state a fresh reserve_scratch() leaves behind.  Arena mappings and
+       resident weights are deliberately untouched: the reactive lists stay
+       mapped and the next token starts from a clean sequence. */
+    if ((f & 1) && g_scratch && g_scratch_bytes)
+        memset(g_scratch, 0, g_scratch_bytes);
+    if (f & 2) g_team_fallbacks = 0;
+    return 0;
+}
+
 /* ---------------- the DAG executor ---------------- */
 
 static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
@@ -3311,6 +3370,13 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
         int8_t *st, *hi, *lo;
         size_t need, st_bytes;
         int p;
+        if (c->rt_base >= 0) {
+            /* The token counter is the only per-token field of CONV; taking
+               it from rt[] keeps the command list byte-identical between
+               tokens, which is what lets the host keep one mapped arena. */
+            if (rt == 0 || c->rt_base >= rt_n) return AEE_EBADPARM;
+            ctr = rt[c->rt_base];
+        }
         if (c->h0 < 0 || c->h0 >= MAXBUF) return AEE_EBADPARM;
         b = &g_buf[c->h0];
         if (!b->used || !b->w) return AEE_EBADPARM;

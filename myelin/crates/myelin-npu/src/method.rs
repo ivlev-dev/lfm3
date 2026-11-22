@@ -55,6 +55,10 @@ pub mod method_id {
     pub const RESERVE_SCRATCH: u32 = 20;
     /// `exec(in long ah, in long cmd_off, in long n_cmds, ...)`
     pub const EXEC: u32 = 21;
+    /// `kv_write(in long hk, in long hkt, in long hv, in long slots, ...)`
+    pub const KV_WRITE: u32 = 22;
+    /// `reset_state(in long flags)`
+    pub const RESET_STATE: u32 = 23;
 }
 
 macro_rules! scalar_pack {
@@ -187,10 +191,21 @@ scalar_pack!(ExecWire {
     outp_len: i32,
     times_len: i32
 } size = 28);
+scalar_pack!(KvWriteWire {
+    hk: i32,
+    hkt: i32,
+    hv: i32,
+    slots: i32,
+    slot: i32,
+    k_len: i32,
+    kt_len: i32,
+    v_len: i32
+} size = 32);
+scalar_pack!(ResetStateScalars { flags: i32 } size = 4);
 
 /// `sizeof(_primIn)` per method, in method-ID order (`lfmgemv_stub.c`).
-pub const PRIM_IN_SIZES: [usize; 22] = [
-    4, 16, 12, 8, 24, 16, 32, 12, 4, 20, 28, 48, 4, 4, 12, 4, 8, 8, 4, 12, 4, 28,
+pub const PRIM_IN_SIZES: [usize; 24] = [
+    4, 16, 12, 8, 24, 16, 32, 12, 4, 20, 28, 48, 4, 4, 12, 4, 8, 8, 4, 12, 4, 28, 32, 4,
 ];
 
 /// Number of i32 values in the stand's `times[]` sequence.
@@ -221,6 +236,8 @@ const _: () = {
     assert!(std::mem::size_of::<AllocViewWire>() == PRIM_IN_SIZES[19]);
     assert!(std::mem::size_of::<ReserveScratchScalars>() == PRIM_IN_SIZES[20]);
     assert!(std::mem::size_of::<ExecWire>() == PRIM_IN_SIZES[21]);
+    assert!(std::mem::size_of::<KvWriteWire>() == PRIM_IN_SIZES[22]);
+    assert!(std::mem::size_of::<ResetStateScalars>() == PRIM_IN_SIZES[23]);
     assert!(std::mem::size_of::<ArenaOut>() == 4);
 };
 

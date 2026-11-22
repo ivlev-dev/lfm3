@@ -327,10 +327,12 @@ lfm_cmd { type, src, dst, pad, h0..h3, dst_h, src_off, src_len,
 Типы: `0 QUANT` (int32 Q12 → int8, один Q16-множитель), `1 GEMV`, `2 FFN`,
 `3 ATTN`, `4 CONV` (depthwise shortconv; `conv_math.h` — общий с `../conv`).
 Источник — scratch или `out`-последовательность; приёмник — scratch, `out`
-или `attach_out`-буфер ручки. `rt[]` — 4 значения на вызов (pos, seq, window,
-reps), команда ссылается на них через `rt_base`, поэтому список статичен и
-не переписывается между токенами (страницы маппинга DSP кэширует; правка
-на месте не видна — проверено в `attach_test`).
+или `attach_out`-буфер ручки. `rt[]` — значения на вызов; команда ссылается
+на них через `rt_base`, поэтому список статичен и не переписывается между
+токенами (страницы маппинга DSP кэширует; правка на месте не видна —
+проверено в `attach_test`). У `ATTN` это `pos/seq/window/reps`, у `CONV` —
+только счётчик токена (`rt_base >= 0` заменяет `a3`, так что список conv
+байт-в-байт одинаков между токенами).
 
 Проверки до первого чтения: magic/version/`cmd_size`/`hdr_size`, `n_cmds`
 совпадает с аргументом, `list_bytes` и весь список внутри арены,
@@ -348,9 +350,12 @@ view, состояние conv в scratch. Любая ошибка — код в�
 | FFN: `exec` в `attach_out`-буфер vs `out`-последовательность | 0/2048 |
 | attention: `attn` RPC vs `exec(ATTN)` | 0 (8192 Б int32) |
 | shortconv: хост-модель кольца vs `exec(CONV)` | 0/2048 |
+| shortconv: счётчик в `a3` vs в `rt[]` | 0/2048 |
+| KV: 12 `load_buf` vs один `kv_write` (через `attn`) | 0 (8192 Б int32) |
 | QUANT: формула vs `exec(QUANT)` | 0/2048 |
 | полный граф: 1 `exec` vs 85 `exec` по одной команде | 0/2048 |
 | 24 слоя × 3 view = 72 ручки: сырой int32 GEMV vs хост-int4 | 0 строк |
+| `reset_state` + повторный прогон vs первый токен | 0/2048 |
 
 `ffn_test`, `attn_test`, `lfmgemv_test`, `attach_test` — PASS.
 

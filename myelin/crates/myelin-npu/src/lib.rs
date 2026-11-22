@@ -168,8 +168,12 @@ mod tests {
 
     #[test]
     fn core_method_ids_match_the_table() {
-        use myelin_core::backend::dsp::{HVX_METHOD_ATTN, HVX_METHOD_FFN};
+        use myelin_core::backend::dsp::{
+            HVX_METHOD_ATTN, HVX_METHOD_FFN, HVX_METHOD_KV_WRITE, HVX_METHOD_RESET_STATE,
+        };
         assert_eq!(method::method_id::FFN, HVX_METHOD_FFN);
         assert_eq!(method::method_id::ATTN, HVX_METHOD_ATTN);
+        assert_eq!(method::method_id::KV_WRITE, HVX_METHOD_KV_WRITE);
+        assert_eq!(method::method_id::RESET_STATE, HVX_METHOD_RESET_STATE);
     }
 }

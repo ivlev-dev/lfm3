@@ -183,8 +183,10 @@ impl<'a> Session<'a> {
         self.kv.get(layer)?.as_ref().map(PagedKvCache::pages_used)
     }
 
-    /// Forget the sequence: release every page and zero the conv history.
+    /// Forget the sequence: release every page, zero the conv history and
+    /// reset the state the backend keeps on the device (CONV rings, counters).
     pub fn reset(&mut self) -> Result<(), RuntimeError> {
+        self.backend.reset()?;
         let kv_dim = self.spec.dims.kv_dim();
         for cache in self.kv.iter_mut().flatten() {
             *cache = PagedKvCache::new(kv_dim, self.max_context)?;

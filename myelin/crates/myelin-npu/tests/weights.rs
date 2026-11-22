@@ -553,14 +553,19 @@ fn packed_tensor_rejects_a_mismatched_blob() {
 fn backend_loads_an_ffn_stage_lazily_and_caches_it() {
     let spec = ModelSpec::placeholder();
     let hidden = spec.dims.hidden;
-    let ffn_dim = spec.dims.ffn;
     let bench = bench();
     allocator(&bench.mock, 1);
-    bench.mock.set_handler(method_id::FFN, move |call| {
-        assert_eq!(call.out_lens, vec![hidden, ffn_dim, 32]);
+    bench.mock.set_handler(method_id::MAP_ARENA, |_| {
+        Ok(MockReply {
+            prim_out: 77i32.to_le_bytes().to_vec(),
+            ..Default::default()
+        })
+    });
+    bench.mock.set_handler(method_id::EXEC, move |call| {
+        assert_eq!(call.out_lens, vec![hidden, 32]);
         Ok(MockReply {
             prim_out: Vec::new(),
-            out_bufs: vec![vec![1u8; hidden], vec![0u8; ffn_dim], vec![0u8; 32]],
+            out_bufs: vec![vec![1u8; hidden], vec![0u8; 32]],
         })
     });
     let mut backend =
@@ -580,12 +585,13 @@ fn backend_loads_an_ffn_stage_lazily_and_caches_it() {
     let mut out = vec![0.0f32; hidden];
     backend.ffn_layer(0, &input, &mut out).expect("lazy ffn");
     assert_eq!(bench.calls(method_id::ALLOC_BUF).len(), 3);
-    assert_eq!(bench.calls(method_id::FFN).len(), 1);
+    assert_eq!(bench.calls(method_id::EXEC).len(), 1);
     assert!(out.iter().all(|value| (*value - 0.5).abs() < 1e-6));
 
     backend.ffn_layer(0, &input, &mut out).expect("cached ffn");
     assert_eq!(bench.calls(method_id::ALLOC_BUF).len(), 3);
-    assert_eq!(bench.calls(method_id::FFN).len(), 2);
+    assert_eq!(bench.calls(method_id::EXEC).len(), 2);
+    assert_eq!(bench.calls(method_id::MAP_ARENA).len(), 1);
 
     drop(backend);
     assert_eq!(bench.calls(method_id::RELEASE_BUF).len(), 3);

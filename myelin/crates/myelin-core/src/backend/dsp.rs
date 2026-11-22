@@ -34,6 +34,10 @@ pub const HVX_METHOD_FFN: u32 = 6;
 pub const HVX_METHOD_ATTN: u32 = 11;
 /// Method ID of `lfmgemv.load_buf` in the HVX FastRPC skeleton.
 pub const HVX_METHOD_LOAD_BUF: u32 = 2;
+/// Method ID of `lfmgemv.kv_write` in the HVX FastRPC skeleton.
+pub const HVX_METHOD_KV_WRITE: u32 = 22;
+/// Method ID of `lfmgemv.reset_state` in the HVX FastRPC skeleton.
+pub const HVX_METHOD_RESET_STATE: u32 = 23;
 
 /// FastRPC handle. 32-bit `remote_handle`, as used by the `qaic` stub.
 pub type DspHandle = i32;
@@ -186,10 +190,12 @@ pub trait DspExecutor: Send + Sync {
     /// Run a command list in one FastRPC call.
     ///
     /// The list must be in [`exec::List::to_bytes`] form. Implementations own
-    /// the host shared-memory arena: allocate it, copy `list`, `map_arena`,
-    /// call `exec`, then `unmap_arena`. `act` is copied by the DSP into
-    /// scratch at offset 0; `rt` carries the per-token values referenced by
-    /// `rt_base`.
+    /// the host shared-memory arena: `myelin-npu`'s `Executor` keeps one
+    /// mapped arena per distinct list (the list is immutable between tokens,
+    /// so `map_arena`/`unmap_arena` leave the hot path); a one-shot
+    /// implementation may map, call `exec` and unmap. `act` is copied by the
+    /// DSP into scratch at offset 0; `rt` carries the per-token values
+    /// referenced by `rt_base` and is therefore not part of the list.
     fn exec(&self, _handle: DspHandle, _request: ExecRun<'_>) -> Result<ExecResult, DspError> {
         Err(DspError::Unavailable(
             "this executor does not implement `exec` (no shared command arena)".to_owned(),
@@ -686,6 +692,27 @@ pub mod exec {
         }
 
         #[allow(clippy::too_many_arguments)]
+        pub const fn ffn(
+            gate: i32,
+            up: i32,
+            down: i32,
+            reps: i32,
+            src_off: i32,
+            src_len: i32,
+            dst_off: i32,
+            dst_len: i32,
+        ) -> Self {
+            let mut command = Self::empty(Op::Ffn);
+            command.h = [gate, up, down, -1];
+            command.args[0] = reps;
+            command.src_off = src_off;
+            command.src_len = src_len;
+            command.dst_off = dst_off;
+            command.dst_len = dst_len;
+            command
+        }
+
+        #[allow(clippy::too_many_arguments)]
         pub const fn attn(
             keys: i32,
             key_scales: i32,
@@ -739,6 +766,13 @@ pub mod exec {
 
         pub const fn with_dst_handle(mut self, handle: i32) -> Self {
             self.dst_h = handle;
+            self
+        }
+
+        /// Read the per-token fields (ATTN pos/seq/window/reps, CONV counter)
+        /// from `rt[rt_base..]` instead of the command itself.
+        pub const fn with_rt_base(mut self, rt_base: i32) -> Self {
+            self.rt_base = rt_base;
             self
         }
 
@@ -970,6 +1004,38 @@ impl DspBackend {
     /// command index (`-1` on success), `[2]` the number of commands run.
     pub fn last_exec_times(&self) -> Option<&[i32; 8]> {
         self.last_exec_times.as_ref()
+    }
+
+    /// Reset the device session state: zero the CONV ring states in the DSP
+    /// scratch, the DSP counters and the host-side token counters.
+    ///
+    /// The mapped command arenas and the resident weights stay in place, so
+    /// the next token reuses the same mappings and starts from a fresh
+    /// sequence. [`Session::reset`](crate::Session::reset) calls this through
+    /// [`Backend::reset`].
+    pub fn reset_session(&mut self) -> Result<(), BackendError> {
+        self.conv_counters.fill(0);
+        self.last_exec_times = None;
+        let Some((executor, handle)) = self.link_parts() else {
+            return Ok(());
+        };
+        self.ensure_scratch()?;
+        // flags = 0: both the scratch (all CONV rings) and the counters.
+        let prim = 0i32.to_le_bytes();
+        let mut prim_out: [u8; 0] = [];
+        let mut no_out: [&mut [u8]; 0] = [];
+        let call = DspCall {
+            method: HVX_METHOD_RESET_STATE,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        };
+        if let Err(error) = executor.invoke(handle, call) {
+            return Err(self.fail("reset_state", error));
+        }
+        self.last_error = None;
+        Ok(())
     }
 
     /// Stage resident FFN handles for `layer`.
@@ -1227,21 +1293,27 @@ impl DspBackend {
             SCRATCH_BCX,
             3 * hidden,
         ));
-        list.push(exec::Command::conv(
-            stage.conv,
-            hidden,
-            stage.ksh,
-            0,
-            counter,
-            stage.state_off,
-            SCRATCH_BCX,
-            SCRATCH_CY,
-        ));
+        list.push(
+            exec::Command::conv(
+                stage.conv,
+                hidden,
+                stage.ksh,
+                0,
+                0,
+                stage.state_off,
+                SCRATCH_BCX,
+                SCRATCH_CY,
+            )
+            .with_rt_base(0),
+        );
         list.push(
             exec::Command::gemv(stage.out_proj, 1, stage.reps, SCRATCH_CY, hidden, 0, hidden)
                 .with_dst(exec::dst::OUT, 0),
         );
-        let result = self.run_exec(&list, &act, &[], dims.hidden)?;
+        // The token counter is the only per-token value; keeping it out of the
+        // command makes the list byte-identical between tokens, so the host
+        // executor can keep one arena mapped for the whole generation.
+        let result = self.run_exec(&list, &act, &[counter], dims.hidden)?;
         if result.out.len() != dims.hidden {
             return Err(unsupported(
                 "conv_layer",
@@ -1549,7 +1621,13 @@ impl DspBackend {
         let slots = stage.caches.cache_pages * crate::kv::PAGE_TOKENS;
         let slot = position % crate::kv::PAGE_TOKENS;
         let head_dim = dims.head_dim;
-        for head in 0..dims.kv_heads {
+        let heads = dims.kv_heads;
+        // One RPC carries every kv head: k (int4), kt (Q16) and v (int8) are
+        // laid out head after head and scattered by the DSP at head*slots+slot.
+        let mut k_bytes = Vec::with_capacity(heads * 64);
+        let mut kt_bytes = Vec::with_capacity(heads * 4);
+        let mut v_bytes = Vec::with_capacity(heads * 128);
+        for head in 0..heads {
             let row = &key[head * head_dim..(head + 1) * head_dim];
             let mut max_abs = 0.0f32;
             for &value in row {
@@ -1568,7 +1646,7 @@ impl DspBackend {
                     "K scale {kt} exceeds the Q16 kernel limit (|k|/q_scale must stay below 448)"
                 )));
             }
-            let mut codes = [0u8; 128];
+            let mut codes = [0u8; 64];
             for (dim, &value) in row.iter().enumerate() {
                 let code = if scale > 0.0 {
                     (value / scale).round().clamp(-7.0, 7.0) as i32
@@ -1577,17 +1655,8 @@ impl DspBackend {
                 };
                 codes[dim / 2] |= (((code + 8) & 0x0f) as u8) << (4 * (dim % 2));
             }
-            let k_offset = ((head * slots + slot) * head_dim) as i32;
-            self.load_buf(executor, handle, stage.caches.keys, k_offset, &codes)?;
-
-            let kt_offset = ((head * slots + slot) * 4) as i32;
-            self.load_buf(
-                executor,
-                handle,
-                stage.caches.key_scales,
-                kt_offset,
-                &kt.to_le_bytes(),
-            )?;
+            k_bytes.extend_from_slice(&codes);
+            kt_bytes.extend_from_slice(&kt.to_le_bytes());
 
             let row = &value[head * head_dim..(head + 1) * head_dim];
             let mut v_codes = [0u8; 128];
@@ -1596,40 +1665,33 @@ impl DspBackend {
                 let code = (value / scale).round().clamp(-127.0, 127.0) as i8;
                 v_codes[dim] = code as u8;
             }
-            let v_offset = ((head * slots + slot) * head_dim) as i32;
-            self.load_buf(executor, handle, stage.caches.values, v_offset, &v_codes)?;
+            v_bytes.extend_from_slice(&v_codes);
         }
-        Ok(())
-    }
 
-    fn load_buf(
-        &mut self,
-        executor: &Arc<dyn DspExecutor>,
-        handle: DspHandle,
-        buffer: i32,
-        offset: i32,
-        data: &[u8],
-    ) -> Result<(), BackendError> {
-        let data_len = i32::try_from(data.len()).map_err(|_| BackendError::Shape {
-            operation: "load_buf data",
-            expected: i32::MAX as usize,
-            got: data.len(),
-        })?;
-        let mut prim = [0u8; 12];
-        prim[0..4].copy_from_slice(&buffer.to_le_bytes());
-        prim[4..8].copy_from_slice(&offset.to_le_bytes());
-        prim[8..12].copy_from_slice(&data_len.to_le_bytes());
+        let slots = id_len(slots, "dsp kv slots")?;
+        let slot = id_len(slot, "dsp kv slot")?;
+        let mut prim = [0u8; 32];
+        prim[0..4].copy_from_slice(&stage.caches.keys.to_le_bytes());
+        prim[4..8].copy_from_slice(&stage.caches.key_scales.to_le_bytes());
+        prim[8..12].copy_from_slice(&stage.caches.values.to_le_bytes());
+        prim[12..16].copy_from_slice(&slots.to_le_bytes());
+        prim[16..20].copy_from_slice(&slot.to_le_bytes());
+        prim[20..24].copy_from_slice(&id_len(k_bytes.len(), "dsp kv k")?.to_le_bytes());
+        prim[24..28].copy_from_slice(&id_len(kt_bytes.len(), "dsp kv kt")?.to_le_bytes());
+        prim[28..32].copy_from_slice(&id_len(v_bytes.len(), "dsp kv v")?.to_le_bytes());
+
+        let in_bufs = [k_bytes.as_slice(), kt_bytes.as_slice(), v_bytes.as_slice()];
         let mut prim_out: [u8; 0] = [];
         let mut no_out: [&mut [u8]; 0] = [];
         let call = DspCall {
-            method: HVX_METHOD_LOAD_BUF,
+            method: HVX_METHOD_KV_WRITE,
             prim_in: &prim,
             prim_out: &mut prim_out,
-            in_bufs: &[data],
+            in_bufs: &in_bufs,
             out_bufs: &mut no_out,
         };
         if let Err(error) = executor.invoke(handle, call) {
-            return Err(self.fail("load_buf", error));
+            return Err(self.fail("kv_write", error));
         }
         Ok(())
     }
@@ -1869,51 +1931,38 @@ impl Backend for DspBackend {
                 got: out.len(),
             });
         }
-        let Some((executor, handle)) = self.link_parts() else {
-            return Err(unsupported("ffn_layer", MISSING_TRANSPORT));
-        };
         let stage = match self.ffn.get(layer).copied().flatten() {
             Some(stage) => stage,
             None => self.load_ffn_stage(layer)?,
         };
         self.last_error = None;
 
+        // The FFN command runs the same `ffn_impl` as the one-RPC `ffn`
+        // method; only the transport differs. Same act, same int8 dst, so the
+        // result is bit-identical to the old path (exec_test checks that
+        // directly on the device).
         let act = quantize(x, stage.act_scale);
-        let mut dst = vec![0u8; dims.hidden];
-        let mut mid = vec![0u8; dims.ffn];
-        let mut times = [0i32; 8];
-
-        // `_primIn[8]` of the qaic stub: handles, actLen, reps, dstLen,
-        // midLen, timesLen. Sequence lengths are part of the scalar pack.
-        let mut prim = [0u8; 32];
-        prim[0..4].copy_from_slice(&stage.gate.to_le_bytes());
-        prim[4..8].copy_from_slice(&stage.up.to_le_bytes());
-        prim[8..12].copy_from_slice(&stage.down.to_le_bytes());
-        prim[12..16].copy_from_slice(&id_len(act.len(), "dsp act")?.to_le_bytes());
-        prim[16..20].copy_from_slice(&stage.reps.to_le_bytes());
-        prim[20..24].copy_from_slice(&id_len(dst.len(), "dsp dst")?.to_le_bytes());
-        prim[24..28].copy_from_slice(&id_len(mid.len(), "dsp mid")?.to_le_bytes());
-        prim[28..32].copy_from_slice(&id_len(times.len(), "dsp times")?.to_le_bytes());
-
-        let in_bufs = [act.as_slice()];
-        let mut prim_out: [u8; 0] = [];
-        let mut out_bufs: [&mut [u8]; 3] = [
-            dst.as_mut_slice(),
-            mid.as_mut_slice(),
-            i32_bytes_mut(&mut times),
-        ];
-        let call = DspCall {
-            method: HVX_METHOD_FFN,
-            prim_in: &prim,
-            prim_out: &mut prim_out,
-            in_bufs: &in_bufs,
-            out_bufs: &mut out_bufs,
-        };
-        if let Err(error) = executor.invoke(handle, call) {
-            return Err(self.fail("ffn_layer", error));
+        let hidden = dims.hidden as i32;
+        let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
+        list.push(exec::Command::ffn(
+            stage.gate,
+            stage.up,
+            stage.down,
+            stage.reps,
+            SCRATCH_ACT,
+            hidden,
+            0,
+            hidden,
+        ));
+        let result = self.run_exec(&list, &act, &[], dims.hidden)?;
+        if result.out.len() != dims.hidden {
+            return Err(unsupported(
+                "ffn_layer",
+                "exec returned the wrong output length",
+            ));
         }
 
-        for (dst_value, quantized) in out.iter_mut().zip(&dst) {
+        for (dst_value, quantized) in out.iter_mut().zip(&result.out) {
             *dst_value = (*quantized as i8) as f32 * stage.out_scale;
         }
         Ok(())
@@ -1946,5 +1995,43 @@ impl Backend for DspBackend {
             "lm_head",
             "FastRPC: the vocabulary projection is not staged as a resident GEMV",
         ))
+    }
+
+    fn reset(&mut self) -> Result<(), BackendError> {
+        self.reset_session()
+    }
+}
+
+#[cfg(test)]
+mod exec_encoder_tests {
+    use super::exec::{Command, List, Op};
+
+    #[test]
+    fn ffn_command_packs_handles_and_lengths() {
+        let bytes = Command::ffn(11, 12, 13, 2, 0, 2_048, 2_048, 2_048).to_bytes();
+        assert_eq!(&bytes[0..4], &(Op::Ffn as u32).to_le_bytes());
+        assert_eq!(&bytes[16..20], &11i32.to_le_bytes());
+        assert_eq!(&bytes[20..24], &12i32.to_le_bytes());
+        assert_eq!(&bytes[24..28], &13i32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &(-1i32).to_le_bytes());
+        assert_eq!(&bytes[40..44], &2_048i32.to_le_bytes());
+        assert_eq!(&bytes[48..52], &2_048i32.to_le_bytes());
+        assert_eq!(&bytes[64..68], &2i32.to_le_bytes());
+        assert_eq!(&bytes[80..84], &(-1i32).to_le_bytes());
+    }
+
+    #[test]
+    fn conv_counter_travels_in_rt_to_keep_the_list_stable() {
+        let first = Command::conv(9, 2_048, 40, 0, 0, 34816, 0, 8192).with_rt_base(0);
+        let second = Command::conv(9, 2_048, 40, 0, 0, 34816, 0, 8192).with_rt_base(0);
+        // The token counter is no longer a command field, so the bytes of the
+        // whole list are identical between tokens.
+        assert_eq!(first.to_bytes(), second.to_bytes());
+        assert_eq!(&first.to_bytes()[76..80], &0i32.to_le_bytes());
+        assert_eq!(&first.to_bytes()[80..84], &0i32.to_le_bytes());
+
+        let mut list = List::new(4 << 20);
+        list.push(first);
+        assert_eq!(list.to_bytes(), list.to_bytes());
     }
 }

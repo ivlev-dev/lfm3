@@ -158,4 +158,10 @@ pub trait Backend {
 
     /// Vocabulary projection of the final hidden state.
     fn lm_head(&mut self, x: &[f32], logits: &mut [f32]) -> Result<(), BackendError>;
+
+    /// Forget the sequence state the backend keeps on the device (CONV rings,
+    /// counters). The default is a no-op for stateless backends.
+    fn reset(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
 }

@@ -88,19 +88,24 @@ rpcmem_flags: 1,           // RPCMEM_DEFAULT_FLAGS
 
 ## Таблица методов
 
-`src/method.rs` содержит все 14 методов IDL `myelin/dsp/hvx/lfmgemv.idl` в
+`src/method.rs` содержит все 24 метода IDL `myelin/dsp/hvx/lfmgemv.idl` в
 порядке объявления. Значения выписаны из сгенерированного qaic
 `lfmgemv_stub.c` (SDK 6.7.0.0):
 
 | ID | метод | ID | метод |
 |---:|---|---:|---|
-| 0 | `alloc_buf` | 7 | `attach_out` |
-| 1 | `set_shape` | 8 | `detach_out` |
-| 2 | `load_buf` | 9 | `gemv_resident` |
-| 3 | `set_scale` | 10 | `ffn_resident` |
-| 4 | `gemv` | 11 | `attn` |
-| 5 | `probe` | 12 | `team_info` |
-| 6 | `ffn` | 13 | `release_buf` |
+| 0 | `alloc_buf` | 12 | `team_info` |
+| 1 | `set_shape` | 13 | `release_buf` |
+| 2 | `load_buf` | 14 | `attach_in` |
+| 3 | `set_scale` | 15 | `detach_in` |
+| 4 | `gemv` | 16 | `alloc_in` |
+| 5 | `probe` | 17 | `map_arena` |
+| 6 | `ffn` | 18 | `unmap_arena` |
+| 7 | `attach_out` | 19 | `alloc_view` |
+| 8 | `detach_out` | 20 | `reserve_scratch` |
+| 9 | `gemv_resident` | 21 | `exec` |
+| 10 | `ffn_resident` | 22 | `kv_write` |
+| 11 | `attn` | 23 | `reset_state` |
 
 `build.rs` при каждой сборке:
 
@@ -158,11 +163,18 @@ attention: x8 -> exec[GEMV q, GEMV k, GEMV v, GEMV gate]
 
 `conv_layer` работает одним `exec` на слой; `attention_layer` — тремя
 (q/k/v+gate, ATTN, o_proj), потому что q/k-norm, rope, V-скейл и gate живут
-на хосте. Каждый `exec` сейчас мапит и размапливает свою ION-арену
-(`map_arena`/`unmap_arena`), а K/V пишутся 12 `load_buf` (4 головы × K/KT/V);
-DSP-время слоя на XQ-BC72 — 0.57 мс conv и 0.44 мс attention, wall — 2.8 и
-8.9 мс на токен. Убрать эти накладные расходы — следующий шаг: одна
-замапленная арена/кольцо и запись K/V пачкой.
+на хосте. `exec` больше не мапит арену на каждый вызов: `Executor` держит
+замапленную арену на каждый неизменный список команд (кэш на 8 списков),
+а счётчик `CONV` теперь приходит через `rt[]`, поэтому список байт-в-байт
+одинаков между токенами. K/V пишутся одним `kv_write` вместо 12 `load_buf`.
+На XQ-BC72 в прогретом режиме conv-слой стоит **1 RPC и ~0.87 мс wall**,
+attention — **4 RPC (3 `exec` + `kv_write`) и ~1.6–1.8 мс wall**, DSP-время —
+0.55 мс и 0.44 мс. `ffn_layer` идёт командой `FFN` внутри `exec` (тот же
+`ffn_impl`, что и RPC `ffn`: стенд сверяет их бит-в-бит).
+
+`DspBackend::reset_session()` (и `Backend::reset`, который зовёт
+`Session::reset`) обнуляет DSP-scratch со всеми ring-состояниями `CONV`,
+счётчики и host-счётчики токенов; арены и веса остаются замапленными.
 
 `embed`, `rms_norm`, `lm_head` пока возвращают `BackendError::Unsupported` с
 конкретной причиной (нет резидентных весов / ядра вне HVX-стенда), а не
@@ -183,9 +195,11 @@ DSP-время слоя на XQ-BC72 — 0.57 мс conv и 0.44 мс attention, 
 * `reserve_scratch(handle, nbytes)` — DSP-heap scratch под промежуточные
   int8/int32 и состояния `CONV`;
 * `exec(handle, ExecRun { list, commands, scratch_bytes, act, rt, out_len })`
-  — один RPC на список команд. Реализация (`executor::run_exec_on`)
-  аллоцирует rpcmem, копирует список, `map_arena(fd, nbytes)` (длина
-  округляется до 128 Б — иначе `AEE_EBADPARM`), `exec`, `unmap_arena`.
+  — один RPC на список команд. Реализация (`executor::run_exec_cached`)
+  держит кэш замапленных арен (8 списков): список копируется в rpcmem и
+  мапится один раз, повторный вызов с теми же байтами идёт прямо в `exec`.
+  Длина округляется до 128 Б — иначе `AEE_EBADPARM`. Список неизменен между
+  токенами: счётчик `CONV` и позиция `ATTN` приходят через `rt[]`.
   Список и скалярный пакет — те же 64/96 Б, что в `method::exec`; тест
   `method::exec_tests::core_encoder_matches_the_dsp_layout` сверяет два
   энкодера побайтово.
@@ -223,31 +237,28 @@ DSP-время слоя на XQ-BC72 — 0.57 мс conv и 0.44 мс attention, 
 
 | слой | cos по токенам | max\|Δ\| | DSP `exec` | wall на токен |
 |---|---:|---:|---:|---:|
-| conv 0, 4 токена | 0.9748 / 0.9815 / 0.9817 / 0.9845 | 2.84e-2 | 0.56–0.64 мс | 2.8 мс |
-| attention 2, 4 токена | 0.9649 / 0.9646 / 0.9663 / 0.9668 | 9.13e-2 | 0.43–0.45 мс | 8.9 мс |
+| conv 0, 4 токена | 0.9748 / 0.9815 / 0.9817 / 0.9845 | 2.84e-2 | 0.54–0.65 мс | 0.87 мс |
+| attention 2, 4 токена | 0.9649 / 0.9646 / 0.9663 / 0.9668 | 9.13e-2 | 0.44–0.45 мс | 1.6–1.9 мс |
 
 `max|Δ|` attention — один выброс в o_proj (int4-вес), не сдвиг всего вектора.
-Wall включает host norm/rope/gate, 12 `load_buf` на K/V и map/unmap арены
-на каждый `exec`; DSP-время — сумма `times[0]` команд.
+Wall — прогрев после первого токена (первый включает `map_arena` и холодное
+ядро); RPC на токен после прогрева: conv 1, attention 4 (3 `exec` +
+`kv_write`). Отдельная проверка `reset`: после `DspBackend::reset_session()`
+повторные 4 токена совпадают с первым прогоном бит-в-бит (0 расхождений).
 
 ### Что осталось до полного сквозного прогона
 
-1. **Арена на токен, а не на `exec`**: сейчас `run_exec_on` делает
-   `map_arena/unmap_arena` на каждый вызов (3 RPC). Для conv список меняется
-   только `a3` (счётчик); нужен ring из 2–3 заранее смапленных арен или
-   перенос счётчика в `rt[]`. Это уберёт ~0.3–0.5 мс на слой.
-2. **K/V одним `load_buf`**: row-layout `[head][slot][128]` не contiguous по
-   головам, поэтому токен пишется 12 вызовами. Нужен `load_buf` с offset или
-   отдельный `kv_write` в IDL; либо token-major layout и запись страницы
-   целиком раз в 32 токена.
-3. **FFN и lm_head на `exec`**: `DspBackend::ffn_layer` ещё делает отдельный
-   RPC `ffn`, `lm_head`/`embed`/`rms_norm` — `Unsupported`. Для одного
-   `exec` на токен их надо включить в общий список (FFN уже есть командой).
-4. **Сброс состояния**: `Session::reset` не обнуляет DSP-ring `CONV` и
-   счётчики; нужен `exec`-команда/метод сброса или пересоздание scratch.
-5. **Общий `StageProvider` для int4**: `weights.rs` планирует HMX int8 и
+Сделано в этом шаге: одна замапленная арена на список команд (счётчик `CONV`
+в `rt[]`), `kv_write` одним RPC, `FFN` внутри `exec` и `reset_state` из
+`Session::reset`. Осталось:
+
+1. **Общий `StageProvider` для int4**: `weights.rs` планирует HMX int8 и
    attention-кэши; `gemv_weights::PackedGemv` умеет ставить int4-матрицу, но
    LRU-бюджет и `LayerPlan` для conv/attention-проекций ещё не расширены.
+2. **`lm_head` и калибровка выхода**: `lm_head`/`embed`/`rms_norm` пока
+   `Unsupported`; для сквозного прогона нужен резидентный `lm_head` и
+   калибровка `s_out` на реальных весах (сейчас `s_out` берётся от
+   аккумулятора, а не от проверки cos по словарю).
 
 ## Загрузка весов (`weights`)
 

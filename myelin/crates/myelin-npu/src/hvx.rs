@@ -11,9 +11,9 @@ use crate::method::{
     decode_i32s, long_len, method_id, octet_len, AllocBufScalars, AllocInScalars, AllocViewWire,
     AttachInScalars, AttachOutScalars, AttnRequest, AttnResponse, AttnWire, DetachInScalars,
     DetachOutScalars, ExecRequest, ExecResponse, ExecWire, FfnRequest, FfnResidentWire,
-    FfnResponse, FfnWire, GemvRequest, GemvResidentWire, GemvResponse, GemvWire, LoadBufWire,
-    MapArenaWire, ReleaseBufScalars, ReserveScratchScalars, SetScaleWire, SetShapeScalars,
-    TeamInfoScalars, UnmapArenaScalars, TIMES_VALUES,
+    FfnResponse, FfnWire, GemvRequest, GemvResidentWire, GemvResponse, GemvWire, KvWriteWire,
+    LoadBufWire, MapArenaWire, ReleaseBufScalars, ReserveScratchScalars, ResetStateScalars,
+    SetScaleWire, SetShapeScalars, TeamInfoScalars, UnmapArenaScalars, TIMES_VALUES,
 };
 use crate::transport::{Call, Handle, Transport};
 
@@ -441,6 +441,58 @@ impl HvxClient {
         let mut no_out: [&mut [u8]; 0] = [];
         self.invoke(Call {
             method: method_id::RESERVE_SCRATCH,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[],
+            out_bufs: &mut no_out,
+        })
+    }
+
+    /// Append one token to all resident K/KT/V heads in one RPC. `k` holds
+    /// `heads * 64` bytes (int4), `kt` `heads * 4` (Q16 scale), `v`
+    /// `heads * 128` (int8); the row index is `head * slots + slot`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_write(
+        &self,
+        hk: i32,
+        hkt: i32,
+        hv: i32,
+        slots: i32,
+        slot: i32,
+        k: &[u8],
+        kt: &[u8],
+        v: &[u8],
+    ) -> Result<(), TransportError> {
+        let prim = KvWriteWire {
+            hk,
+            hkt,
+            hv,
+            slots,
+            slot,
+            k_len: octets(k.len(), "kv_write k")?,
+            kt_len: octets(kt.len(), "kv_write kt")?,
+            v_len: octets(v.len(), "kv_write v")?,
+        }
+        .to_bytes();
+        let mut prim_out: [u8; 0] = [];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::KV_WRITE,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[k, kt, v],
+            out_bufs: &mut no_out,
+        })
+    }
+
+    /// Zero DSP session state: bit 0 = scratch (all CONV rings), bit 1 =
+    /// counters; `flags = 0` means both.
+    pub fn reset_state(&self, flags: i32) -> Result<(), TransportError> {
+        let prim = ResetStateScalars { flags }.to_bytes();
+        let mut prim_out: [u8; 0] = [];
+        let mut no_out: [&mut [u8]; 0] = [];
+        self.invoke(Call {
+            method: method_id::RESET_STATE,
             prim_in: &prim,
             prim_out: &mut prim_out,
             in_bufs: &[],

@@ -12,6 +12,7 @@
 
 #[cfg(target_os = "android")]
 fn main() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -27,7 +28,62 @@ fn main() {
     use myelin_core::{ops, Backend};
     use myelin_npu::gemv_weights::{stage_blob, stage_zero, PackedGemv};
     use myelin_npu::layer_fixture::{compare, read_f32, FixtureRope, LayerFixture};
-    use myelin_npu::{Cdsprpc, CdsprpcConfig, Executor, HvxClient, Transport};
+    use myelin_npu::{
+        Cdsprpc, CdsprpcConfig, Executor, Handle, HvxClient, SharedBuffer, Transport,
+        TransportError,
+    };
+
+    /// Delegating transport that counts FastRPC calls, so the check can print
+    /// the real per-token RPC budget instead of estimating it.
+    struct CountingTransport {
+        inner: Arc<dyn Transport>,
+        calls: AtomicUsize,
+        maps: AtomicUsize,
+    }
+
+    impl CountingTransport {
+        fn new(inner: Arc<dyn Transport>) -> Self {
+            Self {
+                inner,
+                calls: AtomicUsize::new(0),
+                maps: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn maps(&self) -> usize {
+            self.maps.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Transport for CountingTransport {
+        fn open(&self, module: &str) -> Result<Handle, TransportError> {
+            self.inner.open(module)
+        }
+
+        fn close(&self, handle: Handle) -> Result<(), TransportError> {
+            self.inner.close(handle)
+        }
+
+        fn invoke(
+            &self,
+            handle: Handle,
+            call: myelin_npu::transport::Call<'_, '_>,
+        ) -> Result<(), TransportError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if call.method == myelin_npu::method::method_id::MAP_ARENA {
+                self.maps.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.invoke(handle, call)
+        }
+
+        fn alloc_shared(&self, len: usize) -> Result<SharedBuffer, TransportError> {
+            self.inner.alloc_shared(len)
+        }
+    }
 
     fn rope(spec: &FixtureRope) -> RopeSpec {
         RopeSpec {
@@ -98,7 +154,9 @@ fn main() {
 
     let transport: Arc<dyn Transport> =
         Arc::new(Cdsprpc::load(CdsprpcConfig::default()).expect("load libcdsprpc.so"));
-    let client = HvxClient::open(Arc::clone(&transport), "lfmgemv").expect("open lfmgemv");
+    let counted = Arc::new(CountingTransport::new(Arc::clone(&transport)));
+    let counted_dyn: Arc<dyn Transport> = counted.clone();
+    let client = HvxClient::open(counted_dyn, "lfmgemv").expect("open lfmgemv");
     let hidden = dims.hidden;
     let kv_dim = dims.kv_dim();
     let slots = fixture.attention.cache_pages * 32;
@@ -169,7 +227,8 @@ fn main() {
     // The backend owns the handle from here; the client must not close it.
     let handle = client.handle().expect("handle");
     std::mem::forget(client);
-    let executor = Arc::new(Executor::new(transport));
+    let executor_transport: Arc<dyn Transport> = counted.clone();
+    let executor = Arc::new(Executor::new(executor_transport));
     let exec_dyn: Arc<dyn myelin_core::backend::dsp::DspExecutor> = executor.clone();
     let mut backend = DspBackend::with_handle(spec, exec_dyn, handle, "lfmgemv");
 
@@ -236,22 +295,32 @@ fn main() {
     let conv_y = read_f32(&dir.join("conv_y.f32"), conv_tokens * hidden).expect("conv y");
     let mut state = vec![0.0f32; (dims.conv_cache - 1) * hidden];
     let mut out = vec![0.0f32; hidden];
+    let conv_calls0 = counted.calls();
+    let conv_maps0 = counted.maps();
     let started = Instant::now();
     let mut conv_cos = Vec::new();
     let mut conv_max = 0.0f64;
     let mut conv_actual = Vec::with_capacity(conv_tokens * hidden);
     for position in 0..conv_tokens {
         let input = &conv_x[position * hidden..(position + 1) * hidden];
+        let token_started = Instant::now();
         backend
             .conv_layer(fixture.conv_layer, input, &mut state, &mut out)
             .unwrap_or_else(|error| panic!("conv layer: {error} ({:?})", backend.last_error()));
         conv_actual.extend_from_slice(&out);
         println!(
-            "  conv token {position}: dsp {} us",
-            backend.take_exec_micros()
+            "  conv token {position}: dsp {} us wall {:.0} us",
+            backend.take_exec_micros(),
+            token_started.elapsed().as_secs_f64() * 1e6
         );
     }
     let conv_wall = started.elapsed();
+    let conv_calls = counted.calls() - conv_calls0;
+    let conv_maps = counted.maps() - conv_maps0;
+    println!(
+        "conv rpc: {conv_calls} calls for {conv_tokens} tokens ({conv_maps} map_arena), {:.2} per token",
+        conv_calls as f64 / conv_tokens as f64
+    );
     for position in 0..conv_tokens {
         let expected = &conv_y[position * hidden..(position + 1) * hidden];
         let actual = &conv_actual[position * hidden..(position + 1) * hidden];
@@ -259,6 +328,26 @@ fn main() {
         conv_cos.push((position, cos));
         conv_max = conv_max.max(max);
     }
+
+    // Reset must give a fresh DSP sequence: a second run of the same tokens
+    // has to reproduce the first one bit for bit, otherwise the CONV ring
+    // state leaks between sequences.
+    let mut conv_reset = Vec::with_capacity(conv_tokens * hidden);
+    backend.reset().expect("reset conv state");
+    state.fill(0.0);
+    for position in 0..conv_tokens {
+        let input = &conv_x[position * hidden..(position + 1) * hidden];
+        backend
+            .conv_layer(fixture.conv_layer, input, &mut state, &mut out)
+            .unwrap_or_else(|error| panic!("conv layer after reset: {error}"));
+        conv_reset.extend_from_slice(&out);
+    }
+    let conv_reset_mismatches = conv_reset
+        .iter()
+        .zip(&conv_actual)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    println!("conv reset identity: mismatches={conv_reset_mismatches}");
 
     let attn_tokens = fixture.attention_tokens;
     let attn_x = read_f32(&dir.join("attn_x.f32"), attn_tokens * hidden).expect("attn x");
@@ -270,10 +359,13 @@ fn main() {
     };
     let mut kv = PagedKvCache::new(kv_dim, attn_tokens).expect("kv");
     let mut attn_actual = Vec::with_capacity(attn_tokens * hidden);
+    let attn_calls0 = counted.calls();
+    let attn_maps0 = counted.maps();
     let started = Instant::now();
     for position in 0..attn_tokens {
         let input = &attn_x[position * hidden..(position + 1) * hidden];
         let start = ops::window_start(kind, position, dims.sliding_window);
+        let token_started = Instant::now();
         backend
             .attention_layer(
                 AttentionCall {
@@ -291,11 +383,18 @@ fn main() {
             });
         attn_actual.extend_from_slice(&out);
         println!(
-            "  attn token {position}: dsp {} us",
-            backend.take_exec_micros()
+            "  attn token {position}: dsp {} us wall {:.0} us",
+            backend.take_exec_micros(),
+            token_started.elapsed().as_secs_f64() * 1e6
         );
     }
     let attn_wall = started.elapsed();
+    let attn_calls = counted.calls() - attn_calls0;
+    let attn_maps = counted.maps() - attn_maps0;
+    println!(
+        "attn rpc: {attn_calls} calls for {attn_tokens} tokens ({attn_maps} map_arena), {:.2} per token",
+        attn_calls as f64 / attn_tokens as f64
+    );
     let mut attn_cos = Vec::new();
     let mut attn_max = 0.0f64;
     for position in 0..attn_tokens {
@@ -361,7 +460,7 @@ fn main() {
     // is on it. Earlier tokens' cos is reported for the dynamic-range picture.
     let conv_ok = conv_cos.last().is_some_and(|(_, cos)| *cos >= 0.95);
     let attn_ok = attn_cos.last().is_some_and(|(_, cos)| *cos >= 0.90);
-    if conv_ok && attn_ok {
+    if conv_ok && attn_ok && conv_reset_mismatches == 0 {
         println!("VERDICT: PASS");
     } else {
         println!("VERDICT: FAIL");

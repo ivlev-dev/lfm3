@@ -43,7 +43,8 @@ interface lfmgemv {
                      in long reps, rout sequence<octet> mid, rout sequence<long> times);
 
    /* paged attention, M=1, GQA 16 q-heads / 4 kv-heads, head_dim 128.
-      hk/hkt: K cache int4 [4][slots][64B] + per-token scales int32 [4][slots]
+      hk/hkt: K cache int4 [4][slots][128B] (64 useful + 64 pad) + per-token
+              scales int32 [4][slots]
       hv    : V cache int2 [4][slots][32B], one scale per kv head (int32 [4])
       q     : int8 [16][128] (per-channel K scales already folded in by the host)
       tbl   : block table (page id per 32 tokens); window 0 = full
@@ -100,15 +101,38 @@ interface lfmgemv {
    /* ---- one-RPC token pipeline ------------------------------------------
       Execute a fixed, versioned command list stored in arena ah at cmd_off.
       The list never travels through the RPC: map it once, then one exec per
-      token.  Dynamic per-token values (attention pos/seq/window) come from
-      rt[] and are referenced by each command's rt_base; "act" is copied into
-      scratch[0..actLen).  "out" is the caller-allocated result area for
-      commands with dst = out.  times[0] = DSP microseconds spent in the
-      commands, times[1] = failing command index (-1 on success),
+      token.  Dynamic per-token values (attention pos/seq/window and the CONV
+      token counter) come from rt[] and are referenced by each command's
+      rt_base; "act" is copied into scratch[0..actLen).  "out" is the
+      caller-allocated result area for commands with dst = out.
+      times[0] = DSP microseconds spent in the commands,
+      times[1] = failing command index (-1 on success),
       times[2] = commands executed, times[3] = team fallbacks. */
    long exec(in long ah, in long cmd_off, in long n_cmds, in sequence<octet> act,
              in sequence<long> rt, rout sequence<octet> outp,
              rout sequence<long> times);
+
+   /* ---- KV page write ----------------------------------------------------
+      Append one token to the resident K/KT/V caches in one RPC instead of
+      12 load_buf calls (4 heads x K/KT/V).  Row layout matches the attention
+      kernel: K row is 128 B (64 useful int4 bytes + 64 zero pad),
+      kt row is one int32, V row is 128 int8; the row index is
+      head * slots + slot.
+        k  : 64 B per head (int4 nibbles, lo nibble = even dim)
+        kt : 4 B per head (Q16 per-token K scale)
+        v  : 128 B per head (int8, per-channel scales applied on the host)
+      slots is the number of token slots per kv head; slot = position % 32. */
+   long kv_write(in long hk, in long hkt, in long hv, in long slots, in long slot,
+                 in sequence<octet> k, in sequence<octet> kt,
+                 in sequence<octet> v);
+
+   /* ---- session state reset ---------------------------------------------
+      Zero the DSP-heap scratch (which holds every CONV ring state) and the
+      shared counters, so a new sequence starts from exactly the state of a
+      fresh reserve_scratch().  flags: bit 0 = scratch, bit 1 = counters;
+      flags = 0 means both.  The command arenas and resident weights are not
+      touched. */
+   long reset_state(in long flags);
 };
 
 #endif /* LFMGEMV_IDL */

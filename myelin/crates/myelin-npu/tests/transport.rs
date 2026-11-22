@@ -336,18 +336,24 @@ fn backend_without_stage_reports_stage_reason() {
 fn backend_ffn_quantises_calls_and_dequantises() {
     let spec = ModelSpec::placeholder();
     let hidden = spec.dims.hidden;
-    let ffn = spec.dims.ffn;
     let mock = MockTransport::new();
-    mock.set_handler(method_id::FFN, move |call| {
+    mock.set_handler(method_id::MAP_ARENA, |_| {
+        Ok(MockReply {
+            prim_out: 5i32.to_le_bytes().to_vec(),
+            ..Default::default()
+        })
+    });
+    mock.set_handler(method_id::EXEC, move |call| {
+        // `ExecWire`: arena, cmd_off, n_cmds, act_len, rt_len, out_len, times_len.
         assert_eq!(
             call.prim_in,
-            i32_bytes(&[1, 2, 3, hidden as i32, 1, hidden as i32, ffn as i32, 8])
+            i32_bytes(&[5, 0, 1, hidden as i32, 0, hidden as i32, 8])
         );
         assert_eq!(call.in_bufs[0].len(), hidden);
         assert_eq!(call.in_bufs[0][0], 2); // 1.0 * act_scale 2.0
         Ok(reply(
             Vec::new(),
-            vec![vec![10u8; hidden], vec![0u8; ffn], i32_bytes(&[0; 8])],
+            vec![vec![10u8; hidden], i32_bytes(&[0; 8])],
         ))
     });
     let executor: Arc<dyn myelin_core::backend::dsp::DspExecutor> =
@@ -373,8 +379,7 @@ fn backend_ffn_quantises_calls_and_dequantises() {
         .expect("ffn");
     assert!(out.iter().all(|value| (*value - 5.0).abs() < 1e-6));
     let call = mock.last_call().expect("recorded");
-    assert_eq!(call.method, method_id::FFN);
-    assert_eq!(call.scalars, 0x0602_0300);
+    assert_eq!(call.method, method_id::EXEC);
 }
 
 #[test]
@@ -631,4 +636,48 @@ fn arena_view_and_scratch_wire_layout() {
     assert_eq!(calls[2].prim_in, i32_bytes(&[1 << 20]));
     // map_arena: method 17, one in buffer, one scalar out.
     assert_eq!(calls[0].scalars, 0x1101_0100);
+}
+
+#[test]
+fn kv_write_packs_three_sequences_and_one_scalar_out() {
+    let mock = MockTransport::new();
+    let client = HvxClient::open(Arc::new(mock.clone()), "lfmgemv").expect("open");
+    let k = vec![0xa5u8; 4 * 64];
+    let kt = vec![0x11u8; 4 * 4];
+    let v = vec![0x7fu8; 4 * 128];
+    client
+        .kv_write(5, 6, 7, 2048, 5, &k, &kt, &v)
+        .expect("kv_write");
+
+    let call = mock.last_call().expect("recorded");
+    assert_eq!(call.method, method_id::KV_WRITE);
+    assert_eq!(call.prim_in, i32_bytes(&[5, 6, 7, 2048, 5, 256, 16, 512]));
+    assert_eq!(
+        call.in_bufs.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![256, 16, 512]
+    );
+    assert!(call.out_lens.is_empty());
+    // method 22, 4 in buffers (scalars + k/kt/v), no out.
+    assert_eq!(call.scalars, 0x1604_0000);
+}
+
+#[test]
+fn backend_reset_zeroes_the_device_state() {
+    let mock = MockTransport::new();
+    let executor: Arc<dyn myelin_core::backend::dsp::DspExecutor> =
+        Arc::new(Executor::new(Arc::new(mock.clone())));
+    let mut backend =
+        DspBackend::attach(ModelSpec::placeholder(), executor, "lfmgemv").expect("attach");
+    backend.reset().expect("reset");
+
+    let calls = mock.calls();
+    let methods: Vec<u32> = calls.iter().map(|call| call.method).collect();
+    assert_eq!(
+        methods,
+        vec![method_id::RESERVE_SCRATCH, method_id::RESET_STATE]
+    );
+    // flags = 0: scratch and counters.
+    assert_eq!(calls[1].prim_in, i32_bytes(&[0]));
+    // reset_state: method 23, one scalar in, no sequences.
+    assert_eq!(calls[1].scalars, 0x1701_0000);
 }

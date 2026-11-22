@@ -10,6 +10,8 @@
  *        FFN layer   : lfmgemv_ffn(...)        vs exec(FFN)
  *        attention   : lfmgemv_attn(...)       vs exec(ATTN)
  *        shortconv   : host ring model          vs exec(CONV)
+ *        conv counter: a3                       vs rt[rt_base]
+ *        kv page     : 12 load_buf              vs kv_write
  *        quantise    : host int64 formula      vs exec(QUANT)
  *   2. weight handles: 24 layers x 3 tensors = 72 simultaneously mapped views
  *      of ONE arena, each verified against the host int4 dot (raw int32 GEMV).
@@ -18,6 +20,8 @@
  *      ION.  Run (a) as one exec per token and (b) one exec per command
  *      (85 round trips).  Both must produce the same final int8 (0 mismatch).
  *      Prints DSP microseconds, wall and calls per token for both.
+ *   4. reset_state(0) followed by one more token must reproduce the first
+ *      token of the run bit for bit (no CONV ring leaking across sequences).
  *
  * Run on device: ./exec_test [tokens]        (default 5 tokens, full graph)
  *                ./exec_test 5 small        (one shared FFN layer, ~130 MB)
@@ -471,13 +475,16 @@ int main(int argc, char **argv)
     int8_t *bcx = (int8_t *)malloc(3 * HID);
     int8_t *y_ref = (int8_t *)malloc(HID);
     int8_t *y_dev = (int8_t *)malloc(HID);
+    int8_t *first_out = (int8_t *)malloc(HID);
     int8_t *quant_dev = (int8_t *)malloc(HQ * HD);
     int8_t *quant_src = (int8_t *)malloc(HQ * HD * 4);
     uint32_t seed = 0x1234567u;
 
     if (!swbuf || !cwf || !act || !dst_ref || !out_all || !out_one || !out_exec ||
         !tbl || !attn_ref || !attn_dev || !q || !bcx || !y_ref || !y_dev ||
-        !quant_dev || !quant_src) { printf("host alloc failed\n"); return 1; }
+        !first_out || !quant_dev || !quant_src) {
+        printf("host alloc failed\n"); return 1;
+    }
 
     /* ---------- 1. lay out and fill the model arena (before mapping) -------- */
     for (l = 0; l < n_ffn_layers; l++)
@@ -769,6 +776,115 @@ int main(int argc, char **argv)
             printf("bit-exact CONV: ring model vs exec mismatches=%d/%d dsp=%d us\n",
                    bad, HID, times[0]);
             failures += bad != 0;
+
+            /* Same list, but the token counter comes from rt[] (a3 = 0,
+               rt_base = 0). Slot 14 has a fresh ring, like slot 15 above. */
+            {
+                list_t conv_rt;
+                static uint8_t cb_rt[512];
+                int32_t rt_conv[1] = { 100 };
+                memset(cb_rt, 0, sizeof(cb_rt));
+                list_init(cb_rt, 0, 1, &conv_rt);
+                conv_rt.cmd[0] = one_conv.cmd[0];
+                conv_rt.cmd[0].a3 = 0;
+                conv_rt.cmd[0].rt_base = 0;
+                ionbuf_t cl;
+                int ah2 = -1;
+                if (ion_alloc(&cl, 512) == 0) {
+                    memcpy(cl.p, cb_rt, 512);
+                    if ((rc = lfmgemv_map_arena(cl.fd, cl.bytes, &ah2)) == 0)
+                        rc = exec_list(ah2, 0, &conv_rt, bcx, 3 * HID, rt_conv, 1,
+                                       (unsigned char *)y_dev, HID, times);
+                    if (rc == 0) {
+                        bad = 0;
+                        for (i = 0; i < HID; i++) if (y_ref[i] != y_dev[i]) bad++;
+                        printf("bit-exact CONV: counter via rt mismatches=%d/%d\n",
+                               bad, HID);
+                        failures += bad != 0;
+                    } else {
+                        printf("conv rt rc=%d (skipped)\n", rc);
+                        failures += 1;
+                    }
+                    if (ah2 >= 0) lfmgemv_unmap_arena(ah2);
+                    ion_free(&cl);
+                }
+            }
+        }
+
+        /* ---------- 6b. bit-exact: kv_write vs 12 load_buf ---------- */
+        {
+            enum { KVH = 4, KV_SLOTS = 8, KV_ROW = 128 };
+            const int k_head = 64, kt_head = 4, v_head = 128;
+            int hk1 = -1, hkt1 = -1, hv1 = -1, hk2 = -1, hkt2 = -1, hv2 = -1;
+            uint8_t *k_full = (uint8_t *)calloc(1, (size_t)KVH * KV_SLOTS * KV_ROW);
+            uint8_t *kt_full = (uint8_t *)calloc(1, (size_t)KVH * KV_SLOTS * 4);
+            uint8_t *v_full = (uint8_t *)calloc(1, (size_t)KVH * KV_SLOTS * KV_ROW);
+            uint8_t *k_rows = (uint8_t *)malloc((size_t)KVH * k_head);
+            uint8_t *kt_rows = (uint8_t *)malloc((size_t)KVH * kt_head);
+            uint8_t *v_rows = (uint8_t *)malloc((size_t)KVH * v_head);
+            int32_t tbl1[1] = { 0 };
+            int32_t *attn1 = (int32_t *)malloc((size_t)HQ * HD * 4);
+            int32_t *attn2 = (int32_t *)malloc((size_t)HQ * HD * 4);
+            int h;
+            rc = 0;
+            if (!k_full || !kt_full || !v_full || !k_rows || !kt_rows || !v_rows ||
+                !attn1 || !attn2) {
+                printf("kv_write test alloc failed\n"); return 1;
+            }
+            for (i = 0; i < KVH * k_head; i++) k_rows[i] = (uint8_t)(0x10 + i);
+            for (i = 0; i < KVH * kt_head; i++) kt_rows[i] = (uint8_t)(0x40 + i);
+            for (i = 0; i < KVH * v_head; i++) v_rows[i] = (uint8_t)((i * 7) & 0x7f);
+            if ((rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * KV_ROW), &hk1)) == 0 &&
+                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * 4), &hkt1)) == 0 &&
+                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * KV_ROW), &hv1)) == 0 &&
+                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * KV_ROW), &hk2)) == 0 &&
+                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * 4), &hkt2)) == 0 &&
+                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * KV_ROW), &hv2)) == 0) {
+                int kb = (int)(KVH * KV_SLOTS * KV_ROW);
+                int ktb = (int)(KVH * KV_SLOTS * 4);
+                rc = lfmgemv_load_buf(hk1, 0, k_full, kb);
+                if (!rc) rc = lfmgemv_load_buf(hkt1, 0, kt_full, ktb);
+                if (!rc) rc = lfmgemv_load_buf(hv1, 0, v_full, kb);
+                if (!rc) rc = lfmgemv_load_buf(hk2, 0, k_full, kb);
+                if (!rc) rc = lfmgemv_load_buf(hkt2, 0, kt_full, ktb);
+                if (!rc) rc = lfmgemv_load_buf(hv2, 0, v_full, kb);
+                for (h = 0; h < KVH && !rc; h++) {
+                    int row = h * KV_SLOTS + 3;
+                    rc = lfmgemv_load_buf(hk1, row * KV_ROW, k_rows + h * k_head, k_head);
+                    if (!rc) rc = lfmgemv_load_buf(hkt1, row * 4, kt_rows + h * kt_head, kt_head);
+                    if (!rc) rc = lfmgemv_load_buf(hv1, row * KV_ROW, v_rows + h * v_head, v_head);
+                }
+                if (!rc)
+                    rc = lfmgemv_kv_write(hk2, hkt2, hv2, KV_SLOTS, 3, k_rows,
+                                          KVH * k_head, kt_rows, KVH * kt_head,
+                                          v_rows, KVH * v_head);
+                if (!rc)
+                    rc = lfmgemv_attn(hk1, hkt1, hv1, 0, (const unsigned char *)q, HQ * HD,
+                                      tbl1, 1, 3, 4, 0, 1, (unsigned char *)attn1,
+                                      HQ * HD * 4, times, 8);
+                if (!rc)
+                    rc = lfmgemv_attn(hk2, hkt2, hv2, 0, (const unsigned char *)q, HQ * HD,
+                                      tbl1, 1, 3, 4, 0, 1, (unsigned char *)attn2,
+                                      HQ * HD * 4, times, 8);
+            }
+            if (rc == 0) {
+                bad = memcmp(attn1, attn2, (size_t)HQ * HD * 4) != 0;
+                printf("bit-exact KVWRT: load_buf vs kv_write mismatches=%d\n",
+                       bad ? 1 : 0);
+                failures += bad;
+            } else {
+                printf("kv_write rc=0x%x (skipped)\n", rc);
+                failures += 1;
+            }
+            if (hk1 >= 0) lfmgemv_release_buf(hk1);
+            if (hkt1 >= 0) lfmgemv_release_buf(hkt1);
+            if (hv1 >= 0) lfmgemv_release_buf(hv1);
+            if (hk2 >= 0) lfmgemv_release_buf(hk2);
+            if (hkt2 >= 0) lfmgemv_release_buf(hkt2);
+            if (hv2 >= 0) lfmgemv_release_buf(hv2);
+            free(k_full); free(kt_full); free(v_full);
+            free(k_rows); free(kt_rows); free(v_rows);
+            free(attn1); free(attn2);
         }
 
         /* ---------- 7. bit-exact: QUANT formula ---------- */
@@ -890,6 +1006,7 @@ int main(int argc, char **argv)
                 rc = exec_list(ah_cmd, OFF_ALL, &all, act, HID, rt, 4,
                                (unsigned char *)o, HID, times);
                 if (rc != 0) { printf("exec all rc=%d cmd=%d\n", rc, times[1]); return 10; }
+                if (t == 0) memcpy(first_out, o, HID);
                 if (t > 0) { dsp_all[n_all] = times[0]; wall_all[n_all] = now_us() - w0; n_all++; }
             }
             memcpy(out_all, out_exec, HID);
@@ -940,6 +1057,22 @@ int main(int argc, char **argv)
                        1e6 / wmin_a, 1e6 / wmin_o);
                 printf("  vs 54.3 ms report: %+6.1f %% (wall min)\n",
                        (wmin_a / 54300.0 - 1.0) * 100.0);
+            }
+
+            /* ---------- 10. reset_state returns a fresh sequence ---------- */
+            {
+                int8_t *after = out_one;
+                double w0;
+                rc = lfmgemv_reset_state(0);
+                if (rc != 0) { printf("reset_state rc=%d\n", rc); return 10; }
+                w0 = now_us();
+                rc = exec_list(ah_cmd, OFF_ALL, &all, act, HID, rt, 4,
+                               (unsigned char *)after, HID, times);
+                if (rc != 0) { printf("exec after reset rc=%d cmd=%d\n", rc, times[1]); return 10; }
+                bad = memcmp(first_out, after, HID) != 0;
+                printf("reset identity: after reset mismatches=%d/%d dsp=%d us wall=%.0f us\n",
+                       bad ? 1 : 0, HID, times[0], now_us() - w0);
+                failures += bad;
             }
         }
     }
