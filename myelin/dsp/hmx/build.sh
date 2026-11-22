@@ -37,7 +37,8 @@ INC="-I$S/incs -I$S/incs/stddef -I. \
 "$QAIC" -I$S/incs -I$S/incs/stddef mx4.idl
 
 # DSP-скелет. Исходники qhblas_hmx берутся прямо из SDK (ref/ не нужен).
-$CC -mv68 -mhmx -O2 -fPIC -shared -g -Wall $INC \
+# -mhvx нужен для HVX-копий VTCM (pref/bw) и для паковки.
+$CC -mv68 -mhmx -mhvx -mhvx-length=128b -O2 -fPIC -shared -g -Wall $INC \
     -o libmx4_skel.so mx4_skel.c mx4_impl.c \
     "$QH/qhblas_hmx_matrix_matrix_mpy_ahf.c" \
     "$QH/qhblas_hmx_matrix_matrix_mpy_hf_sm.S" \

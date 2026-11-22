@@ -1834,7 +1834,8 @@ static int do_i8(int N, int K, int lay, int wl, int art, int wc,
 }
 
 /* ---- int8 with M spatial rows (32/64) --------------------------------- */
-static int do_i8m(int M, int N, int K, int bs, int amax, int mode, int reps)
+static int do_i8m(int M, int N, int K, int bs, int amax, int mode, int reps,
+                  int mul, int npair)
 {
     static int8_t *A, *B;
     static unsigned char raw[4096];
@@ -1862,7 +1863,8 @@ static int do_i8m(int M, int N, int K, int bs, int amax, int mode, int reps)
                               : amax ? (int)(rnd() % (unsigned)(amax + 1)) : 0);
 
     rc = mx4_i8m((unsigned char *)A, M * K, (unsigned char *)B, K * N,
-                 M, N, K, 3, 3, 0x3FF, 1023, 0, 4, bs, mode, reps,
+                 M, N, K, 3, (N > 32 ? 4 : 3), 0x3FF, (N > 32 ? 2047 : 1023), 0,
+                 mul, npair, bs, mode, reps,
                  raw, 4096, info, 16);
     if (rc || info[0]) {
         printf("i8m M=%d N=%d K=%d rc=%d st=%d\n", M, N, K, rc, info[0]);
@@ -1870,15 +1872,17 @@ static int do_i8m(int M, int N, int K, int bs, int amax, int mode, int reps)
     }
     usrep = (double)info[1] / (double)reps;
     macs = (long long)M * N * K;
-    printf("i8m M=%d N=%d K=%d bs=%#x amax=%d reps=%d us/rep=%.3f pcyc/rep=%d "
-           "TMAC/s=%.3f\n", M, N, K, (unsigned)bs, amax, reps, usrep,
-           info[2], usrep > 0 ? macs / usrep * 1e-6 : 0.0);
+    printf("i8m M=%d N=%d K=%d mul=%d bs=%#x amax=%d reps=%d us/rep=%.3f "
+           "pcyc/rep=%d TMAC/s=%.3f\n", M, N, K, mul, (unsigned)bs, amax, reps,
+           usrep, info[2], usrep > 0 ? macs / usrep * 1e-6 : 0.0);
     for (c = 0; c < 2048; c++) if (raw[c]) nz++;
     printf("  tile: nz=%d/%d head:", nz, 2048);
     for (c = 0; c < 12; c++) printf(" %3d", raw[c]);
+    printf(" | s32 half:");
+    for (c = 1024; c < 1030; c++) printf(" %3d", raw[c]);
     printf("\n");
 
-    for (c = 3; c <= 3; c++) {
+    for (c = 3; c <= 6; c += 3) {
         mxerr = 0; dot = 0; na = 0; nb = 0; bad = 0; sat = 0;
         for (s = 0; s < M; s++)
             for (n = 0; n < N; n++) {
@@ -1899,6 +1903,174 @@ static int do_i8m(int M, int N, int K, int bs, int amax, int mode, int reps)
                mxerr, cosv, bad, M * N, sat,
                (bad == 0 && cosv > 0.9999) ? "   <== MATCH" : "");
     }
+    return 0;
+}
+
+/* one-hot activation probe: A[s0][k0]=1, B=1 everywhere -> which output rows
+ * consumed that activation byte? (a nonzero output row == the row that read it) */
+static int do_i8one(int s0, int k0, int K, int N, int bs, int mode, int reps)
+{
+    static int8_t *A, *B;
+    static unsigned char raw[4096];
+    int info[16], rc, s, n, k, i, hits = 0;
+
+    A = calloc(64 * 2048, 1);
+    B = malloc(64 * 2048);
+    if (!A || !B) { printf("alloc failed\n"); return 1; }
+    memset(B, 1, 64 * 2048);
+    A[s0 * K + k0] = 1;
+    rc = mx4_i8m((unsigned char *)A, 64 * K, (unsigned char *)B, K * N,
+                 64, N, K, 3, 3, 0x3FF, 1023, 0, 0, 0, bs, mode, reps,
+                 raw, 4096, info, 16);
+    if (rc || info[0]) { printf("i8one rc=%d st=%d\n", rc, info[0]); return 1; }
+    printf("i8one act(s=%d,k=%d) K=%d N=%d ->", s0, k0, K, N);
+    for (s = 0; s < 64; s++)
+        for (n = 0; n < N; n++)
+            if (raw[i8_off(3, s, n)]) {
+                if (hits < 8) printf(" (s=%d,n=%d)=%d", s, n, raw[i8_off(3, s, n)]);
+                hits++;
+            }
+    printf("  hits=%d\n", hits);
+    free(A); free(B);
+    return 0;
+}
+
+/* spatial identity ramp: A[s][k]=s (k independent), B[n][0]=1, B[n][k>0]=0.
+ * out[s][n] then equals the spatial row s' whose activation byte was read.
+ * A duplicate/aliased bank shows up as out[32+i] == i. */
+static int do_i8ramp(int K, int N, int bs, int mul, int npair, int reps)
+{
+    static int8_t *A, *B;
+    static unsigned char raw[4096];
+    int info[16], rc, s, n, bad = 0;
+
+    A = malloc(64 * 2048); B = calloc(64 * 2048, 1);
+    if (!A || !B) { printf("alloc failed\n"); return 1; }
+    for (s = 0; s < 64; s++)
+        for (int k = 0; k < K; k++) A[s * K + k] = (int8_t)(s + 1);
+    for (n = 0; n < N; n++) B[n * K] = 1;
+    rc = mx4_i8m((unsigned char *)A, 64 * K, (unsigned char *)B, K * N,
+                 64, N, K, 3, 3, 0x3FF, 1023, 0, mul, npair, bs, 0, reps,
+                 raw, 4096, info, 16);
+    if (rc || info[0]) { printf("i8ramp rc=%d st=%d\n", rc, info[0]); return 1; }
+    printf("i8ramp K=%d N=%d mul=%d np=%d -> out rows (should be s+1):\n   ", K, mul, npair);
+    for (s = 0; s < 64; s++) {
+        int v = raw[i8_off(3, s, 0)];
+        if (v != s + 1) bad++;
+        printf("%d%s", v, (s % 16 == 15) ? "\n   " : " ");
+    }
+    printf("\n   bad=%d/64\n", bad);
+    free(A); free(B);
+    return 0;
+}
+
+/* ---- batched prefill GEMM -------------------------------------------- */
+static int do_pref(int M, int N, int K, int mode, int reps)
+{
+    static int8_t *A, *B;
+    static unsigned char *C;
+    int info[16];
+    int rc, s, n, k, bad = 0, sat = 0;
+    double macs, us;
+    long long lmacs;
+
+    A = malloc((size_t)M * K);
+    B = malloc((size_t)N * K);
+    C = malloc((size_t)M * N);
+    if (!A || !B || !C) { printf("alloc failed\n"); return 1; }
+    for (s = 0; s < M; s++)
+        for (k = 0; k < K; k++) A[(size_t)s * K + k] = (int8_t)((rnd() % 8) == 0 ? 1 : 0);
+    for (n = 0; n < N; n++)
+        for (k = 0; k < K; k++) B[(size_t)n * K + k] = (int8_t)((int)(rnd() % 3) - 1);
+
+    rc = mx4_pref((unsigned char *)A, M * K, (unsigned char *)B, N * K,
+                  M, N, K, mode, reps, C, M * N, info, 16);
+    if (rc || info[0]) { printf("pref M=%d N=%d K=%d rc=%d st=%d\n", M, N, K, rc, info[0]); return 1; }
+    lmacs = (long long)M * N * K;
+    us = (double)info[1] / (double)reps;
+    printf("pref M=%d N=%d K=%d mode=%d reps=%d -> us/rep=%.1f pcyc/rep=%d "
+           "TMAC/s=%.2f  (ntiles=%d mtiles=%d ncr=%d vtcm=%d wgt=%d)\n",
+           M, N, K, mode, reps, us, info[2] / reps,
+           us > 0 ? lmacs / us * 1e-6 : 0.0, info[3], info[4], info[5],
+           info[10], info[11]);
+    printf("  copycheck(bad bytes in first staged tile)=%d\n", info[12]);
+    if (us > 0) printf("  per token: %.3f us -> %.1f tok/s (batch %d)\n",
+                       us / M, M * 1e6 / us, M);
+
+    if (mode & 8) {
+        long long cmacs = 0;
+        double dot = 0, na = 0, nb = 0, mx = 0;
+        for (s = 0; s < M; s++)
+            for (n = 0; n < N; n++) {
+                int ref = 0, got = C[(size_t)s * N + n], e;
+                for (k = 0; k < K; k++) ref += (int)A[(size_t)s * K + k] * (int)B[(size_t)n * K + k];
+                cmacs++;
+                if (ref > 255) { ref = 255; sat++; }
+                if (ref < 0) ref = 0;
+                e = got - ref; if (e < 0) e = -e;
+                if (e > mx) mx = (double)e;
+                if (e) { if (bad < 6) printf("  [bad s=%d n=%d got=%d ref=%d]%s", s, n, got, ref, (bad==5)?"\n":"  "); bad++; }
+                dot += (double)got * ref; na += (double)got * got; nb += (double)ref * ref;
+            }
+        printf("  check: cells=%lld maxerr=%.0f cos=%.7f bad=%d sat=%d%s\n",
+               cmacs, mx, (na > 0 && nb > 0) ? dot / sqrt(na * nb) : 0, bad, sat,
+               bad ? "" : "   <== MATCH");
+    }
+    free(A); free(B); free(C);
+    return 0;
+}
+
+/* ---- int4 weights (weight.n) ------------------------------------------ */
+static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int reps)
+{
+    static int8_t *A, *B;
+    static unsigned char raw[4096];
+    int info[16], rc, s, n, k, c, bad = 0, sat = 0, nz = 0;
+    double mx = 0, cos = 0, dot = 0, na = 0, nb = 0, us;
+
+    A = malloc(64 * 2048); B = malloc(32 * 2048);
+    if (!A || !B) { printf("alloc failed\n"); return 1; }
+    for (s = 0; s < 64; s++)
+        for (k = 0; k < K; k++)
+            A[s * K + k] = (int8_t)(amax == -1 ? 1
+                              : amax == -4 ? 1
+                              : amax ? (int)(rnd() % (unsigned)(amax + 1)) : 0);
+    for (n = 0; n < N; n++)
+        for (k = 0; k < K; k++) {
+            int v;
+            if (amax == -1 || amax == -4) v = 1;
+            else if (amax == -2) v = (int)(rnd() % 16) - 8;         /* -8..7 */
+            else if (amax == -3) v = ((int)(rnd() % 2) ? 7 : -7);   /* +-7 */
+            else v = (int)(rnd() % (unsigned)(amax + 1));
+            B[n * K + k] = (int8_t)v;
+        }
+    rc = mx4_i4((unsigned char *)A, 64 * K, (unsigned char *)B, N * K,
+                M, N, K, wl, 0x3FF, 0, bs, mode, reps, raw, 4096, info, 16);
+    if (rc || info[0]) { printf("i4 rc=%d st=%d\n", rc, info[0]); return 1; }
+    us = (double)info[1] / (double)reps;
+    printf("i4 M=%d N=%d K=%d wl=%d bs=%#x amax=%d mode=%d reps=%d us/rep=%.3f "
+           "pcyc=%d\n", M, N, K, wl, (unsigned)bs, amax, mode, reps, us, info[2]);
+    for (c = 0; c < 2048; c++) if (raw[c]) nz++;
+    printf("  tile nz=%d head:", nz);
+    for (c = 0; c < 12; c++) printf(" %3d", raw[c]);
+    printf("\\n");
+    bad = 0; sat = 0;
+    for (s = 0; s < 32; s++)
+        for (n = 0; n < N; n++) {
+            int ref = 0, got, e;
+            for (k = 0; k < K; k++) ref += (int)A[s * K + k] * (int)B[n * K + k];
+            got = raw[(s >> 2) * 128 + 4 * n + (s & 3)];
+            if (ref > 255) { ref = 255; sat++; }
+            if (ref < 0) ref = 0;
+            e = got - ref; if (e < 0) e = -e;
+            if ((double)e > mx) mx = (double)e;
+            if (e) bad++;
+            dot += (double)got * ref; na += (double)got * got; nb += (double)ref * ref;
+        }
+    cos = (na > 0 && nb > 0) ? dot / sqrt(na * nb) : 0;
+    printf("  check maxerr=%.0f cos=%.7f bad=%d/%d sat=%d%s\n", mx, cos, bad,
+           32 * N, sat, (bad == 0 && cos > 0.9999) ? "   <== MATCH" : "");
+    free(A); free(B);
     return 0;
 }
 
@@ -2387,8 +2559,52 @@ int main(int argc, char **argv)
         int amax = argc > 6 ? atoi(argv[6]) : 0;
         int mode = argc > 7 ? (int)strtol(argv[7], 0, 0) : 0;
         int reps = argc > 8 ? atoi(argv[8]) : 100;
-        return do_i8m(M, N, K, bs, amax, mode, reps);
+        int mul = argc > 9 ? atoi(argv[9]) : 4;
+        int npair = argc > 10 ? atoi(argv[10]) : 0;
+        return do_i8m(M, N, K, bs, amax, mode, reps, mul, npair);
     }
+    if (!strcmp(cmd, "i8one"))
+        return do_i8one(argc > 2 ? atoi(argv[2]) : 0,
+                        argc > 3 ? atoi(argv[3]) : 0,
+                        argc > 4 ? atoi(argv[4]) : 32,
+                        argc > 5 ? atoi(argv[5]) : 32,
+                        argc > 6 ? (int)strtol(argv[6], 0, 0) : 0x6000,
+                        argc > 7 ? (int)strtol(argv[7], 0, 0) : 0,
+                        argc > 8 ? atoi(argv[8]) : 20);
+    if (!strcmp(cmd, "i8ramp"))
+        return do_i8ramp(argc > 2 ? atoi(argv[2]) : 32,
+                         argc > 3 ? atoi(argv[3]) : 32,
+                         argc > 4 ? (int)strtol(argv[4], 0, 0) : 0x6000,
+                         argc > 5 ? atoi(argv[5]) : 0,
+                         argc > 6 ? atoi(argv[6]) : 0,
+                         argc > 7 ? atoi(argv[7]) : 20);
+    if (!strcmp(cmd, "pref"))
+        return do_pref(argc > 2 ? atoi(argv[2]) : 128,
+                       argc > 3 ? atoi(argv[3]) : 128,
+                       argc > 4 ? atoi(argv[4]) : 64,
+                       argc > 5 ? atoi(argv[5]) : 0,
+                       argc > 6 ? atoi(argv[6]) : 1);
+    if (!strcmp(cmd, "bw")) {
+        int r8[8];
+        int mb = argc > 2 ? atoi(argv[2]) : 16;
+        int md = argc > 3 ? atoi(argv[3]) : 0;
+        int rp = argc > 4 ? atoi(argv[4]) : 3;
+        int rc = mx4_bw(mb, md, rp, r8, 8);
+        printf("bw %d MB mode=%d reps=%d rc=%d st=%d us=%u bytes=%u pcyc=%u "
+               "-> %.2f GB/s (align=%d)\n", mb, md, rp, rc, r8[0],
+               (unsigned)r8[1], (unsigned)r8[2], (unsigned)r8[3],
+               (double)r8[2] / (r8[1] ? r8[1] * 1e3 : 1.0), r8[5]);
+        return 0;
+    }
+    if (!strcmp(cmd, "i4"))
+        return do_i4(argc > 2 ? atoi(argv[2]) : 32,
+                     argc > 3 ? atoi(argv[3]) : 32,
+                     argc > 4 ? atoi(argv[4]) : 32,
+                     argc > 5 ? atoi(argv[5]) : 0,
+                     argc > 6 ? (int)strtol(argv[6], 0, 0) : 0x6000,
+                     argc > 7 ? atoi(argv[7]) : 1,
+                     argc > 8 ? atoi(argv[8]) : 0,
+                     argc > 9 ? atoi(argv[9]) : 100);
     if (!strcmp(cmd, "clk")) {
         int r[4];
         int rc = mx4_clk(r, 4);

@@ -1475,6 +1475,8 @@ int mx4_gemm(const unsigned char *A, int ALen,
 
 #include "qurt_hmx.h"
 #include "qurt_hvx.h"
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
 
 int32_t qhblas_hmx_transfer_row_ahf(__fp16 *input_mtx, uint8_t *vtcm_addr, uint32_t K);
 int32_t qhblas_hmx_transfer_column_ahf(__fp16 *input_mtx, uint8_t *vtcm_addr,
@@ -1801,11 +1803,11 @@ int mx4_i8(const unsigned char *Adata, int ALen,
 int mx4_i8m(const unsigned char *Adata, int ALen,
             const unsigned char *Bdata, int BLen,
             int M, int N, int K, int lay, int wl, int art, int wc, int srt,
-            int mul, int bscale, int mode, int reps,
+            int mul, int npair, int bscale, int mode, int reps,
             unsigned char *raw, int rawLen, int *info, int infoLen)
 {
     return i8_core((const int8_t *)Adata, ALen, (const int8_t *)Bdata, BLen,
-                   M, N, K, lay, wl, art, wc, srt, mul, 0, bscale, mode,
+                   M, N, K, lay, wl, art, wc, srt, mul, npair, bscale, mode,
                    reps, raw, rawLen, info, infoLen);
 }
 
@@ -1836,13 +1838,15 @@ static int i8_core(const int8_t *A, int ALen, const int8_t *B, int BLen,
     aregion = 2048u * (unsigned)ncr;
     wstep   = (N > 32 || wl == 4) ? 2048u : 1024u;
     wregion = wstep * (unsigned)ncr;
-    need = aregion + wregion + 4096u + 512u + 2048u;
+    need = align_up(aregion + wregion, 2048u) + 4096u + 512u + 2048u;
     rc = res_get(need, &r);
     info[0] = rc;
     if (rc) return 0;
+    /* HMX store/load addresses are 2 KB granular (Rs[31:11]); a 1 KB-offset
+     * output pointer silently writes only the first KB (= 32 spatial rows). */
     vact = r.base;
     vwgt = vact + aregion;
-    vout = vwgt + wregion;
+    vout = vact + align_up(aregion + wregion, 2048u);
     vbias = vout + 4096u;
     memset(r.base, 0, need);
     info[10] = (int)r.size;
@@ -1935,6 +1939,485 @@ static int i8_core(const int8_t *A, int ALen, const int8_t *B, int BLen,
     info[1] = (int)(t1 - t0);   /* total over all reps, us */
     info[2] = (int)((c1 - c0) / (uint64_t)reps);
     for (i = 0; i < (rawLen >= 4096 ? 4096 : 2048); i++) raw[i] = vout[i];
+    res_put(&r);
+    info[0] = 0;
+    return 0;
+}
+
+
+/* ================================================================== */
+/* prefill / batched int8 GEMM with real VTCM staging                  */
+/* ================================================================== */
+/* Shapes: N is a multiple of 64, K a multiple of 32, M any (padded to 64
+ * spatial rows per tile).  Every HMX operand lives in VTCM, so a real FFN
+ * layer must stream the weights DDR -> VTCM; mode bit0 selects that path.
+ *
+ *   mode bit0 : stage the weights from DDR for every N tile (honest cost)
+ *        bit1 : skip the HMX instruction stream (staging only)
+ *        bit2 : keep HMX power / locks across reps (timing isolation)
+ *        bit3 : collect C (slow scalar unpack, correctness runs only) */
+
+#define PREF_MAXK 2048
+
+static inline void i8_mul_wdeep(const void *act, uint32_t art,
+                                const void *wgt, uint32_t wc)
+{
+    __asm__ __volatile__(
+        "{\n\t activation.ub = mxmem(%0,%1)\n\t weight.b = mxmem(%2,%3):deep\n\t}"
+        :: "r"((uint32_t)(uintptr_t)act), "r"(art),
+           "r"((uint32_t)(uintptr_t)wgt), "r"(wc) : "memory");
+}
+
+/* DDR -> VTCM copy: 2048 B = 16 x 128 B HVX vectors */
+static inline void copy_v128(void *dst, const void *src)
+{
+    int i;
+    const uint8_t *s = (const uint8_t *)src;
+    uint8_t *d = (uint8_t *)dst;
+    for (i = 0; i < 2048; i += 128) {
+        HVX_Vector v = *(const HVX_Vector *)(s + i);
+        *(HVX_Vector *)(d + i) = v;
+    }
+}
+
+/* whole 2 KB crouton, N loads in flight then N stores (U-way unroll).
+ * The plain `*d++ = *s++` loop serialises load/store (store-load aliasing),
+ * which caps the copy at ~2 GB/s (one 128 B load per DDR latency). */
+static inline void copy_v2048(void *dst, const void *src)
+{
+    const HVX_Vector *s = (const HVX_Vector *)src;
+    HVX_Vector *d = (HVX_Vector *)dst;
+    int i;
+    for (i = 0; i < 16; i++) d[i] = s[i];
+}
+
+static void copy_mem(void *dst, const void *src)
+{
+    memcpy(dst, src, 2048);
+}
+
+/* 2048 B with 64-bit scalar transfers */
+static void copy64(void *dst, const void *src)
+{
+    const uint64_t *s = (const uint64_t *)src;
+    uint64_t *d = (uint64_t *)dst;
+    uint64_t v0, v1, v2, v3;
+    int i;
+    for (i = 0; i < 256; i += 4) {
+        v0 = s[i]; v1 = s[i + 1]; v2 = s[i + 2]; v3 = s[i + 3];
+        d[i] = v0; d[i + 1] = v1; d[i + 2] = v2; d[i + 3] = v3;
+    }
+}
+
+static void pref_pack_act(uint8_t *dst, const int8_t *A, int M, int K, int ncr)
+{
+    int g, c;
+    for (g = 0; g < M; g++)
+        for (c = 0; c < K; c++)
+            dst[(unsigned)(g >> 6) * (unsigned)ncr * 2048u
+                + 2048u * (unsigned)(c >> 5)
+                + 128u * (unsigned)((g & 63) >> 2)
+                + 4u * (unsigned)(c & 31) + (unsigned)(g & 3)] =
+                (uint8_t)A[(size_t)g * K + c];
+}
+
+/* weight K x N, wl=4 style: one 2 KB crouton per 32 K x 64 N tile */
+static void pref_pack_wgt(uint8_t *dst, const int8_t *B, int N, int K, int ncr)
+{
+    int k, n, nt;
+    for (nt = 0; nt < N / 64; nt++)
+        for (k = 0; k < K; k++)
+            for (n = 0; n < 64; n++)
+                dst[(unsigned)nt * (unsigned)ncr * 2048u
+                    + 2048u * (unsigned)(k >> 5) + 1024u * (unsigned)(n >> 5)
+                    + 128u * (unsigned)((k & 31) >> 2)
+                    + 4u * (unsigned)(n & 31) + (unsigned)(k & 3)] =
+                    (uint8_t)B[(size_t)(nt * 64 + n) * K + k];
+}
+
+static void pref_unpack(const uint8_t *tile, uint8_t *C, int ldc, int s0, int n0,
+                        int rows, int cols)
+{
+    int s, n;
+    for (s = 0; s < rows; s++)
+        for (n = 0; n < cols; n++)
+            C[(size_t)(s0 + s) * ldc + n0 + n] =
+                tile[(unsigned)(s >> 2) * 128u + 4u * (unsigned)n + (unsigned)(s & 3)];
+}
+
+int mx4_pref(const unsigned char *Adata, int ALen,
+             const unsigned char *Bdata, int BLen,
+             int M, int N, int K, int mode, int reps,
+             unsigned char *Cdata, int CLen, int *info, int infoLen)
+{
+    res_t r;
+    uint8_t *vact, *vwgt, *vout, *vbias, *wpack = 0, *dscratch = 0;
+    const int8_t *A = (const int8_t *)Adata;
+    const int8_t *B = (const int8_t *)Bdata;
+    int ncr, mt, nt, rc, i, rep, k, m, c, ch;
+    unsigned aregion, wregion, need;
+    uint64_t t0, t1, c0, c1;
+    uint32_t art, wc;
+
+    if (infoLen < 14) return -1;
+    memset(info, 0, sizeof(int) * infoLen);
+    if (K < 32 || K > PREF_MAXK || (K & 31)) return -2;
+    if (N < 64 || (N & 63)) return -3;
+    if (M < 1 || M > 512) return -4;
+    if (ALen < M * K) return -5;
+    if (BLen < N * K) return -6;
+    if (reps < 1 || reps > 100) reps = 1;
+
+    ncr = K / 32;
+    mt  = (M + 63) / 64;
+    nt  = N / 64;
+
+    aregion = 2048u * (unsigned)ncr * (unsigned)mt;
+    wregion = 2048u * (unsigned)ncr;          /* one N tile of 64 channels */
+    need = aregion + wregion + 4096u + 512u + 2048u + 2048u;
+    rc = res_get(need, &r);
+    info[0] = rc;
+    if (rc) return 0;
+    info[10] = (int)r.size;
+
+    vact  = r.base;
+    vwgt  = vact + aregion;
+    vout  = vwgt + align_up(wregion, 2048u);
+    vbias = vout + 4096u;
+    memset(r.base, 0, need);
+
+    t0 = HAP_perf_get_time_us();
+    pref_pack_act(vact, A, M, K, ncr);
+    /* all N tiles packed into DDR once: the staged variant streams from here */
+    wpack = (uint8_t *)memalign(128, (size_t)nt * (size_t)ncr * 2048u + 128u);
+    if (!wpack) { res_put(&r); info[0] = -7; return 0; }
+    if (mode & 64) {   /* staging destination = DDR, to separate DDR vs VTCM cost */
+        dscratch = (uint8_t *)memalign(128, wregion + 128u);
+        if (!dscratch) { free(wpack); res_put(&r); info[0] = -8; return 0; }
+    }
+    pref_pack_wgt(wpack, B, N, K, ncr);
+    memcpy(vwgt, wpack, wregion);              /* resident set = first N tile */
+    info[13] = (int)(HAP_perf_get_time_us() - t0);   /* layout transform, us */
+    {
+        uint32_t *bl = (uint32_t *)vbias;
+        for (i = 0; i < 128; i++) bl[i] = 0;
+        /* scale 0x6000 (= 512.0) is the int8 identity: the converter carries
+         * an implicit 1/512.  Low words of both channel groups. */
+        for (i = 0; i < 32; i++) { bl[i] = 0x6000u; bl[64 + i] = 0x6000u; }
+    }
+
+    if (!(mode & 4)) info[8] = qurt_hvx_lock(QURT_HVX_MODE_128B);
+    if (!(mode & 4)) info[6] = hmx_power(1);
+    if (!(mode & 4)) info[7] = compute_resource_hmx_lock ? compute_resource_hmx_lock(r.ctx) : -100;
+
+    t0 = HAP_perf_get_time_us();
+    c0 = HAP_perf_get_pcycles();
+    for (rep = 0; rep < reps; rep++) {
+        hmx_clr();
+        for (i = 0; i < nt; i++) {
+            if (mode & 1) {
+                const uint8_t *wsrc = ((mode & 512) ? (const uint8_t *)Bdata
+                                                    : wpack)
+                                      + (size_t)i * (size_t)ncr * 2048u;
+                uint8_t *wdst = dscratch ? dscratch : vwgt;
+                if (mode & 32) {           /* diagnostics: libc block memcpy */
+                    memcpy(wdst, wsrc, wregion);
+                } else if (mode & 128) {   /* diagnostics: 64-bit scalar */
+                    for (k = 0; k < ncr; k++)
+                        copy64(wdst + (unsigned)k * 2048u,
+                               wsrc + (size_t)k * 2048u);
+                } else {                   /* per-crouton HVX copy */
+                    for (k = 0; k < ncr; k++)
+                        copy_v2048(wdst + (unsigned)k * 2048u,
+                                   wsrc + (size_t)k * 2048u);
+                }
+                /* make the VTCM writes visible to the HMX agent */
+                __asm__ __volatile__("syncht" ::: "memory");
+                __asm__ __volatile__("barrier" ::: "memory");
+                if (i == 0) {   /* copy sanity: byte compare VTCM vs DDR source */
+                    int j, bad = 0;
+                    for (j = 0; j < (int)wregion; j++)
+                        if (vwgt[j] != wsrc[j]) bad++;
+                    info[12] = bad;
+                }
+            }
+            if (mode & 2) continue;
+            for (m = 0; m < mt; m++) {
+                if (mode & 16) {
+                    /* one :deep activation load per 32 K croutons */
+                    for (c = 0; c < ncr; c += 32) {
+                        ch = (ncr - c) > 32 ? 32 : (ncr - c);
+                        art = ((uint32_t)(ch - 1) << 11) | 0x3FFu;
+                        wc  = (uint32_t)ch * 2048u - 1u;
+                        i8_mul_deepact(vact + (unsigned)m * (unsigned)ncr * 2048u
+                                       + (unsigned)c * 2048u, art,
+                                       vwgt + (unsigned)c * 2048u, wc);
+                    }
+                } else {
+                    /* verified N=64 recipe: one pair per K crouton, :deep on
+                     * the weight so the acc defers until the store */
+                    for (c = 0; c < ncr; c++)
+                        i8_mul_wdeep(vact + (unsigned)m * (unsigned)ncr * 2048u
+                                     + (unsigned)c * 2048u, 0x3FFu,
+                                     vwgt + (unsigned)c * 2048u, 2047u);
+                }
+                hmx_bias(vbias);
+                i8_store(vout, 0, 0);
+                hmx_bias(vbias + 256);
+                i8_store(vout + 2048, 0, 0);
+                if (mode & 8) {
+                    int rows = (M - m * 64) < 64 ? (M - m * 64) : 64;
+                    pref_unpack(vout, Cdata, N, m * 64, i * 64, rows, 32);
+                    pref_unpack(vout + 2048, Cdata, N, m * 64, i * 64 + 32, rows, 32);
+                }
+            }
+        }
+    }
+    hmx_sync();
+    c1 = HAP_perf_get_pcycles();
+    t1 = HAP_perf_get_time_us();
+    info[1] = (int)(t1 - t0);
+    info[2] = (int)(c1 - c0);
+    info[3] = nt;
+    info[4] = mt;
+    info[5] = ncr;
+    info[9] = mode;
+    info[11] = (int)((unsigned long long)nt * (unsigned)ncr * 2048u);
+    info[12] = 0;
+    info[13] = 0;
+
+    if (!(mode & 4)) {
+        if (compute_resource_hmx_unlock) compute_resource_hmx_unlock(r.ctx);
+        hmx_power(0);
+        qurt_hvx_unlock();
+    }
+    free(dscratch);
+    free(wpack);
+    res_put(&r);
+    info[0] = 0;
+    return 0;
+}
+
+
+/* DDR / VTCM copy bandwidth probe.
+ *   mode 0 : HVX read-sum of a DDR buffer            (read only)
+ *   mode 1 : HVX read from DDR, store to DDR buffer  (read+write)
+ *   mode 2 : HVX read from DDR, store to VTCM        (staging path)
+ * r = {status, us, bytes, pcyc, GB/s*100, align_ddr, 0, 0} */
+int mx4_bw(int mb, int mode, int reps, int *r, int rLen)
+{
+    res_t res;
+    uint8_t *src, *dst;
+    unsigned bytes = (unsigned)mb << 20;
+    unsigned i, n = bytes / 128u;
+    int rc, rep;
+    uint64_t t0, t1, c0, c1;
+    HVX_Vector acc;
+    int hvx;
+
+    if (rLen < 8) return -1;
+    memset(r, 0, sizeof(int) * rLen);
+    if (mb < 1 || mb > 64 || reps < 1 || reps > 100) return -2;
+
+    src = (uint8_t *)memalign(128, bytes);
+    dst = (uint8_t *)memalign(128, 1u << 20);
+    if (!src || !dst) { r[0] = -3; return 0; }
+    memset(src, 1, bytes);
+    memset(dst, 0, 1u << 20);
+    r[5] = (int)(((uintptr_t)src) & 127);
+
+    rc = res_get(1u << 20, &res);
+    r[0] = rc;
+    if (rc) { free(src); free(dst); return 0; }
+
+    hvx = qurt_hvx_lock(QURT_HVX_MODE_128B);
+    if (hvx) { r[0] = -4; res_put(&res); free(src); free(dst); return 0; }
+
+    acc = Q6_V_vzero();
+    t0 = HAP_perf_get_time_us();
+    c0 = HAP_perf_get_pcycles();
+    for (rep = 0; rep < reps; rep++) {
+        if (mode == 0) {
+            const HVX_Vector *p = (const HVX_Vector *)src;
+            HVX_Vector a1 = Q6_V_vzero(), a2 = Q6_V_vzero(), a3 = Q6_V_vzero();
+            for (i = 0; i < n; i += 4) {
+                acc = Q6_Vw_vadd_VwVw(acc, p[i]);
+                a1  = Q6_Vw_vadd_VwVw(a1,  p[i + 1]);
+                a2  = Q6_Vw_vadd_VwVw(a2,  p[i + 2]);
+                a3  = Q6_Vw_vadd_VwVw(a3,  p[i + 3]);
+            }
+            acc = Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(acc, a1),
+                                  Q6_Vw_vadd_VwVw(a2, a3));
+        } else if (mode == 1) {
+            const HVX_Vector *p = (const HVX_Vector *)src;
+            HVX_Vector *q = (HVX_Vector *)dst;
+            unsigned m = (1u << 20) / 128u;
+            unsigned j = 0;
+            for (i = 0; i < n; i++) { q[j] = p[i]; if (++j == m) j = 0; }
+        } else {
+            const HVX_Vector *p = (const HVX_Vector *)src;
+            HVX_Vector *q = (HVX_Vector *)res.base;
+            unsigned m = (1u << 20) / 128u;
+            unsigned j = 0;
+            for (i = 0; i < n; i++) { q[j] = p[i]; if (++j == m) j = 0; }
+        }
+    }
+    c1 = HAP_perf_get_pcycles();
+    t1 = HAP_perf_get_time_us();
+    ((HVX_Vector *)dst)[0] = acc;
+    r[1] = (int)(t1 - t0);
+    r[2] = (int)bytes * reps;
+    r[3] = (int)(c1 - c0);
+    r[4] = (t1 > t0) ? (int)((double)bytes * reps / (double)(t1 - t0) * 100.0 / 1000.0) : 0;
+    r[6] = 0;
+    r[7] = 0;
+
+    qurt_hvx_unlock();
+    res_put(&res);
+    free(src);
+    free(dst);
+    return 0;
+}
+
+
+/* ================================================================== */
+/* int4 weights: weight.n = mxmem(w, 512-1)                            */
+/* ================================================================== */
+/* 4-bit tile: 32 K x 32 N = 512 B.  The nibble address is a halved
+ * int8 crouton; `wl` selects the candidate permutation. */
+static void i4_pack_wgt(uint8_t *dst, const int8_t *B, int N, int K, int wl)
+{
+    int k, n, ncr = (K + 31) / 32;
+    memset(dst, 0, (size_t)512 * (size_t)ncr);
+    for (k = 0; k < K; k++)
+        for (n = 0; n < N; n++) {
+            unsigned g = ((unsigned)k & 31u) >> 2, byte, nib;
+            int odd = k & 1;
+            switch (wl & 3) {
+            case 0: byte = 64u * g + 2u * (unsigned)n + (((unsigned)k & 3u) >> 1);
+                    nib = (unsigned)(odd == 0); break;
+            case 1: byte = 64u * g + 2u * (unsigned)n + (((unsigned)k & 3u) >> 1);
+                    nib = (unsigned)(odd != 0); break;
+            case 2: byte = 64u * g + (unsigned)n + 32u * (((unsigned)k & 3u) >> 1);
+                    nib = (unsigned)(odd == 0); break;
+            default: byte = 64u * g + (unsigned)n + 32u * (((unsigned)k & 3u) >> 1);
+                    nib = (unsigned)(odd != 0); break;
+            }
+            byte += 512u * ((unsigned)k >> 5);
+            if (nib)
+                dst[byte] = (uint8_t)((dst[byte] & 0x0Fu) | ((B[n * K + k] & 0x0F) << 4));
+            else
+                dst[byte] = (uint8_t)((dst[byte] & 0xF0u) | (B[n * K + k] & 0x0F));
+        }
+}
+
+static inline void i4_mul(const void *act, uint32_t art,
+                          const void *wgt, uint32_t wc, int deep)
+{
+    if (deep)
+        __asm__ __volatile__(
+            "{\n\t activation.ub = mxmem(%0,%1):deep\n\t weight.n = mxmem(%2,%3)\n\t}"
+            :: "r"((uint32_t)(uintptr_t)act), "r"(art),
+               "r"((uint32_t)(uintptr_t)wgt), "r"(wc) : "memory");
+    else
+        __asm__ __volatile__(
+            "{\n\t activation.ub = mxmem(%0,%1)\n\t weight.n = mxmem(%2,%3)\n\t}"
+            :: "r"((uint32_t)(uintptr_t)act), "r"(art),
+               "r"((uint32_t)(uintptr_t)wgt), "r"(wc) : "memory");
+}
+
+/* A: M x K uint8 row major, B: N x K int8 row major with values in [-8,7].
+ *   wl  : nibble permutation candidate 0..3
+ *   bs  : bias/scale low word (0x6000 = int8 identity)
+ *   mode bit0: :deep on the activation (chunked), bit1: skip power/lock
+ *              bit2: no bias load, bit3: M=64 spatial
+ *   raw = 2 KB output tile, info = {status, us, pcyc, ncr, art, wc, 0,0,0,0,
+ *   vtcm, bs, wl, 0} */
+int mx4_i4(const unsigned char *Adata, int ALen,
+           const unsigned char *Bdata, int BLen,
+           int M, int N, int K, int wl, int art, int wc, int bs,
+           int mode, int reps, unsigned char *raw, int rawLen,
+           int *info, int infoLen)
+{
+    res_t r;
+    uint8_t *vact, *vwgt, *vout, *vbias;
+    const int8_t *A = (const int8_t *)Adata;
+    const int8_t *B = (const int8_t *)Bdata;
+    int ncr = (K + 31) / 32, rc, i, rep, c, ch;
+    unsigned aregion, wregion, need;
+    uint64_t t0, t1, c0, c1;
+    int hvx_ok = 0;
+
+    if (infoLen < 14) return -1;
+    memset(info, 0, sizeof(int) * infoLen);
+    if (K < 32 || K > 2048 || (K & 31)) return -2;
+    if (N < 1 || N > 32) return -3;
+    if (M < 1 || M > 64) return -3;
+    if (ALen < M * K || BLen < N * K) return -4;
+    if (rawLen < 2048) return -5;
+    if (reps < 1 || reps > 20000) reps = 1;
+    if (wc <= 0) wc = 512 * ncr - 1;
+    M = (mode & 8) ? 64 : 32;
+
+    aregion = 2048u * (unsigned)ncr;
+    wregion = 512u * (unsigned)ncr;
+    need = aregion + align_up(wregion, 2048u) + 4096u + 512u + 2048u;
+    rc = res_get(need, &r);
+    info[0] = rc;
+    if (rc) return 0;
+    info[10] = (int)r.size;
+    vact = r.base;
+    vwgt = vact + aregion;
+    vout = vact + align_up(aregion + wregion, 2048u);
+    vbias = vout + 4096u;
+    memset(r.base, 0, need);
+    i8_pack_act(vact, A, K, 3, M);
+    i4_pack_wgt(vwgt, B, N, K, wl);
+    if (bs) {
+        uint32_t *bl = (uint32_t *)vbias;
+        for (i = 0; i < 128; i++) bl[i] = 0;
+        for (i = 0; i < 32; i++) { bl[i] = (uint32_t)bs; bl[64 + i] = (uint32_t)bs; }
+    }
+
+    info[3] = ncr; info[4] = art; info[5] = wc;
+    info[11] = bs; info[12] = wl;
+    if (!(mode & 2)) {
+        info[8] = qurt_hvx_lock(QURT_HVX_MODE_128B);
+        hvx_ok = (info[8] == 0);
+        info[6] = hmx_power(1);
+        info[7] = compute_resource_hmx_lock ? compute_resource_hmx_lock(r.ctx) : -100;
+    }
+    t0 = HAP_perf_get_time_us();
+    c0 = HAP_perf_get_pcycles();
+    for (rep = 0; rep < reps; rep++) {
+        hmx_clr();
+        if (mode & 1) {
+            for (c = 0; c < ncr; c += 32) {
+                ch = (ncr - c) > 32 ? 32 : (ncr - c);
+                i4_mul(vact + (unsigned)c * 2048u,
+                       ((uint32_t)(ch - 1) << 11) | 0x3FFu,
+                       vwgt + (unsigned)c * 512u,
+                       (uint32_t)ch * 512u - 1u, 1);
+            }
+        } else {
+            for (c = 0; c < ncr; c++)
+                i4_mul(vact + (unsigned)c * 2048u, 0x3FFu,
+                       vwgt + (unsigned)c * 512u, (uint32_t)wc, 0);
+        }
+        if (bs) hmx_bias(vbias);
+        i8_store(vout, 0, 0);
+    }
+    hmx_sync();
+    c1 = HAP_perf_get_pcycles();
+    t1 = HAP_perf_get_time_us();
+    info[1] = (int)(t1 - t0);
+    info[2] = (int)((c1 - c0) / (uint64_t)reps);
+    if (!(mode & 2)) {
+        if (compute_resource_hmx_unlock) compute_resource_hmx_unlock(r.ctx);
+        hmx_power(0);
+        if (hvx_ok) qurt_hvx_unlock();
+    }
+    for (i = 0; i < 2048 && i < rawLen; i++) raw[i] = vout[i];
     res_put(&r);
     info[0] = 0;
     return 0;

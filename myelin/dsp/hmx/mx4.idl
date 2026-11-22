@@ -139,8 +139,35 @@ interface mx4 {
       hvx_rc, srt, vtcm_bytes, mul, act_region, wgt_region} */
    long i8m(in sequence<octet> A, in sequence<octet> B, in long M, in long N,
             in long K, in long lay, in long wl, in long art, in long wc,
-            in long srt, in long mul, in long bscale, in long mode,
-            in long reps, rout sequence<octet> raw, rout sequence<long> info);
+            in long srt, in long mul, in long npair, in long bscale,
+            in long mode, in long reps, rout sequence<octet> raw,
+            rout sequence<long> info);
+
+   /* Batched FFN-shaped int8 GEMM with real VTCM staging.
+        A : M*K uint8 row major, B : N*K uint8 row major (B[n][k]),
+        N % 64 == 0, K % 32 == 0, M in 1..512 (spatial padded to 64).
+        mode bit0 stage weights DDR->VTCM per N tile (honest), bit1 staging
+        only, bit2 keep HMX power/lock across reps, bit3 collect C.
+        C : M*N uint8 row major (only read when mode bit3).
+        info = {status, us_total, pcyc_total, ntiles, mtiles, ncr, power_rc,
+                lock_rc, hvx_rc, mode, vtcm_bytes, wgt_bytes, 0, 0} */
+   long pref(in sequence<octet> A, in sequence<octet> B, in long M, in long N,
+             in long K, in long mode, in long reps,
+             rout sequence<octet> C, rout sequence<long> info);
+
+   /* int4 weights via weight.n.  A: M x K uint8, B: N x K int8 in [-8,7].
+      wl 0..3 selects the nibble permutation candidate; bs is the bias/scale
+      low word; mode bit0 chunked :deep activation, bit1 skip power/lock,
+      bit3 use 64 spatial rows.  raw = 2 KB tile.
+      info = {status, us, pcyc, ncr, art, wc, power, lock, hvx, srt, vtcm,
+      bs, wl, 0} */
+   long i4(in sequence<octet> A, in sequence<octet> B, in long M, in long N,
+           in long K, in long wl, in long art, in long wc, in long bs,
+           in long mode, in long reps, rout sequence<octet> raw,
+           rout sequence<long> info);
+
+   /* Bandwidth probe: r = {status, us, bytes, pcyc, MB/s, align, 0, 0} */
+   long bw(in long mb, in long mode, in long reps, rout sequence<long> r);
 
    /* DSP clock calibration: r = {pcycles, us, pcycles_per_us} */
    long clk(rout sequence<long> r);
