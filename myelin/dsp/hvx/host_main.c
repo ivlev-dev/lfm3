@@ -211,6 +211,38 @@ int main(int argc, char **argv)
     rc = lfmgemv_set_scale(h, sbuf, 16 + (int)N * 4);
     printf("set_scale rc=%d\n", rc);
 
+    /* --------- correctness: int8 output WITH scales ---------
+     * The int32 check above never exercised pack_out_i8() or the
+     * `sw*sa/so -> qp` multiplier, which is the path a real model uses. */
+    {
+        const float sa_check = 0.05f, so_check = 0.5f;
+        int bad = 0, maxerr = 0;
+        rc = lfmgemv_gemv(h, 1, (const unsigned char *)act, K, 1, dst, N, times, 8);
+        if (rc != 0) { printf("gemv i8 check rc=%d\n", rc); return 20; }
+        for (r = 0; r < N; r++) {
+            int32_t acc_ref = dot_ref(wsigned + (size_t)r * K, act, K);
+            float m = srow[r] * sa_check / so_check;
+            int32_t q;
+            int64_t v;
+            int32_t got = (int8_t)dst[r];
+            if (m < 0.0f) m = 0.0f;
+            if (m > 0.99997f) m = 0.99997f;
+            q = (int32_t)(m * 65536.0f + 0.5f);
+            v = ((int64_t)acc_ref * (int64_t)q + 32768) >> 16;
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            if (v != got) {
+                int32_t e = v > got ? (int32_t)(v - got) : (int32_t)(got - v);
+                bad++;
+                if (e > maxerr) maxerr = e;
+                if (bad <= 5)
+                    printf("  i8 row %d: ref=%lld got=%d acc=%d m=%.6f\n",
+                           r, (long long)v, got, acc_ref, m);
+            }
+        }
+        printf("int8 output vs host: mismatches=%d of %d max_err=%d\n", bad, N, maxerr);
+    }
+
     printf("\n%-6s %-8s %-10s %-10s %-10s %-9s %-9s\n",
            "M", "reps", "kernel_us", "wall_us", "GB/s", "GMAC/s", "RPC_us");
     for (m = 1; m <= 4; m *= 2) {
