@@ -77,7 +77,10 @@ static gbuf_t g_buf[MAXBUF];
 
 typedef struct {
     int32_t *acc2;
+    int32_t *acc_lo;   /* low plane accumulator of the 16-bit down pass */
     int8_t  *h;
+    int8_t  *hi;       /* 16-bit mid, high plane  */
+    int8_t  *lo;       /* 16-bit mid, low plane   */
     int      n;
 } ffn_t;
 static ffn_t g_ffn;
@@ -1089,6 +1092,35 @@ static inline int8_t silu_lane(int k, const gbuf_t *g, const gbuf_t *u, int32_t 
     return (int8_t)requant_mid(pr, mq_mid);
 }
 
+/* One lane of the 16-bit mid chain: same product as silu_lane(), but 256x
+ * finer quantisation (/ mid16 = 256 * mid8) so the down projection sees 16
+ * effective bits.  Split into two signed int8 planes keeps the int8 GEMV:
+ * mid16 = 128*hi + lo, so dot(w, mid16) = 128*dot(w, hi) + dot(w, lo). */
+static inline int32_t mid16_lane(int k, const gbuf_t *g, const gbuf_t *u, int32_t mq16)
+{
+    int32_t zg = deq_wide(g->acc[k], g->qm[k]);
+    int32_t zu = deq_wide(g_ffn.acc2[k], u->qm[k]);
+    int32_t pr = prod_p(silu_qk(zg, g->qshift), zu, u->qshift);
+    int64_t v = ((int64_t)pr * (int64_t)mq16 + ((int64_t)1 << 27)) >> 28;
+    if (v > 32767) v = 32767;
+    if (v < -32767) v = -32767;
+    return (int32_t)v;
+}
+
+static void silu_planes16(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
+                          int32_t mq16, int8_t *hi, int8_t *lo)
+{
+    int k;
+    for (k = i0; k < i1; k++) {
+        int32_t v = mid16_lane(k, g, u, mq16);
+        int32_t ph = (v + 64) >> 7;
+        if (ph > 127) ph = 127;
+        if (ph < -127) ph = -127;
+        hi[k] = (int8_t)ph;
+        lo[k] = (int8_t)(v - (ph << 7));
+    }
+}
+
 /* Guards for the split multiply: the scalar chain is reproduced exactly while
  * every product stays inside the int32 partial-product bounds. */
 static int silu_vec_guard(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
@@ -1962,7 +1994,7 @@ static void attn_group(int kh)
 
 static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen, int reps,
                     unsigned char *dst, int dstLen, unsigned char *mid, int midLen,
-                    int *times, int timesLen, int use_resident)
+                    int *times, int timesLen, int use_resident, int use16)
 {
     gbuf_t *g, *u, *d;
     const int8_t *x = (const int8_t *)act;
@@ -1986,11 +2018,16 @@ static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen
 
     set_perf();
     if (g_ffn.n != g->N) {
-        free(g_ffn.acc2); free(g_ffn.h);
-        g_ffn.acc2 = (int32_t *)memalign(128, (size_t)g->N * sizeof(int32_t));
-        g_ffn.h    = (int8_t *)memalign(128, (size_t)g->N + 128);
+        free(g_ffn.acc2); free(g_ffn.h); free(g_ffn.acc_lo);
+        free(g_ffn.hi); free(g_ffn.lo);
+        g_ffn.acc2   = (int32_t *)memalign(128, (size_t)g->N * sizeof(int32_t));
+        g_ffn.acc_lo = (int32_t *)memalign(128, (size_t)g->N * sizeof(int32_t));
+        g_ffn.h      = (int8_t *)memalign(128, (size_t)g->N + 128);
+        g_ffn.hi     = (int8_t *)memalign(128, (size_t)g->N + 128);
+        g_ffn.lo     = (int8_t *)memalign(128, (size_t)g->N + 128);
         g_ffn.n = g->N;
-        if (!g_ffn.acc2 || !g_ffn.h) return AEE_ENOMEMORY;
+        if (!g_ffn.acc2 || !g_ffn.acc_lo || !g_ffn.h || !g_ffn.hi || !g_ffn.lo)
+            return AEE_ENOMEMORY;
     }
     mq_mid = (int32_t)(4096.0f / d->sa);
     g_ffn_last_g = g;
@@ -2010,16 +2047,36 @@ static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen
         run_split_m1(u, g->ae, g->ao, bias, g_ffn.acc2);
         t1 = HAP_perf_get_time_us(); ph[1] += t1 - t0;
 
-        /* 3: silu(gate) * up -> int8, split across the worker team */
+        /* 3: silu(gate) * up -> int8 (or 16-bit planes), across the team */
         t0 = HAP_perf_get_time_us();
-        run_split_silu(g, u, mq_mid);
+        if (use16) {
+            /* Scalar on purpose for the first measurement: 7680 lanes cost
+               ~0.1 ms against a 1.3 ms layer. */
+            silu_planes16(0, g->N, g, u, mq_mid << 8, g_ffn.hi, g_ffn.lo);
+        } else {
+            run_split_silu(g, u, mq_mid);
+        }
         t1 = HAP_perf_get_time_us(); ph[2] += t1 - t0;
 
         /* 4: down GEMV */
         t0 = HAP_perf_get_time_us();
-        deinterleave(g_ffn.h, d->ae, d->ao, d->K);
-        biasd = -8 * sum_act_i8(g_ffn.h, d->K);
-        run_split_m1(d, d->ae, d->ao, biasd, d->acc);
+        if (use16) {
+            int32_t bhi, blo, i;
+            deinterleave(g_ffn.hi, d->ae, d->ao, d->K);
+            bhi = -8 * sum_act_i8(g_ffn.hi, d->K);
+            run_split_m1(d, d->ae, d->ao, bhi, d->acc);
+            deinterleave(g_ffn.lo, d->ae, d->ao, d->K);
+            blo = -8 * sum_act_i8(g_ffn.lo, d->K);
+            run_split_m1(d, d->ae, d->ao, blo, g_ffn.acc_lo);
+            for (i = 0; i < d->N; i++) {
+                int64_t c = ((int64_t)128 * (int64_t)d->acc[i]) + (int64_t)g_ffn.acc_lo[i];
+                d->acc[i] = (int32_t)((c + 128) >> 8);
+            }
+        } else {
+            deinterleave(g_ffn.h, d->ae, d->ao, d->K);
+            biasd = -8 * sum_act_i8(g_ffn.h, d->K);
+            run_split_m1(d, d->ae, d->ao, biasd, d->acc);
+        }
         t1 = HAP_perf_get_time_us(); ph[3] += t1 - t0;
 
         /* 5: dequant + pack */
@@ -2048,7 +2105,7 @@ int lfmgemv_ffn(int hg, int hu, int hd, const unsigned char *act, int actLen, in
                 int *times, int timesLen)
 {
     return ffn_impl(hg, hu, hd, act, actLen, reps, dst, dstLen, mid, midLen,
-                    times, timesLen, 0);
+                    times, timesLen, 0, 0);
 }
 
 int lfmgemv_ffn_resident(int hg, int hu, int hd, const unsigned char *act, int actLen,
@@ -2056,7 +2113,7 @@ int lfmgemv_ffn_resident(int hg, int hu, int hd, const unsigned char *act, int a
                          int *times, int timesLen)
 {
     return ffn_impl(hg, hu, hd, act, actLen, reps, 0, 0, mid, midLen,
-                    times, timesLen, 1);
+                    times, timesLen, 1, 0);
 }
 
 static int attn_core(int hk, int hkt, int hv, int hvs, const unsigned char *q, int qLen,
@@ -3106,7 +3163,7 @@ int lfmgemv_release_buf(int h)
 #define LFM_CMD_MAX       256
 
 enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
-       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5 };
+       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5, LFM_CMD_FFN16 = 6 };
 enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
 enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
 
@@ -3302,7 +3359,7 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
     uint8_t *dp = 0;
     int rc, reps, n;
 
-    if (c->type > LFM_CMD_DUMP) return AEE_EBADPARM;
+    if (c->type > LFM_CMD_FFN16) return AEE_EBADPARM;
     rc = lfm_src_ptr(c, out, outLen, &sp);
     if (rc != 0) return rc;
     rc = lfm_dst_ptr(c, out, outLen, &dp);
@@ -3334,7 +3391,11 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
     case LFM_CMD_FFN:
         reps = c->a0 < 1 ? 1 : c->a0;
         return ffn_impl(c->h0, c->h1, c->h2, sp, c->src_len, reps, dp,
-                        c->dst_len, 0, 0, 0, 0, 0);
+                        c->dst_len, 0, 0, 0, 0, 0, 0);
+    case LFM_CMD_FFN16:
+        reps = c->a0 < 1 ? 1 : c->a0;
+        return ffn_impl(c->h0, c->h1, c->h2, sp, c->src_len, reps, dp,
+                        c->dst_len, 0, 0, 0, 0, 0, 1);
     case LFM_CMD_ATTN: {
         const int *tbl;
         int tbl_n = c->tbl_len, pos, seq, window, areps;

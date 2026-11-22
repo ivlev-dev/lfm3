@@ -638,6 +638,7 @@ pub mod exec {
         Attn = 3,
         Conv = 4,
         Dump = 5,
+        Ffn16 = 6,
     }
 
     fn put_i32(out: &mut [u8], offset: usize, value: i32) {
@@ -694,6 +695,27 @@ pub mod exec {
             command.dst_off = dst_off;
             command.dst_len = n;
             command.args[0] = multiplier_q16;
+            command
+        }
+
+        /// FFN with a 16-bit `mid` buffer (two int8 planes inside the kernel).
+        pub const fn ffn16(
+            gate: i32,
+            up: i32,
+            down: i32,
+            reps: i32,
+            src_off: i32,
+            src_len: i32,
+            dst_off: i32,
+            dst_len: i32,
+        ) -> Self {
+            let mut command = Self::empty(Op::Ffn16);
+            command.h = [gate, up, down, -1];
+            command.args[0] = reps;
+            command.src_off = src_off;
+            command.src_len = src_len;
+            command.dst_off = dst_off;
+            command.dst_len = dst_len;
             command
         }
 

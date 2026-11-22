@@ -378,11 +378,14 @@ impl Backend for CpuBackend {
             });
         }
         let scratch = &mut self.scratch;
-        ffn.up.multiply(x, &mut scratch.up)?;
-        ffn.gate.multiply(x, &mut scratch.gate)?;
+        let mut x8 = x.to_vec();
+        maybe_quantize_i8(&mut x8);
+        ffn.up.multiply(&x8, &mut scratch.up)?;
+        ffn.gate.multiply(&x8, &mut scratch.gate)?;
         for index in 0..scratch.acted.len() {
             scratch.acted[index] = ops::silu(scratch.gate[index]) * scratch.up[index];
         }
+        maybe_quantize_i8(&mut scratch.acted);
         ffn.down.multiply(&scratch.acted, out)
     }
 
@@ -553,6 +556,23 @@ fn tensor<'a>(file: &'a GgufFile, name: &str) -> Result<&'a TensorInfo, RuntimeE
 /// dequantisation, i.e. exactly what `myelin-pack` stores for the DSP. It is
 /// the control experiment for "is the remaining error the DSP path or the
 /// 4-bit weight format itself".
+/// `MYELIN_CPU_INT8_ACT=1` rounds activations to int8 the way the DSP does
+/// (one scale per vector, absmax/110), so the host can reproduce the device's
+/// intermediate quantisation without the device.
+fn maybe_quantize_i8(values: &mut [f32]) {
+    if std::env::var_os("MYELIN_CPU_INT8_ACT").is_none() {
+        return;
+    }
+    let max = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    if max <= 0.0 {
+        return;
+    }
+    let step = max / 110.0;
+    for value in values.iter_mut() {
+        *value = (*value / step).round().clamp(-127.0, 127.0) * step;
+    }
+}
+
 fn quantize_int4_rows(data: &mut [f32], n: usize, k: usize) {
     for row in 0..n {
         let values = &mut data[row * k..(row + 1) * k];
