@@ -1728,6 +1728,9 @@ static void i8_pack_act(uint8_t *dst, const int8_t *A, int K, int lay, int M)
             if (lay == 3)       /* hardware int8: 4 spatial per 128 B vector */
                 off = 2048u * (unsigned)(c >> 5) + 128u * (unsigned)(s >> 2)
                     + 4u * (unsigned)(c & 31) + (unsigned)(s & 3);
+            else if (lay == 4)  /* int4 probe: 1 KB activation croutons */
+                off = 1024u * (unsigned)(c >> 5) + 128u * (unsigned)(s >> 2)
+                    + 4u * (unsigned)(c & 31) + (unsigned)(s & 3);
             else if (lay == 0)  /* 64 ch/crouton, rows s,s+1 interleaved 1:1 */
                 off = 2048u * (unsigned)(c >> 6) + 128u * (unsigned)(s >> 1)
                     + 2u * (unsigned)(c & 63) + (unsigned)(s & 1);
@@ -2009,6 +2012,16 @@ static void copy64(void *dst, const void *src)
     }
 }
 
+__attribute__((noinline))
+static void stage_plain(uint8_t *__restrict dst, const uint8_t *__restrict src,
+                        unsigned bytes)
+{
+    const HVX_Vector *sp = (const HVX_Vector *)src;
+    HVX_Vector *dp = (HVX_Vector *)dst;
+    unsigned n = bytes >> 7, i;
+    for (i = 0; i < n; i++) dp[i] = sp[i];
+}
+
 static void pref_pack_act(uint8_t *dst, const int8_t *A, int M, int K, int ncr)
 {
     int g, c;
@@ -2059,7 +2072,7 @@ int mx4_pref(const unsigned char *Adata, int ALen,
     uint64_t t0, t1, c0, c1;
     uint32_t art, wc;
 
-    if (infoLen < 14) return -1;
+    if (infoLen < 16) return -1;
     memset(info, 0, sizeof(int) * infoLen);
     if (K < 32 || K > PREF_MAXK || (K & 31)) return -2;
     if (N < 64 || (N & 63)) return -3;
@@ -2074,7 +2087,8 @@ int mx4_pref(const unsigned char *Adata, int ALen,
 
     aregion = 2048u * (unsigned)ncr * (unsigned)mt;
     wregion = 2048u * (unsigned)ncr;          /* one N tile of 64 channels */
-    need = aregion + wregion + 4096u + 512u + 2048u + 2048u;
+    need = aregion + 2u * align_up(wregion, 2048u) + 4096u + 512u + 2048u + 2048u;
+    if (mode & 4096) need = 2u << 20;      /* VTCM allocation size diagnostic */
     rc = res_get(need, &r);
     info[0] = rc;
     if (rc) return 0;
@@ -2082,7 +2096,7 @@ int mx4_pref(const unsigned char *Adata, int ALen,
 
     vact  = r.base;
     vwgt  = vact + aregion;
-    vout  = vwgt + align_up(wregion, 2048u);
+    vout  = vwgt + 2u * align_up(wregion, 2048u);
     vbias = vout + 4096u;
     memset(r.base, 0, need);
 
@@ -2114,34 +2128,57 @@ int mx4_pref(const unsigned char *Adata, int ALen,
     c0 = HAP_perf_get_pcycles();
     for (rep = 0; rep < reps; rep++) {
         hmx_clr();
+        if ((mode & 1) && (mode & 2048)) {
+            for (k = 0; k < ncr; k++)
+                copy_v2048(vwgt + (unsigned)k * 2048u,
+                           ((const uint8_t *)wpack) + (size_t)k * 2048u);
+            __asm__ __volatile__("syncht" ::: "memory");
+            __asm__ __volatile__("barrier" ::: "memory");
+        }
         for (i = 0; i < nt; i++) {
             if (mode & 1) {
-                const uint8_t *wsrc = ((mode & 512) ? (const uint8_t *)Bdata
-                                                    : wpack)
-                                      + (size_t)i * (size_t)ncr * 2048u;
-                uint8_t *wdst = dscratch ? dscratch : vwgt;
-                if (mode & 32) {           /* diagnostics: libc block memcpy */
-                    memcpy(wdst, wsrc, wregion);
-                } else if (mode & 128) {   /* diagnostics: 64-bit scalar */
-                    for (k = 0; k < ncr; k++)
-                        copy64(wdst + (unsigned)k * 2048u,
-                               wsrc + (size_t)k * 2048u);
-                } else {                   /* per-crouton HVX copy */
-                    for (k = 0; k < ncr; k++)
-                        copy_v2048(wdst + (unsigned)k * 2048u,
+                int j = (mode & 2048) ? (i + 1) : i;
+                if (j < nt) {
+                    uint64_t tc0 = HAP_perf_get_time_us();
+                    const uint8_t *wsrc = ((mode & 512) ? (const uint8_t *)Bdata
+                                                        : wpack)
+                                          + (size_t)((mode & 8192) ? 0 : j)
+                                            * (size_t)ncr * 2048u;
+                    uint8_t *wdst = dscratch ? dscratch
+                                  : (vwgt + (unsigned)((mode & 2048)
+                                                       ? (j & 1) * (int)wregion : 0));
+                    if ((mode & 2048) && i > 0)
+                        hmx_sync();      /* previous tile must be done with its slot */
+                    if (mode & 32) {
+                        memcpy(wdst, wsrc, wregion);
+                    } else if (mode & 128) {
+                        for (k = 0; k < ncr; k++)
+                            copy64(wdst + (unsigned)k * 2048u,
                                    wsrc + (size_t)k * 2048u);
-                }
-                /* make the VTCM writes visible to the HMX agent */
-                __asm__ __volatile__("syncht" ::: "memory");
-                __asm__ __volatile__("barrier" ::: "memory");
-                if (i == 0) {   /* copy sanity: byte compare VTCM vs DDR source */
-                    int j, bad = 0;
-                    for (j = 0; j < (int)wregion; j++)
-                        if (vwgt[j] != wsrc[j]) bad++;
-                    info[12] = bad;
+                    } else if (mode & 256) {
+                        stage_plain(wdst, wsrc, wregion);
+                    } else {
+                        for (k = 0; k < ncr; k++)
+                            copy_v2048(wdst + (unsigned)k * 2048u,
+                                       wsrc + (size_t)k * 2048u);
+                    }
+                    if (!(mode & 1024)) {
+                        __asm__ __volatile__("syncht" ::: "memory");
+                        __asm__ __volatile__("barrier" ::: "memory");
+                    }
+                    info[15] += (int)(HAP_perf_get_time_us() - tc0);
+                    if (i == 0 && j == 0 && rep == 0 && !(mode & 16384)) {
+                        int q, bad = 0;
+                        for (q = 0; q < (int)wregion; q++)
+                            if (vwgt[q] != wsrc[q]) bad++;
+                        info[12] = bad;
+                    }
                 }
             }
             if (mode & 2) continue;
+            {
+                uint8_t *wuse = (mode & 2048)
+                    ? (vwgt + (unsigned)(i & 1) * wregion) : vwgt;
             for (m = 0; m < mt; m++) {
                 if (mode & 16) {
                     /* one :deep activation load per 32 K croutons */
@@ -2151,7 +2188,7 @@ int mx4_pref(const unsigned char *Adata, int ALen,
                         wc  = (uint32_t)ch * 2048u - 1u;
                         i8_mul_deepact(vact + (unsigned)m * (unsigned)ncr * 2048u
                                        + (unsigned)c * 2048u, art,
-                                       vwgt + (unsigned)c * 2048u, wc);
+                                       wuse + (unsigned)c * 2048u, wc);
                     }
                 } else {
                     /* verified N=64 recipe: one pair per K crouton, :deep on
@@ -2159,7 +2196,7 @@ int mx4_pref(const unsigned char *Adata, int ALen,
                     for (c = 0; c < ncr; c++)
                         i8_mul_wdeep(vact + (unsigned)m * (unsigned)ncr * 2048u
                                      + (unsigned)c * 2048u, 0x3FFu,
-                                     vwgt + (unsigned)c * 2048u, 2047u);
+                                     wuse + (unsigned)c * 2048u, 2047u);
                 }
                 hmx_bias(vbias);
                 i8_store(vout, 0, 0);
@@ -2170,6 +2207,7 @@ int mx4_pref(const unsigned char *Adata, int ALen,
                     pref_unpack(vout, Cdata, N, m * 64, i * 64, rows, 32);
                     pref_unpack(vout + 2048, Cdata, N, m * 64, i * 64 + 32, rows, 32);
                 }
+            }
             }
         }
     }
@@ -2184,7 +2222,6 @@ int mx4_pref(const unsigned char *Adata, int ALen,
     info[9] = mode;
     info[11] = (int)((unsigned long long)nt * (unsigned)ncr * 2048u);
     info[12] = 0;
-    info[13] = 0;
 
     if (!(mode & 4)) {
         if (compute_resource_hmx_unlock) compute_resource_hmx_unlock(r.ctx);
@@ -2281,18 +2318,660 @@ int mx4_bw(int mb, int mode, int reps, int *r, int rLen)
 
 
 /* ================================================================== */
+/* bw2: where the 4.29 GB/s ceiling comes from                         */
+/* ================================================================== */
+/* kind:
+ *   0 read-sum, 4 accumulators      (same shape as mx4_bw mode 0)
+ *   1 read-sum, 8 accumulators
+ *   2 copy DDR->VTCM per 2 KB crouton (staging baseline)
+ *   3 copy DDR->VTCM, contiguous chunkKb block
+ *   4 copy DDR->VTCM, l2fetch pipelined (depth DEPTH chunks)
+ *   5 read-sum, l2fetch pipelined (prefetch + consume, no VTCM store)
+ *   6 libc memcpy DDR->VTCM per chunkKb block
+ * mode bit0: source = host FastRPC/ION buffer, else DSP-heap memalign
+ * mode bit1: write VTCM (kinds 2..4,6); else VTCM region untouched
+ * r = {status, us, bytes, pcyc, GBps*100, src_align, sink, chunk_kb}
+ */
+
+#define BW2_VTCM (2u << 20)
+#define BW2_DEPTH 4
+
+static inline void l2f(void *p, unsigned len)
+{
+    while (len) {
+        unsigned w = len > 32768u ? 32768u : len;
+        uint64_t d = ((uint64_t)w << 16) | 1u;   /* height=1, stride=0, dir=0 */
+        Q6_l2fetch_AP(p, d);
+        p = (char *)p + w;
+        len -= w;
+    }
+}
+
+/* issue `ns` independent l2fetch streams covering one chunk */
+static inline void l2f_multi(void *p, unsigned len, int ns)
+{
+    unsigned sub = (len / (unsigned)ns) & ~127u;
+    int i;
+    for (i = 0; i < ns; i++)
+        l2f((char *)p + (size_t)i * sub, sub);
+}
+
+static void bw2_body(uint8_t *src, int kind, unsigned chunk, unsigned nchunks,
+                     unsigned nvec, uint8_t *vdst, int reps, HVX_Vector *accp)
+{
+    unsigned i, ci, rep;
+    HVX_Vector acc = *accp;
+
+    for (rep = 0; rep < reps; rep++) {
+        switch (kind) {
+        case 0: {
+            const HVX_Vector *p = (const HVX_Vector *)src;
+            HVX_Vector a1 = Q6_V_vzero(), a2 = Q6_V_vzero(), a3 = Q6_V_vzero();
+            unsigned n = nchunks * nvec;
+            for (i = 0; i + 3 < n; i += 4) {
+                acc = Q6_Vw_vadd_VwVw(acc, p[i]);
+                a1  = Q6_Vw_vadd_VwVw(a1,  p[i + 1]);
+                a2  = Q6_Vw_vadd_VwVw(a2,  p[i + 2]);
+                a3  = Q6_Vw_vadd_VwVw(a3,  p[i + 3]);
+            }
+            acc = Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(acc, a1),
+                                  Q6_Vw_vadd_VwVw(a2, a3));
+            break;
+        }
+        case 1: {   /* batched loads: 16 vectors in flight, then consume */
+            const HVX_Vector *p = (const HVX_Vector *)src;
+            unsigned n = nchunks * nvec;
+            for (i = 0; i + 15 < n; i += 16) {
+                HVX_Vector b0 = p[i + 0],  b1 = p[i + 1],
+                           b2 = p[i + 2],  b3 = p[i + 3],
+                           b4 = p[i + 4],  b5 = p[i + 5],
+                           b6 = p[i + 6],  b7 = p[i + 7],
+                           b8 = p[i + 8],  b9 = p[i + 9],
+                           b10 = p[i + 10], b11 = p[i + 11],
+                           b12 = p[i + 12], b13 = p[i + 13],
+                           b14 = p[i + 14], b15 = p[i + 15];
+                acc = Q6_Vw_vadd_VwVw(acc, b0);
+                b1 = Q6_Vw_vadd_VwVw(b1, b2);
+                b3 = Q6_Vw_vadd_VwVw(b3, b4);
+                b5 = Q6_Vw_vadd_VwVw(b5, b6);
+                b7 = Q6_Vw_vadd_VwVw(b7, b8);
+                b9 = Q6_Vw_vadd_VwVw(b9, b10);
+                b11 = Q6_Vw_vadd_VwVw(b11, b12);
+                b13 = Q6_Vw_vadd_VwVw(b13, b14);
+                b15 = Q6_Vw_vadd_VwVw(b15, b1);
+                b3 = Q6_Vw_vadd_VwVw(b3, b5);
+                b7 = Q6_Vw_vadd_VwVw(b7, b9);
+                b11 = Q6_Vw_vadd_VwVw(b11, b13);
+                b15 = Q6_Vw_vadd_VwVw(b15, b3);
+                b15 = Q6_Vw_vadd_VwVw(b15, b7);
+                acc = Q6_Vw_vadd_VwVw(acc, Q6_Vw_vadd_VwVw(b11, b15));
+            }
+            break;
+        }
+        case 2: {   /* per-2 KB crouton, 16 loads then 16 stores */
+            unsigned nc = BW2_VTCM / 2048u;
+            if (chunk < 2048u) break;
+            for (ci = 0; ci < nchunks; ci++) {
+                const uint8_t *s = src + (size_t)ci * chunk;
+                uint8_t *d = vdst + (size_t)(ci % nc) * 2048u;
+                unsigned k, ncr = chunk / 2048u;
+                for (k = 0; k < ncr; k++) {
+                    const HVX_Vector *sp = (const HVX_Vector *)(s + k * 2048u);
+                    HVX_Vector *dp = (HVX_Vector *)(d + k * 2048u);
+                    HVX_Vector b0 = sp[0],  b1 = sp[1],  b2 = sp[2],
+                               b3 = sp[3],  b4 = sp[4],  b5 = sp[5],
+                               b6 = sp[6],  b7 = sp[7],  b8 = sp[8],
+                               b9 = sp[9],  b10 = sp[10], b11 = sp[11],
+                               b12 = sp[12], b13 = sp[13], b14 = sp[14],
+                               b15 = sp[15];
+                    dp[0] = b0; dp[1] = b1; dp[2] = b2;  dp[3] = b3;
+                    dp[4] = b4; dp[5] = b5; dp[6] = b6;  dp[7] = b7;
+                    dp[8] = b8; dp[9] = b9; dp[10] = b10; dp[11] = b11;
+                    dp[12] = b12; dp[13] = b13; dp[14] = b14; dp[15] = b15;
+                }
+            }
+            break;
+        }
+        case 3: {   /* contiguous chunk, plain load/store loop */
+            unsigned nc = BW2_VTCM / chunk;
+            for (ci = 0; ci < nchunks; ci++) {
+                const HVX_Vector *s = (const HVX_Vector *)(src + (size_t)ci * chunk);
+                HVX_Vector *d = (HVX_Vector *)(vdst + (size_t)(ci % nc) * chunk);
+                for (i = 0; i < nvec; i++) d[i] = s[i];
+            }
+            break;
+        }
+        case 4: {   /* contiguous chunk + l2fetch pipeline */
+            unsigned nc = BW2_VTCM / chunk;
+            for (i = 0; i < BW2_DEPTH && i < nchunks; i++)
+                l2f(src + (size_t)i * chunk, chunk);
+            for (ci = 0; ci < nchunks; ci++) {
+                const HVX_Vector *s = (const HVX_Vector *)(src + (size_t)ci * chunk);
+                HVX_Vector *d = (HVX_Vector *)(vdst + (size_t)(ci % nc) * chunk);
+                if (ci + BW2_DEPTH < nchunks)
+                    l2f(src + (size_t)(ci + BW2_DEPTH) * chunk, chunk);
+                for (i = 0; i < nvec; i++) d[i] = s[i];
+            }
+            break;
+        }
+        case 5: {   /* l2fetch + consume (read only) */
+            for (i = 0; i < BW2_DEPTH && i < nchunks; i++)
+                l2f(src + (size_t)i * chunk, chunk);
+            for (ci = 0; ci < nchunks; ci++) {
+                const HVX_Vector *s = (const HVX_Vector *)(src + (size_t)ci * chunk);
+                HVX_Vector a1 = Q6_V_vzero(), a2 = Q6_V_vzero(),
+                           a3 = Q6_V_vzero();
+                if (ci + BW2_DEPTH < nchunks)
+                    l2f(src + (size_t)(ci + BW2_DEPTH) * chunk, chunk);
+                for (i = 0; i + 3 < nvec; i += 4) {
+                    acc = Q6_Vw_vadd_VwVw(acc, s[i]);
+                    a1  = Q6_Vw_vadd_VwVw(a1,  s[i + 1]);
+                    a2  = Q6_Vw_vadd_VwVw(a2,  s[i + 2]);
+                    a3  = Q6_Vw_vadd_VwVw(a3,  s[i + 3]);
+                }
+                acc = Q6_Vw_vadd_VwVw(acc, Q6_Vw_vadd_VwVw(a1,
+                                      Q6_Vw_vadd_VwVw(a2, a3)));
+            }
+            break;
+        }
+        case 6: {   /* libc memcpy per chunk */
+            unsigned nc = BW2_VTCM / chunk;
+            for (ci = 0; ci < nchunks; ci++)
+                memcpy(vdst + (size_t)(ci % nc) * chunk,
+                       src + (size_t)ci * chunk, chunk);
+            break;
+        }
+        case 7: {   /* 2 KB crouton copy: 8 loads, 8 stores, 2x per crouton */
+            unsigned nc = BW2_VTCM / 2048u;
+            if (chunk < 2048u) break;
+            for (ci = 0; ci < nchunks; ci++) {
+                const uint8_t *s = src + (size_t)ci * chunk;
+                uint8_t *d = vdst + (size_t)(ci % nc) * 2048u;
+                unsigned k, ncr = chunk / 2048u;
+                for (k = 0; k < ncr; k++) {
+                    const HVX_Vector *sp = (const HVX_Vector *)(s + k * 2048u);
+                    HVX_Vector *dp = (HVX_Vector *)(d + k * 2048u);
+                    int h;
+                    for (h = 0; h < 16; h += 8) {
+                        HVX_Vector b0 = sp[h], b1 = sp[h + 1],
+                                   b2 = sp[h + 2], b3 = sp[h + 3],
+                                   b4 = sp[h + 4], b5 = sp[h + 5],
+                                   b6 = sp[h + 6], b7 = sp[h + 7];
+                        dp[h] = b0; dp[h + 1] = b1;
+                        dp[h + 2] = b2; dp[h + 3] = b3;
+                        dp[h + 4] = b4; dp[h + 5] = b5;
+                        dp[h + 6] = b6; dp[h + 7] = b7;
+                    }
+                }
+            }
+            break;
+        }
+        case 8: case 9: case 10: case 11: {
+            /* N independent sequential streams spread over the buffer.
+             * One 128 B vector per stream per iteration, step = ns. */
+            int ns = 1 << (kind - 7);      /* 2, 4, 8, 16 */
+            unsigned seg = (nchunks * nvec) / (unsigned)ns;
+            const HVX_Vector *p = (const HVX_Vector *)src;
+            HVX_Vector a0 = Q6_V_vzero(), a1 = Q6_V_vzero(),
+                       a2 = Q6_V_vzero(), a3 = Q6_V_vzero();
+            HVX_Vector a4 = Q6_V_vzero(), a5 = Q6_V_vzero(),
+                       a6 = Q6_V_vzero(), a7 = Q6_V_vzero();
+            seg &= ~7u;
+            for (i = 0; i < seg; i += (unsigned)ns) {
+                a0 = Q6_Vw_vadd_VwVw(a0, p[i]);
+                if (ns > 1) a1 = Q6_Vw_vadd_VwVw(a1, p[seg + i]);
+                if (ns > 2) a2 = Q6_Vw_vadd_VwVw(a2, p[2 * seg + i]);
+                if (ns > 3) a3 = Q6_Vw_vadd_VwVw(a3, p[3 * seg + i]);
+                if (ns > 4) {
+                    a4 = Q6_Vw_vadd_VwVw(a4, p[4 * seg + i]);
+                    a5 = Q6_Vw_vadd_VwVw(a5, p[5 * seg + i]);
+                    a6 = Q6_Vw_vadd_VwVw(a6, p[6 * seg + i]);
+                    a7 = Q6_Vw_vadd_VwVw(a7, p[7 * seg + i]);
+                }
+            }
+            if (ns == 2)
+                a0 = Q6_Vw_vadd_VwVw(a0, a1);
+            else if (ns == 4)
+                a0 = Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(a0, a1),
+                                     Q6_Vw_vadd_VwVw(a2, a3));
+            else if (ns > 4)
+                a0 = Q6_Vw_vadd_VwVw(a0, Q6_Vw_vadd_VwVw(
+                        Q6_Vw_vadd_VwVw(a4, a5), Q6_Vw_vadd_VwVw(a6, a7)));
+            acc = Q6_Vw_vadd_VwVw(acc, a0);
+            break;
+        }
+        case 12: case 13: case 14: {
+            /* copy the chunk as 2/4/8 independent sequential streams */
+            int ns = 1 << (kind - 11);
+            unsigned sub = chunk / (unsigned)ns;      /* bytes per stream */
+            unsigned sn = sub / 128u;                 /* vectors per stream */
+            unsigned nc = BW2_VTCM / chunk;
+            for (ci = 0; ci < nchunks; ci++) {
+                const HVX_Vector *sp = (const HVX_Vector *)(src + (size_t)ci * chunk);
+                HVX_Vector *dp = (HVX_Vector *)(vdst + (size_t)(ci % nc) * chunk);
+                unsigned j;
+                for (j = 0; j < sn; j++) {
+                    HVX_Vector b0, b1, b2, b3, b4, b5, b6, b7;
+                    b0 = sp[j];
+                    dp[j] = b0;
+                    if (ns > 1) {
+                        b1 = sp[sn + j]; dp[sn + j] = b1;
+                    }
+                    if (ns > 2) {
+                        b2 = sp[2 * sn + j]; dp[2 * sn + j] = b2;
+                        b3 = sp[3 * sn + j]; dp[3 * sn + j] = b3;
+                    }
+                    if (ns > 4) {
+                        b4 = sp[4 * sn + j]; dp[4 * sn + j] = b4;
+                        b5 = sp[5 * sn + j]; dp[5 * sn + j] = b5;
+                        b6 = sp[6 * sn + j]; dp[6 * sn + j] = b6;
+                        b7 = sp[7 * sn + j]; dp[7 * sn + j] = b7;
+                    }
+                }
+            }
+            break;
+        }
+        case 15: case 16: {   /* multi-stream l2fetch pipeline + plain copy */
+            int ns = (kind == 15) ? 8 : 4;
+            unsigned nc = BW2_VTCM / chunk;
+            for (i = 0; i < BW2_DEPTH && i < nchunks; i++)
+                l2f_multi(src + (size_t)i * chunk, chunk, ns);
+            for (ci = 0; ci < nchunks; ci++) {
+                const HVX_Vector *sp = (const HVX_Vector *)(src + (size_t)ci * chunk);
+                HVX_Vector *dp = (HVX_Vector *)(vdst + (size_t)(ci % nc) * chunk);
+                if (ci + BW2_DEPTH < nchunks)
+                    l2f_multi(src + (size_t)(ci + BW2_DEPTH) * chunk, chunk, ns);
+                for (i = 0; i < nvec; i++) dp[i] = sp[i];
+            }
+            break;
+        }
+        case 17: {   /* L2-resident copy: 512 KB window copied over and over */
+            unsigned win = 512u << 10;
+            unsigned wn = win / 128u;
+            unsigned passes = (nchunks * chunk) / win;
+            const HVX_Vector *sp = (const HVX_Vector *)src;
+            HVX_Vector *dp = (HVX_Vector *)vdst;
+            unsigned q;
+            if (passes < 1) passes = 1;
+            for (q = 0; q < passes; q++)
+                for (i = 0; i < wn; i++) dp[i] = sp[i];
+            break;
+        }
+        case 18: case 19: {
+            /* copy with batched loads from 4 or 8 streams: 16 loads, then
+             * 16 stores (the crouton pattern, but spread over the chunk) */
+            int ns = (kind == 18) ? 4 : 8;
+            unsigned per = (kind == 18) ? 4u : 2u;
+            unsigned nc = BW2_VTCM / chunk;
+            unsigned sub = (chunk / (unsigned)ns) & ~127u;
+            unsigned sn = sub / 128u;
+            for (ci = 0; ci < nchunks; ci++) {
+                const HVX_Vector *sp = (const HVX_Vector *)(src + (size_t)ci * chunk);
+                HVX_Vector *dp = (HVX_Vector *)(vdst + (size_t)(ci % nc) * chunk);
+                unsigned j;
+                for (j = 0; j + per <= sn; j += per) {
+                    HVX_Vector b[16];
+                    int q;
+                    for (q = 0; q < ns; q++)
+                        for (i = 0; i < per; i++)
+                            b[q * per + i] = sp[(size_t)q * sn + j + i];
+                    for (q = 0; q < ns; q++)
+                        for (i = 0; i < per; i++)
+                            dp[(size_t)q * sn + j + i] = b[q * per + i];
+                }
+            }
+            break;
+        }
+        case 20: {   /* two-pass staging: 8-stream read fills L2, then the
+                      * chunk is copied L2 -> VTCM at cache speed */
+            unsigned nc = BW2_VTCM / chunk;
+            unsigned seg = nvec / 8u;
+            for (ci = 0; ci < nchunks; ci++) {
+                const HVX_Vector *s = (const HVX_Vector *)(src + (size_t)ci * chunk);
+                HVX_Vector *d = (HVX_Vector *)(vdst + (size_t)(ci % nc) * chunk);
+                HVX_Vector a1 = Q6_V_vzero(), a2 = Q6_V_vzero(),
+                           a3 = Q6_V_vzero(), a4 = Q6_V_vzero(),
+                           a5 = Q6_V_vzero(), a6 = Q6_V_vzero(),
+                           a7 = Q6_V_vzero();
+                for (i = 0; i < seg; i++) {
+                    acc = Q6_Vw_vadd_VwVw(acc, s[i]);
+                    a1 = Q6_Vw_vadd_VwVw(a1, s[seg + i]);
+                    a2 = Q6_Vw_vadd_VwVw(a2, s[2 * seg + i]);
+                    a3 = Q6_Vw_vadd_VwVw(a3, s[3 * seg + i]);
+                    a4 = Q6_Vw_vadd_VwVw(a4, s[4 * seg + i]);
+                    a5 = Q6_Vw_vadd_VwVw(a5, s[5 * seg + i]);
+                    a6 = Q6_Vw_vadd_VwVw(a6, s[6 * seg + i]);
+                    a7 = Q6_Vw_vadd_VwVw(a7, s[7 * seg + i]);
+                }
+                acc = Q6_Vw_vadd_VwVw(acc, Q6_Vw_vadd_VwVw(
+                        Q6_Vw_vadd_VwVw(a1, a2), Q6_Vw_vadd_VwVw(a3, a4)));
+                acc = Q6_Vw_vadd_VwVw(acc, Q6_Vw_vadd_VwVw(
+                        Q6_Vw_vadd_VwVw(a5, a6), a7));
+                for (i = 0; i < nvec; i++) d[i] = s[i];
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    *accp = acc;
+}
+
+/* bus bandwidth vote: the DSP client's own DDR vote (mips_bw request) */
+static int hmx_bus_vote(uint64_t bytes_per_sec, int on)
+{
+    HAP_power_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.type = HAP_power_set_mips_bw;
+    req.mips_bw.set_bus_bw = TRUE;
+    req.mips_bw.bwBytePerSec = bytes_per_sec;
+    req.mips_bw.busbwUsagePercentage = on ? 100 : 0;
+    req.mips_bw.set_mips = FALSE;
+    return HAP_power_set(0, &req);
+}
+
+/* DCVS v3: performance mode + bus corner TURBO (or back to defaults) */
+static int hmx_bus_corner(int corner)
+{
+    HAP_power_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.type = HAP_power_set_DCVS_v3;
+    req.dcvs_v3.set_dcvs_enable = TRUE;
+    req.dcvs_v3.dcvs_enable = TRUE;
+    req.dcvs_v3.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
+    req.dcvs_v3.set_bus_params = TRUE;
+    req.dcvs_v3.bus_params.target_corner = (HAP_dcvs_voltage_corner_t)corner;
+    req.dcvs_v3.bus_params.min_corner = (HAP_dcvs_voltage_corner_t)corner;
+    req.dcvs_v3.bus_params.max_corner = (HAP_dcvs_voltage_corner_t)corner;
+    return HAP_power_set(0, &req);
+}
+
+static void bw2_timed(uint8_t *src, int kind, unsigned chunk, unsigned nchunks,
+                      unsigned nvec, uint8_t *vdst, int reps, HVX_Vector *acc,
+                      int *us, int *pcyc, int *rate100)
+{
+    uint64_t t0, t1, c0, c1;
+    unsigned bytes = chunk * nchunks * (unsigned)reps;
+    t0 = HAP_perf_get_time_us();
+    c0 = HAP_perf_get_pcycles();
+    bw2_body(src, kind, chunk, nchunks, nvec, vdst, reps, acc);
+    c1 = HAP_perf_get_pcycles();
+    t1 = HAP_perf_get_time_us();
+    *us = (int)(t1 - t0);
+    *pcyc = (int)(c1 - c0);
+    *rate100 = (*us > 0) ? (int)((double)bytes / (double)*us * 100.0 / 1000.0) : 0;
+}
+
+/* r = {status, usA, bytes, pcycA, rateA*100, align, vote_rc, chunk_kb,
+ *      usB, pcycB, rateB*100, src_align, usC, pcycC, rateC*100, 0} */
+int mx4_bw2(const unsigned char *srcData, int srcLen,
+            int kind, int chunkKb, int reps, int mode, int *r, int rLen)
+{
+    res_t res;
+    uint8_t *src, *heap = 0, *host = (uint8_t *)srcData;
+    unsigned bytes, chunk, nchunks;
+    unsigned nvec;
+    int rc;
+    HVX_Vector acc;
+
+    if (rLen < 16) return -1;
+    memset(r, 0, sizeof(int) * rLen);
+    if (srcLen < (1 << 20) || reps < 1 || reps > 50) { r[0] = -2; return 0; }
+    if (chunkKb < 1 || chunkKb > 1024) chunkKb = 32;
+
+    bytes = (unsigned)srcLen & ~127u;
+    chunk = (unsigned)chunkKb << 10;
+    if (chunk > bytes) chunk = bytes;
+    nchunks = bytes / chunk;
+    nvec = chunk / 128u;
+
+    heap = (uint8_t *)memalign(4096, bytes + (1u << 18));
+    if (!heap) { r[0] = -3; return 0; }
+    memset(heap, 3, bytes + (1u << 18));
+
+    rc = res_get(BW2_VTCM, &res);
+    r[0] = rc;
+    if (rc) { free(heap); return 0; }
+
+    rc = qurt_hvx_lock(QURT_HVX_MODE_128B);
+    if (rc) { r[0] = -4; res_put(&res); free(heap); return 0; }
+
+    src = (mode & 1) ? host : heap;
+    if (mode & 0x40) {          /* HMX powered + locked, as during prefill */
+        r[6] = hmx_power(1);
+        r[6] |= (compute_resource_hmx_lock ? compute_resource_hmx_lock(res.ctx) : -100) << 8;
+    }
+    r[5] = (int)(((uintptr_t)src) & 4095);
+    r[7] = chunkKb;
+    r[2] = (int)bytes * reps;
+
+    acc = Q6_V_vzero();
+    bw2_timed(src, kind, chunk, nchunks, nvec, res.base, reps, &acc,
+              &r[1], &r[3], &r[4]);
+
+    if (mode & 6) {         /* phase B: with a bus vote */
+        int rc1 = 0;
+        if (mode & 2) rc1 |= hmx_bus_vote((uint64_t)12 << 30, 1) & 0xff;
+        if (mode & 4) rc1 |= (hmx_bus_corner(HAP_DCVS_VCORNER_TURBO) & 0xff) << 8;
+        r[6] = rc1;
+        bw2_timed(src, kind, chunk, nchunks, nvec, res.base, reps, &acc,
+                  &r[8], &r[9], &r[10]);
+        if (mode & 2) hmx_bus_vote(0, 0);
+        if (mode & 4) hmx_bus_corner(HAP_DCVS_VCORNER_NOM);
+        bw2_timed(src, kind, chunk, nchunks, nvec, res.base, reps, &acc,
+                  &r[12], &r[13], &r[14]);
+    }
+
+    ((HVX_Vector *)res.base)[0] = acc;
+
+    if (mode & 0x40) {
+        if (compute_resource_hmx_unlock) compute_resource_hmx_unlock(res.ctx);
+        hmx_power(0);
+    }
+    qurt_hvx_unlock();
+    res_put(&res);
+    free(heap);
+    return 0;
+}
+
+
+/* L2 fill test: cold read, warm read, l2fetch-then-read (single / 8 stream).
+ * r = {status, bytes, cold_us, warm_us, pref1_us, pref8_us, cold_pc, warm_pc} */
+int mx4_l2t(const unsigned char *srcData, int srcLen, int kb, int reps,
+            int *r, int rLen)
+{
+    res_t res;
+    uint8_t *heap, *src;
+    unsigned bytes, i, rep;
+    int rc;
+    HVX_Vector acc;
+    uint64_t t0, t1;
+    int us[4], pc[4];
+
+    if (rLen < 8) return -1;
+    memset(r, 0, sizeof(int) * rLen);
+    if (srcLen < kb * 1024 || kb < 64 || kb > 4096) { r[0] = -2; return 0; }
+    bytes = (unsigned)kb * 1024u;
+    heap = (uint8_t *)memalign(4096, bytes + (1u << 18));
+    if (!heap) { r[0] = -3; return 0; }
+    memset(heap, 5, bytes + (1u << 18));
+    src = heap;
+    rc = res_get(1u << 20, &res);
+    r[0] = rc;
+    if (rc) { free(heap); return 0; }
+    rc = qurt_hvx_lock(QURT_HVX_MODE_128B);
+    if (rc) { r[0] = -4; res_put(&res); free(heap); return 0; }
+
+    for (i = 0; i < 4; i++) { us[i] = 0; pc[i] = 0; }
+    acc = Q6_V_vzero();
+    for (rep = 0; rep < reps; rep++) {
+        const HVX_Vector *p = (const HVX_Vector *)src;
+        unsigned n = bytes / 128u;
+        unsigned j;
+
+        /* cold: drop the region from L2 first */
+        for (j = 0; j < bytes; j += 128)
+            Q6_dccleaninva_A((void *)(src + j));
+
+        t0 = HAP_perf_get_time_us();
+        { uint64_t c = HAP_perf_get_pcycles();
+          for (i = 0; i + 3 < n; i += 4) {
+              acc = Q6_Vw_vadd_VwVw(acc, p[i]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 1]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 2]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 3]);
+          }
+          pc[0] += (int)(HAP_perf_get_pcycles() - c); }
+        t1 = HAP_perf_get_time_us(); us[0] += (int)(t1 - t0);
+
+        t0 = HAP_perf_get_time_us();
+        { uint64_t c = HAP_perf_get_pcycles();
+          for (i = 0; i + 3 < n; i += 4) {
+              acc = Q6_Vw_vadd_VwVw(acc, p[i]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 1]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 2]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 3]);
+          }
+          pc[1] += (int)(HAP_perf_get_pcycles() - c); }
+        t1 = HAP_perf_get_time_us(); us[1] += (int)(t1 - t0);
+
+        for (j = 0; j < bytes; j += 128)
+            Q6_dccleaninva_A((void *)(src + j));
+        t0 = HAP_perf_get_time_us();
+        { uint64_t c = HAP_perf_get_pcycles();
+          l2f(src, bytes);                         /* single stream */
+          __asm__ __volatile__("syncht" ::: "memory");
+          __asm__ __volatile__("barrier" ::: "memory");
+          for (i = 0; i + 3 < n; i += 4) {
+              acc = Q6_Vw_vadd_VwVw(acc, p[i]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 1]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 2]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 3]);
+          }
+          pc[2] += (int)(HAP_perf_get_pcycles() - c); }
+        t1 = HAP_perf_get_time_us(); us[2] += (int)(t1 - t0);
+
+        for (j = 0; j < bytes; j += 128)
+            Q6_dccleaninva_A((void *)(src + j));
+        t0 = HAP_perf_get_time_us();
+        { uint64_t c = HAP_perf_get_pcycles();
+          l2f_multi(src, bytes, 8);                /* 8 streams */
+          __asm__ __volatile__("syncht" ::: "memory");
+          __asm__ __volatile__("barrier" ::: "memory");
+          for (i = 0; i + 3 < n; i += 4) {
+              acc = Q6_Vw_vadd_VwVw(acc, p[i]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 1]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 2]);
+              acc = Q6_Vw_vadd_VwVw(acc, p[i + 3]);
+          }
+          pc[3] += (int)(HAP_perf_get_pcycles() - c); }
+        t1 = HAP_perf_get_time_us(); us[3] += (int)(t1 - t0);
+    }
+    ((HVX_Vector *)res.base)[0] = acc;
+
+    r[1] = (int)bytes * reps;
+    r[2] = us[0] / reps;
+    r[3] = us[1] / reps;
+    r[4] = us[2] / reps;
+    r[5] = us[3] / reps;
+    r[6] = pc[0] / reps;
+    r[7] = pc[1] / reps;
+    qurt_hvx_unlock();
+    res_put(&res);
+    free(heap);
+    return 0;
+}
+
+
+/* Interleaved tournament: every kind is measured in the same process, in
+ * forward and reverse order, so DVFS drift hits all kinds alike.
+ * r = {status, bytes_per_kind, reps, chunk_bytes,
+ *      best rate*100 per kind 0..7 (8 entries), last rate*100 0..2} */
+int mx4_bwt(const unsigned char *srcData, int srcLen, int chunkKb, int reps,
+            int rounds, int *r, int rLen)
+{
+    res_t res;
+    uint8_t *heap;
+    unsigned bytes, chunk, nchunks, nvec;
+    int rc, kind, rnd, idx;
+    HVX_Vector acc;
+    int best[24], last[24];
+
+    if (rLen < 16) return -1;
+    memset(r, 0, sizeof(int) * rLen);
+    if (srcLen < (1 << 20) || reps < 1 || reps > 8 || rounds < 1 || rounds > 8)
+        { r[0] = -2; return 0; }
+    if (chunkKb < 1 || chunkKb > 1024) chunkKb = 32;
+
+    bytes = (unsigned)srcLen & ~127u;
+    chunk = (unsigned)chunkKb << 10;
+    if (chunk > bytes) chunk = bytes;
+    nchunks = bytes / chunk;
+    nvec = chunk / 128u;
+
+    heap = (uint8_t *)memalign(4096, bytes + (1u << 18));
+    if (!heap) { r[0] = -3; return 0; }
+    memset(heap, 3, bytes + (1u << 18));
+    (void)srcData;
+
+    rc = res_get(BW2_VTCM, &res);
+    r[0] = rc;
+    if (rc) { free(heap); return 0; }
+    rc = qurt_hvx_lock(QURT_HVX_MODE_128B);
+    if (rc) { r[0] = -4; res_put(&res); free(heap); return 0; }
+
+    for (kind = 0; kind < 21; kind++) { best[kind] = 0; last[kind] = 0; }
+    acc = Q6_V_vzero();
+    for (rnd = 0; rnd < rounds; rnd++) {
+        for (idx = 0; idx < 21; idx++) {
+            int us, pcyc, rate;
+            kind = (rnd & 1) ? (20 - idx) : idx;
+            bw2_timed(heap, kind, chunk, nchunks, nvec, res.base, reps, &acc,
+                      &us, &pcyc, &rate);
+            last[kind] = rate;
+            if (rate > best[kind]) best[kind] = rate;
+        }
+    }
+    ((HVX_Vector *)res.base)[0] = acc;
+
+    r[1] = (int)bytes * reps;
+    r[2] = reps;
+    r[3] = (int)chunk;
+    for (kind = 0; kind < 21; kind++) {
+        if (28 + kind < rLen) r[28 + kind] = best[kind];
+        if (4 + kind < rLen) r[4 + kind] = last[kind];
+    }
+    qurt_hvx_unlock();
+    res_put(&res);
+    free(heap);
+    return 0;
+}
+
+
+/* ================================================================== */
 /* int4 weights: weight.n = mxmem(w, 512-1)                            */
 /* ================================================================== */
 /* 4-bit tile: 32 K x 32 N = 512 B.  The nibble address is a halved
  * int8 crouton; `wl` selects the candidate permutation. */
-static void i4_pack_wgt(uint8_t *dst, const int8_t *B, int N, int K, int wl)
+static void i4_pack_wgt(uint8_t *dst, const int8_t *B, int N, int K, int wl,
+                        unsigned wstride)
 {
     int k, n, ncr = (K + 31) / 32;
-    memset(dst, 0, (size_t)512 * (size_t)ncr);
+    memset(dst, 0, (size_t)wstride * (size_t)ncr);
     for (k = 0; k < K; k++)
         for (n = 0; n < N; n++) {
             unsigned g = ((unsigned)k & 31u) >> 2, byte, nib;
             int odd = k & 1;
+            if (wl == 4) {          /* verified v68 int4 layout: 8 K per 128 B */
+                unsigned bb = 128u * ((unsigned)k >> 3) + 4u * (unsigned)n
+                            + ((unsigned)k & 3u);
+                int hi = ((unsigned)k >> 2) & 1u;
+                bb += wstride * ((unsigned)k >> 5);
+                if (hi) dst[bb] = (uint8_t)((dst[bb] & 0x0Fu) | ((B[n * K + k] & 0x0F) << 4));
+                else    dst[bb] = (uint8_t)((dst[bb] & 0xF0u) | (B[n * K + k] & 0x0F));
+                continue;
+            }
             switch (wl & 3) {
             case 0: byte = 64u * g + 2u * (unsigned)n + (((unsigned)k & 3u) >> 1);
                     nib = (unsigned)(odd == 0); break;
@@ -2303,7 +2982,7 @@ static void i4_pack_wgt(uint8_t *dst, const int8_t *B, int N, int K, int wl)
             default: byte = 64u * g + (unsigned)n + 32u * (((unsigned)k & 3u) >> 1);
                     nib = (unsigned)(odd != 0); break;
             }
-            byte += 512u * ((unsigned)k >> 5);
+            byte += wstride * ((unsigned)k >> 5);
             if (nib)
                 dst[byte] = (uint8_t)((dst[byte] & 0x0Fu) | ((B[n * K + k] & 0x0F) << 4));
             else
@@ -2314,7 +2993,17 @@ static void i4_pack_wgt(uint8_t *dst, const int8_t *B, int N, int K, int wl)
 static inline void i4_mul(const void *act, uint32_t art,
                           const void *wgt, uint32_t wc, int deep)
 {
-    if (deep)
+    if (deep == 2)
+        __asm__ __volatile__(
+            "{\n\t activation.ub = mxmem(%0,%1)\n\t weight.n = mxmem(%2,%3):deep\n\t}"
+            :: "r"((uint32_t)(uintptr_t)act), "r"(art),
+               "r"((uint32_t)(uintptr_t)wgt), "r"(wc) : "memory");
+    else if (deep == 3)
+        __asm__ __volatile__(
+            "{\n\t activation.ub = mxmem(%0,%1):deep\n\t weight.n = mxmem(%2,%3):deep\n\t}"
+            :: "r"((uint32_t)(uintptr_t)act), "r"(art),
+               "r"((uint32_t)(uintptr_t)wgt), "r"(wc) : "memory");
+    else if (deep)
         __asm__ __volatile__(
             "{\n\t activation.ub = mxmem(%0,%1):deep\n\t weight.n = mxmem(%2,%3)\n\t}"
             :: "r"((uint32_t)(uintptr_t)act), "r"(art),
@@ -2344,7 +3033,7 @@ int mx4_i4(const unsigned char *Adata, int ALen,
     const int8_t *A = (const int8_t *)Adata;
     const int8_t *B = (const int8_t *)Bdata;
     int ncr = (K + 31) / 32, rc, i, rep, c, ch;
-    unsigned aregion, wregion, need;
+    unsigned aregion, wregion, need, wstride;
     uint64_t t0, t1, c0, c1;
     int hvx_ok = 0;
 
@@ -2356,12 +3045,13 @@ int mx4_i4(const unsigned char *Adata, int ALen,
     if (ALen < M * K || BLen < N * K) return -4;
     if (rawLen < 2048) return -5;
     if (reps < 1 || reps > 20000) reps = 1;
-    if (wc <= 0) wc = 512 * ncr - 1;
+    if (wc <= 0) wc = (wl == 4) ? 511 : 512 * ncr - 1;
     M = (mode & 8) ? 64 : 32;
 
+    wstride = (mode & 4) ? 1024u : (mode & 16) ? 2048u : 512u;
     aregion = 2048u * (unsigned)ncr;
-    wregion = 512u * (unsigned)ncr;
-    need = aregion + align_up(wregion, 2048u) + 4096u + 512u + 2048u;
+    wregion = wstride * (unsigned)ncr;
+    need = aregion + align_up(wregion, 2048u) + 8192u + 512u + 2048u;
     rc = res_get(need, &r);
     info[0] = rc;
     if (rc) return 0;
@@ -2371,8 +3061,8 @@ int mx4_i4(const unsigned char *Adata, int ALen,
     vout = vact + align_up(aregion + wregion, 2048u);
     vbias = vout + 4096u;
     memset(r.base, 0, need);
-    i8_pack_act(vact, A, K, 3, M);
-    i4_pack_wgt(vwgt, B, N, K, wl);
+    i8_pack_act(vact, A, K, (mode & 128) ? 4 : 3, M);
+    i4_pack_wgt(vwgt, B, N, K, wl, wstride);
     if (bs) {
         uint32_t *bl = (uint32_t *)vbias;
         for (i = 0; i < 128; i++) bl[i] = 0;
@@ -2391,21 +3081,32 @@ int mx4_i4(const unsigned char *Adata, int ALen,
     c0 = HAP_perf_get_pcycles();
     for (rep = 0; rep < reps; rep++) {
         hmx_clr();
-        if (mode & 1) {
+        if (mode & 64) {
+            i4_mul(vact, ((uint32_t)(ncr - 1) << 11) | 0x3FFu,
+                   vwgt, (uint32_t)wstride * (uint32_t)ncr - 1u, 2);
+        } else if (mode & 32) {
+            i4_mul(vact, ((uint32_t)(ncr - 1) << 11) | 0x3FFu,
+                   vwgt, (uint32_t)wstride * (uint32_t)ncr - 1u, 3);
+        } else if (mode & 1) {
             for (c = 0; c < ncr; c += 32) {
                 ch = (ncr - c) > 32 ? 32 : (ncr - c);
                 i4_mul(vact + (unsigned)c * 2048u,
                        ((uint32_t)(ch - 1) << 11) | 0x3FFu,
-                       vwgt + (unsigned)c * 512u,
-                       (uint32_t)ch * 512u - 1u, 1);
+                       vwgt + (unsigned)c * wstride,
+                       (uint32_t)ch * wstride - 1u, 1);
             }
         } else {
             for (c = 0; c < ncr; c++)
-                i4_mul(vact + (unsigned)c * 2048u, 0x3FFu,
-                       vwgt + (unsigned)c * 512u, (uint32_t)wc, 0);
+                i4_mul(vact + (unsigned)c * (unsigned)((mode & 256) ? 0 :
+                                                      (mode & 128) ? 1024 : 2048),
+                       0x3FFu, vwgt + (unsigned)c * wstride, (uint32_t)wc, 0);
         }
         if (bs) hmx_bias(vbias);
         i8_store(vout, 0, 0);
+        if (mode & 512) {
+            if (bs) hmx_bias(vbias + 256);
+            i8_store(vout + 2048, 0, 0);
+        }
     }
     hmx_sync();
     c1 = HAP_perf_get_pcycles();
@@ -2420,6 +3121,143 @@ int mx4_i4(const unsigned char *Adata, int ALen,
     for (i = 0; i < 2048 && i < rawLen; i++) raw[i] = vout[i];
     res_put(&r);
     info[0] = 0;
+    return 0;
+}
+
+/* int4 impulse map: one nibble at a time at physical byte nb of the 512 B
+ * weight tile.  A[s][k] = k+1, so a responding output column n carrying the
+ * value v decodes to (k = v-1, n).  map[nb] = (k<<5)|n, 0xFF = no response,
+ * 0xFE = response outside 1..32.  info = {status, max_v, hits, nibhi, 0,0,0,0} */
+int mx4_i4map(int nibhi, int art, int wc, int bs, int amode, int k0,
+              unsigned char *map, int mapLen, int *info, int infoLen)
+{
+    res_t r;
+    uint8_t *vact, *vwgt, *vout, *vbias;
+    int rc, nb, n, i, hits = 0, maxv = 0, maxhit = 0;
+    int8_t A[32 * 32];
+    unsigned need = 2048u + 4096u + 4096u + 512u + 2048u;
+
+    if (infoLen < 8 || mapLen < 512) return -1;
+    memset(info, 0, sizeof(int) * infoLen);
+    memset(map, 0xFF, 512);
+    rc = res_get(need, &r);
+    info[0] = rc;
+    if (rc) return 0;
+    vact  = r.base;
+    vwgt  = vact + 2048u;
+    vout  = vwgt + 4096u;
+    vbias = vout + 4096u;
+    memset(r.base, 0, need);
+
+    for (i = 0; i < 32; i++)
+        for (n = 0; n < 32; n++) {
+            if (amode == 0 || amode == 4 || amode == 5 || amode == 6 ||
+                amode == 7 || amode == 8 || amode == 9 || amode == 10)
+                A[i * 32 + n] = 1;
+            else if (amode == 1)
+                A[i * 32 + n] = (int8_t)(n + 1);
+            else
+                A[i * 32 + n] = (int8_t)(n == k0 ? 1 : 0);
+        }
+    i8_pack_act(vact, A, 32, 3, 32);
+    {
+        uint32_t *bl = (uint32_t *)vbias;
+        for (i = 0; i < 128; i++) bl[i] = 0;
+        for (i = 0; i < 32; i++) { bl[i] = (uint32_t)bs; bl[64 + i] = (uint32_t)bs; }
+    }
+
+    info[6] = qurt_hvx_lock(QURT_HVX_MODE_128B);
+    info[7] = hmx_power(1);
+    info[5] = compute_resource_hmx_lock ? compute_resource_hmx_lock(r.ctx) : -100;
+
+    if (amode == 5) {
+        /* one nibble at byte k0, A = ones: dump out[s][0] for s = 0..63 */
+        memset(vwgt, 0, 2048);
+        vwgt[k0 & 511] = nibhi ? 0x10u : 0x01u;
+        memset(vout, 0, 2048);
+        hmx_clr();
+        i4_mul(vact, (uint32_t)art, vwgt, (uint32_t)wc, 0);
+        hmx_bias(vbias);
+        i8_store(vout, 0, 0);
+        hmx_sync();
+        for (nb = 0; nb < 64; nb++)
+            map[nb] = vout[(unsigned)(nb >> 2) * 128u + (unsigned)(nb & 3)];
+        info[1] = 0;
+        for (nb = 0; nb < 2048; nb++) if (vout[nb]) info[1]++;
+        if (compute_resource_hmx_unlock) compute_resource_hmx_unlock(r.ctx);
+        hmx_power(0);
+        qurt_hvx_unlock();
+        res_put(&r);
+        info[0] = 0;
+        return 0;
+    }
+
+    for (nb = 0; nb < 512; nb++) {
+        int nresp = 0, first = -1;
+        memset(vwgt, 0, 2048);
+        if (amode == 8) {
+            memset(vwgt, 0x01, 2048);          /* low nibbles only */
+        } else if (amode == 9) {
+            memset(vwgt, 0x10, 2048);          /* high nibbles only */
+        } else if (amode == 10) {
+            memset(vwgt, 0x11, 2048);          /* both nibbles */
+        } else if (amode == 7) {
+            vwgt[0] = 0x01u; vwgt[128] = (unsigned)(k0 & 15);
+        } else if (amode == 4) {
+            memset(vwgt, nibhi ? ((k0 & 15) << 4) : (k0 & 15), 2048);
+        } else if (amode == 6) {
+            memset(vwgt, nibhi ? ((k0 & 15) << 4) : (k0 & 15), 2048);
+            memset(vwgt, 0, (k0 & 3) * 128u);
+            memset(vwgt + (unsigned)((k0 & 3) + 1) * 128u, 0,
+                   512u - (unsigned)((k0 & 3) + 1) * 128u);
+        } else if (amode == 3) {
+            vwgt[nb] = nibhi ? (unsigned)((k0 & 15) << 4) : (unsigned)(k0 & 15);
+        } else {
+            vwgt[nb] = nibhi ? 0x10u : 0x01u;
+        }
+        memset(vout, 0, 2048);
+        hmx_clr();
+        i4_mul(vact, (uint32_t)art, vwgt, (uint32_t)wc, 0);
+        hmx_bias(vbias);
+        i8_store(vout, 0, 0);
+        hmx_sync();
+        for (n = 0; n < 32; n++) {
+            unsigned v = vout[4u * (unsigned)n];
+            if (v) {
+                if ((int)v > maxv) maxv = (int)v;
+                nresp++;
+                if (first < 0) first = n;
+            }
+        }
+        if (nresp > maxhit) maxhit = nresp;
+        if (nresp) { map[nb] = (unsigned char)first; hits++; }
+        if (amode == 6 || (amode >= 7 && amode <= 10)) break;
+    }
+    if (compute_resource_hmx_unlock) compute_resource_hmx_unlock(r.ctx);
+    hmx_power(0);
+    qurt_hvx_unlock();
+    res_put(&r);
+    info[1] = maxv;
+    info[2] = hits;
+    info[3] = nibhi;
+    info[4] = maxhit;
+    info[5] = k0;
+    info[0] = 0;
+    return 0;
+}
+
+int mx4_ping0(int x, int *r, int rLen)
+{
+    if (rLen < 1) return -1;
+    r[0] = x + 1;
+    return 0;
+}
+
+int mx4_pingbuf(const unsigned char *data, int len, int *r, int rLen)
+{
+    if (rLen < 2) return -1;
+    r[0] = len;
+    r[1] = (len > 0) ? (int)data[0] + (int)data[len - 1] : 0;
     return 0;
 }
 

@@ -1965,6 +1965,68 @@ static int do_i8ramp(int K, int N, int bs, int mul, int npair, int reps)
 }
 
 /* ---- batched prefill GEMM -------------------------------------------- */
+static int do_bw2(int mb, int kind, int chunkKb, int reps, int useHost)
+{
+    int r[16];
+    int n = (mb << 20) + (1 << 18);
+    unsigned char *src = (unsigned char *)malloc(n);
+    int rc;
+
+    if (!src) return 1;
+    memset(src, 0x5a, n);
+    rc = mx4_bw2(src, n, kind, chunkKb, reps,
+                 (useHost ? 1 : 0) | (getenv("BW_HMX") ? 0x40 : 0) |
+                 (getenv("BW_VOTE") ? 6 : 0), r, 16);
+    printf("bw2 %dMB kind=%d chunk=%dKB reps=%d rc=%d st=%d src=%s hmx=%d\n"
+           "  A : %.2f GB/s (us=%u pcyc=%u)\n",
+           mb, kind, chunkKb, reps, rc, r[0], useHost ? "host" : "heap",
+           getenv("BW_HMX") ? 1 : 0,
+           (double)r[2] / (r[1] ? r[1] * 1e3 : 1.0), (unsigned)r[1], (unsigned)r[3]);
+    if (getenv("BW_VOTE"))
+        printf("  B vote : %.2f GB/s (us=%d pcyc=%d) vote_rc=%#x\n"
+               "  C undo : %.2f GB/s (us=%d pcyc=%d)\n",
+               (double)r[10] / 100.0, r[8], r[9], r[6],
+               (double)r[14] / 100.0, r[12], r[13]);
+    free(src);
+    return 0;
+}
+
+static const char *bw2_kind_name(int k)
+{
+    static const char *n[24] = {
+        "read-sum 4acc", "read-sum 16-inflight", "copy 2KB croutons",
+        "copy chunk plain", "copy chunk l2fetch", "read-sum l2fetch",
+        "copy chunk memcpy", "copy 2KB 8+8",
+        "read-sum 2 streams", "read-sum 4 streams",
+        "read-sum 8 streams", "read-sum 16 streams",
+        "copy 2 streams", "copy 4 streams", "copy 8 streams",
+        "copy l2f 8 streams", "copy l2f 4 streams", "copy L2-resident 512K",
+        "copy 4x4 batched", "copy 8x2 batched", "2-pass L2 staging"
+    };
+    return (k >= 0 && k < 21) ? n[k] : "?";
+}
+
+static int do_bwt(int mb, int chunkKb, int reps, int rounds)
+{
+    int r[64];
+    int n = (mb << 20) + (1 << 18);
+    unsigned char *src = (unsigned char *)malloc(n);
+    int rc, k;
+
+    if (!src) return 1;
+    memset(src, 0x5a, n);
+    rc = mx4_bwt(src, n, chunkKb, reps, rounds, r, 64);
+    printf("bwt %dMB chunk=%dKB reps=%d rounds=%d rc=%d st=%d\n",
+           mb, chunkKb, reps, rounds, rc, r[0]);
+    if (rc == 0 && r[0] == 0) {
+        for (k = 0; k < 21; k++)
+            printf("  %-20s last %6.2f  best %6.2f GB/s\n", bw2_kind_name(k),
+                   r[4 + k] / 100.0, r[28 + k] / 100.0);
+    }
+    free(src);
+    return 0;
+}
+
 static int do_pref(int M, int N, int K, int mode, int reps)
 {
     static int8_t *A, *B;
@@ -1993,7 +2055,8 @@ static int do_pref(int M, int N, int K, int mode, int reps)
            M, N, K, mode, reps, us, info[2] / reps,
            us > 0 ? lmacs / us * 1e-6 : 0.0, info[3], info[4], info[5],
            info[10], info[11]);
-    printf("  copycheck(bad bytes in first staged tile)=%d\n", info[12]);
+    printf("  copycheck(bad bytes in first staged tile)=%d  copy_us/rep=%.1f\n",
+           info[12], (double)info[15] / reps);
     if (us > 0) printf("  per token: %.3f us -> %.1f tok/s (batch %d)\n",
                        us / M, M * 1e6 / us, M);
 
@@ -2033,27 +2096,39 @@ static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int re
     for (s = 0; s < 64; s++)
         for (k = 0; k < K; k++)
             A[s * K + k] = (int8_t)(amax == -1 ? 1
-                              : amax == -4 ? 1
+                              : (amax <= -8) ? 1
+                              : (amax == -7) ? (k >= 32 ? 1 : 0)
+                              : (amax <= -2) ? (int)(rnd() % 4u)
                               : amax ? (int)(rnd() % (unsigned)(amax + 1)) : 0);
     for (n = 0; n < N; n++)
         for (k = 0; k < K; k++) {
             int v;
             if (amax == -1 || amax == -4) v = 1;
             else if (amax == -2) v = (int)(rnd() % 16) - 8;         /* -8..7 */
+            else if (amax == -5) v = (k >= 32) ? 1 : 0;             /* 2nd half */
+            else if (amax == -6) v = (k < 32) ? 1 : 0;              /* 1st half */
+            else if (amax == -7) v = 1;                              /* act 2nd */
+            else if (amax <= -8) { int cc = -8 - amax;
+                                   v = (((int)k >> 5) == cc) ? 1 : 0; }
             else if (amax == -3) v = ((int)(rnd() % 2) ? 7 : -7);   /* +-7 */
             else v = (int)(rnd() % (unsigned)(amax + 1));
             B[n * K + k] = (int8_t)v;
         }
     rc = mx4_i4((unsigned char *)A, 64 * K, (unsigned char *)B, N * K,
-                M, N, K, wl, 0x3FF, 0, bs, mode, reps, raw, 4096, info, 16);
+                M, N, K, wl, 0x3FF,
+                getenv("I4_WC") ? atoi(getenv("I4_WC")) : 0, bs, mode, reps,
+                raw, 4096, info, 16);
     if (rc || info[0]) { printf("i4 rc=%d st=%d\n", rc, info[0]); return 1; }
     us = (double)info[1] / (double)reps;
     printf("i4 M=%d N=%d K=%d wl=%d bs=%#x amax=%d mode=%d reps=%d us/rep=%.3f "
            "pcyc=%d\n", M, N, K, wl, (unsigned)bs, amax, mode, reps, us, info[2]);
     for (c = 0; c < 2048; c++) if (raw[c]) nz++;
-    printf("  tile nz=%d head:", nz);
-    for (c = 0; c < 12; c++) printf(" %3d", raw[c]);
-    printf("\\n");
+    { int nz2 = 0;
+      for (c = 1024; c < 2048; c++) if (raw[c]) nz2++;
+      printf("  tile nz=%d nz2=%d head:", nz, nz2);
+      for (c = 0; c < 12; c++) printf(" %3d", raw[c]);
+      printf("  b1:"); for (c = 1024; c < 1036; c++) printf(" %3d", raw[c]);
+      printf("\\n"); }
     bad = 0; sat = 0;
     for (s = 0; s < 32; s++)
         for (n = 0; n < N; n++) {
@@ -2596,6 +2671,54 @@ int main(int argc, char **argv)
                (double)r8[2] / (r8[1] ? r8[1] * 1e3 : 1.0), r8[5]);
         return 0;
     }
+    if (!strcmp(cmd, "bw2"))
+        return do_bw2(argc > 2 ? atoi(argv[2]) : 16,
+                      argc > 3 ? atoi(argv[3]) : 0,
+                      argc > 4 ? atoi(argv[4]) : 32,
+                      argc > 5 ? atoi(argv[5]) : 3,
+                      argc > 6 ? atoi(argv[6]) : 0);
+    if (!strcmp(cmd, "bwt"))
+        return do_bwt(argc > 2 ? atoi(argv[2]) : 8,
+                      argc > 3 ? atoi(argv[3]) : 128,
+                      argc > 4 ? atoi(argv[4]) : 1,
+                      argc > 5 ? atoi(argv[5]) : 4);
+    if (!strcmp(cmd, "i4map")) {
+        unsigned char map[512];
+        int info[8];
+        int rc = mx4_i4map(argc > 2 ? atoi(argv[2]) : 0,
+                           argc > 3 ? (int)strtol(argv[3], 0, 0) : 0x3FF,
+                           argc > 4 ? (int)strtol(argv[4], 0, 0) : 511,
+                           argc > 5 ? (int)strtol(argv[5], 0, 0) : 0x6000,
+                           argc > 6 ? atoi(argv[6]) : 0,
+                           argc > 7 ? atoi(argv[7]) : 0,
+                           map, 512, info, 8);
+        int b;
+        printf("i4map rc=%d st=%d maxv=%d hits=%d nibhi=%d maxcols=%d k0=%d\n",
+               rc, info[0], info[1], info[2], info[3], info[4], info[5]);
+        for (b = 0; b < (info[3] == 0 && info[5] >= 0 && info[5] < 32 ? 64 : 512); b++)
+            printf("%d %d\n", b, map[b] == 0xFF ? -1 : map[b]);
+        return 0;
+    }
+    if (!strcmp(cmd, "l2t")) {
+        int r[8];
+        int kb = argc > 2 ? atoi(argv[2]) : 512;
+        int rp = argc > 3 ? atoi(argv[3]) : 5;
+        int n = (kb << 10) + (1 << 18);
+        unsigned char *src = (unsigned char *)malloc(n);
+        int rc;
+        if (!src) return 1;
+        memset(src, 0x33, n);
+        rc = mx4_l2t(src, n, kb, rp, r, 8);
+        printf("l2t %dKB reps=%d rc=%d st=%d bytes=%d | cold %.2f GB/s (%d us) "
+               "warm %.2f GB/s (%d us) pref1 %.2f GB/s (%d us) pref8 %.2f GB/s "
+               "(%d us)\n", kb, rp, rc, r[0], r[1],
+               r[1] / (r[2] ? r[2] * 1e3 : 1.0), r[2],
+               r[1] / (r[3] ? r[3] * 1e3 : 1.0), r[3],
+               r[1] / (r[4] ? r[4] * 1e3 : 1.0), r[4],
+               r[1] / (r[5] ? r[5] * 1e3 : 1.0), r[5]);
+        free(src);
+        return 0;
+    }
     if (!strcmp(cmd, "i4"))
         return do_i4(argc > 2 ? atoi(argv[2]) : 32,
                      argc > 3 ? atoi(argv[3]) : 32,
@@ -2605,6 +2728,43 @@ int main(int argc, char **argv)
                      argc > 7 ? atoi(argv[7]) : 1,
                      argc > 8 ? atoi(argv[8]) : 0,
                      argc > 9 ? atoi(argv[9]) : 100);
+    if (!strcmp(cmd, "rpc")) {
+        int it = argc > 2 ? atoi(argv[2]) : 31;
+        int r[4], i, rc, sz;
+        double s[256];
+        int sizes[3] = {0, 1024, 1 << 20}, si;
+        for (si = 0; si < 3; si++) {
+            sz = sizes[si];
+            unsigned char *buf = sz ? (unsigned char *)malloc(sz) : 0;
+            if (buf) memset(buf, 7, sz);
+            for (i = 0; i < 3; i++) {
+                if (sz) rc = mx4_pingbuf(buf, sz, r, 4);
+                else rc = mx4_ping0(1, r, 4);
+            }
+            for (i = 0; i < it && i < 256; i++) {
+                struct timespec a, b;
+                clock_gettime(CLOCK_MONOTONIC, &a);
+                if (sz) rc = mx4_pingbuf(buf, sz, r, 4);
+                else rc = mx4_ping0(1, r, 4);
+                clock_gettime(CLOCK_MONOTONIC, &b);
+                s[i] = (double)(b.tv_sec - a.tv_sec) * 1e6
+                     + (double)(b.tv_nsec - a.tv_nsec) / 1e3;
+            }
+            {   /* insertion sort */
+                int j;
+                for (i = 1; i < it; i++) {
+                    double v = s[i];
+                    for (j = i - 1; j >= 0 && s[j] > v; j--) s[j + 1] = s[j];
+                    s[j + 1] = v;
+                }
+            }
+            printf("rpc %7s rc=%d  min %8.1f us  median %8.1f us  p95 %8.1f us\n",
+                   sz >= (1 << 20) ? "1 MiB" : sz ? "1 KiB" : "empty", rc,
+                   s[0], s[it / 2], s[(it * 95 / 100) < it ? it * 95 / 100 : it - 1]);
+            free(buf);
+        }
+        return 0;
+    }
     if (!strcmp(cmd, "clk")) {
         int r[4];
         int rc = mx4_clk(r, 4);

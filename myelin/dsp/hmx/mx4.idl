@@ -166,8 +166,36 @@ interface mx4 {
            in long mode, in long reps, rout sequence<octet> raw,
            rout sequence<long> info);
 
+   /* int4 impulse map: map[nb] = (k<<5)|n decoded from one nibble at physical
+      byte nb.  info = {status, max_v, hits, nibhi, 0,0,0,0} */
+   long i4map(in long nibhi, in long art, in long wc, in long bs,
+              in long amode, in long k0,
+              rout sequence<octet> map, rout sequence<long> info);
+
    /* Bandwidth probe: r = {status, us, bytes, pcyc, MB/s, align, 0, 0} */
    long bw(in long mb, in long mode, in long reps, rout sequence<long> r);
+
+   /* Bandwidth probe v2: kind 0 read-sum(4 acc), 1 read-sum(8 acc),
+      2 copy 2KB croutons, 3 copy chunkKb block, 4 copy + l2fetch pipeline,
+      5 read-sum + l2fetch pipeline, 6 libc memcpy.  mode bit0 -> source is
+      the host (FastRPC) buffer.  r = {status, us, bytes, pcyc, GBps*100,
+      src_align, vtcm_align, chunk_kb} */
+   long bw2(in sequence<octet> src, in long kind, in long chunkKb, in long reps,
+            in long mode, rout sequence<long> r);
+
+   /* Interleaved tournament over bw2 kinds 0..7 in one process.  r = {status,
+      bytes_per_kind, reps, chunk_bytes, best*100 for kinds 0..7, last 0..3} */
+   long bwt(in sequence<octet> src, in long chunkKb, in long reps, in long rounds,
+            rout sequence<long> r);
+
+   /* L2 fill test.  r = {status, bytes, cold_us, warm_us, pref1_us, pref8_us,
+      cold_pcyc, warm_pcyc} */
+   long l2t(in sequence<octet> src, in long kb, in long reps,
+            rout sequence<long> r);
+
+   /* RPC overhead probes: x is echoed, the buffer is only touched. */
+   long ping0(in long x, rout sequence<long> r);
+   long pingbuf(in sequence<octet> data, rout sequence<long> r);
 
    /* DSP clock calibration: r = {pcycles, us, pcycles_per_us} */
    long clk(rout sequence<long> r);
