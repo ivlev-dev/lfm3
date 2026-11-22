@@ -49,6 +49,9 @@ typedef struct {
     int      w8;        /* 1 = int8 weights (N*K bytes, stored offset-128) */
     int8_t  *out_ptr;   /* host ION buffer mapped via apps_mem_share_map */
     int      out_bytes;
+    uint8_t *w_heap;    /* weight copy allocated on the DSP heap (alloc_buf) */
+    int8_t  *in_ptr;    /* host ION buffer mapped as the weights (attach_in) */
+    int      in_bytes;
     float    sa, so;    /* activation / output scales last given to set_scale */
 } gbuf_t;
 
@@ -1340,6 +1343,90 @@ int lfmgemv_detach_out(int h)
     return 0;
 }
 
+/* ---------------- zero-copy weights (attach_in) ----------------
+ * The host owns the weights in an rpcmem/ION buffer; the DSP only needs the
+ * mapping.  apps_mem_share_map() returns the DSP virtual address of the same
+ * pages, so b->w can point straight at DDR: gemv/ffn/gemv_resident/
+ * ffn_resident read it exactly as they read the heap copy.
+ *
+ * Cache rules measured on the device (XQ-BC72, see attach_main.c):
+ *   - data written by the host before attach_in is visible to the DSP
+ *     without an explicit flush, for cached and uncached rpcmem alike
+ *     (the map itself does the AP-side cache maintenance);
+ *   - rewriting the pages in place afterwards is NOT visible, even with a
+ *     host DMA_BUF_IOCTL_SYNC flush: the DSP keeps its own cached view.  The
+ *     only refresh path is detach_in + attach_in.
+ *
+ * detach_in/release_buf drop the mapping.  The DSP keeps no copy of its own,
+ * so nothing is written back on the way out (weights are read-only here).
+ */
+static int attach_in_locked(gbuf_t *b, int fd, int nbytes)
+{
+    uint64 vapps = 0, vadsp = 0;
+    int rc;
+    if (fd < 0 || nbytes <= 0 || (nbytes & 127) != 0) return AEE_EBADPARM;
+    rc = apps_mem_share_map(fd, nbytes, &vapps, &vadsp);
+    if (rc != 0 || vadsp == 0) return rc ? rc : AEE_EBADPARM;
+    if (((uint64)vadsp & 127) != 0) {   /* HVX loads need 128 B alignment */
+        apps_mem_share_unmap(vadsp, nbytes);
+        return AEE_EBADPARM;
+    }
+    /* replace the previous mapping / heap copy only once the new map worked */
+    if (b->in_ptr) {
+        apps_mem_share_unmap((uint64)(size_t)b->in_ptr, b->in_bytes);
+        b->in_ptr = 0;
+        b->in_bytes = 0;
+    }
+    free(b->w_heap);
+    b->w_heap = 0;
+    b->in_ptr = (int8_t *)(size_t)vadsp;
+    b->in_bytes = nbytes;
+    b->w = (uint8_t *)b->in_ptr;
+    b->wbytes = (size_t)nbytes;
+    return 0;
+}
+
+int lfmgemv_attach_in(int h, int fd, int nbytes)
+{
+    gbuf_t *b;
+    int rc;
+    if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
+    b = &g_buf[h];
+    if (b->N && (size_t)b->N * (size_t)(b->K / 2) > (size_t)nbytes)
+        return AEE_EBADPARM;   /* weights already described do not fit */
+    rc = attach_in_locked(b, fd, nbytes);
+    if (rc == 0) set_perf();
+    return rc;
+}
+
+int lfmgemv_detach_in(int h)
+{
+    if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
+    if (g_buf[h].in_ptr) {
+        apps_mem_share_unmap((uint64)(size_t)g_buf[h].in_ptr, g_buf[h].in_bytes);
+        g_buf[h].in_ptr = 0;
+        g_buf[h].in_bytes = 0;
+        g_buf[h].w = 0;
+        g_buf[h].wbytes = 0;
+    }
+    return 0;
+}
+
+int lfmgemv_alloc_in(int fd, int nbytes, int *h)
+{
+    int i, rc;
+    if (h == 0 || fd < 0 || nbytes <= 0) return AEE_EBADPARM;
+    set_perf();
+    for (i = 0; i < MAXBUF; i++) if (!g_buf[i].used) break;
+    if (i == MAXBUF) return AEE_EBADPARM;
+    memset(&g_buf[i], 0, sizeof(g_buf[i]));
+    rc = attach_in_locked(&g_buf[i], fd, nbytes);
+    if (rc != 0) return rc;
+    g_buf[i].used = 1;
+    *h = i;
+    return 0;
+}
+
 /* tiny thread probes */
 void tiny_worker(void *a) { *(volatile int *)a = 42; }
 void sem_worker(void *a) { qurt_sem_up((qurt_sem_t *)a); }
@@ -1799,6 +1886,7 @@ static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen
         return AEE_EBADPARM;
     g = &g_buf[hg]; u = &g_buf[hu]; d = &g_buf[hd];
     if (!g->used || !u->used || !d->used) return AEE_EBADPARM;
+    if (!g->w || !u->w || !d->w) return AEE_EBADPARM;
     if (g->N != u->N || g->K != u->K || d->N != u->K || d->K != g->N) return AEE_EBADPARM;
     if (actLen != g->K) return AEE_EBADPARM;
     if (use_resident) {
@@ -2058,6 +2146,7 @@ int lfmgemv_alloc_buf(int nbytes, int *h)
     memset(&g_buf[i], 0, sizeof(g_buf[i]));
     g_buf[i].w = (uint8_t *)memalign(128, (size_t)nbytes + 128);
     if (g_buf[i].w == 0) return AEE_ENOMEMORY;
+    g_buf[i].w_heap = g_buf[i].w;
     g_buf[i].used = 1;
     g_buf[i].wbytes = (size_t)nbytes;
     *h = i;
@@ -2094,6 +2183,7 @@ int lfmgemv_load_buf(int h, int off, const unsigned char *data, int dataLen)
     gbuf_t *b;
     if (h < 0 || h >= MAXBUF || !g_buf[h].used || !data || dataLen < 0) return AEE_EBADPARM;
     b = &g_buf[h];
+    if (!b->w) return AEE_EBADPARM;
     if ((size_t)off + (size_t)dataLen > b->wbytes) return AEE_EBADPARM;
     memcpy(b->w + off, data, (size_t)dataLen);
     return 0;
@@ -2159,6 +2249,7 @@ static int gemv_impl(int h, int M, const unsigned char *act, int actLen, int rep
 
     if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
     b = &g_buf[h];
+    if (!b->w) return AEE_EBADPARM;
     if (M != 1 && M != 2 && M != 4) return AEE_EBADPARM;
     if (actLen != M * b->K) return AEE_EBADPARM;
     if (b->qp) {
@@ -2827,7 +2918,13 @@ int lfmgemv_probe(int h, int kind, int arg, int *res, int resLen)
 int lfmgemv_release_buf(int h)
 {
     if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
-    free(g_buf[h].w);
+    if (g_buf[h].in_ptr) {
+        apps_mem_share_unmap((uint64)(size_t)g_buf[h].in_ptr, g_buf[h].in_bytes);
+        g_buf[h].in_ptr = 0;
+    }
+    if (g_buf[h].out_ptr)
+        apps_mem_share_unmap((uint64)(size_t)g_buf[h].out_ptr, g_buf[h].out_bytes);
+    free(g_buf[h].w_heap);
     free(g_buf[h].qp);
     free(g_buf[h].qm);
     free(g_buf[h].acc);

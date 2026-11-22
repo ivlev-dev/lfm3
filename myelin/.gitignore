@@ -21,6 +21,8 @@
 /dsp/hvx/ab_test
 /dsp/hvx/ffn_test
 /dsp/hvx/attn_test
+/dsp/hvx/attach_test
+/dsp/hvx/rpc_test
 /dsp/hvx/diag_test
 /dsp/hvx/probe_test
 /dsp/conv/conv_test

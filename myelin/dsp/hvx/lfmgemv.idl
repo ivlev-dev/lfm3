@@ -58,6 +58,24 @@ interface lfmgemv {
    long team_info(rout sequence<long> res);
 
    long release_buf(in long h);
+
+   /* zero-copy weight buffer: map a host rpcmem/ION fd as the resident
+      weights of handle h (the "which" index), replacing the DSP heap copy
+      made by alloc_buf.  nbytes is the mapped length; the first byte must be
+      128 B aligned (rpcmem/ION pages are).  The host owns cache maintenance:
+      flush the buffer before this call, or allocate it uncached.
+      Existing resident calls (gemv/ffn/gemv_resident/ffn_resident) then read
+      the weights straight out of DDR, with no heap copy and no per-call
+      upload. */
+   long attach_in(in long h, in long fd, in long nbytes);
+
+   /* drop the mapping made by attach_in; the handle stays allocated but has
+      no weights until it is attached again */
+   long detach_in(in long h);
+
+   /* create a weight handle that lives entirely in the host fd: no DSP heap
+      weight allocation at all (use this for models larger than the DSP heap) */
+   long alloc_in(in long fd, in long nbytes, rout long h);
 };
 
 #endif /* LFMGEMV_IDL */

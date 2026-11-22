@@ -10,7 +10,7 @@
 set -e
 cd "$(dirname "$0")"
 
-BINS="liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test"
+BINS="liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test attach_test rpc_test"
 D=${MDEV:-/data/local/tmp/lfmgemv}
 if [ -z "$MADB" ]; then
     MADB=$(adb devices | awk 'NR>1 && $2=="device" {print $1; exit}')

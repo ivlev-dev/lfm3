@@ -57,5 +57,13 @@ $HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o attn_test \
     attn_main.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
 echo "ATTN OK"
 
+$HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o attach_test \
+    attach_main.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
+echo "ATTACH OK"
+
+$HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o rpc_test \
+    rpc_main.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
+echo "RPC OK"
+
 echo "BUILD OK"
-ls -la liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test ffn_sim ffn_real_study
+ls -la liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test attach_test rpc_test ffn_sim ffn_real_study
