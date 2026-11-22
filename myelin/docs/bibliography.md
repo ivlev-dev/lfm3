@@ -27,7 +27,7 @@
 | `/tmp/opencode/gemv/` | int4 GEMV, FFN, attention, `README.md`, `*.c` |
 | `/tmp/opencode/ffn_raw.txt` | сырые прогоны FFN (разброс времени) |
 | `/tmp/opencode/conv/` | shortconv: `lfmconv_impl.c`, `conv_sim`, `conv_math.h` |
-| `/tmp/opencode/hmx4/` | HMX: `mx4_impl.c`, `REPORT*.md`, `FINAL*.md` |
+| `/tmp/opencode/hmx4/` | HMX: `mx4_impl.c`, `REPORT18.md` (тайл), `REPORT19.md` (M=64, честный prefill, decode, полоса DDR), `FINAL*.md` |
 | `/tmp/opencode/qnn-study/` | дизассемблер скела: `hmx_syms.txt`, `groups.md`, `kernels.tsv`, `*.s`, `REPORT.md` |
 | `/tmp/opencode/android/qnn*.c` | стенды QNN: `qnnlayer.c`, `qnnblk.c`, `qnnarg.c`, `qnndump.c` |
 
@@ -35,7 +35,9 @@
 
 * Документированной раскладки **int8**-кроутонов HMX для v68 (PRM покрывает
   только fp16) — снимали экспериментально; S1 закрыт 22.11.2026
-  (`REPORT18.md`: int8 побитово).
+  (`REPORT18.md`: int8 побитово), M=64 и честный prefill — в `REPORT19.md`.
+* int4 (`weight.n`) на v68 — ни документации, ни собственного замера:
+  в REPORT19 ядро собрано, но на устройстве не запускалось.
 * Официального описания `qurt_hvx_get_units`/поведения `qurt_thread_create` с
   HVX на потребительских прошивках — выяснено на стенде.
 * Публичных цифр QNN для LFM3 на V68 — все числа сняты нами.

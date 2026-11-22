@@ -76,7 +76,8 @@ sum(w·a) = sum(u·a) − 8·sum(a),   u = nibble ∈ [0,15]
 * `pack_out_i8` скалярный: `Q6_Vw_vmpyieacc_VwVwVuh` дал неверные lanes.
 * `mulq16(a,b) = (a·b)>>16` реализован без 64-битных хелперов (разбиение на
   hi/lo), ошибка ≤ 0.03 реальных единицы — ниже 1 LSB int8.
-* M > 4 не реализовано; prefill идёт через QNN/HVX-GEMM (см. [hmx.md](hmx.md)).
+* M > 4 не реализовано; prefill идёт через QNN, HMX-путь измерен, но упирается
+  в доставку весов (см. [hmx.md](hmx.md), §9.1).
 
 ## 2. FFN-слой одним RPC
 
@@ -260,8 +261,9 @@ ring/phase с shift-register подтверждает механику коль�
 
 * Интеграция ядер в `myelin-core`/`myelin-npu` (сейчас ядра живут отдельным
   стендом в `/tmp/opencode`).
-* Prefill-GEMM на HVX (сейчас prefill — QNN; HMX-тайл заведён и измерен,
-  интеграции в рантайм нет, см. [hmx.md](hmx.md)).
+* Prefill-GEMM на HVX (сейчас prefill — QNN; HMX-тайл заведён и измерен:
+  compute-only 376.8 мкс, со стейджингом 7319 мкс, интеграции в рантайм нет,
+  см. [hmx.md](hmx.md) §9.1).
 * On-DSP расширение V 2 бита (нужна halfword-interleave идиома).
 * Нормализация/rope/residual как отдельные DSP-ядра (в стенде считаются
   упрощённо или на хосте).
