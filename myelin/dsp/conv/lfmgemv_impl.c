@@ -409,6 +409,10 @@ static void gemv_rows_m4(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
 }
 
 /* dequant int32 -> int8. qv[i] holds the Q16 multiplier (any halfword).
+ * The product is taken in 64 bits: mulq16(acc,q) resolves acc with a step of
+ * 256, so its int8 error is (acc & 0xff)*m -- fine when m ~ 1, but ~4 LSB of
+ * 127 when m ~ 0.015 (this layer's out_proj).  conv_pack_i8() in conv_math.h
+ * is the same expression; the host reference must stay bit-exact with this.
  * Scalar on purpose: N is 2k..8k, ~8 cycles/element = 15..45 us, and the
  * vector vmpyiewh form turned out to be numerically unreliable here. */
 static void pack_out_i8(const int32_t *acc, const int32_t *qv, int8_t *out, int n)
@@ -416,7 +420,7 @@ static void pack_out_i8(const int32_t *acc, const int32_t *qv, int8_t *out, int 
     int i;
     for (i = 0; i < n; i++) {
         int32_t q = (int32_t)((uint32_t)qv[i] & 0xffffu);
-        int32_t v = mulq16(acc[i], q);
+        int64_t v = ((int64_t)acc[i] * (int64_t)q + 32768) >> 16;
         if (v > 127) v = 127;
         if (v < -127) v = -127;
         out[i] = (int8_t)v;

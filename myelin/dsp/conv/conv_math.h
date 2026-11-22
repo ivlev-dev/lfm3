@@ -15,33 +15,41 @@
  */
 #include <stdint.h>
 
-/* (a*b)>>16 without 64-bit helpers -- identical to the GEMV harness idiom. */
-static inline int32_t conv_mulq16(int32_t a, int32_t b)
-{
-    int32_t hi = a >> 16;
-    uint32_t lo = ((uint32_t)a >> 8) & 0xFFu;
-    return hi * b + (int32_t)(((uint32_t)lo * (uint32_t)b) >> 8);
-}
-
-/* Q15 per-row dequant multiplier.  A conv output projection easily needs
- * s_w*sa/s_out > 1, so a Q16 field with a 1.0 clamp saturated the output
- * (64 % of values).  Q15 keeps 1 bit less precision but covers m up to 2.0. */
+/* Q16 per-row dequant multiplier, exactly as lfm_bridge set_scale() builds it
+ * (lfmgemv_impl.c):  m = sw*sa/so, field clamped to 0.99997.
+ *
+ * History: an earlier revision switched this to Q15 (clamp 1.9999) to "fix"
+ * int8 saturation of out_proj.  That was a red herring: the saturation came
+ * from a double offset-8 subtraction in conv_ref.h (ref_dot_int4() already
+ * removes the offset and the callers removed it again).  Q16 is restored
+ * because it is the device's format; m is ~0.0015 for in_proj and ~0.015 for
+ * out_proj on this layer, so the clamp is never reached.                   */
 static inline int32_t conv_row_scale(float sw, float sa, float so)
 {
     float m = sw * sa / so;
     unsigned q;
     if (m < 0.0f) m = 0.0f;
-    if (m > 1.9999f) m = 1.9999f;
-    q = (unsigned)(m * 32768.0f + 0.5f);
+    if (m > 0.99997f) m = 0.99997f;
+    q = (unsigned)(m * 65536.0f + 0.5f);
     if (q > 65535u) q = 65535u;
     return (int32_t)(q | (q << 16));
 }
 
-/* int8 dequant of one GEMV row: out = clamp((acc*qp)>>15, +-127) */
+/* int8 dequant of one GEMV row: out = clamp(round(acc*qp/65536), +-127).
+ *
+ * The product is taken in 64 bits on purpose.  The GEMV harness idiom
+ * mulq16(a,b) = (a>>16)*b + (((a>>8)&0xff)*b)>>8 resolves `a` with a step of
+ * 256, so the int8 output error is (acc & 0xff)*m: harmless when m ~ 1 (the
+ * comment in lfmgemv_impl.c quotes 0.03), but ~4 LSB of the 127-wide output
+ * when m ~ 0.015, which is exactly this layer's out_proj.  Measured on the
+ * stand (global cos(out) over all tokens): 0.986 with the truncation,
+ * 0.996 without.
+ * pack_out_i8() in lfmgemv_impl.c uses the same expression (same file set,
+ * same arithmetic -- the host reference must stay bit-exact with the DSP). */
 static inline int8_t conv_pack_i8(int32_t acc, int32_t qp)
 {
     int32_t q = (int32_t)((uint32_t)qp & 0xffffu);
-    int32_t v = conv_mulq16(acc, q) << 1;   /* >>16 then <<1 == >>15 */
+    int64_t v = ((int64_t)acc * (int64_t)q + 32768) >> 16;
     if (v > 127) v = 127;
     if (v < -127) v = -127;
     return (int8_t)v;

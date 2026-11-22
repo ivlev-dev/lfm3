@@ -5,13 +5,18 @@
  * runs on the build machine) and conv_main (on-device test driver).
  *
  * Three models of the same layer:
- *   ref_f32_run()   f32 arithmetic on the *dequantised* int4 weights  -> truth
- *   ref_i8_run()    the integer pipeline with a plain 6-tap shift register
- *   ref_ring_run()  the integer pipeline exactly as the DSP does it:
- *                   8 ring positions, phase-rotated int8 weights, byte planes
+ *   ref_f32_run()    f32 arithmetic on the *dequantised* int4 weights -> truth
+ *   ref_i8_run(),    the integer pipeline with a plain 6-tap shift register
+ *   ref_i8_run_y()   (y8 for every token; out_proj is a separate pass, its
+ *                     scale is calibrated from the accumulator range)
+ *   ref_ring_token() the integer pipeline exactly as the DSP does it:
+ *                    8 ring positions, phase-rotated int8 weights, byte planes
  *
- * ref_i8_run() and ref_ring_run() must agree bit for bit; that is what
+ * The integer models must agree with each other bit for bit; that is what
  * validates the ring/phase trick without a device.
+ *
+ * Scale calibration: s_bc / s_y from the f32 absmax (110/127 of full scale),
+ * s_out from the out_proj accumulator range (ref_calib_s_out below).
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -72,15 +77,22 @@ static inline void ref_pack_int4(uint8_t *w, int8_t *ws, int n, int k, uint32_t 
     }
 }
 
-/* int4 row dot, offset-8 form, exact integers (same value as the HVX kernel) */
+/* int4 row dot, offset-8 form, exact integers (same value as the HVX kernel).
+ * The kernel multiplies the *unsigned* nibble (0..15) by the activation and
+ * applies the offset once, row-independently, through `bias`:
+ *     sum(w_s*a) = sum(u*a) - 8*sum(a),   u = w_s + 8
+ * Do NOT subtract 8 per element here: the callers already pass
+ * bias = -8*sum(act), exactly as lfm_bridge_gemv() does on the device
+ * (see lfmgemv_impl.c, gemv_rows_m1_generic).  Subtracting twice throws the
+ * row output off by 8*sum(act)*sw, which is the same order as the signal. */
 static inline int32_t ref_dot_int4(const uint8_t *row, const int8_t *act, int K, int32_t bias)
 {
     int32_t s = 0;
     int i;
     for (i = 0; i < K; i += 2) {
         uint8_t b = row[i >> 1];
-        s += ((int)(b & 0xf) - 8) * (int)act[i];
-        s += ((int)(b >> 4) - 8) * (int)act[i + 1];
+        s += (int)(b & 0xf) * (int)act[i];
+        s += (int)(b >> 4) * (int)act[i + 1];
     }
     return s + bias;
 }
@@ -257,29 +269,49 @@ static inline void ref_out8(const ref_model_t *m, const int8_t *y8, int8_t *out8
                                conv_row_scale(m->sw_out[r], m->s_y, m->s_out));
 }
 
+/* one token of the shift-register pipeline: y8 only, no out_proj */
+static inline void ref_i8_token(const ref_model_t *m, const ref_convw_t *W,
+                                int16_t *hist6, int8_t *bcx8, int8_t *y8)
+{
+    int H = m->H, ch, j;
+    for (ch = 0; ch < H; ch++) {
+        int32_t bx = (int32_t)bcx8[ch] * (int32_t)bcx8[2 * H + ch];
+        int32_t a = (int32_t)W->wq1[(size_t)ch * CONV_KSIZE + 6] * bx;
+        for (j = 0; j < 6; j++)
+            a += (int32_t)W->wq1[(size_t)ch * CONV_KSIZE + j] *
+                 (int32_t)hist6[(size_t)j * H + ch];
+        y8[ch] = conv_glue(a, bcx8[H + ch], W->kq[ch], W->ksh);
+    }
+    for (ch = 0; ch < H; ch++) {
+        int32_t bx = (int32_t)bcx8[ch] * (int32_t)bcx8[2 * H + ch];
+        for (j = 0; j < 5; j++)
+            hist6[(size_t)j * H + ch] = hist6[(size_t)(j + 1) * H + ch];
+        hist6[(size_t)5 * H + ch] = (int16_t)bx;
+    }
+}
+
+/* y8 of every token, state carried across tokens.
+ * out_proj is a separate pass: its scale s_out must be calibrated from the
+ * out_proj accumulator range first (see ref_calib_s_out below).            */
+static inline void ref_i8_run_y(const ref_model_t *m, const ref_convw_t *W,
+                                int16_t *hist6, int8_t *bcx8, int8_t *y_all)
+{
+    int t;
+    for (t = 0; t < m->ntok; t++) {
+        ref_bcx8(m, m->tok + (size_t)t * m->H, bcx8);
+        ref_i8_token(m, W, hist6, bcx8, y_all + (size_t)t * m->H);
+    }
+}
+
 static inline void ref_i8_run(const ref_model_t *m, const ref_convw_t *W,
                               int16_t *hist6, int8_t *bcx8,
                               int8_t *y8, int8_t *out8)
 {
-    int H = m->H, t, ch, j;
+    int t;
     for (t = 0; t < m->ntok; t++) {
-        const int8_t *a8 = m->tok + (size_t)t * H;
-        ref_bcx8(m, a8, bcx8);
-        for (ch = 0; ch < H; ch++) {
-            int32_t bx = (int32_t)bcx8[ch] * (int32_t)bcx8[2 * H + ch];
-            int32_t a = (int32_t)W->wq1[(size_t)ch * CONV_KSIZE + 6] * bx;
-            for (j = 0; j < 6; j++)
-                a += (int32_t)W->wq1[(size_t)ch * CONV_KSIZE + j] *
-                     (int32_t)hist6[(size_t)j * H + ch];
-            y8[ch] = conv_glue(a, bcx8[H + ch], W->kq[ch], W->ksh);
-        }
-        for (ch = 0; ch < H; ch++) {
-            int32_t bx = (int32_t)bcx8[ch] * (int32_t)bcx8[2 * H + ch];
-            for (j = 0; j < 5; j++)
-                hist6[(size_t)j * H + ch] = hist6[(size_t)(j + 1) * H + ch];
-            hist6[(size_t)5 * H + ch] = (int16_t)bx;
-        }
-        ref_out8(m, y8, out8 + (size_t)t * H);
+        ref_bcx8(m, m->tok + (size_t)t * m->H, bcx8);
+        ref_i8_token(m, W, hist6, bcx8, y8);
+        ref_out8(m, y8, out8 + (size_t)t * m->H);
     }
 }
 
@@ -373,6 +405,75 @@ static inline double ref_rms(float *a, int n)
     int i;
     for (i = 0; i < n; i++) s += (double)a[i] * (double)a[i];
     return sqrt(s / (double)n);
+}
+
+/* ------------------------------------------------------------------ */
+/* out_proj scale calibration                                         */
+/* ------------------------------------------------------------------ */
+/*
+ * The out_proj output for row r is
+ *     out8[r] = clamp(acc[r] * m_r),   m_r = sw_out[r]*s_y/s_out,
+ *     acc[r]  = sum_j wq[r][j]*y8[j]   (int4 dot, exact int32)
+ * so row r clips iff m_r * acc_max[r] > 127.  Deriving s_out from
+ * absmax(out_f32) bounds the real output on the calibration set but not the
+ * accumulator that produces it; a scale that is a few times too small then
+ * clips whole rows (the original 64 % saturation).  Bound the accumulator
+ * instead:
+ *     s_out = max_r( sw_out[r]*s_y*acc_max[r] ) / target,  target <= 127
+ * which makes max_r m_r*acc_max[r] == target for the binding row.
+ * target = 110 keeps the same 13 % headroom as the s_bc / s_y calibration.
+ */
+
+/* acc_max[row] = max_t |acc| over the calibration tokens; returns the global
+ * max over rows (the number that has to fit the int8 output range).
+ * Per row/token: ref_dot_int4(row, y8, H, -8*sum(y8)) -- the GEMV algebra. */
+static inline int32_t ref_out_acc_profile(const ref_model_t *m, const int8_t *y8_all,
+                                          int ntok, int32_t *acc_max)
+{
+    int H = m->H, t, r;
+    int32_t gmax = 0;
+    for (r = 0; r < H; r++) acc_max[r] = 0;
+    for (t = 0; t < ntok; t++) {
+        const int8_t *y8 = y8_all + (size_t)t * H;
+        int32_t bias = -8 * ref_sum_i8(y8, H);
+        for (r = 0; r < H; r++) {
+            int32_t a = ref_dot_int4(m->w_out + (size_t)r * (H / 2), y8, H, bias);
+            if (a < 0) a = -a;
+            if (a > acc_max[r]) acc_max[r] = a;
+        }
+    }
+    for (r = 0; r < H; r++) if (acc_max[r] > gmax) gmax = acc_max[r];
+    return gmax;
+}
+
+/* s_out from the accumulator range (see the block comment above). */
+static inline float ref_calib_s_out(const ref_model_t *m, const int32_t *acc_max, float target)
+{
+    double need = 0.0;
+    int r;
+    for (r = 0; r < m->H; r++) {
+        double s = (double)m->sw_out[r] * (double)m->s_y *
+                   (double)acc_max[r] / (double)target;
+        if (s > need) need = s;
+    }
+    return (float)need;
+}
+
+/* Invariant the calibration must satisfy: for every row m_r <= 127/acc_max[r].
+ * Returns max_r m_r*acc_max[r] (int8 units, must stay <= 127) and, through
+ * mrmax, max_r m_r (compare with 127/acc_max over the whole tensor).       */
+static inline double ref_s_out_worst(const ref_model_t *m, const int32_t *acc_max,
+                                     float s_out, double *mrmax)
+{
+    double worst = 0.0, mx = 0.0;
+    int r;
+    for (r = 0; r < m->H; r++) {
+        double mr = (double)m->sw_out[r] * (double)m->s_y / (double)s_out;
+        if (mr > mx) mx = mr;
+        if (mr * (double)acc_max[r] > worst) worst = mr * (double)acc_max[r];
+    }
+    if (mrmax) *mrmax = mx;
+    return worst;
 }
 
 #endif /* CONV_REF_H */
