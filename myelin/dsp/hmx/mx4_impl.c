@@ -30,6 +30,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <dlfcn.h>
 
 #define SLOT      2048u
@@ -2964,10 +2965,10 @@ static void i4_pack_wgt(uint8_t *dst, const int8_t *B, int N, int K, int wl,
             unsigned g = ((unsigned)k & 31u) >> 2, byte, nib;
             int odd = k & 1;
             if (wl == 4) {          /* verified v68 int4 layout: 8 K per 128 B */
-                unsigned bb = 128u * ((unsigned)k >> 3) + 4u * (unsigned)n
-                            + ((unsigned)k & 3u);
+                unsigned bb = wstride * ((unsigned)k >> 5)
+                            + 128u * (((unsigned)k & 31u) >> 3)
+                            + 4u * (unsigned)n + ((unsigned)k & 3u);
                 int hi = ((unsigned)k >> 2) & 1u;
-                bb += wstride * ((unsigned)k >> 5);
                 if (hi) dst[bb] = (uint8_t)((dst[bb] & 0x0Fu) | ((B[n * K + k] & 0x0F) << 4));
                 else    dst[bb] = (uint8_t)((dst[bb] & 0xF0u) | (B[n * K + k] & 0x0F));
                 continue;
@@ -3015,6 +3016,50 @@ static inline void i4_mul(const void *act, uint32_t art,
                "r"((uint32_t)(uintptr_t)wgt), "r"(wc) : "memory");
 }
 
+/* int4 weights with 16-bit (fp16) activations - QNN native_hmx_a16w4. */
+static inline void i4_mul_hf(const void *act, uint32_t art,
+                             const void *wgt, uint32_t wc, int deep)
+{
+    if (deep)
+        __asm__ __volatile__(
+            "{\n\t activation.hf = mxmem(%0,%1):deep\n\t weight.n = mxmem(%2,%3)\n\t}"
+            :: "r"((uint32_t)(uintptr_t)act), "r"(art),
+               "r"((uint32_t)(uintptr_t)wgt), "r"(wc) : "memory");
+    else
+        __asm__ __volatile__(
+            "{\n\t activation.hf = mxmem(%0,%1)\n\t weight.n = mxmem(%2,%3)\n\t}"
+            :: "r"((uint32_t)(uintptr_t)act), "r"(art),
+               "r"((uint32_t)(uintptr_t)wgt), "r"(wc) : "memory");
+}
+
+/* fp16 activation packing: same spatial/K ordering as the int8 lay=3 crouton
+ * but two bytes per element and a 4 KB stride per 32 K. */
+static void i4_pack_act_hf(uint8_t *dst, const int8_t *A, int K, int M)
+{
+    int s, c;
+    for (s = 0; s < M && s < 64; s++)
+        for (c = 0; c < K; c++) {
+            unsigned off = 4096u * (unsigned)(c >> 5)
+                         + 128u * (unsigned)(s >> 2)
+                         + 4u * (unsigned)(c & 31) + (unsigned)(s & 3);
+            __fp16 v = (__fp16)A[s * K + c];
+            memcpy(dst + 2u * off, &v, 2);
+        }
+}
+
+/* H16: 16-K activation crouton = 1 KB (32 spatial x 16 K). */
+static void i4_pack_act16(uint8_t *dst, const int8_t *A, int K, int M)
+{
+    int s, c;
+    for (s = 0; s < M && s < 64; s++)
+        for (c = 0; c < K; c++) {
+            unsigned off = 1024u * (unsigned)(c >> 4)
+                         + 128u * (unsigned)(s >> 2)
+                         + 4u * (unsigned)(c & 15) + (unsigned)(s & 3);
+            dst[off] = (uint8_t)A[s * K + c];
+        }
+}
+
 /* A: M x K uint8 row major, B: N x K int8 row major with values in [-8,7].
  *   wl  : nibble permutation candidate 0..3
  *   bs  : bias/scale low word (0x6000 = int8 identity)
@@ -3025,7 +3070,8 @@ static inline void i4_mul(const void *act, uint32_t art,
 int mx4_i4(const unsigned char *Adata, int ALen,
            const unsigned char *Bdata, int BLen,
            int M, int N, int K, int wl, int art, int wc, int bs,
-           int mode, int reps, unsigned char *raw, int rawLen,
+           int mode, int reps, int astep, int wstep, int aoff, int woff,
+           unsigned char *raw, int rawLen,
            int *info, int infoLen)
 {
     res_t r;
@@ -3033,7 +3079,9 @@ int mx4_i4(const unsigned char *Adata, int ALen,
     const int8_t *A = (const int8_t *)Adata;
     const int8_t *B = (const int8_t *)Bdata;
     int ncr = (K + 31) / 32, rc, i, rep, c, ch;
-    unsigned aregion, wregion, need, wstride;
+    unsigned aregion, wregion, need, wstride, aspan;
+    int estep, nmul, loopdeep;
+    uint32_t eart;
     uint64_t t0, t1, c0, c1;
     int hvx_ok = 0;
 
@@ -3049,19 +3097,56 @@ int mx4_i4(const unsigned char *Adata, int ALen,
     M = (mode & 8) ? 64 : 32;
 
     wstride = (mode & 4) ? 1024u : (mode & 16) ? 2048u : 512u;
-    aregion = 2048u * (unsigned)ncr;
+
+    /* --- probe controls (REPORT21).  mode=0 is the fixed int4 path. --- */
+    eart = (uint32_t)art;
+    estep  = (mode & 1024)    ? 4096            /* H1: two act croutons/insn */
+           : (mode & 16384)   ? 0               /* same act every insn */
+           : (mode & 65536)   ? 1024            /* half act crouton */
+           : 2048;
+    if (astep > 0) estep = astep;
+    if (wstep < 0) {
+        wstep = (mode & 32768)   ? 0            /* same weight every insn */
+              : (mode & 131072)  ? (int)wstride / 2
+              : (int)wstride;
+    }
+    nmul   = (mode & 4096)    ? 1 : ncr;        /* H: one instruction only */
+    loopdeep = (mode & 262144) ? 2 : (mode & 524288) ? 3 : 0;
+    if (mode & 2097152) {                       /* H16: 16-K croutons */
+        wstride = 256u;
+        if (astep <= 0) estep = 1024;
+        if (wstep < 0) wstep = 256;
+        if (!(mode & 4096)) nmul = 2 * ncr;
+    }
+    if (mode & 1048576) {                       /* native_hmx_a16w4: hf acts */
+        if (astep <= 0) estep = 4096;
+    }
+
+    aregion = ((mode & 1048576) ? 4096u : 2048u) * (unsigned)ncr;
+    aspan = aregion;
+    if (nmul > 1) {
+        unsigned need_a = (unsigned)(nmul - 1) * (unsigned)(estep > 0 ? estep : 0) + 2048u;
+        if (need_a > aspan) aspan = need_a;
+    }
     wregion = wstride * (unsigned)ncr;
-    need = aregion + align_up(wregion, 2048u) + 8192u + 512u + 2048u;
+    if (mode & 2097152) wregion += 512u;   /* 16-K probe: spare room */
+    if (nmul > 1 && wstep > 0) {
+        unsigned need_w = (unsigned)(nmul - 1) * (unsigned)wstep + wstride;
+        if (need_w > wregion) wregion = need_w;
+    }
+    need = aspan + align_up(wregion, 2048u) + 8192u + 512u + 2048u;
     rc = res_get(need, &r);
     info[0] = rc;
     if (rc) return 0;
     info[10] = (int)r.size;
     vact = r.base;
-    vwgt = vact + aregion;
-    vout = vact + align_up(aregion + wregion, 2048u);
+    vwgt = vact + aspan;
+    vout = vact + align_up(aspan + wregion, 2048u);
     vbias = vout + 4096u;
     memset(r.base, 0, need);
-    i8_pack_act(vact, A, K, (mode & 128) ? 4 : 3, M);
+    if (mode & 1048576)      i4_pack_act_hf(vact, A, K, M);
+    else if (mode & 2097152) i4_pack_act16(vact, A, K, M);
+    else                     i8_pack_act(vact, A, K, (mode & 128) ? 4 : 3, M);
     i4_pack_wgt(vwgt, B, N, K, wl, wstride);
     if (bs) {
         uint32_t *bl = (uint32_t *)vbias;
@@ -3096,16 +3181,22 @@ int mx4_i4(const unsigned char *Adata, int ALen,
                        (uint32_t)ch * wstride - 1u, 1);
             }
         } else {
-            for (c = 0; c < ncr; c++)
-                i4_mul(vact + (unsigned)c * (unsigned)((mode & 256) ? 0 :
-                                                      (mode & 128) ? 1024 : 2048),
-                       0x3FFu, vwgt + (unsigned)c * wstride, (uint32_t)wc, 0);
+            for (c = 0; c < nmul; c++) {
+                uint32_t a = (mode & 8192)
+                    ? ((((uint32_t)c & 0x1Fu) << 11) | 0x3FFu) : eart;
+                const void *ap = vact + (unsigned)aoff
+                               + (unsigned)c * (unsigned)estep;
+                const void *wp = vwgt + (unsigned)woff
+                               + (unsigned)c * (unsigned)wstep;
+                if (mode & 1048576) i4_mul_hf(ap, a, wp, (uint32_t)wc, loopdeep);
+                else                i4_mul(ap, a, wp, (uint32_t)wc, loopdeep);
+            }
         }
         if (bs) hmx_bias(vbias);
-        i8_store(vout, 0, 0);
+        i8_store(vout, 0, (mode & 2048) ? 3 : 0);
         if (mode & 512) {
             if (bs) hmx_bias(vbias + 256);
-            i8_store(vout + 2048, 0, 0);
+            i8_store(vout + 2048, 0, (mode & 2048) ? 3 : 0);
         }
     }
     hmx_sync();
@@ -3118,7 +3209,7 @@ int mx4_i4(const unsigned char *Adata, int ALen,
         hmx_power(0);
         if (hvx_ok) qurt_hvx_unlock();
     }
-    for (i = 0; i < 2048 && i < rawLen; i++) raw[i] = vout[i];
+    for (i = 0; i < 4096 && i < rawLen; i++) raw[i] = vout[i];
     res_put(&r);
     info[0] = 0;
     return 0;

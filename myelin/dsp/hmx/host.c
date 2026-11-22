@@ -2084,7 +2084,7 @@ static int do_pref(int M, int N, int K, int mode, int reps)
 }
 
 /* ---- int4 weights (weight.n) ------------------------------------------ */
-static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int reps)
+static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int reps, int astep, int wstep, int aoff, int woff)
 {
     static int8_t *A, *B;
     static unsigned char raw[4096];
@@ -2096,6 +2096,8 @@ static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int re
     for (s = 0; s < 64; s++)
         for (k = 0; k < K; k++)
             A[s * K + k] = (int8_t)(amax == -1 ? 1
+                              : (amax <= -200) ? 1
+                              : (amax <= -100) ? (k == (-100 - amax) ? 1 : 0)
                               : (amax <= -8) ? 1
                               : (amax == -7) ? (k >= 32 ? 1 : 0)
                               : (amax <= -2) ? (int)(rnd() % 4u)
@@ -2103,7 +2105,12 @@ static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int re
     for (n = 0; n < N; n++)
         for (k = 0; k < K; k++) {
             int v;
-            if (amax == -1 || amax == -4) v = 1;
+            if (amax <= -300 && amax > -400) {
+                int c16 = -300 - amax;
+                v = (((int)k >> 4) == c16) ? 1 : 0;
+            }
+            else if (amax <= -200) v = (k == (-200 - amax)) ? 1 : 0;
+            else if (amax == -1 || amax == -4 || amax <= -100) v = 1;
             else if (amax == -2) v = (int)(rnd() % 16) - 8;         /* -8..7 */
             else if (amax == -5) v = (k >= 32) ? 1 : 0;             /* 2nd half */
             else if (amax == -6) v = (k < 32) ? 1 : 0;              /* 1st half */
@@ -2115,9 +2122,10 @@ static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int re
             B[n * K + k] = (int8_t)v;
         }
     rc = mx4_i4((unsigned char *)A, 64 * K, (unsigned char *)B, N * K,
-                M, N, K, wl, 0x3FF,
+                M, N, K, wl,
+                getenv("I4_ART") ? (int)strtol(getenv("I4_ART"), 0, 0) : 0x3FF,
                 getenv("I4_WC") ? atoi(getenv("I4_WC")) : 0, bs, mode, reps,
-                raw, 4096, info, 16);
+                astep, wstep, aoff, woff, raw, 4096, info, 16);
     if (rc || info[0]) { printf("i4 rc=%d st=%d\n", rc, info[0]); return 1; }
     us = (double)info[1] / (double)reps;
     printf("i4 M=%d N=%d K=%d wl=%d bs=%#x amax=%d mode=%d reps=%d us/rep=%.3f "
@@ -2146,6 +2154,138 @@ static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int re
     printf("  check maxerr=%.0f cos=%.7f bad=%d/%d sat=%d%s\n", mx, cos, bad,
            32 * N, sat, (bad == 0 && cos > 0.9999) ? "   <== MATCH" : "");
     free(A); free(B);
+    return 0;
+}
+
+/* Per-k contribution map: A is one-hot at k, B is all ones.  A contributing k
+ * shows up as a 1 in every output cell, so we print a bitmap and the per-32
+ * crouton totals.  One mx4_i4 call per k. */
+static int do_i4k(int N, int K, int wl, int bs, int mode, int reps, int astep, int wstep, int aoff, int woff)
+{
+    static int8_t *A, *B;
+    static unsigned char raw[4096];
+    int info[16], k, s, n, rc;
+    char line[2100];
+    int cr[64];
+
+    A = malloc(64 * 2048); B = malloc(32 * 2048);
+    if (!A || !B) { printf("alloc failed\n"); return 1; }
+    for (n = 0; n < N; n++)
+        for (k = 0; k < K; k++) B[n * K + k] = 1;
+    memset(cr, 0, sizeof(cr));
+    for (k = 0; k < K; k++) {
+        int got;
+        memset(A, 0, 64 * K);
+        for (s = 0; s < 32; s++) A[s * K + k] = 1;
+        rc = mx4_i4((unsigned char *)A, 64 * K, (unsigned char *)B, N * K,
+                    32, N, K, wl, 0x3FF, 0, bs, mode, reps,
+                    astep, wstep, aoff, woff, raw, 4096, info, 16);
+        if (rc || info[0]) {
+            printf("i4k rc=%d st=%d\n", rc, info[0]);
+            free(A); free(B); return 1;
+        }
+        got = raw[0];
+        line[k] = got ? '#' : '.';
+        cr[k >> 5] += got ? 1 : 0;
+    }
+    line[K] = 0;
+    printf("i4k N=%d K=%d wl=%d bs=%#x mode=%d: got per k:\n%s\n", N, K, wl,
+           (unsigned)bs, mode, line);
+    printf("  crouton hits (of 32):");
+    for (k = 0; k < (K + 31) / 32; k++) printf(" %d", cr[k]);
+    printf("\n");
+    free(A); free(B);
+    return 0;
+}
+
+/* Weight-side map: B is one-hot at k, A is all ones.  A contributing weight k
+ * leaves a 1 in every output cell. */
+static int do_i4w(int N, int K, int wl, int bs, int mode, int reps, int astep, int wstep, int aoff, int woff)
+{
+    static int8_t *A, *B;
+    static unsigned char raw[4096];
+    int info[16], k, s, n, rc;
+    char line[2100];
+    int cr[64];
+
+    A = malloc(64 * 2048); B = malloc(32 * 2048);
+    if (!A || !B) { printf("alloc failed\n"); return 1; }
+    for (s = 0; s < 64; s++)
+        for (k = 0; k < K; k++) A[s * K + k] = 1;
+    memset(cr, 0, sizeof(cr));
+    for (k = 0; k < K; k++) {
+        int got;
+        memset(B, 0, (size_t)32 * K);
+        for (n = 0; n < N; n++) B[n * K + k] = 1;
+        rc = mx4_i4((unsigned char *)A, 64 * K, (unsigned char *)B, N * K,
+                    32, N, K, wl, 0x3FF, 0, bs, mode, reps,
+                    astep, wstep, aoff, woff, raw, 4096, info, 16);
+        if (rc || info[0]) {
+            printf("i4w rc=%d st=%d\n", rc, info[0]);
+            free(A); free(B); return 1;
+        }
+        got = raw[0];
+        line[k] = got ? '#' : '.';
+        cr[k >> 5] += got ? 1 : 0;
+    }
+    line[K] = 0;
+    printf("i4w N=%d K=%d wl=%d bs=%#x mode=%d: got per k:\n%s\n", N, K, wl,
+           (unsigned)bs, mode, line);
+    printf("  crouton hits (of 32):");
+    for (k = 0; k < (K + 31) / 32; k++) printf(" %d", cr[k]);
+    printf("\n");
+    free(A); free(B);
+    return 0;
+}
+
+/* Pair matrix: A one-hot at ka, B one-hot at kb, one instruction (mode bit12
+ * recommended).  Line ka shows which kb pair with it: '#' = hit. */
+static int do_i4pm(int N, int K, int wl, int bs, int mode, int astep, int wstep,
+                   int aoff, int woff)
+{
+    static int8_t *A, *B;
+    static unsigned char raw[4096];
+    int info[16], ka, kb, s, n, rc, hits = 0;
+    char line[2100];
+
+    if (K > 512) K = 512;
+    A = malloc(64 * 2048); B = malloc(32 * 2048);
+    if (!A || !B) { printf("alloc failed\n"); return 1; }
+    for (ka = 0; ka < K; ka++) {
+        memset(A, 0, 64 * K);
+        for (s = 0; s < 32; s++) A[s * K + ka] = 1;
+        for (kb = 0; kb < K; kb++) {
+            memset(B, 0, (size_t)32 * K);
+            for (n = 0; n < N; n++) B[n * K + kb] = 1;
+            rc = mx4_i4((unsigned char *)A, 64 * K, (unsigned char *)B, N * K,
+                        32, N, K, wl, 0x3FF, 0, bs, mode, 1,
+                        astep, wstep, aoff, woff, raw, 4096, info, 16);
+            if (rc || info[0]) {
+                printf("i4pm rc=%d st=%d\n", rc, info[0]);
+                free(A); free(B); return 1;
+            }
+            line[kb] = raw[0] ? '#' : '.';
+            if (raw[0]) hits++;
+        }
+        line[K] = 0;
+        printf("a=%4d %s\n", ka, line);
+    }
+    printf("i4pm K=%d wl=%d mode=%d aoff=%d woff=%d hits=%d\n", K, wl, mode,
+           aoff, woff, hits);
+    free(A); free(B);
+    return 0;
+}
+
+/* K sweep: cell (0,0) and CPU reference error for one mode. */
+static int do_i4sweep(int N, int wl, int bs, int amax, int mode, int reps, int astep, int wstep, int aoff, int woff)
+{
+    static const int ks[] = {32, 64, 96, 128, 160, 192, 256, 512, 1024, 2048};
+    unsigned i;
+    for (i = 0; i < sizeof(ks) / sizeof(ks[0]); i++) {
+        printf("  K=%4d -> ", ks[i]);
+        fflush(stdout);
+        if (do_i4(32, N, ks[i], wl, bs, amax, mode, reps, astep, wstep, aoff, woff)) return 1;
+    }
     return 0;
 }
 
@@ -2727,7 +2867,54 @@ int main(int argc, char **argv)
                      argc > 6 ? (int)strtol(argv[6], 0, 0) : 0x6000,
                      argc > 7 ? atoi(argv[7]) : 1,
                      argc > 8 ? atoi(argv[8]) : 0,
-                     argc > 9 ? atoi(argv[9]) : 100);
+                     argc > 9 ? atoi(argv[9]) : 100,
+                     argc > 10 ? atoi(argv[10]) : 0,
+                     argc > 11 ? atoi(argv[11]) : -1,
+                     argc > 12 ? atoi(argv[12]) : 0,
+                     argc > 13 ? atoi(argv[13]) : 0);
+    if (!strcmp(cmd, "i4k"))
+        return do_i4k(argc > 2 ? atoi(argv[2]) : 32,
+                      argc > 3 ? atoi(argv[3]) : 64,
+                      argc > 4 ? atoi(argv[4]) : 4,
+                      argc > 5 ? (int)strtol(argv[5], 0, 0) : 0x6000,
+                      argc > 6 ? atoi(argv[6]) : 0,
+                      argc > 7 ? atoi(argv[7]) : 1,
+                      argc > 8 ? atoi(argv[8]) : 0,
+                      argc > 9 ? atoi(argv[9]) : -1,
+                      argc > 10 ? atoi(argv[10]) : 0,
+                      argc > 11 ? atoi(argv[11]) : 0);
+    if (!strcmp(cmd, "i4sweep"))
+        return do_i4sweep(argc > 2 ? atoi(argv[2]) : 32,
+                          argc > 3 ? atoi(argv[3]) : 4,
+                          argc > 4 ? (int)strtol(argv[4], 0, 0) : 0x6000,
+                          argc > 5 ? atoi(argv[5]) : -1,
+                          argc > 6 ? atoi(argv[6]) : 0,
+                          argc > 7 ? atoi(argv[7]) : 20,
+                          argc > 8 ? atoi(argv[8]) : 0,
+                          argc > 9 ? atoi(argv[9]) : -1,
+                          argc > 10 ? atoi(argv[10]) : 0,
+                          argc > 11 ? atoi(argv[11]) : 0);
+    if (!strcmp(cmd, "i4w"))
+        return do_i4w(argc > 2 ? atoi(argv[2]) : 32,
+                      argc > 3 ? atoi(argv[3]) : 64,
+                      argc > 4 ? atoi(argv[4]) : 4,
+                      argc > 5 ? (int)strtol(argv[5], 0, 0) : 0x6000,
+                      argc > 6 ? atoi(argv[6]) : 0,
+                      argc > 7 ? atoi(argv[7]) : 1,
+                      argc > 8 ? atoi(argv[8]) : 0,
+                      argc > 9 ? atoi(argv[9]) : -1,
+                      argc > 10 ? atoi(argv[10]) : 0,
+                      argc > 11 ? atoi(argv[11]) : 0);
+    if (!strcmp(cmd, "i4pm"))
+        return do_i4pm(argc > 2 ? atoi(argv[2]) : 32,
+                       argc > 3 ? atoi(argv[3]) : 64,
+                       argc > 4 ? atoi(argv[4]) : 4,
+                       argc > 5 ? (int)strtol(argv[5], 0, 0) : 0x6000,
+                       argc > 6 ? atoi(argv[6]) : 4096,
+                       argc > 7 ? atoi(argv[7]) : 0,
+                       argc > 8 ? atoi(argv[8]) : -1,
+                       argc > 9 ? atoi(argv[9]) : 0,
+                       argc > 10 ? atoi(argv[10]) : 0);
     if (!strcmp(cmd, "rpc")) {
         int it = argc > 2 ? atoi(argv[2]) : 31;
         int r[4], i, rc, sz;

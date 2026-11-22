@@ -163,8 +163,9 @@ interface mx4 {
       bs, wl, 0} */
    long i4(in sequence<octet> A, in sequence<octet> B, in long M, in long N,
            in long K, in long wl, in long art, in long wc, in long bs,
-           in long mode, in long reps, rout sequence<octet> raw,
-           rout sequence<long> info);
+           in long mode, in long reps, in long astep, in long wstep,
+           in long aoff, in long woff,
+           rout sequence<octet> raw, rout sequence<long> info);
 
    /* int4 impulse map: map[nb] = (k<<5)|n decoded from one nibble at physical
       byte nb.  info = {status, max_v, hits, nibhi, 0,0,0,0} */
