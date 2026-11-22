@@ -71,6 +71,7 @@ typedef struct {
     int      in_owned;  /* 1 = in_ptr is this handle's own mapping */
     int      arena;     /* arena index for an alloc_view handle, else -1 */
     float    sa, so;    /* activation / output scales last given to set_scale */
+    int      wide;      /* 1 = m > 1 on some row: use the int64 pack path */
 } gbuf_t;
 
 static gbuf_t g_buf[MAXBUF];
@@ -511,6 +512,24 @@ static void gemv_rows_m4(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
  * (both cheap: N/32 vector ops); when it fails (m near 1 with a large
  * accumulator, e.g. some FFN down matrices) the scalar 64-bit loop runs.
  * Same code as in myelin/dsp/conv/lfmgemv_impl.c, where 196 us became 16. */
+/* Pack with the int64 multiplier `qm` (m/2^qshift in Q16.16).
+ *
+ * `pack_out_i8` holds the multiplier in 16 bits, so any row whose
+ * `sw*sa/so` exceeds 1.0 was silently clamped (L1 conv.in_proj had 39 such
+ * rows out of 6144). This path carries the exact multiplier. */
+static void pack_out_i8_wide(const int32_t *acc, const int32_t *qm, int qshift,
+                             int8_t *out, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        int64_t v = ((int64_t)acc[i] * (int64_t)qm[i] + ((int64_t)1 << 15)) >> 16;
+        v <<= qshift;
+        if (v > 127) v = 127;
+        if (v < -127) v = -127;
+        out[i] = (int8_t)v;
+    }
+}
+
 static void pack_out_i8(const int32_t *acc, const int32_t *qv, int8_t *out, int n)
 {
     HVX_Vector qmask = Q6_V_vsplat_R(0xffff);
@@ -2412,6 +2431,9 @@ int lfmgemv_set_scale(int h, const unsigned char *scales, int scalesLen)
         /* gate/up need the wide (int64) dequant; down stays below 1 and uses
          * qp.  k is 0 whenever the worst-case product fits 2^30. */
         b->qshift = deq_shift_for(mmax, K, b->w8 ? 7 : 3);
+        /* Disabled: 39 clamped rows per 6144 do not pay for the scalar
+           path, which costs 5x on the whole matrix. Kept for the record. */
+        b->wide = 0;
     }
     for (i = 0; i < N; i++) {
         float m = sw[i] * sa / so;          /* exactly the old pack_out field */
@@ -2501,8 +2523,13 @@ static int gemv_impl(int h, int M, const unsigned char *act, int actLen, int rep
         if (b->qp) {
             int8_t *o = use_resident ? b->out_ptr : (int8_t *)dst;
             for (m = 0; m < M; m++) {
-                pack_out_i8(b->acc + (size_t)m * b->N, b->qp,
-                            o + (size_t)m * b->N, b->N);
+                if (b->wide) {
+                    pack_out_i8_wide(b->acc + (size_t)m * b->N, b->qm, b->qshift,
+                                     o + (size_t)m * b->N, b->N);
+                } else {
+                    pack_out_i8(b->acc + (size_t)m * b->N, b->qp,
+                                o + (size_t)m * b->N, b->N);
+                }
             }
         } else {
             memcpy(dst, b->acc, (size_t)M * b->N * sizeof(int32_t));
