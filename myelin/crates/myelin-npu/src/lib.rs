@@ -1,14 +1,45 @@
-//! NPU transport boundary.
+//! NPU transport boundary for Myelin.
 //!
-//! The real FastRPC/DSP backend will implement [`NpuBackend`]. Until then
-//! [`MockBackend`] lets the FFI and the Android build exercise the whole
-//! call path on the host and on the device.
+//! Two layers live here:
+//!
+//! * the legacy [`NpuBackend`]/[`MockBackend`] step contract used by the FFI
+//!   skeleton, kept so the Android build keeps working;
+//! * the FastRPC transport ([`Transport`]) that `myelin-core`'s `DspBackend`
+//!   drives. [`Cdsprpc`] is the Android implementation, [`MockTransport`] is
+//!   the deterministic host implementation.
+//!
+//! [`HvxClient`] wraps one `lfmgemv` handle and exposes typed methods
+//! (`ffn`, `attn`, `gemv`, ...); [`method`] owns the method IDs and scalar
+//! layouts.
 
 use std::fmt;
 
 use myelin_core::ModelSpec;
 
-/// Transport-level failures.
+pub mod error;
+pub mod executor;
+pub mod hvx;
+pub mod method;
+pub mod mock;
+pub mod transport;
+
+#[cfg(target_os = "android")]
+pub mod cdsprpc;
+
+pub use error::{fastrpc_error_name, rpc_error, TransportError};
+pub use executor::Executor;
+pub use hvx::HvxClient;
+pub use method::{
+    AttnRequest, AttnResponse, AttnScalars, FfnRequest, FfnResponse, FfnScalars, GemvRequest,
+    GemvResponse, GemvScalars,
+};
+pub use mock::{MockCall, MockReply, MockTransport, RecordedCall};
+pub use transport::{Call, Handle, SharedBuffer, SharedOwner, Transport};
+
+#[cfg(target_os = "android")]
+pub use cdsprpc::{Cdsprpc, CdsprpcConfig, FASTRPC_ATTR_KEEP_MAP};
+
+/// Transport-level failures of the legacy step contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NpuError {
     NotPrepared,
@@ -114,5 +145,12 @@ mod tests {
         let mut backend = MockBackend::default();
         let mut out = [0u32; 1];
         assert_eq!(backend.step(&[1], &mut out), Err(NpuError::NotPrepared));
+    }
+
+    #[test]
+    fn core_method_ids_match_the_table() {
+        use myelin_core::backend::dsp::{HVX_METHOD_ATTN, HVX_METHOD_FFN};
+        assert_eq!(method::method_id::FFN, HVX_METHOD_FFN);
+        assert_eq!(method::method_id::ATTN, HVX_METHOD_ATTN);
     }
 }

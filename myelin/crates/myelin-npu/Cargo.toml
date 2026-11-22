@@ -1,10 +1,20 @@
 [package]
 name = "myelin-npu"
-description = "NPU transport boundary for Myelin (mock backend for now)"
+description = "NPU transport boundary for Myelin (FastRPC transport and mock executor)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
 myelin-core.workspace = true
+libc = "0.2"
+
+[lib]
+name = "myelin_npu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "npu-bench"
+path = "src/bin/npu-bench.rs"
