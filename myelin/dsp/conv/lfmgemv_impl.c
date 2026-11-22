@@ -98,7 +98,9 @@ static inline int32_t vsum_w(HVX_Vector v) {
 }
 /* (a*b)>>16 without 64-bit helpers: |a| < 2^23, |b| < 2^23.
  * Splits a into high/low 16 bits and truncates the low part to 8 bits,
- * error <= 0.03 in real units (well below 1 LSB of int8). */
+ * error ~= (a & 0xff)*b/65536.  Negligible in the SiLU/exp path (b ~ 2^16),
+ * but NOT for int8 requantisation with a small multiplier: b ~ 0.015 gives
+ * ~4 LSB of 127.  pack_out_i8() below takes the product in 64 bits. */
 static inline int32_t mulq16(int32_t a, int32_t b)
 {
     int32_t hi = a >> 16;

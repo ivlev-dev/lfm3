@@ -100,7 +100,9 @@ static inline int32_t vsum_w(HVX_Vector v) {
 }
 /* (a*b)>>16 without 64-bit helpers: |a| < 2^23, |b| < 2^23.
  * Splits a into high/low 16 bits and truncates the low part to 8 bits,
- * error <= 0.03 in real units (well below 1 LSB of int8). */
+ * error ~= (a & 0xff)*b/65536.  Negligible in the SiLU/exp path (b ~ 2^16),
+ * but NOT for int8 requantisation with a small multiplier: b ~ 0.015 gives
+ * ~4 LSB of 127.  pack_out_i8() below takes the product in 64 bits. */
 static inline int32_t mulq16(int32_t a, int32_t b)
 {
     int32_t hi = a >> 16;
@@ -411,6 +413,11 @@ static void gemv_rows_m4(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
 }
 
 /* dequant int32 -> int8. qv[i] holds the Q16 multiplier (any halfword).
+ * The product is taken in 64 bits: mulq16(acc,q) resolves acc with a step of
+ * 256, so its int8 error is (acc & 0xff)*m -- fine when m ~ 1, but ~4 LSB of
+ * 127 when m ~ 0.015 (the FFN down / out_proj layers).  Kept bit-exact with
+ * conv_pack_i8() in myelin/dsp/conv/conv_math.h (the host reference must
+ * match the DSP).
  * Scalar on purpose: N is 2k..8k, ~8 cycles/element = 15..45 us, and the
  * vector vmpyiewh form turned out to be numerically unreliable here. */
 static void pack_out_i8(const int32_t *acc, const int32_t *qv, int8_t *out, int n)
@@ -418,7 +425,7 @@ static void pack_out_i8(const int32_t *acc, const int32_t *qv, int8_t *out, int 
     int i;
     for (i = 0; i < n; i++) {
         int32_t q = (int32_t)((uint32_t)qv[i] & 0xffffu);
-        int32_t v = mulq16(acc[i], q);
+        int64_t v = ((int64_t)acc[i] * (int64_t)q + 32768) >> 16;
         if (v > 127) v = 127;
         if (v < -127) v = -127;
         out[i] = (int8_t)v;

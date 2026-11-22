@@ -324,7 +324,9 @@ int main(int argc, char **argv)
             }
             for (r = 0; r < K; r++) {
                 int32_t ref = dot_i8(sd + (size_t)r * NH, h, NH);
-                int32_t o = mulq16(ref, mark_q16(sdw[r] * s_mid / s_out));
+                int32_t q = mark_q16(sdw[r] * s_mid / s_out);
+                /* pack_out_i8: 64-bit product, must stay bit-exact */
+                int64_t o = ((int64_t)ref * (int64_t)q + 32768) >> 16;
                 int got = dst_out[r];
                 int d;
                 if (o > 127) o = 127;

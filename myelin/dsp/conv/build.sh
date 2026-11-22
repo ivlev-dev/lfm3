@@ -3,8 +3,7 @@
 #
 #   liblfmgemv_skel.so — DSP-скелет (v68, -mhvx): gemv + conv-слой
 #   conv_sim           — офлайновый симулятор на хосте (x86/aarch64, без устройства)
-#   conv_test          — host-драйвер, ЕСЛИ рядом лежит conv_main.c
-#                        (в репозиторий он не переносился: см. README)
+#   conv_test          — host-драйвер (FastRPC), запуск на телефоне
 #
 #   HEXAGON_SDK_ROOT=/path/to/Hexagon_SDK/6.7.0.0 ./build.sh
 set -e
@@ -40,13 +39,9 @@ $CC -mv68 -mhvx -mhvx-length=128b -O3 -fPIC -shared -g -Wall \
     -Wl,-Bsymbolic -Wl,--start-group -lc -lgcc -Wl,--end-group
 echo "SKEL OK"
 
-if [ -f conv_main.c ]; then
-    $HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o conv_test \
-        conv_main.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
-    echo "CONV TEST OK"
-else
-    echo "conv_test пропущен: нет conv_main.c (host-драйвер не сохранился, см. README)"
-fi
+$HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o conv_test \
+    conv_main.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
+echo "CONV TEST OK"
 
 echo "BUILD OK"
-ls -la liblfmgemv_skel.so conv_sim
+ls -la liblfmgemv_skel.so conv_sim conv_test
