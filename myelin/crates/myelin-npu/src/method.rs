@@ -667,6 +667,34 @@ mod exec_tests {
     use super::exec::*;
 
     #[test]
+    fn core_encoder_matches_the_dsp_layout() {
+        use myelin_core::backend::dsp::exec as core_exec;
+
+        let mut ours = List::new(1 << 20);
+        ours.push(Command::quant(0, 1024, 2048, 4096));
+        ours.push(
+            Command::gemv(5, 1, 2, 0, 2048, 1024, 7680)
+                .with_dst(dst::OUT, 64)
+                .with_dst_handle(11),
+        );
+        ours.push(Command::attn(1, 2, 3, 4, -1, 16, 0, 0, 8192));
+        ours.push(Command::conv(9, 2048, 18, 0, 100, 34816, 0, 16384));
+
+        let mut theirs = core_exec::List::new(1 << 20);
+        theirs.push(core_exec::Command::quant(0, 1024, 2048, 4096));
+        theirs.push(
+            core_exec::Command::gemv(5, 1, 2, 0, 2048, 1024, 7680)
+                .with_dst(core_exec::dst::OUT, 64)
+                .with_dst_handle(11),
+        );
+        theirs.push(core_exec::Command::attn(1, 2, 3, 4, -1, 16, 0, 0, 8192));
+        theirs.push(core_exec::Command::conv(
+            9, 2048, 18, 0, 100, 34816, 0, 16384,
+        ));
+        assert_eq!(ours.to_bytes(), theirs.to_bytes());
+    }
+
+    #[test]
     fn command_layout_matches_the_dsp_struct() {
         let command = Command::ffn(11, 12, 13, 2, 0, 2048, 4096, 7680)
             .with_dst(dst::ATTACHED, 64)

@@ -28,7 +28,9 @@ use myelin_core::ModelSpec;
 
 pub mod error;
 pub mod executor;
+pub mod gemv_weights;
 pub mod hvx;
+pub mod layer_fixture;
 pub mod method;
 pub mod mock;
 pub mod transport;
@@ -39,6 +41,7 @@ pub mod cdsprpc;
 
 pub use error::{fastrpc_error_name, rpc_error, TransportError};
 pub use executor::Executor;
+pub use gemv_weights::{PackedGemv, GEMV_LOAD_CHUNK};
 pub use hvx::HvxClient;
 pub use method::{
     exec, AttnRequest, AttnResponse, AttnScalars, ExecRequest, ExecResponse, FfnRequest,

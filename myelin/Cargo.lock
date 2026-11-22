@@ -712,9 +712,13 @@ dependencies = [
 name = "myelin-npu"
 version = "0.1.0"
 dependencies = [
+ "half",
+ "lfm-gguf",
  "libc",
  "myelin-core",
  "myelin-pack",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

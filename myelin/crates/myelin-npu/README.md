@@ -128,12 +128,45 @@ rpcmem_flags: 1,           // RPCMEM_DEFAULT_FLAGS
   (`0..ceil((position+1)/32)`), делает один RPC `attn` и деквантует int32 Q12
   в f32. Стенд фиксирован на 16 q-heads × 128, поэтому другая геометрия
   отклоняется типизированной ошибкой. `AttentionStage::preprojected` должен
-  быть выставлен: `attn` принимает уже спроецированный q, а q/k/v-проекции,
-  q/k-norm и rope в этом крейте ещё не реализованы.
+  быть выставлен, если используется старый путь: `attn` принимает уже
+  спроецированный q.
 
-`embed`, `rms_norm`, `conv_layer`, `lm_head` пока возвращают
-`BackendError::Unsupported` с конкретной причиной (нет резидентных весов /
-ядра вне HVX-стенда), а не `unimplemented!()`. Полный диагностический
+Полный путь (`stage_attention_full`, `stage_conv`) — это то, что делает
+сквозной прогон:
+
+```text
+conv:      x8 -> exec[GEMV in_proj -> CONV -> GEMV out_proj] -> y8
+attention: x8 -> exec[GEMV q, GEMV k, GEMV v, GEMV gate]
+           -> host q/k RMSNorm + rope, int4 K / int8 V в KV-образ
+           -> exec[ATTN] -> host V-scale (per channel) + sigmoid(gate)
+           -> exec[GEMV o_proj] -> y8
+```
+
+Масштабы: `*Stage::act_scale` — **множитель** f32→int8 (`value * scale`);
+`mix_scale`/`y_scale`/`q_scale`/`out_scale` — **деквант** одного int8-кода
+(то, что ядро ждёт как `sa`/`so`). `set_scale` получает `sa = 1/act_scale`
+для входной активации и деквант-масштабы матриц. Это разные величины, и
+перепутать их — самая частая ошибка: активация превращается в нули.
+
+Два соглашения ядра, проверенные на устройстве:
+
+* score хранится в Q8 и не делится на `sqrt(head_dim)`, поэтому в KV-образ
+  пишется `kt = (max|k|/7) * 65536 / (q_scale * sqrt(head_dim))`;
+* V-скейл per-channel: 128 множителей применяются после `ATTN`, до gate и
+  o_proj. Global-скейл на реальных V даёт `cos(PV) 0.999815` против
+  `0.999992` у per-channel.
+
+`conv_layer` работает одним `exec` на слой; `attention_layer` — тремя
+(q/k/v+gate, ATTN, o_proj), потому что q/k-norm, rope, V-скейл и gate живут
+на хосте. Каждый `exec` сейчас мапит и размапливает свою ION-арену
+(`map_arena`/`unmap_arena`), а K/V пишутся 12 `load_buf` (4 головы × K/KT/V);
+DSP-время слоя на XQ-BC72 — 0.57 мс conv и 0.44 мс attention, wall — 2.8 и
+8.9 мс на токен. Убрать эти накладные расходы — следующий шаг: одна
+замапленная арена/кольцо и запись K/V пачкой.
+
+`embed`, `rms_norm`, `lm_head` пока возвращают `BackendError::Unsupported` с
+конкретной причиной (нет резидентных весов / ядра вне HVX-стенда), а не
+`unimplemented!()`. Полный диагностический
 `DspError` (с кодом FastRPC) доступен через `DspBackend::last_error()`.
 
 Ленивая загрузка: `attach_weights(Box<dyn StageProvider>)` подключает
@@ -142,6 +175,79 @@ rpcmem_flags: 1,           // RPCMEM_DEFAULT_FLAGS
 застейдженный слой имеет приоритет. Ошибка бюджета приходит как
 `BackendError::Budget`. Handle для планировщика берётся из
 `DspBackend::handle()`, executor — из `DspBackend::executor()`.
+
+## `exec` и сквозные слои
+
+`DspExecutor` получил два метода поверх `invoke`:
+
+* `reserve_scratch(handle, nbytes)` — DSP-heap scratch под промежуточные
+  int8/int32 и состояния `CONV`;
+* `exec(handle, ExecRun { list, commands, scratch_bytes, act, rt, out_len })`
+  — один RPC на список команд. Реализация (`executor::run_exec_on`)
+  аллоцирует rpcmem, копирует список, `map_arena(fd, nbytes)` (длина
+  округляется до 128 Б — иначе `AEE_EBADPARM`), `exec`, `unmap_arena`.
+  Список и скалярный пакет — те же 64/96 Б, что в `method::exec`; тест
+  `method::exec_tests::core_encoder_matches_the_dsp_layout` сверяет два
+  энкодера побайтово.
+
+`DspBackend` теперь исполняет:
+
+* **conv-слой** — один `exec` из трёх команд:
+  `GEMV(in_proj) → CONV(blob) → GEMV(out_proj)`. `bcx` (3H int8) и `y` (H
+  int8) остаются в scratch; ring state `CONV` живёт по
+  `dsp::conv_state_offset(layer)` (256 КиБ на слой), счётчик токенов —
+  в `DspBackend`. `ConvStage` несёт `ksh`, `act/mix/y/out` масштабы.
+* **attention-слой** — `stage_attention_full`:
+  1. один `exec`: `GEMV(q)`, `GEMV(k)`, `GEMV(v)`, `GEMV(gate)` в один `out`;
+  2. host: per-head q/k RMSNorm + rope (те же `ops`, что у CPU), int8 q,
+     per-token int4 K, per-channel int8 V, `load_buf` в резидентные K/KT/V;
+  3. один `exec`: `ATTN` (q + block table в одной `act`);
+  4. host: `q12/4096 * v_scale[d]`, sigmoid(gate), int8 для o_proj;
+  5. один `exec`: `GEMV(o)`.
+  K/V параллельно пишутся в host-`KvCache` (реальные f32), чтобы планировщик
+  видел ту же последовательность.
+
+Ключевая численная деталь: `kt` в KV-образе — это
+`(max|k|/7) * 65536 / (q_scale * sqrt(head_dim))`. Ядро хранит score в Q8 и
+не делит на `sqrt(d)`; без этого множителя softmax «холоднее» и на 4 токенах
+`cos` падает с 0.965 до 0.91. V-скейл — per-channel (измерено: `cos(PV)`
+0.999992 против 0.999815 у global). Per-channel K не нужен (0.9992 → 0.9998
+ценой разрядности q; folded-вариант 0.9952).
+
+### Проверка на XQ-BC72
+
+`cargo run -p myelin-npu --example make_layer_fixture` собирает из реального
+чекпоинта conv-слой 0 и attention-слой 2 (int4 blob'ы, shortconv blob,
+входы и CPU-эталон по позициям). `dsp-layer-check` (Android, release)
+загружает их, исполняет через `exec` и сравнивает:
+
+| слой | cos по токенам | max\|Δ\| | DSP `exec` | wall на токен |
+|---|---:|---:|---:|---:|
+| conv 0, 4 токена | 0.9748 / 0.9815 / 0.9817 / 0.9845 | 2.84e-2 | 0.56–0.64 мс | 2.8 мс |
+| attention 2, 4 токена | 0.9649 / 0.9646 / 0.9663 / 0.9668 | 9.13e-2 | 0.43–0.45 мс | 8.9 мс |
+
+`max|Δ|` attention — один выброс в o_proj (int4-вес), не сдвиг всего вектора.
+Wall включает host norm/rope/gate, 12 `load_buf` на K/V и map/unmap арены
+на каждый `exec`; DSP-время — сумма `times[0]` команд.
+
+### Что осталось до полного сквозного прогона
+
+1. **Арена на токен, а не на `exec`**: сейчас `run_exec_on` делает
+   `map_arena/unmap_arena` на каждый вызов (3 RPC). Для conv список меняется
+   только `a3` (счётчик); нужен ring из 2–3 заранее смапленных арен или
+   перенос счётчика в `rt[]`. Это уберёт ~0.3–0.5 мс на слой.
+2. **K/V одним `load_buf`**: row-layout `[head][slot][128]` не contiguous по
+   головам, поэтому токен пишется 12 вызовами. Нужен `load_buf` с offset или
+   отдельный `kv_write` в IDL; либо token-major layout и запись страницы
+   целиком раз в 32 токена.
+3. **FFN и lm_head на `exec`**: `DspBackend::ffn_layer` ещё делает отдельный
+   RPC `ffn`, `lm_head`/`embed`/`rms_norm` — `Unsupported`. Для одного
+   `exec` на токен их надо включить в общий список (FFN уже есть командой).
+4. **Сброс состояния**: `Session::reset` не обнуляет DSP-ring `CONV` и
+   счётчики; нужен `exec`-команда/метод сброса или пересоздание scratch.
+5. **Общий `StageProvider` для int4**: `weights.rs` планирует HMX int8 и
+   attention-кэши; `gemv_weights::PackedGemv` умеет ставить int4-матрицу, но
+   LRU-бюджет и `LayerPlan` для conv/attention-проекций ещё не расширены.
 
 ## Загрузка весов (`weights`)
 
@@ -263,9 +369,9 @@ C-стенд на том же устройстве даёт те же велич
 
 ### Что ждёт устройства
 
-* `myelin-pack` упаковывает **HMX int8** тайлы, а текущий HVX-скелет `ffn`
-  принимает int4. Планировщик загружает и учитывает blob как есть; численное
-  совпадение с ядром появится вместе с HMX int8-ядром или int8-входом HVX.
+* `myelin-pack gemv` даёт ровно тот int4-формат, который принимает HVX
+  `ffn`/`gemv`; `gemv_weights::PackedGemv` грузит **секцию весов**, а не
+  заголовок. HMX int8-кроустоны по-прежнему отдельный путь.
 * Заголовок `set_scale` (`act_scale`/`out_scale`) — контракт вызывающего.
   Q16-соглашение стенда для gate/up (`s_in * 65536`) здесь не зашито: его
   должен задать слой, который знает конкретное ядро.
@@ -274,6 +380,26 @@ C-стенд на том же устройстве даёт те же велич
   сбрасывает кэш, поэтому мутация K/V во время генерации остаётся задачей
   KV-рантайма.
 
+
+## Проверка слоёв на устройстве
+
+`examples/make_layer_fixture.rs` собирает из реального GGUF фикстуру: int4
+blob'ы conv-слоя 0 и attention-слоя 2, shortconv blob, входы четырёх
+позиций и выходы CPU-эталона. `src/bin/dsp-layer-check.rs` грузит их,
+прогоняет `DspBackend` и печатает `cos`/`max|Δ|` по позициям.
+
+```sh
+cargo run -p myelin-npu --example make_layer_fixture -- \
+    ../models/LFM3-1.7B-Q4_K_M.gguf /tmp/opencode/layer-fixture
+# cross-build dsp-layer-check (release, aarch64-linux-android), push skeleton,
+# fixture and binary, then:
+adb shell 'cd /data/local/tmp/lfmgemv && \
+    ADSP_LIBRARY_PATH=$PWD ./dsp-layer-check /data/local/tmp/layer-fixture'
+```
+
+`tests/device_layers.rs` (ignored) делает то же через adb:
+`MYELIN_LAYER_FIXTURE=/tmp/opencode/layer-fixture cargo test -p myelin-npu
+--test device_layers -- --ignored --nocapture`.
 
 ## Проверка на хосте
 
