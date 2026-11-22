@@ -120,6 +120,30 @@ __kernel void quantize_q8(__global const float *x, __global char *xq, __global f
     }
 }
 
+/* Quantise with a coarser block scale: one step for `block` elements, written
+ * into each `group` slot it covers. Lets the same matmul kernels run with a
+ * 256-wide activation block (the DSP design) without touching their layouts. */
+__kernel void quantize_q8_block(__global const float *x, __global char *xq,
+                                __global float *xs, uint n, uint group, uint block) {
+    uint g = get_global_id(0);
+    uint ng = n / group;
+    if (g >= ng) return;
+    uint base = g * group;
+    uint bstart = (base / block) * block;
+    uint bend = min(bstart + block, n);
+    float amax = 0.0f;
+    for (uint i = bstart; i < bend; ++i) {
+        amax = fmax(amax, fabs(x[i]));
+    }
+    float sc = amax > 0.0f ? amax / 127.0f : 0.0f;
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    xs[g] = sc;
+    for (uint i = 0u; i < group; ++i) {
+        float v = x[base + i] * inv;
+        xq[base + i] = (char)convert_int_rte(v);
+    }
+}
+
 static void gsm_k4(uint j, __global const uchar *q, uchar *d, uchar *m) {
     uint jm = j & 3u;
     uint h = j >> 2;

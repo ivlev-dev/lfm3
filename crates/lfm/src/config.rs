@@ -608,6 +608,11 @@ impl BackendSection {
             program_cache: self.program_cache,
             kv_pool: self.effective_kv_pool(),
             gemm_force: self.gemm_force.clone(),
+            act_block: std::env::var("LFM_ACT_BLOCK")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value: &usize| (32..=2048).contains(value))
+                .unwrap_or(32),
         }
     }
 }
