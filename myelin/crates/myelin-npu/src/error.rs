@@ -19,7 +19,7 @@ pub enum TransportError {
     },
     /// `remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE)` failed.
     SessionControl { code: i32, name: &'static str },
-    /// `remote_handle64_open` failed.
+    /// `remote_handle_open` failed.
     HandleOpen { module: String, code: i32 },
     /// A method returned a non-zero FastRPC code.
     Rpc {
@@ -35,6 +35,8 @@ pub enum TransportError {
         expected: usize,
         got: usize,
     },
+    /// A sequence length does not fit the 32-bit `long` the IDL uses.
+    InvalidLength { what: &'static str, len: usize },
     /// Shared-memory allocation (`rpcmem`) failed.
     SharedMemory { bytes: usize, code: i32 },
     /// The handle has already been closed.
@@ -53,6 +55,7 @@ impl TransportError {
             | Self::SymbolMissing { .. }
             | Self::Timeout { .. }
             | Self::BufferTooSmall { .. }
+            | Self::InvalidLength { .. }
             | Self::Closed { .. } => None,
         }
     }
@@ -66,6 +69,7 @@ impl TransportError {
             | Self::SessionControl { .. }
             | Self::HandleOpen { .. }
             | Self::BufferTooSmall { .. }
+            | Self::InvalidLength { .. }
             | Self::SharedMemory { .. }
             | Self::Closed { .. } => None,
         }
@@ -87,7 +91,7 @@ impl fmt::Display for TransportError {
             ),
             Self::HandleOpen { module, code } => write!(
                 f,
-                "remote_handle64_open({module}) failed: 0x{code:08x} ({})",
+                "remote_handle_open({module}) failed: 0x{code:08x} ({})",
                 fastrpc_error_name(*code)
             ),
             Self::Rpc { method, code, name } => write!(
@@ -104,6 +108,10 @@ impl fmt::Display for TransportError {
             } => write!(
                 f,
                 "{buffer} buffer too small: need {expected} bytes, got {got}"
+            ),
+            Self::InvalidLength { what, len } => write!(
+                f,
+                "{what} length {len} does not fit a 32-bit IDL sequence count"
             ),
             Self::SharedMemory { bytes, code } => write!(
                 f,

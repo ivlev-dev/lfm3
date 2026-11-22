@@ -55,7 +55,8 @@ fn main() {
         }
     }
     if stub.exists() {
-        let mids = parse_stub(&read(&stub));
+        let source = read(&stub);
+        let mids = parse_stub(&source);
         if mids.is_empty() {
             panic!("no method IDs parsed from {}", stub.display());
         }
@@ -69,7 +70,109 @@ fn main() {
                 None => panic!("src/method.rs has no constant for {name}"),
             }
         }
+
+        // Every sequence length is part of `_primIn`; check the Rust wire pack
+        // sizes against the generated stub byte for byte.
+        let sizes = parse_prim_sizes(&read(&method_rs));
+        assert_eq!(
+            sizes.len(),
+            names.len(),
+            "PRIM_IN_SIZES in src/method.rs must list one size per method"
+        );
+        let stub_sizes = parse_stub_prim_sizes(&source);
+        for (index, name) in names.iter().enumerate() {
+            match stub_sizes.get(name) {
+                // The stub declares `uint32_t _primIn[N]`, so N is in longs.
+                Some(size) if size * 4 == sizes[index] => {}
+                Some(size) => panic!(
+                    "{name}: PRIM_IN_SIZES[{index}] = {} in src/method.rs, \
+                     but the stub declares {} longs ({} bytes)",
+                    sizes[index],
+                    size,
+                    size * 4
+                ),
+                None => panic!("cannot find the _primIn size of {name} in the stub"),
+            }
+        }
     }
+}
+
+/// The `PRIM_IN_SIZES` array in `src/method.rs`.
+fn parse_prim_sizes(source: &str) -> Vec<usize> {
+    let start = source
+        .find("pub const PRIM_IN_SIZES:")
+        .expect("src/method.rs must define PRIM_IN_SIZES");
+    let rest = &source[start..];
+    let value = rest.find('=').expect("PRIM_IN_SIZES =");
+    let open = rest[value..]
+        .find('[')
+        .expect("PRIM_IN_SIZES opening bracket")
+        + value;
+    let body = &rest[open + 1..];
+    let close = body.find(']').expect("PRIM_IN_SIZES closing bracket");
+    body[..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("bad PRIM_IN_SIZES entry {value}"))
+        })
+        .collect()
+}
+
+/// `static __inline int _stub_methodN(... uint32_t _primIn[M] ...)`.
+fn parse_stub_prim_sizes(source: &str) -> BTreeMap<String, usize> {
+    // helper name -> sizeof(_primIn)
+    let mut helpers: BTreeMap<String, usize> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut depth = 0usize;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("static __inline int _stub_method") {
+            let name = rest.split('(').next().unwrap_or("").to_owned();
+            current = Some(format!("_stub_method{name}"));
+            depth = 0;
+        }
+        if let Some(name) = &current {
+            if let Some(start) = trimmed.find("_primIn[") {
+                let digits = &trimmed[start + "_primIn[".len()..];
+                let digits = digits.split(']').next().unwrap_or("");
+                if let Ok(size) = digits.parse::<usize>() {
+                    helpers.insert(name.clone(), size);
+                }
+            }
+            depth += line.matches('{').count();
+            depth = depth.saturating_sub(line.matches('}').count());
+            if depth == 0 && trimmed.ends_with('}') {
+                current = None;
+            }
+        }
+    }
+
+    // export wrapper -> helper it calls
+    let mut sizes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut pending: Option<String> = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(start) = trimmed.find("__QAIC_STUB(lfmgemv_") {
+            let rest = &trimmed[start + "__QAIC_STUB(lfmgemv_".len()..];
+            pending = rest.split(')').next().map(str::to_owned);
+        }
+        if let Some(name) = &pending {
+            if let Some(start) = trimmed.find("return _stub_method") {
+                let rest = &trimmed[start + "return _stub_method".len()..];
+                let suffix = rest.split('(').next().unwrap_or("");
+                let helper = format!("_stub_method{suffix}");
+                if let Some(size) = helpers.get(&helper) {
+                    sizes.insert(name.clone(), *size);
+                }
+                pending = None;
+            }
+        }
+    }
+    sizes
 }
 
 fn read(path: &Path) -> String {

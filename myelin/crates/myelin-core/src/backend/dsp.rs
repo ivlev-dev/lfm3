@@ -33,8 +33,8 @@ pub const HVX_METHOD_FFN: u32 = 6;
 /// Method ID of `lfmgemv.attn` in the HVX FastRPC skeleton.
 pub const HVX_METHOD_ATTN: u32 = 11;
 
-/// FastRPC handle. `remote_handle64` on the host side.
-pub type DspHandle = u64;
+/// FastRPC handle. 32-bit `remote_handle`, as used by the `qaic` stub.
+pub type DspHandle = i32;
 
 /// One FastRPC invocation.
 ///
@@ -59,7 +59,7 @@ pub struct DspCall<'a, 'b> {
 pub enum DspError {
     /// `libcdsprpc.so` is absent or a required symbol is missing.
     Unavailable(String),
-    /// `remote_handle64_open` returned a non-zero FastRPC code.
+    /// `remote_handle_open` returned a non-zero FastRPC code.
     HandleOpen { code: i32 },
     /// A method returned a non-zero FastRPC code.
     Rpc {
@@ -510,6 +510,15 @@ fn unsupported(operation: &'static str, reason: &'static str) -> BackendError {
     }
 }
 
+/// Length of an IDL sequence (`long`/`octet`, both fit a 32-bit count).
+fn id_len(count: usize, what: &'static str) -> Result<i32, BackendError> {
+    i32::try_from(count).map_err(|_| BackendError::Shape {
+        operation: what,
+        expected: i32::MAX as usize,
+        got: count,
+    })
+}
+
 fn quantize(x: &[f32], scale: f32) -> Vec<u8> {
     x.iter()
         .map(|value| {
@@ -590,11 +599,17 @@ impl Backend for DspBackend {
         let mut mid = vec![0u8; dims.ffn];
         let mut times = [0i32; 8];
 
-        let mut prim = [0u8; 16];
+        // `_primIn[8]` of the qaic stub: handles, actLen, reps, dstLen,
+        // midLen, timesLen. Sequence lengths are part of the scalar pack.
+        let mut prim = [0u8; 32];
         prim[0..4].copy_from_slice(&stage.gate.to_le_bytes());
         prim[4..8].copy_from_slice(&stage.up.to_le_bytes());
         prim[8..12].copy_from_slice(&stage.down.to_le_bytes());
-        prim[12..16].copy_from_slice(&stage.reps.to_le_bytes());
+        prim[12..16].copy_from_slice(&id_len(act.len(), "dsp act")?.to_le_bytes());
+        prim[16..20].copy_from_slice(&stage.reps.to_le_bytes());
+        prim[20..24].copy_from_slice(&id_len(dst.len(), "dsp dst")?.to_le_bytes());
+        prim[24..28].copy_from_slice(&id_len(mid.len(), "dsp mid")?.to_le_bytes());
+        prim[28..32].copy_from_slice(&id_len(times.len(), "dsp times")?.to_le_bytes());
 
         let in_bufs = [act.as_slice()];
         let mut prim_out: [u8; 0] = [];
@@ -699,15 +714,21 @@ impl Backend for DspBackend {
         let mut outp = vec![0u8; dims.q_dim() * 4];
         let mut times = [0i32; 8];
 
-        let mut prim = [0u8; 32];
+        // `_primIn[12]` of the qaic stub: handles, qLen, tblLen (long
+        // elements), pos, seq, window, reps, outLen, timesLen.
+        let mut prim = [0u8; 48];
         prim[0..4].copy_from_slice(&stage.keys.to_le_bytes());
         prim[4..8].copy_from_slice(&stage.key_scales.to_le_bytes());
         prim[8..12].copy_from_slice(&stage.values.to_le_bytes());
         prim[12..16].copy_from_slice(&stage.value_scales.to_le_bytes());
-        prim[16..20].copy_from_slice(&position.to_le_bytes());
-        prim[20..24].copy_from_slice(&seq.to_le_bytes());
-        prim[24..28].copy_from_slice(&window.to_le_bytes());
-        prim[28..32].copy_from_slice(&stage.reps.to_le_bytes());
+        prim[16..20].copy_from_slice(&id_len(q.len(), "dsp attn q")?.to_le_bytes());
+        prim[20..24].copy_from_slice(&id_len(table.len(), "dsp attn tbl")?.to_le_bytes());
+        prim[24..28].copy_from_slice(&position.to_le_bytes());
+        prim[28..32].copy_from_slice(&seq.to_le_bytes());
+        prim[32..36].copy_from_slice(&window.to_le_bytes());
+        prim[36..40].copy_from_slice(&stage.reps.to_le_bytes());
+        prim[40..44].copy_from_slice(&id_len(outp.len(), "dsp attn outp")?.to_le_bytes());
+        prim[44..48].copy_from_slice(&id_len(times.len(), "dsp attn times")?.to_le_bytes());
 
         let table_bytes = i32_bytes(&table);
         let in_bufs = [q.as_slice(), table_bytes];

@@ -23,14 +23,23 @@ pub trait Transport: Send + Sync {
 
 `Call` — это ровно то, что `qaic` кладёт в `remote_arg[]`:
 
-1. `prim_in` — скалярные `in long`-параметры, little-endian;
+1. `prim_in` — `_primIn[]`: скалярные `in long`-параметры **и длины
+   последовательностей**, little-endian;
 2. входные последовательности (`in sequence<octet>` / `in sequence<long>`);
 3. `prim_out` — скалярные `rout long`-параметры;
 4. выходные последовательности (`rout sequence<...>`).
 
+Длины в `_primIn` — не «по логике», а буквально из стаба: для `load_buf`
+qaic пишет `_COPY(_primIn, 8, _in2Len, 0, 4)`, поэтому пакет `{h, off}`
+отвергается с `AEE_EBADPARM`. В `sequence<long>` длина считается в
+элементах (`4 * len` байт буфера), в `sequence<octet>` — в байтах.
+Структуры `*Wire` в `src/method.rs` повторяют `_primIn[]` каждого метода, а
+`build.rs` сверяет их размеры с `sizeof(_primIn)` в сгенерированном
+`lfmgemv_stub.c`.
+
 Число входов/выходов кодируется в `REMOTE_SCALARS_MAKEX(0, method, in, out,
-0, 0)`. Имена и ID методов — в `src/method.rs`; структуры `*Scalars` дают
-`to_bytes()` с точной раскладкой qaic.
+0, 0)`. Handle — 32-битный `remote_handle`: `remote_handle64_*` на этом
+устройстве возвращает `AEE_EBADPARM` для любого модуля.
 
 `SharedBuffer` — RAII: `alloc_shared` выделяет rpcmem/ION (на устройстве) или
 кучу (в моке), а `Drop` вызывает `rpcmem_free` / учитывает освобождение.
@@ -45,12 +54,13 @@ pub trait Transport: Send + Sync {
 | вариант | когда |
 |---|---|
 | `LibraryNotFound` | `dlopen("libcdsprpc.so")` не удался (в том числе на хосте) |
-| `SymbolMissing` | в библиотеке нет `remote_handle64_*`/`rpcmem_*` |
+| `SymbolMissing` | в библиотеке нет `remote_handle_*`/`rpcmem_*` |
 | `SessionControl` | не включился unsigned PD |
-| `HandleOpen` | `remote_handle64_open` вернул код |
+| `HandleOpen` | `remote_handle_open` вернул код |
 | `Rpc` | метод вернул ненулевой FastRPC-код, с расшифровкой `AEE_*` |
 | `Timeout` | `AEE_EEXPIRED` (или таймаут мока) |
 | `BufferTooSmall` | выход мока/метода не влез в буфер вызывающего |
+| `InvalidLength` | длина последовательности не влезла в 32-битный `long` |
 | `SharedMemory` | `rpcmem_alloc`/`rpcmem_to_fd` не удались |
 | `Closed` | вызов на уже закрытом handle |
 
@@ -97,7 +107,9 @@ rpcmem_flags: 1,           // RPCMEM_DEFAULT_FLAGS
 * парсит `myelin/dsp/hvx/lfmgemv.idl` и проверяет, что объявления идут в том
   же порядке, что константы в `src/method.rs`;
 * если рядом есть сгенерированный `myelin/dsp/hvx/lfmgemv_stub.c`, проверяет
-  каждый `uint32_t _mid = N;` против константы.
+  каждый `uint32_t _mid = N;` против константы;
+* сверяет `PRIM_IN_SIZES` (размеры `_primIn[]` в байтах) с
+  `uint32_t _primIn[N]` в каждом `_stub_method*`.
 
 Расхождение — ошибка сборки. `myelin/dsp/**` не изменяется.
 
@@ -146,7 +158,7 @@ rpcmem_flags: 1,           // RPCMEM_DEFAULT_FLAGS
 FFN-матрица (ffn_main.c:67-81, host_main.c:123-211):
   alloc_buf(len)
   set_shape(h, N_padded, K_padded, with_scale = 1)
-  load_buf(h, 0, chunk) ...               # 256 КиБ, как в стенде
+  load_buf(h, off, chunk) ...             # чанк настраивается, дефолт 4 МиБ
   set_scale(h, payload)
 
 attention (attn_main.c:225-241):
@@ -175,7 +187,23 @@ attention (attn_main.c:225-241):
   `BackendError::Budget`.
 * Иначе вытесняются целые стадии в LRU-порядке, пока новая не влезет.
   `ResidentWeights::stats()` отдаёт `loads`, `evictions`, `unloads`,
-  `load_calls`, `live_bytes`, `resident_units`.
+  `load_calls`, `load_bytes`, `load_micros` (часы хоста), `chunk`,
+  `strategy`, `live_bytes`, `resident_units`.
+* `ResidentWeights::set_chunk(n)` меняет размер чанка `load_buf` (дефолт
+  `LOAD_CHUNK = 4 МиБ`).
+
+### Стратегии загрузки
+
+`LoadStrategy::Copy` (дефолт) — `alloc_buf` + `load_buf` чанками, как выше:
+веса копируются в DSP-кучу.
+
+`LoadStrategy::Attach` — zero-copy: веса должны остаться в host ION, а DSP
+читать их на месте. Текущий `lfmgemv` этого не умеет: `attach_out` мапит
+**выходной** буфер (`apps_mem_share_map(fd)`, `b->out_ptr`), а входного
+attach-метода в IDL нет. Поэтому стратегия возвращает
+`WeightError::UnsupportedStrategy` с причиной, а не молча откатывается на
+`Copy`. Zero-copy выход при этом доступен напрямую через
+`HvxClient::attach_out` + `gemv_resident`/`ffn_resident`.
 * `Drop` (и `DspBackend::drop` до закрытия handle) вызывает `release_buf` для
   каждого живого буфера; `release_all()` идемпотентен.
 * Ошибка `alloc_buf`/`set_shape`/`load_buf`/`set_scale` освобождает уже
@@ -204,14 +232,34 @@ FFN-стадия (gate/up/down), бюджет равен её размеру:
 | blob одной матрицы 2048×7680 | 15 790 208 Б (15.06 МиБ) |
 | вес (тайлы) | 15 728 640 Б, 15 360 тайлов по 1 КиБ |
 | bias/scale блоки | 61 440 Б (240 × 256) |
-| `load_buf` на матрицу | 61 |
+| `load_buf` на матрицу, чанк 256 КиБ | 61 |
+| `load_buf` на матрицу, чанк 4 МиБ | 4 |
 | FFN-слой целиком | 47 325 568 Б (45.13 МиБ) |
-| `load_buf` на слой | 183 |
+| `load_buf` на слой, чанк 256 КиБ (стенд) | 183 |
+| `load_buf` на слой, чанк 4 МиБ (дефолт) | 12 |
 | `alloc_buf` / `set_scale` на слой | 3 / 3 |
 
 Слой влезает в бюджет ровно 45.13 МиБ. Два FFN-слоя (90.3 МиБ) в такой
 бюджет не влезают и требуют LRU-вытеснения. `team_info` сообщает только
 число ядер/потоков и не отдаёт размер кучи, поэтому бюджет задаёт вызывающий.
+
+### Замеры на XQ-BC72 (Hexagon v68)
+
+`npu-bench --iterations 31`, release-сборка, Rust-транспорт:
+
+| операция | min | median | p95 |
+|---|---:|---:|---:|
+| пустой RPC (`team_info`) | 151.6 мкс | 160.5 мкс | 167.0 мкс |
+| `load_buf` 1 КиБ | 139.1 мкс | 141.8 мкс | 257.7 мкс |
+| `load_buf` 256 КиБ | 624.8 мкс | 662.7 мкс | 726.3 мкс |
+| `load_buf` 1 МиБ | 1682.2 мкс | 2011.8 мкс | 2103.1 мкс |
+| `load_buf` 4 МиБ | 5670.6 мкс | 6996.3 мкс | 7635.9 мкс |
+
+C-стенд на том же устройстве даёт те же величины в пределах разброса
+(`team_info` 152–170 мкс, 1 МиБ 1965–2089 мкс, 4 МиБ 6916 мкс). Отсюда
+оценка слоя: 183 × 256 КиБ ≈ 121 мс против 12 × 4 МиБ ≈ 84 мс.
+Длинные циклы `load_buf` без пауз ловят SSR — на устройстве их надо резать
+на короткие серии.
 
 ### Что ждёт устройства
 
@@ -250,7 +298,9 @@ cargo test --workspace
 
 * точную последовательность `alloc_buf`/`set_shape`/`load_buf`/`set_scale`
   для gate/up/down и `alloc_buf`/`load_buf` для attention;
-* размеры, смещения и разбиение `load_buf` по 256 КиБ;
+* размеры, смещения и разбиение `load_buf` по настраиваемому чанку
+  (по умолчанию 4 МиБ);
+* явную ошибку `LoadStrategy::Attach`, пока у скелета нет attach-in;
 * точный бюджет: `bytes` влезает, `bytes - 1` даёт `WeightError::Budget`;
 * LRU-вытеснение со счётчиками `loads`/`evictions`/`unloads`;
 * `live_bytes == 0` после `release_all`/`Drop`, ровно один `release_buf` на
@@ -287,24 +337,30 @@ cargo build --target aarch64-linux-android -p myelin-npu
 ```bash
 cd myelin/dsp/hvx && ./build.sh
 adb push liblfmgemv_skel.so /data/local/tmp/myelin/
-# host-бинарь npu-bench из target/aarch64-linux-android/debug/
-adb push ../target/aarch64-linux-android/debug/npu-bench /data/local/tmp/myelin/
+# host-бинарь npu-bench из target/aarch64-linux-android/release/
+adb push ../target/aarch64-linux-android/release/npu-bench /data/local/tmp/myelin/
 adb shell ADSP_LIBRARY_PATH=/data/local/tmp/myelin \
     /data/local/tmp/myelin/npu-bench --iterations 31
 ```
 
-`npu-bench` печатает min/median/p95 для пустого RPC (`team_info`) и
-`load_buf` с 1 КиБ и 1 МиБ. На хосте он честно пишет, что меряет
-`MockTransport`, а не FastRPC.
+`ADSP_LIBRARY_PATH` должен содержать **ровно один** каталог: список через
+двоеточие на XQ-BC72 падает в `AEE_EUNABLETOLOAD`, даже если каждый каталог
+верный.
 
-Настоящий smoke-тест помечен `#[ignore]`:
+`npu-bench` печатает min/median/p95 для пустого RPC (`team_info`) и
+`load_buf` с 1 КиБ, 256 КиБ, 1 МиБ и 4 МиБ. На хосте он честно пишет, что
+меряет `MockTransport`, а не FastRPC.
+
+Настоящие smoke-тесты помечены `#[ignore]`:
 
 ```bash
 cargo test -p myelin-npu --target aarch64-linux-android -- --ignored
 ```
 
-Он требует `libcdsprpc.so` в системе, unsigned PD и
-`liblfmgemv_skel.so` в `ADSP_LIBRARY_PATH`.
+Они требуют `libcdsprpc.so` в системе, unsigned PD и
+`liblfmgemv_skel.so` в `ADSP_LIBRARY_PATH`. `tests/real_rpc.rs` проверяет
+`open` → `alloc_buf` → `load_buf` 256 КиБ и 4 МиБ → `release_buf`, а также
+`attach_out` + `gemv_resident` против обычного `gemv`.
 
 ## Известные ограничения
 
@@ -325,3 +381,8 @@ cargo test -p myelin-npu --target aarch64-linux-android -- --ignored
 * Стенд `attn` жёстко зашит на 16 q-heads / 4 kv-heads / 128 dim.
 * `remote_register_buf_attr` с `FASTRPC_ATTR_KEEP_MAP` пока только в
   конфиге: `attach_out` использует fd напрямую.
+* `attach_out` — только выход. Host-мапинг ION кэшируемый: DSP-результат
+  виден CPU после `detach_out` (он сбрасывает/снимает мапинг). Если буфер
+  сразу уходит в следующий DSP-этап, читать его на хосте не нужно.
+* Веса zero-copy через `attach_out` не загружаются: для этого нужен
+  attach-in метод в IDL/скелете. До него — `LoadStrategy::Copy`.

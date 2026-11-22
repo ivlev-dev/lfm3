@@ -1,7 +1,8 @@
 //! Host-side FastRPC cost benchmark.
 //!
 //! On the device this opens `libcdsprpc.so`, enables unsigned PD and measures
-//! an empty RPC (`team_info`) plus `load_buf` with 1 KiB and 1 MiB payloads.
+//! an empty RPC (`team_info`) plus `load_buf` with 1 KiB, 256 KiB, 1 MiB and
+//! 4 MiB payloads. The last two bracket the weight-loader chunk choice.
 //! On a host build it uses [`MockTransport`]; the numbers then describe Rust
 //! call overhead, not FastRPC, and the tool says so.
 
@@ -89,19 +90,23 @@ fn main() -> ExitCode {
         failure = true;
     }
 
-    let resident = match client.alloc_buf(1 << 20) {
+    let resident = match client.alloc_buf(8 << 20) {
         Ok(handle) => Some(handle),
         Err(error) => {
-            eprintln!("alloc_buf(1 MiB) failed: {error}");
+            eprintln!("alloc_buf(8 MiB) failed: {error}");
             None
         }
     };
     if let Some(handle) = resident {
         let payload_1k = vec![0x5au8; 1 << 10];
+        let payload_256k = vec![0x33u8; 256 << 10];
         let payload_1m = vec![0xa5u8; 1 << 20];
+        let payload_4m = vec![0x77u8; 4 << 20];
         for (label, payload) in [
             ("load_buf 1 KiB", &payload_1k),
+            ("load_buf 256 KiB", &payload_256k),
             ("load_buf 1 MiB", &payload_1m),
+            ("load_buf 4 MiB", &payload_4m),
         ] {
             if let Err(error) = bench(label, options.iterations, || {
                 client.load_buf(handle, 0, payload)
@@ -183,6 +188,7 @@ fn usage() {
         "usage: npu-bench [--mock] [--iterations N] [--module NAME]\n\
          \n\
          Runs on the device with libcdsprpc.so and liblfmgemv_skel.so deployed.\n\
-         Set ADSP_LIBRARY_PATH to the directory holding the skeleton."
+         Set ADSP_LIBRARY_PATH to exactly one directory holding the skeleton;\n\
+         a colon-separated list fails with AEE_EUNABLETOLOAD on the XQ-BC72."
     );
 }

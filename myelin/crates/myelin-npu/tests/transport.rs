@@ -102,7 +102,9 @@ fn ffn_round_trips_typed_buffers() {
 
     let call = mock.last_call().expect("recorded");
     assert_eq!(call.scalars, 0x0602_0300);
-    assert_eq!(call.prim_in, i32_bytes(&[1, 2, 3, 1]));
+    // _primIn[8] from the stub: three handles, actLen, reps, dstLen, midLen,
+    // timesLen (sequence<long> elements).
+    assert_eq!(call.prim_in, i32_bytes(&[1, 2, 3, 4, 1, 4, 8, 8]));
 }
 
 #[test]
@@ -138,7 +140,12 @@ fn attn_packs_eight_scalars_and_block_table() {
 
     let call = mock.last_call().expect("recorded");
     assert_eq!(call.scalars, 0x0b03_0200);
-    assert_eq!(call.prim_in, i32_bytes(&[1, 2, 3, 0, 63, 64, 32, 2]));
+    // _primIn[12]: handles, qLen, tblLen (long elements), pos, seq, window,
+    // reps, outLen, timesLen.
+    assert_eq!(
+        call.prim_in,
+        i32_bytes(&[1, 2, 3, 0, 4, 3, 63, 64, 32, 2, 8, 8])
+    );
 }
 
 #[test]
@@ -161,9 +168,10 @@ fn gemv_returns_declared_dst_length() {
         })
         .expect("gemv rpc");
     assert_eq!(response.dst.len(), 6);
+    // _primIn[6]: h, M, actLen, reps, dstLen, timesLen.
     assert_eq!(
         mock.last_call().expect("call").prim_in,
-        i32_bytes(&[4, 1, 1])
+        i32_bytes(&[4, 1, 3, 1, 6, 8])
     );
 }
 
@@ -331,7 +339,10 @@ fn backend_ffn_quantises_calls_and_dequantises() {
     let ffn = spec.dims.ffn;
     let mock = MockTransport::new();
     mock.set_handler(method_id::FFN, move |call| {
-        assert_eq!(call.prim_in, i32_bytes(&[1, 2, 3, 1]));
+        assert_eq!(
+            call.prim_in,
+            i32_bytes(&[1, 2, 3, hidden as i32, 1, hidden as i32, ffn as i32, 8])
+        );
         assert_eq!(call.in_bufs[0].len(), hidden);
         assert_eq!(call.in_bufs[0][0], 2); // 1.0 * act_scale 2.0
         Ok(reply(
@@ -416,7 +427,23 @@ fn backend_attention_calls_attn_and_mirrors_host_kv() {
     let q_dim = spec.dims.q_dim();
     let mock = MockTransport::new();
     mock.set_handler(method_id::ATTN, move |call| {
-        assert_eq!(call.prim_in, i32_bytes(&[1, 2, 3, 0, 0, 1, 0, 1]));
+        assert_eq!(
+            call.prim_in,
+            i32_bytes(&[
+                1,
+                2,
+                3,
+                0,
+                q_dim as i32,
+                1,
+                0,
+                1,
+                0,
+                1,
+                (q_dim * 4) as i32,
+                8
+            ])
+        );
         assert_eq!(call.in_bufs[0].len(), q_dim);
         assert_eq!(call.in_bufs[1], i32_bytes(&[0]));
         let mut outp = Vec::with_capacity(q_dim * 4);
@@ -535,7 +562,8 @@ fn mock_handler_sees_exact_call_shape() {
     let mock = MockTransport::new();
     mock.set_handler(method_id::LOAD_BUF, |call: &MockCall| {
         assert_eq!(call.method, method_id::LOAD_BUF);
-        assert_eq!(call.prim_in, i32_bytes(&[3, 1024]));
+        // `dataLen` is part of the scalar pack in the qaic stub.
+        assert_eq!(call.prim_in, i32_bytes(&[3, 1024, 4]));
         assert_eq!(call.in_bufs, vec![vec![0xab; 4]]);
         Ok(MockReply::default())
     });

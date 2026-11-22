@@ -29,6 +29,9 @@ impl From<TransportError> for DspError {
             TransportError::BufferTooSmall { expected, got, .. } => {
                 Self::BufferTooSmall { expected, got }
             }
+            TransportError::InvalidLength { what, len } => Self::Other(format!(
+                "{what} length {len} does not fit a 32-bit IDL field"
+            )),
             TransportError::SharedMemory { bytes, code } => Self::Other(format!(
                 "shared memory allocation of {bytes} bytes failed: 0x{code:08x}"
             )),

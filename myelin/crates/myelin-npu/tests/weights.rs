@@ -192,9 +192,19 @@ fn ffn_upload_matches_the_stand_order() {
         );
         assert_eq!(read_i32(&loads[index].prim_in[0..4]), handle);
         assert_eq!(read_i32(&loads[index].prim_in[4..8]), 0);
+        assert_eq!(
+            read_i32(&loads[index].prim_in[8..12]) as usize,
+            tensor.blob().len(),
+            "load_buf packs dataLen as _primIn[3]"
+        );
         assert_eq!(loads[index].in_bufs.len(), 1);
         assert_eq!(loads[index].in_bufs[0], tensor.blob());
-        assert_eq!(read_i32(&scales[index].prim_in), handle);
+        assert_eq!(read_i32(&scales[index].prim_in[0..4]), handle);
+        assert_eq!(
+            read_i32(&scales[index].prim_in[4..8]) as usize,
+            scales[index].in_bufs[0].len(),
+            "set_scale packs scalesLen as _primIn[2]"
+        );
         assert_eq!(
             scales[index].in_bufs[0],
             expected_scale_payload(tensor, 2.0, 0.5)
@@ -208,38 +218,80 @@ fn ffn_upload_matches_the_stand_order() {
     let stats = planner.stats();
     assert_eq!(stats.loads, 1);
     assert_eq!(stats.load_calls, 3);
+    assert_eq!(stats.load_bytes, bytes as u64);
+    assert_eq!(stats.chunk, myelin_npu::LOAD_CHUNK);
+    assert_eq!(stats.strategy, myelin_npu::LoadStrategy::Copy);
     assert_eq!(stats.evictions, 0);
     assert_eq!(stats.live_bytes, bytes);
     assert_eq!(stats.resident_units, 1);
 }
 
 #[test]
-fn loads_follow_the_stand_chunking_and_offsets() {
+fn default_chunk_is_four_mebibytes() {
+    assert_eq!(myelin_npu::LOAD_CHUNK, 4 * 1024 * 1024);
+    let tensor = packed("gate", 64, 32, 5);
+    assert_eq!(tensor.load_calls(), tensor.load_calls_with(4 * 1024 * 1024));
+    assert_eq!(tensor.load_calls(), 1);
+    assert_eq!(tensor.load_calls_with(tensor.len()), 1);
+    assert_eq!(tensor.load_calls_with(tensor.len() - 1), 2);
+}
+
+#[test]
+fn loads_follow_the_configured_chunking_and_offsets() {
     let bench = bench();
     allocator(&bench.mock, 1);
     let layer = ffn(512, 512, 0x1234);
     let bytes = layer.bytes();
     let plan = WeightPlan::builder(bytes).ffn(0, layer.clone()).build();
-    let planner = bench.planner(plan);
+    let mut planner = bench.planner(plan);
+    planner.set_chunk(64 * 1024);
 
     planner.ffn_stage(0).expect("ffn stage");
 
     let loads = bench.calls(method_id::LOAD_BUF);
     let gate = layer.gate();
-    let expected_calls = gate.load_calls();
+    let expected_calls = gate.load_calls_with(64 * 1024);
     assert!(expected_calls > 1, "test must exercise chunking");
     assert_eq!(loads.len(), expected_calls * 3);
     for (index, tensor) in [layer.gate(), layer.up(), layer.down()].iter().enumerate() {
+        assert_eq!(tensor.load_calls_with(64 * 1024), expected_calls);
         for chunk in 0..expected_calls {
             let call = &loads[index * expected_calls + chunk];
-            assert_eq!(read_i32(&call.prim_in[4..8]) as usize, chunk * 256 * 1024);
-            let start = chunk * 256 * 1024;
-            let end = (start + 256 * 1024).min(tensor.len());
+            assert_eq!(read_i32(&call.prim_in[4..8]) as usize, chunk * 64 * 1024);
+            assert_eq!(
+                read_i32(&call.prim_in[8..12]) as usize,
+                call.in_bufs[0].len()
+            );
+            let start = chunk * 64 * 1024;
+            let end = (start + 64 * 1024).min(tensor.len());
             assert_eq!(call.in_bufs[0], &tensor.blob()[start..end]);
         }
     }
-    assert_eq!(planner.stats().load_calls, (expected_calls * 3) as u64);
-    assert_eq!(planner.stats().live_bytes, bytes);
+    let stats = planner.stats();
+    assert_eq!(stats.load_calls, (expected_calls * 3) as u64);
+    assert_eq!(stats.load_bytes, bytes as u64);
+    assert_eq!(stats.chunk, 64 * 1024);
+    assert_eq!(stats.live_bytes, bytes);
+}
+
+#[test]
+fn attach_strategy_is_rejected_explicitly() {
+    let bench = bench();
+    allocator(&bench.mock, 1);
+    let layer = ffn(64, 32, 61);
+    let plan = WeightPlan::builder(layer.bytes()).ffn(0, layer).build();
+    let mut planner = bench.planner(plan);
+    planner.set_strategy(myelin_npu::LoadStrategy::Attach);
+    let error = planner.ffn_stage(0).expect_err("attach is unsupported");
+    match error {
+        WeightError::UnsupportedStrategy { strategy, reason } => {
+            assert_eq!(strategy, myelin_npu::LoadStrategy::Attach);
+            assert!(reason.contains("attach_out"));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(bench.calls(method_id::ALLOC_BUF).is_empty());
+    assert!(bench.calls(method_id::LOAD_BUF).is_empty());
 }
 
 #[test]
@@ -608,7 +660,7 @@ fn real_lfm3_ffn_gate_footprint() {
          ({} for gate); resident {} B in {} units; load_calls {}",
         gate_result.manifest.weight_bytes,
         gate_result.manifest.tiles.len(),
-        gate_bytes.div_ceil(256 * 1024),
+        gate_bytes.div_ceil(myelin_npu::LOAD_CHUNK),
         stats.live_bytes,
         stats.resident_units,
         stats.load_calls

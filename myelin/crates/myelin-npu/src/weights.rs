@@ -40,11 +40,48 @@ use myelin_core::backend::dsp::{
 use myelin_pack::{Manifest, PackResult};
 
 use crate::method::{
-    method_id, AllocBufScalars, LoadBufScalars, ReleaseBufScalars, SetScaleScalars, SetShapeScalars,
+    method_id, octet_len, AllocBufScalars, LoadBufWire, ReleaseBufScalars, SetScaleWire,
+    SetShapeScalars,
 };
 
-/// Chunk size used by the stand for `load_buf` (`ffn_main.c`, `host_main.c`).
-pub const LOAD_CHUNK: usize = 256 * 1024;
+/// Default `load_buf` chunk size.
+///
+/// The stand used 256 KiB (183 RPCs per FFN layer, ~106 ms). On the device a
+/// 4 MiB chunk takes ~6.8 ms, so the same layer needs ~12 calls (~79 ms); the
+/// win comes only at >= 4 MiB, smaller chunks are dominated by per-RPC cost.
+pub const LOAD_CHUNK: usize = 4 * 1024 * 1024;
+
+/// How resident weights reach the DSP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadStrategy {
+    /// `alloc_buf` + `load_buf` chunks + `set_scale`: the weights are copied
+    /// into the DSP heap by the PD.
+    #[default]
+    Copy,
+    /// Zero-copy: the weights stay in a host ION buffer that the DSP maps
+    /// directly, so neither the host marshaller nor the PD copies them.
+    ///
+    /// This requires an `attach-in` style method on the skeleton; `attach_out`
+    /// only maps *output* buffers (see [`crate::hvx::HvxClient::attach_out`]),
+    /// so the current `lfmgemv` IDL rejects this strategy with
+    /// [`WeightError::UnsupportedStrategy`] instead of falling back silently.
+    Attach,
+}
+
+impl LoadStrategy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Attach => "attach",
+        }
+    }
+}
+
+impl fmt::Display for LoadStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// DSP heap budget for resident weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +150,11 @@ pub enum WeightError {
     TooLarge { what: &'static str, bytes: usize },
     /// A FastRPC call failed; the original code is preserved.
     Transport(DspError),
+    /// The selected upload strategy is not implemented by the skeleton.
+    UnsupportedStrategy {
+        strategy: LoadStrategy,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for WeightError {
@@ -140,6 +182,9 @@ impl fmt::Display for WeightError {
                 )
             }
             Self::Transport(error) => write!(f, "{error}"),
+            Self::UnsupportedStrategy { strategy, reason } => {
+                write!(f, "strategy `{strategy}` is unsupported: {reason}")
+            }
         }
     }
 }
@@ -159,9 +204,9 @@ impl From<WeightError> for StageError {
             WeightError::Transport(error) => Self::Transport(error.clone()),
             WeightError::Budget { .. } => Self::Budget(error.to_string()),
             WeightError::Missing { .. } => Self::Unknown(error.to_string()),
-            WeightError::Layout(_) | WeightError::TooLarge { .. } => {
-                Self::Layout(error.to_string())
-            }
+            WeightError::Layout(_)
+            | WeightError::TooLarge { .. }
+            | WeightError::UnsupportedStrategy { .. } => Self::Layout(error.to_string()),
         }
     }
 }
@@ -177,6 +222,14 @@ pub struct WeightStats {
     pub unloads: u64,
     /// Number of successful `load_buf` RPCs.
     pub load_calls: u64,
+    /// Bytes handed to `load_buf`.
+    pub load_bytes: u64,
+    /// Host wall-clock time spent inside `load_buf` calls.
+    pub load_micros: u64,
+    /// Chunk size `load_buf` used.
+    pub chunk: usize,
+    /// Upload strategy.
+    pub strategy: LoadStrategy,
     /// Units currently resident.
     pub resident_units: usize,
     /// Bytes currently resident.
@@ -286,7 +339,15 @@ impl PackedTensor {
 
     /// Number of `load_buf` RPCs needed at [`LOAD_CHUNK`].
     pub fn load_calls(&self) -> usize {
-        self.blob.len().div_ceil(LOAD_CHUNK)
+        self.load_calls_with(LOAD_CHUNK)
+    }
+
+    /// Number of `load_buf` RPCs at `chunk` bytes per call.
+    pub fn load_calls_with(&self, chunk: usize) -> usize {
+        if chunk == 0 {
+            return 0;
+        }
+        self.blob.len().div_ceil(chunk)
     }
 }
 
@@ -629,6 +690,8 @@ struct State {
     evictions: u64,
     unloads: u64,
     load_calls: u64,
+    load_bytes: u64,
+    load_micros: u64,
 }
 
 /// Resident weights backed by a DSP heap and an LRU budget.
@@ -636,6 +699,8 @@ pub struct ResidentWeights {
     executor: Arc<dyn DspExecutor>,
     handle: DspHandle,
     plan: WeightPlan,
+    chunk: usize,
+    strategy: LoadStrategy,
     state: Mutex<State>,
 }
 
@@ -649,8 +714,30 @@ impl ResidentWeights {
             executor,
             handle,
             plan,
+            chunk: LOAD_CHUNK,
+            strategy: LoadStrategy::Copy,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Override the `load_buf` chunk size. Zero is clamped to one byte.
+    pub fn set_chunk(&mut self, chunk: usize) {
+        self.chunk = chunk.max(1);
+    }
+
+    /// Chunk size used by `load_buf`.
+    pub const fn chunk(&self) -> usize {
+        self.chunk
+    }
+
+    /// Select the upload strategy.
+    pub fn set_strategy(&mut self, strategy: LoadStrategy) {
+        self.strategy = strategy;
+    }
+
+    /// Selected upload strategy.
+    pub const fn strategy(&self) -> LoadStrategy {
+        self.strategy
     }
 
     /// Plan this planner follows.
@@ -666,6 +753,10 @@ impl ResidentWeights {
             evictions: state.evictions,
             unloads: state.unloads,
             load_calls: state.load_calls,
+            load_bytes: state.load_bytes,
+            load_micros: state.load_micros,
+            chunk: self.chunk,
+            strategy: self.strategy,
             resident_units: state.units.len(),
             live_bytes: state.used,
             budget: self.plan.budget.bytes(),
@@ -756,6 +847,13 @@ impl ResidentWeights {
     }
 
     fn ensure(&self, key: UnitKey) -> Result<Vec<i32>, WeightError> {
+        if self.strategy == LoadStrategy::Attach {
+            return Err(WeightError::UnsupportedStrategy {
+                strategy: self.strategy,
+                reason: "`lfmgemv.attach_out` maps output buffers only; the skeleton has no \
+                         attach-in method that would let the DSP read host ION weights in place",
+            });
+        }
         let bytes = self.plan.unit_bytes(key).ok_or(WeightError::Missing {
             layer: key.layer,
             kind: key.kind,
@@ -989,7 +1087,15 @@ impl ResidentWeights {
     }
 
     fn set_scale(&self, handle: i32, payload: &[u8]) -> Result<(), WeightError> {
-        let prim = SetScaleScalars { h: handle }.to_bytes();
+        let data_len = octet_len(payload.len()).ok_or(WeightError::TooLarge {
+            what: "set_scale data",
+            bytes: payload.len(),
+        })?;
+        let prim = SetScaleWire {
+            h: handle,
+            data_len,
+        }
+        .to_bytes();
         let mut prim_out: [u8; 0] = [];
         let mut no_out: [&mut [u8]; 0] = [];
         self.executor
@@ -1007,8 +1113,8 @@ impl ResidentWeights {
     }
 
     fn load_all(&self, handle: i32, data: &[u8], state: &mut State) -> Result<(), WeightError> {
-        for (index, chunk) in data.chunks(LOAD_CHUNK).enumerate() {
-            let offset = index * LOAD_CHUNK;
+        for (index, chunk) in data.chunks(self.chunk).enumerate() {
+            let offset = index * self.chunk;
             self.load_chunk(handle, offset, chunk, state)?;
         }
         Ok(())
@@ -1022,9 +1128,20 @@ impl ResidentWeights {
         state: &mut State,
     ) -> Result<(), WeightError> {
         let off = to_i32(offset, "load_buf offset")?;
-        let prim = LoadBufScalars { h: handle, off }.to_bytes();
+        // The stub packs `dataLen` as the third scalar (`_primIn[3]`).
+        let data_len = octet_len(data.len()).ok_or(WeightError::TooLarge {
+            what: "load_buf data",
+            bytes: data.len(),
+        })?;
+        let prim = LoadBufWire {
+            h: handle,
+            off,
+            data_len,
+        }
+        .to_bytes();
         let mut prim_out: [u8; 0] = [];
         let mut no_out: [&mut [u8]; 0] = [];
+        let started = std::time::Instant::now();
         self.executor
             .invoke(
                 self.handle,
@@ -1038,6 +1155,8 @@ impl ResidentWeights {
             )
             .map_err(WeightError::Transport)?;
         state.load_calls += 1;
+        state.load_bytes += data.len() as u64;
+        state.load_micros += started.elapsed().as_micros() as u64;
         Ok(())
     }
 

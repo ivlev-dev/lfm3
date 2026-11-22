@@ -12,6 +12,15 @@
 //! (`ffn`, `attn`, `gemv`, ...); [`method`] owns the method IDs and scalar
 //! layouts. [`weights`] uploads `myelin-pack` blobs into resident DSP buffers
 //! under an explicit memory budget with LRU eviction.
+//!
+//! # Device deployment
+//!
+//! The handle ABI is the 32-bit `remote_handle_*` one used by the `qaic`
+//! stub; `remote_handle64_*` returns `AEE_EBADPARM` on the XQ-BC72.
+//!
+//! `ADSP_LIBRARY_PATH` must name **exactly one** directory holding
+//! `liblfmgemv_skel.so`. A colon-separated list is rejected by the driver with
+//! `AEE_EUNABLETOLOAD`, even when every entry is valid.
 
 use std::fmt;
 
@@ -38,7 +47,7 @@ pub use method::{
 pub use mock::{MockCall, MockReply, MockTransport, RecordedCall};
 pub use transport::{Call, Handle, SharedBuffer, SharedOwner, Transport};
 pub use weights::{
-    AttentionParams, AttentionPlan, FfnPlan, LayerPlan, PackedTensor, ResidentImage,
+    AttentionParams, AttentionPlan, FfnPlan, LayerPlan, LoadStrategy, PackedTensor, ResidentImage,
     ResidentWeights, StageKind, WeightBudget, WeightError, WeightPlan, WeightPlanBuilder,
     WeightStats, LOAD_CHUNK,
 };

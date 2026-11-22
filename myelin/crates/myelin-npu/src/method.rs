@@ -67,6 +67,12 @@ macro_rules! scalar_pack {
     };
 }
 
+// The scalar packs below are the *wire* layout of `_primIn[]` in
+// `lfmgemv_stub.c`. qaic writes every sequence length into that array as well
+// (`_COPY(_primIn, 8, _in2Len, 0, 4)` for `load_buf`), so a pack that carries
+// only the declared `in long` arguments is not accepted by the skeleton
+// (`AEE_EBADPARM`). `PRIM_IN_SIZES` is checked against the generated stub by
+// `build.rs`.
 scalar_pack!(AllocBufScalars { nbytes: i32 } size = 4);
 scalar_pack!(AllocBufOut { h: i32 } size = 4);
 scalar_pack!(SetShapeScalars {
@@ -75,29 +81,66 @@ scalar_pack!(SetShapeScalars {
     k: i32,
     with_scale: i32
 } size = 16);
-scalar_pack!(LoadBufScalars { h: i32, off: i32 } size = 8);
-scalar_pack!(SetScaleScalars { h: i32 } size = 4);
-scalar_pack!(GemvScalars {
+scalar_pack!(LoadBufWire {
+    h: i32,
+    off: i32,
+    data_len: i32
+} size = 12);
+scalar_pack!(SetScaleWire { h: i32, data_len: i32 } size = 8);
+scalar_pack!(GemvWire {
     h: i32,
     m: i32,
-    reps: i32
-} size = 12);
-scalar_pack!(FfnScalars {
+    act_len: i32,
+    reps: i32,
+    dst_len: i32,
+    times_len: i32
+} size = 24);
+scalar_pack!(FfnWire {
     gate: i32,
     up: i32,
     down: i32,
-    reps: i32
+    act_len: i32,
+    reps: i32,
+    dst_len: i32,
+    mid_len: i32,
+    times_len: i32
+} size = 32);
+scalar_pack!(ProbeWire {
+    h: i32,
+    kind: i32,
+    arg: i32,
+    res_len: i32
 } size = 16);
-scalar_pack!(AttnScalars {
+scalar_pack!(GemvResidentWire {
+    h: i32,
+    m: i32,
+    act_len: i32,
+    reps: i32,
+    times_len: i32
+} size = 20);
+scalar_pack!(FfnResidentWire {
+    gate: i32,
+    up: i32,
+    down: i32,
+    act_len: i32,
+    reps: i32,
+    mid_len: i32,
+    times_len: i32
+} size = 28);
+scalar_pack!(AttnWire {
     keys: i32,
     key_scales: i32,
     values: i32,
     value_scales: i32,
+    q_len: i32,
+    tbl_len: i32,
     position: i32,
     seq: i32,
     window: i32,
-    reps: i32
-} size = 32);
+    reps: i32,
+    out_len: i32,
+    times_len: i32
+} size = 48);
 scalar_pack!(AttachOutScalars {
     h: i32,
     fd: i32,
@@ -107,20 +150,73 @@ scalar_pack!(DetachOutScalars { h: i32 } size = 4);
 scalar_pack!(ReleaseBufScalars { h: i32 } size = 4);
 scalar_pack!(TeamInfoScalars { len: i32 } size = 4);
 
+/// `sizeof(_primIn)` per method, in method-ID order (`lfmgemv_stub.c`).
+pub const PRIM_IN_SIZES: [usize; 14] = [4, 16, 12, 8, 24, 16, 32, 12, 4, 20, 28, 48, 4, 4];
+
+/// Number of i32 values in the stand's `times[]` sequence.
+pub const TIMES_VALUES: usize = 8;
+
 const _: () = {
-    assert!(std::mem::size_of::<AllocBufScalars>() == 4);
+    assert!(std::mem::size_of::<AllocBufScalars>() == PRIM_IN_SIZES[0]);
+    assert!(std::mem::size_of::<SetShapeScalars>() == PRIM_IN_SIZES[1]);
+    assert!(std::mem::size_of::<LoadBufWire>() == PRIM_IN_SIZES[2]);
+    assert!(std::mem::size_of::<SetScaleWire>() == PRIM_IN_SIZES[3]);
+    assert!(std::mem::size_of::<GemvWire>() == PRIM_IN_SIZES[4]);
+    assert!(std::mem::size_of::<ProbeWire>() == PRIM_IN_SIZES[5]);
+    assert!(std::mem::size_of::<FfnWire>() == PRIM_IN_SIZES[6]);
+    assert!(std::mem::size_of::<AttachOutScalars>() == PRIM_IN_SIZES[7]);
+    assert!(std::mem::size_of::<DetachOutScalars>() == PRIM_IN_SIZES[8]);
+    assert!(std::mem::size_of::<GemvResidentWire>() == PRIM_IN_SIZES[9]);
+    assert!(std::mem::size_of::<FfnResidentWire>() == PRIM_IN_SIZES[10]);
+    assert!(std::mem::size_of::<AttnWire>() == PRIM_IN_SIZES[11]);
+    assert!(std::mem::size_of::<TeamInfoScalars>() == PRIM_IN_SIZES[12]);
+    assert!(std::mem::size_of::<ReleaseBufScalars>() == PRIM_IN_SIZES[13]);
     assert!(std::mem::size_of::<AllocBufOut>() == 4);
-    assert!(std::mem::size_of::<SetShapeScalars>() == 16);
-    assert!(std::mem::size_of::<LoadBufScalars>() == 8);
-    assert!(std::mem::size_of::<SetScaleScalars>() == 4);
-    assert!(std::mem::size_of::<GemvScalars>() == 12);
-    assert!(std::mem::size_of::<FfnScalars>() == 16);
-    assert!(std::mem::size_of::<AttnScalars>() == 32);
-    assert!(std::mem::size_of::<AttachOutScalars>() == 12);
-    assert!(std::mem::size_of::<DetachOutScalars>() == 4);
-    assert!(std::mem::size_of::<ReleaseBufScalars>() == 4);
-    assert!(std::mem::size_of::<TeamInfoScalars>() == 4);
 };
+
+/// `sequence<octet>` length in elements (one element is one byte).
+pub fn octet_len(bytes: usize) -> Option<i32> {
+    i32::try_from(bytes).ok()
+}
+
+/// `sequence<long>` length in elements (`4` bytes each).
+pub fn long_len(bytes: usize) -> Option<i32> {
+    if bytes % 4 != 0 {
+        return None;
+    }
+    i32::try_from(bytes / 4).ok()
+}
+
+/// Declared `in long` arguments of `gemv`; the sequence lengths are derived
+/// from the buffers in [`GemvRequest`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GemvScalars {
+    pub h: i32,
+    pub m: i32,
+    pub reps: i32,
+}
+
+/// Declared `in long` arguments of `ffn`; lengths come from the request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FfnScalars {
+    pub gate: i32,
+    pub up: i32,
+    pub down: i32,
+    pub reps: i32,
+}
+
+/// Declared `in long` arguments of `attn`; lengths come from the request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttnScalars {
+    pub keys: i32,
+    pub key_scales: i32,
+    pub values: i32,
+    pub value_scales: i32,
+    pub position: i32,
+    pub seq: i32,
+    pub window: i32,
+    pub reps: i32,
+}
 
 /// Typed `gemv` request.
 pub struct GemvRequest<'a> {

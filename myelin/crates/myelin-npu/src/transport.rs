@@ -4,8 +4,12 @@ use std::sync::Arc;
 
 use crate::error::TransportError;
 
-/// FastRPC handle (`remote_handle64`).
-pub type Handle = u64;
+/// FastRPC handle (`remote_handle`).
+///
+/// The `qaic`-generated stub and `libcdsprpc.so` use the 32-bit
+/// `remote_handle` ABI on the device; `remote_handle64_*` rejects every module
+/// with `AEE_EBADPARM`. Keep this signed so the invalid value `-1` is visible.
+pub type Handle = i32;
 
 /// One FastRPC invocation.
 ///

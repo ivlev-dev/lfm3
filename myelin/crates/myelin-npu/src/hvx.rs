@@ -6,10 +6,12 @@
 use std::sync::Arc;
 
 use crate::error::TransportError;
+use crate::method::FfnScalars;
 use crate::method::{
-    decode_i32s, method_id, AllocBufScalars, AttachOutScalars, AttnRequest, AttnResponse,
-    DetachOutScalars, FfnRequest, FfnResponse, GemvRequest, GemvResponse, LoadBufScalars,
-    ReleaseBufScalars, SetScaleScalars, SetShapeScalars, TeamInfoScalars,
+    decode_i32s, long_len, method_id, octet_len, AllocBufScalars, AttachOutScalars, AttnRequest,
+    AttnResponse, AttnWire, DetachOutScalars, FfnRequest, FfnResidentWire, FfnResponse, FfnWire,
+    GemvRequest, GemvResidentWire, GemvResponse, GemvWire, LoadBufWire, ReleaseBufScalars,
+    SetScaleWire, SetShapeScalars, TeamInfoScalars, TIMES_VALUES,
 };
 use crate::transport::{Call, Handle, Transport};
 
@@ -98,7 +100,14 @@ impl HvxClient {
 
     /// Copy `data` into the resident buffer at byte offset `off`.
     pub fn load_buf(&self, h: i32, off: i32, data: &[u8]) -> Result<(), TransportError> {
-        let prim = LoadBufScalars { h, off }.to_bytes();
+        // `load_buf` packs the sequence length as the third scalar
+        // (`_primIn[3]` in the stub), not only `{h, off}`.
+        let prim = LoadBufWire {
+            h,
+            off,
+            data_len: octets(data.len(), "load_buf data")?,
+        }
+        .to_bytes();
         let mut prim_out: [u8; 0] = [];
         let mut no_out: [&mut [u8]; 0] = [];
         self.invoke(Call {
@@ -112,7 +121,11 @@ impl HvxClient {
 
     /// Upload per-row fp32 scales (the stand's `16 + 4*N` byte prefix layout).
     pub fn set_scale(&self, h: i32, scales: &[u8]) -> Result<(), TransportError> {
-        let prim = SetScaleScalars { h }.to_bytes();
+        let prim = SetScaleWire {
+            h,
+            data_len: octets(scales.len(), "set_scale data")?,
+        }
+        .to_bytes();
         let mut prim_out: [u8; 0] = [];
         let mut no_out: [&mut [u8]; 0] = [];
         self.invoke(Call {
@@ -126,9 +139,17 @@ impl HvxClient {
 
     /// Resident GEMV.
     pub fn gemv(&self, request: GemvRequest<'_>) -> Result<GemvResponse, TransportError> {
-        let prim = request.scalars.to_bytes();
         let mut dst = vec![0u8; request.dst_len];
         let mut times = [0i32; 8];
+        let prim = GemvWire {
+            h: request.scalars.h,
+            m: request.scalars.m,
+            act_len: octets(request.act.len(), "gemv act")?,
+            reps: request.scalars.reps,
+            dst_len: octets(dst.len(), "gemv dst")?,
+            times_len: TIMES_VALUES as i32,
+        }
+        .to_bytes();
         let mut prim_out: [u8; 0] = [];
         let mut out_bufs: [&mut [u8]; 2] = [dst.as_mut_slice(), i32_bytes_mut(&mut times)];
         self.invoke(Call {
@@ -143,10 +164,20 @@ impl HvxClient {
 
     /// One-RPC FFN layer.
     pub fn ffn(&self, request: FfnRequest<'_>) -> Result<FfnResponse, TransportError> {
-        let prim = request.scalars.to_bytes();
         let mut dst = vec![0u8; request.dst_len];
         let mut mid = vec![0u8; request.mid_len];
         let mut times = [0i32; 8];
+        let prim = FfnWire {
+            gate: request.scalars.gate,
+            up: request.scalars.up,
+            down: request.scalars.down,
+            act_len: octets(request.act.len(), "ffn act")?,
+            reps: request.scalars.reps,
+            dst_len: octets(dst.len(), "ffn dst")?,
+            mid_len: octets(mid.len(), "ffn mid")?,
+            times_len: TIMES_VALUES as i32,
+        }
+        .to_bytes();
         let mut prim_out: [u8; 0] = [];
         let mut out_bufs: [&mut [u8]; 3] = [
             dst.as_mut_slice(),
@@ -165,10 +196,24 @@ impl HvxClient {
 
     /// Paged attention, M=1.
     pub fn attn(&self, request: AttnRequest<'_>) -> Result<AttnResponse, TransportError> {
-        let prim = request.scalars.to_bytes();
         let table = i32_bytes(request.table);
         let mut outp = vec![0u8; request.out_len];
         let mut times = [0i32; 8];
+        let prim = AttnWire {
+            keys: request.scalars.keys,
+            key_scales: request.scalars.key_scales,
+            values: request.scalars.values,
+            value_scales: request.scalars.value_scales,
+            q_len: octets(request.q.len(), "attn q")?,
+            tbl_len: longs(table.len(), "attn tbl")?,
+            position: request.scalars.position,
+            seq: request.scalars.seq,
+            window: request.scalars.window,
+            reps: request.scalars.reps,
+            out_len: octets(outp.len(), "attn outp")?,
+            times_len: TIMES_VALUES as i32,
+        }
+        .to_bytes();
         let mut prim_out: [u8; 0] = [];
         let mut out_bufs: [&mut [u8]; 2] = [outp.as_mut_slice(), i32_bytes_mut(&mut times)];
         self.invoke(Call {
@@ -181,8 +226,75 @@ impl HvxClient {
         Ok(AttnResponse { outp, times })
     }
 
+    /// GEMV whose result goes into the buffer mapped by [`HvxClient::attach_out`].
+    ///
+    /// Only the DSP-side `times[]` sequence crosses FastRPC; `dst` is written
+    /// in place, so no output copy is marshalled by the host.
+    pub fn gemv_resident(
+        &self,
+        h: i32,
+        m: i32,
+        act: &[u8],
+        reps: i32,
+    ) -> Result<[i32; 8], TransportError> {
+        let prim = GemvResidentWire {
+            h,
+            m,
+            act_len: octets(act.len(), "gemv_resident act")?,
+            reps,
+            times_len: TIMES_VALUES as i32,
+        }
+        .to_bytes();
+        let mut times = [0i32; 8];
+        let mut prim_out: [u8; 0] = [];
+        let mut out_bufs: [&mut [u8]; 1] = [i32_bytes_mut(&mut times)];
+        self.invoke(Call {
+            method: method_id::GEMV_RESIDENT,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[act],
+            out_bufs: &mut out_bufs,
+        })?;
+        Ok(times)
+    }
+
+    /// FFN whose final int8 result goes into the attached buffer.
+    pub fn ffn_resident(
+        &self,
+        scalars: FfnScalars,
+        act: &[u8],
+        mid: &mut [u8],
+    ) -> Result<[i32; 8], TransportError> {
+        let prim = FfnResidentWire {
+            gate: scalars.gate,
+            up: scalars.up,
+            down: scalars.down,
+            act_len: octets(act.len(), "ffn_resident act")?,
+            reps: scalars.reps,
+            mid_len: octets(mid.len(), "ffn_resident mid")?,
+            times_len: TIMES_VALUES as i32,
+        }
+        .to_bytes();
+        let mut times = [0i32; 8];
+        let mut prim_out: [u8; 0] = [];
+        let mut out_bufs: [&mut [u8]; 2] = [mid, i32_bytes_mut(&mut times)];
+        self.invoke(Call {
+            method: method_id::FFN_RESIDENT,
+            prim_in: &prim,
+            prim_out: &mut prim_out,
+            in_bufs: &[act],
+            out_bufs: &mut out_bufs,
+        })?;
+        Ok(times)
+    }
+
     /// Map a host rpcmem fd once; subsequent resident calls write straight into
     /// it.
+    ///
+    /// The host mapping is cached on this platform: after a resident call the
+    /// DSP result becomes visible to the CPU mapping when [`HvxClient::detach_out`]
+    /// unmaps it. Callers that only hand the buffer to the next DSP stage need
+    /// not read it at all; callers that do must detach (or re-attach) first.
     pub fn attach_out(&self, h: i32, fd: i32, nbytes: i32) -> Result<(), TransportError> {
         let prim = AttachOutScalars { h, fd, nbytes }.to_bytes();
         let mut prim_out: [u8; 0] = [];
@@ -212,12 +324,10 @@ impl HvxClient {
 
     /// Worker-team information (`8` values in the stand).
     pub fn team_info(&self, len: usize) -> Result<Vec<i32>, TransportError> {
-        let len_i32 = i32::try_from(len).map_err(|_| TransportError::BufferTooSmall {
-            buffer: "team_info",
-            expected: len,
-            got: i32::MAX as usize,
-        })?;
-        let prim = TeamInfoScalars { len: len_i32 }.to_bytes();
+        let prim = TeamInfoScalars {
+            len: longs(len * 4, "team_info res")?,
+        }
+        .to_bytes();
         let mut out = vec![0u8; len * 4];
         let mut prim_out: [u8; 0] = [];
         let mut out_bufs: [&mut [u8]; 1] = [out.as_mut_slice()];
@@ -250,6 +360,14 @@ impl Drop for HvxClient {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+fn octets(bytes: usize, what: &'static str) -> Result<i32, TransportError> {
+    octet_len(bytes).ok_or(TransportError::InvalidLength { what, len: bytes })
+}
+
+fn longs(bytes: usize, what: &'static str) -> Result<i32, TransportError> {
+    long_len(bytes).ok_or(TransportError::InvalidLength { what, len: bytes })
 }
 
 fn i32_bytes(values: &[i32]) -> &[u8] {

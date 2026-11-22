@@ -6,7 +6,7 @@
 //!
 //! Unsigned PD is enabled exactly as the DSP stands do:
 //! `remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE)` with
-//! `CDSP_DOMAIN_ID` and `enable = 1`, before the first `remote_handle64_open`.
+//! `CDSP_DOMAIN_ID` and `enable = 1`, before the first `remote_handle_open`.
 //! The shell name (`fastrpc_shell_unsigned_3`) is diagnostic context kept in
 //! [`CdsprpcConfig`]; the driver chooses the shell itself.
 
@@ -28,9 +28,9 @@ const RPCMEM_HEAP_ID_SYSTEM: i32 = 25;
 /// output buffers.
 pub const FASTRPC_ATTR_KEEP_MAP: i32 = 0x8;
 
-type OpenFn = unsafe extern "C" fn(*const c_char, *mut u64) -> c_int;
-type InvokeFn = unsafe extern "C" fn(u64, u32, *mut RemoteArg) -> c_int;
-type CloseFn = unsafe extern "C" fn(u64) -> c_int;
+type OpenFn = unsafe extern "C" fn(*const c_char, *mut Handle) -> c_int;
+type InvokeFn = unsafe extern "C" fn(Handle, u32, *mut RemoteArg) -> c_int;
+type CloseFn = unsafe extern "C" fn(Handle) -> c_int;
 type SessionControlFn = unsafe extern "C" fn(u32, *mut c_void, u32) -> c_int;
 type RpcmemAllocFn = unsafe extern "C" fn(i32, u32, i32) -> *mut c_void;
 type RpcmemFreeFn = unsafe extern "C" fn(*mut c_void);
@@ -46,6 +46,7 @@ struct RemoteBuf {
 /// `remote_arg` on the 64-bit ABI. `remote_buf` is the largest member, so the
 /// union has the same size and alignment as the C type.
 #[repr(C)]
+#[derive(Clone, Copy)]
 union RemoteArg {
     buf: RemoteBuf,
 }
@@ -145,8 +146,16 @@ impl Cdsprpc {
                 library: library_name.clone(),
                 detail: "library name contains NUL".to_owned(),
             })?;
+        // `RTLD_NODELETE`: libcdsprpc starts worker threads and keeps internal
+        // state; unloading it while those threads live segfaults the process
+        // when the last client drops.
         // SAFETY: `name` is a valid C string.
-        let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        let handle = unsafe {
+            libc::dlopen(
+                name.as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NODELETE,
+            )
+        };
         if handle.is_null() {
             let detail = dlerror().unwrap_or_else(|| "dlopen failed".to_owned());
             return Err(TransportError::LibraryNotFound {
@@ -158,9 +167,12 @@ impl Cdsprpc {
 
         // SAFETY: each symbol is resolved from a live library and stored in a
         // field with the exact FastRPC signature.
-        let open = unsafe { resolve::<OpenFn>(&library, "remote_handle64_open")? };
-        let invoke = unsafe { resolve::<InvokeFn>(&library, "remote_handle64_invoke")? };
-        let close = unsafe { resolve::<CloseFn>(&library, "remote_handle64_close")? };
+        // `remote_handle64_*` exists on newer SDKs but this device rejects it
+        // with `AEE_EBADPARM` for every module; the qaic stub and the working
+        // C stands use the 32-bit ABI.
+        let open = unsafe { resolve::<OpenFn>(&library, "remote_handle_open")? };
+        let invoke = unsafe { resolve::<InvokeFn>(&library, "remote_handle_invoke")? };
+        let close = unsafe { resolve::<CloseFn>(&library, "remote_handle_close")? };
         let session_control =
             unsafe { resolve::<SessionControlFn>(&library, "remote_session_control")? };
         let rpcmem_alloc = unsafe { resolve::<RpcmemAllocFn>(&library, "rpcmem_alloc")? };
@@ -225,13 +237,13 @@ impl Transport for Cdsprpc {
             module: module.to_owned(),
             code: 0,
         })?;
-        let mut handle = 0u64;
+        let mut handle: Handle = -1;
         // SAFETY: `name` is a valid C string and `handle` is writable.
         let code = unsafe { (self.open)(name.as_ptr(), &mut handle) };
-        if code != 0 {
+        if code != 0 || handle < 0 {
             return Err(TransportError::HandleOpen {
                 module: module.to_owned(),
-                code,
+                code: if code != 0 { code } else { 0x2c }, // AEE_EINVHANDLE
             });
         }
         Ok(handle)
@@ -247,22 +259,38 @@ impl Transport for Cdsprpc {
     }
 
     fn invoke(&self, handle: Handle, call: Call<'_, '_>) -> Result<(), TransportError> {
-        let mut args: Vec<RemoteArg> = Vec::with_capacity(call.in_count() + call.out_count());
-        args.push(remote_buf(
+        // At most `prim_in + 2 in + prim_out + 3 out = 7` arguments exist in
+        // `lfmgemv`; a fixed array keeps the hot path allocation-free.
+        const MAX_ARGS: usize = 8;
+        let mut args = [empty_arg(); MAX_ARGS];
+        let mut count = 0;
+        push_arg(
+            &mut args,
+            &mut count,
             call.prim_in.as_ptr() as *mut u8,
             call.prim_in.len(),
-        ));
+        )?;
         for buffer in call.in_bufs {
-            args.push(remote_buf(buffer.as_ptr() as *mut u8, buffer.len()));
+            push_arg(
+                &mut args,
+                &mut count,
+                buffer.as_ptr() as *mut u8,
+                buffer.len(),
+            )?;
         }
         if !call.prim_out.is_empty() {
-            args.push(remote_buf(call.prim_out.as_mut_ptr(), call.prim_out.len()));
+            push_arg(
+                &mut args,
+                &mut count,
+                call.prim_out.as_mut_ptr(),
+                call.prim_out.len(),
+            )?;
         }
         for buffer in call.out_bufs.iter_mut() {
-            args.push(remote_buf(buffer.as_mut_ptr(), buffer.len()));
+            push_arg(&mut args, &mut count, buffer.as_mut_ptr(), buffer.len())?;
         }
-        // SAFETY: `args` is a contiguous `remote_arg[]` for the duration of the
-        // call, and every pointer refers to a live Rust slice.
+        // SAFETY: `args[..count]` is a contiguous `remote_arg[]` for the
+        // duration of the call, and every pointer refers to a live Rust slice.
         let code = unsafe { (self.invoke)(handle, call.scalars(), args.as_mut_ptr()) };
         if code != 0 {
             return Err(rpc_error(call.method, code));
@@ -317,6 +345,25 @@ fn remote_buf(ptr: *mut u8, len: usize) -> RemoteArg {
             n_len: len,
         },
     }
+}
+
+fn empty_arg() -> RemoteArg {
+    remote_buf(std::ptr::null_mut(), 0)
+}
+
+fn push_arg(
+    args: &mut [RemoteArg; 8],
+    count: &mut usize,
+    ptr: *mut u8,
+    len: usize,
+) -> Result<(), TransportError> {
+    let slot = args.get_mut(*count).ok_or(TransportError::InvalidLength {
+        what: "remote_arg",
+        len: *count + 1,
+    })?;
+    *slot = remote_buf(ptr, len);
+    *count += 1;
+    Ok(())
 }
 
 fn dlerror() -> Option<String> {
