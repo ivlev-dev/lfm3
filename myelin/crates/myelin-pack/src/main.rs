@@ -10,7 +10,8 @@ use myelin_pack::kvarn::{self, KvarnFormat, KvarnManifest};
 use myelin_pack::kvpage::{self, KvLayout, KvPackParams, VScaleMode};
 use myelin_pack::shortconv::{self, ActivationScales, ConvManifest};
 use myelin_pack::{
-    gguf_source, metrics, pack_gguf, unpack, DType, Manifest, PackOptions, QualityStats, Result,
+    gemv, gguf_source, metrics, pack_gguf, unpack, DType, Manifest, PackOptions, QualityStats,
+    Result,
 };
 
 #[derive(Debug, Parser)]
@@ -214,6 +215,61 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Pack a GGUF tensor into the int4 `GEMV` weight format.
+    Gemv {
+        #[arg(long)]
+        model: PathBuf,
+        /// Explicit GGUF tensor name.
+        #[arg(long)]
+        tensor: Option<String>,
+        /// Layer index for `--role` (e.g. `2` for `blk.2.attn_q.weight`).
+        #[arg(long)]
+        layer: Option<usize>,
+        /// `in_proj`, `out_proj`, `attn_q`, `attn_k`, `attn_v`, `attn_o`,
+        /// `attn_gate`.
+        #[arg(long)]
+        role: Option<String>,
+        /// Binary int4 blob to write.
+        #[arg(long)]
+        out: PathBuf,
+        /// JSON manifest to write.
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        quality_json: Option<PathBuf>,
+        /// Read only the first N output rows (spot checks on big tensors).
+        #[arg(long)]
+        rows: Option<usize>,
+        #[arg(long, default_value_t = 0.98)]
+        min_cos: f64,
+        /// Optional floor for the worst output row.
+        #[arg(long)]
+        min_row_cos: Option<f64>,
+    },
+    /// Re-check an int4 GEMV blob against its manifest and the GGUF tensor.
+    GemvVerify {
+        #[arg(long)]
+        blob: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        tensor: Option<String>,
+        #[arg(long, default_value_t = 0.98)]
+        min_cos: f64,
+        #[arg(long)]
+        min_row_cos: Option<f64>,
+    },
+    /// Decode an int4 GEMV blob back to raw f32 (`[n][k]`).
+    GemvUnpack {
+        #[arg(long)]
+        blob: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -368,6 +424,49 @@ fn run() -> Result<()> {
             page.as_deref(),
             &out,
         ),
+        Command::Gemv {
+            model,
+            tensor,
+            layer,
+            role,
+            out,
+            manifest,
+            quality_json,
+            rows,
+            min_cos,
+            min_row_cos,
+        } => gemv_pack(GemvArgs {
+            model,
+            tensor,
+            layer,
+            role,
+            out,
+            manifest,
+            quality_json,
+            rows,
+            min_cos,
+            min_row_cos,
+        }),
+        Command::GemvVerify {
+            blob,
+            manifest,
+            model,
+            tensor,
+            min_cos,
+            min_row_cos,
+        } => gemv_verify(
+            &blob,
+            &manifest,
+            &model,
+            tensor.as_deref(),
+            min_cos,
+            min_row_cos,
+        ),
+        Command::GemvUnpack {
+            blob,
+            manifest,
+            out,
+        } => gemv_unpack(&blob, &manifest, &out),
     }
 }
 
@@ -465,6 +564,138 @@ fn print_summary(tensor: &str, quality: &QualityStats, blob_bytes: usize, path: 
     println!(
         "max |delta|       {:.6e} ({:.4} x scale)",
         quality.max_abs_err, quality.max_abs_err_over_scale
+    );
+    println!(
+        "saturated         {} ({:.4}% of samples)",
+        quality.saturated,
+        quality.saturated_fraction * 100.0
+    );
+}
+
+// ---------------------------------------------------------------- int4 GEMV
+
+struct GemvArgs {
+    model: PathBuf,
+    tensor: Option<String>,
+    layer: Option<usize>,
+    role: Option<String>,
+    out: PathBuf,
+    manifest: PathBuf,
+    quality_json: Option<PathBuf>,
+    rows: Option<usize>,
+    min_cos: f64,
+    min_row_cos: Option<f64>,
+}
+
+fn gemv_tensor(tensor: Option<&str>, layer: Option<usize>, role: Option<&str>) -> Result<String> {
+    match (tensor, layer, role) {
+        (Some(name), None, None) => Ok(name.to_string()),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(myelin_pack::PackError::RawInput(
+            "use either --tensor or --layer/--role, not both".to_string(),
+        )),
+        (None, Some(layer), Some(role)) => gemv::tensor_for_role(layer, role),
+        (None, Some(_), None) => Err(myelin_pack::PackError::RawInput(
+            "--layer also needs --role".to_string(),
+        )),
+        (None, None, Some(_)) => Err(myelin_pack::PackError::RawInput(
+            "--role also needs --layer".to_string(),
+        )),
+        (None, None, None) => Err(myelin_pack::PackError::RawInput(
+            "either --tensor or --layer/--role is required".to_string(),
+        )),
+    }
+}
+
+fn gemv_pack(args: GemvArgs) -> Result<()> {
+    let tensor = gemv_tensor(args.tensor.as_deref(), args.layer, args.role.as_deref())?;
+    let (matrix, source) = gguf_source::load_matrix(&args.model, &tensor, args.rows)?;
+    let meta = myelin_pack::PackMeta {
+        tensor: tensor.clone(),
+        source: Some(source),
+    };
+    let packed = gemv::build(&matrix, &meta)?;
+    let manifest = myelin_pack::GemvManifest::from_blob(&meta, &packed);
+
+    write_bytes(&args.out, &packed.blob)?;
+    manifest.write(&args.manifest)?;
+    if let Some(path) = args.quality_json.as_deref() {
+        write_bytes(
+            path,
+            serde_json::to_string_pretty(&packed.quality)?.as_bytes(),
+        )?;
+    }
+    print_gemv_summary(&tensor, &packed, &args.out, &args.manifest);
+    packed.quality.check(args.min_cos, args.min_row_cos)
+}
+
+fn gemv_verify(
+    blob_path: &Path,
+    manifest_path: &Path,
+    model: &Path,
+    tensor: Option<&str>,
+    min_cos: f64,
+    min_row_cos: Option<f64>,
+) -> Result<()> {
+    let manifest = myelin_pack::GemvManifest::read(manifest_path)?;
+    let blob = std::fs::read(blob_path)?;
+    let header = manifest.verify_blob(&blob)?;
+    let name = tensor.unwrap_or(&manifest.tensor);
+    let (weights, _) = gguf_source::load_matrix(model, name, Some(header.n))?;
+    if weights.k() != header.k || weights.n() != header.n {
+        return Err(myelin_pack::PackError::ManifestMismatch(format!(
+            "{name} is {}x{}, manifest is {}x{}",
+            weights.n(),
+            weights.k(),
+            header.n,
+            header.k
+        )));
+    }
+    let packed = myelin_pack::GemvBlob::new(header, blob.clone(), &weights)?;
+    print_gemv_summary(name, &packed, blob_path, manifest_path);
+    packed.quality.check(min_cos, min_row_cos)
+}
+
+fn gemv_unpack(blob_path: &Path, manifest_path: &Path, out: &Path) -> Result<()> {
+    let manifest = myelin_pack::GemvManifest::read(manifest_path)?;
+    let blob = std::fs::read(blob_path)?;
+    let header = manifest.verify_blob(&blob)?;
+    let values = gemv::unpack(&blob)?;
+    write_f32(out, &values)?;
+    println!(
+        "decoded           {} x {}: {} values -> {}",
+        header.n,
+        header.k,
+        values.len(),
+        out.display()
+    );
+    Ok(())
+}
+
+fn print_gemv_summary(tensor: &str, packed: &myelin_pack::GemvBlob, path: &Path, manifest: &Path) {
+    let header = &packed.header;
+    let quality = &packed.quality;
+    println!("tensor            {tensor}");
+    println!(
+        "shape             k={} n={} (padded {} x {})",
+        header.k, header.n, header.k_padded, header.n_padded
+    );
+    println!(
+        "blob              {} ({}), {} rows of {} B",
+        human_bytes(packed.blob.len()),
+        path.display(),
+        header.n_padded,
+        header.row_bytes
+    );
+    println!("manifest          {}", manifest.display());
+    println!("build id          {}", gemv::format_build_id_hex());
+    println!("cos total         {:.8}", quality.cos_total);
+    println!(
+        "cos per row       min {:.8}, mean {:.8}",
+        quality.cos_min_row, quality.cos_mean_row
+    );
+    println!(
+        "max |delta|/s     {:.4} (int4 limit 0.5)",
+        quality.max_abs_err_over_scale
     );
     println!(
         "saturated         {} ({:.4}% of samples)",

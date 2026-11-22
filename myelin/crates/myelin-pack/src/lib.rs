@@ -1,10 +1,12 @@
 //! Weight packer for the DSP/HMX paths, with built-in quality control.
 //!
-//! Three wire formats live here, each transcribed from the code that consumes
+//! Four wire formats live here, each transcribed from the code that consumes
 //! it rather than from a specification:
 //!
 //! * [`crownstone`] — int8 HMX `weight.b` tiles + bias/scale blocks
 //!   (GGUF `[K, N]` tensor -> 32x32 tiles);
+//! * [`gemv`] — int4 row-major `[N][K/2]` weights for the HVX `gemv` kernel,
+//!   with f32 and Q16 per-row scales and a git-independent format build id;
 //! * [`shortconv`] — the quantised LFM3 depthwise convolution blob read by the
 //!   DSP `CONV` command (8 rotated int8 tap phases + per-channel `kq`);
 //! * [`kvpage`] — K/KT/V images read by the DSP paged-attention kernel
@@ -29,6 +31,7 @@
 //! ```
 
 pub mod crownstone;
+pub mod gemv;
 pub mod gguf_source;
 pub mod kvarn;
 pub mod kvpage;
@@ -44,6 +47,7 @@ use std::path::Path;
 
 pub use crownstone::{pack, unpack, Decoded, PackResult};
 pub use error::{PackError, Result};
+pub use gemv::{GemvBlob, GemvHeader, GemvManifest, GemvQuality};
 pub use kvpage::{KvImage, KvLayout, KvManifest, KvPackParams, KvQuality, VScaleMode};
 pub use manifest::{Manifest, PackMeta, ScaleTable, SourceInfo};
 pub use matrix::Matrix;

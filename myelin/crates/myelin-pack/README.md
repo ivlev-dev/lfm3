@@ -1,14 +1,18 @@
 # myelin-pack — форматы весов для DSP и HMX
 
-Утилита и библиотека: берёт тензоры из GGUF и собирает три бинарных формата,
+Утилита и библиотека: берёт тензоры из GGUF и собирает четыре бинарных формата,
 которые читает конкретный код, а не «примерно похожий»:
 
 1. **HMX int8 crownstone** — один тензор (`dims = [K, N]`, `N` — выходные
    каналы) в симметричный int8 с построчными масштабами, кроустоны `weight.b`
    (1 КиБ на тайл 32×32) и 256-байтовые bias/scale-блоки;
-2. **shortconv blob** — 13 conv-слоёв LFM3 в образ команды `CONV` DSP-ядра
+2. **int4 GEMV** — строка `[N][K/2]` для HVX-ядра `gemv` с двумя signed
+   int4 в байте (`w + 8`), построчным f32-масштабом и Q16-таблицей;
+3. **shortconv blob** — 13 conv-слоёв LFM3 в образ команды `CONV` DSP-ядра
    (`myelin/dsp/hvx/lfmgemv_impl.c`): 8 фаз повёрнутых int8-тапов + `kq[H]`;
-3. **KV-страницы** — образы K/KT/V для paged attention того же ядра, плюс
+3. **int4 GEMV** — row-major `[N][K/2]` веса для `gemv`/`ffn`/`exec`, две
+   signed int4 в байте (`w+8`) и per-row масштабы (f32 + Q16);
+4. **KV-страницы** — образы K/KT/V для paged attention того же ядра, плюс
    эталонный кодек `kvarn` (K4/V2, K4/V4), который DSP **не** читает.
 
 Главное — встроенная проверка качества: каждый blob распаковывается обратно,
@@ -43,6 +47,15 @@ cargo build --release -p myelin-pack
 ./target/release/myelin-pack verify \
   --blob /tmp/attn_k.mpk --manifest /tmp/attn_k.json \
   --model ../models/LFM3-1.7B-Q4_K_M.gguf
+
+# int4 GEMV-матрица (in_proj/out_proj/attn_q/k/v/o) -> blob для gemv/exec
+./target/release/myelin-pack gemv \
+  --model ../models/LFM3-1.7B-Q4_K_M.gguf \
+  --layer 2 --role attn_q \
+  --out /tmp/attn_q.gemv --manifest /tmp/attn_q.json \
+  --quality-json /tmp/attn_q.quality.json
+./target/release/myelin-pack gemv-verify --blob /tmp/attn_q.gemv \
+  --manifest /tmp/attn_q.json --model ../models/LFM3-1.7B-Q4_K_M.gguf
 
 # shortconv-слой -> blob для команды CONV
 ./target/release/myelin-pack conv \
@@ -215,6 +228,90 @@ K-чанка лежат в одном 2-КиБ диапазоне `weight.b:deep
 `max |Δ|/s` в норме. Если такие каналы станут проблемой, нужен второй
 уровень масштабов по K (сейчас формат и ядро его не используют).
 
+## int4 GEMV: веса для `gemv`/`gemv_resident`
+
+`myelin-pack gemv` собирает образ, который читает `lfmgemv_set_shape()` +
+`lfmgemv_set_scale()` + `gemv` (`ffn_pack_i4_row()` в
+`myelin/dsp/hvx/ffn_ref.h` — эталон квантования). Формат проверен **побайтово**
+против этой C-функции, а не «примерно».
+
+```text
+[0   .. 128)      заголовок
+[128 .. ...)      веса [N_padded][K_padded/2], row-major
+[... .. ...)      sw f32   [N_padded]   — точный C-масштаб max|w|/7
+[... .. ...)      sw q16 i32[N_padded]  — round(sw * 65536)
+```
+
+Заголовок (little endian): `0` magic `MPG1`, `4` версия 1, `6` dtype 4 (int4),
+`7` flags (bit0 — K дополнен, bit1 — N дополнен), `8` K, `12` N, `16`
+K_padded, `20` N_padded, `24` row_bytes = K_padded/2, `28` header_bytes = 128,
+`32` weight_base, `40` weight_bytes, `48` scale_base, `56` scale_bytes, `64`
+scale_q16_base, `72` scale_q16_bytes (все u64), `80` build_id u64.
+
+Кодирование нибблов — как у ядра: `byte = lo | (hi << 4)`, `lo` — чётный `k`,
+`hi` — нечётный, хранимый ниббл `w_signed + 8`. Ядро вычитает `8*sum(act)`
+один раз на строку.
+
+Ограничения ядра: `K % 256 == 0` (`set_shape` отвергает остальное). Пакер
+дополняет `K` до 256 и `N` до 32 нулями; масштаб дополненных строк — 0,
+поэтому их int8-выход равен 0. Реальные тензоры LFM3 (`K=2048`) не
+дополняются по K. `H = 2048` — row stride 1024 Б (128-байтное выравнивание
+для HVX).
+
+**Build-id формата** — `e7ac56da9cdb0f2e`: FNV-1a 64 от канонической строки
+`myelin-dsp-gemv-int4|v1|row_major_nk|i4_offset8_lo_even_hi_odd|k_align=256|n_align=32|scale=f32+q16`.
+Он не зависит от git и от формы тензора; другой порядок строк/нибблов или
+масштабов даст другой id, и `gemv-verify` отвергнет blob.
+
+```sh
+./target/release/myelin-pack gemv --model ../models/LFM3-1.7B-Q4_K_M.gguf \
+  --layer 2 --role attn_q --out /tmp/q.gemv --manifest /tmp/q.json
+./target/release/myelin-pack gemv-verify --blob /tmp/q.gemv \
+  --manifest /tmp/q.json --model ../models/LFM3-1.7B-Q4_K_M.gguf
+./target/release/myelin-pack gemv-unpack --blob /tmp/q.gemv \
+  --manifest /tmp/q.json --out /tmp/q.f32
+```
+
+`--role`: `in_proj`, `out_proj` (`blk.N.shortconv.*`), `attn_q`, `attn_k`,
+`attn_v`, `attn_o`, `attn_gate` (`blk.N.*`). `--tensor` задаёт имя явно.
+
+### Побитовая сверка с C
+
+`tests/c/gemv_ref.c` включает **настоящий** `ffn_ref.h` и вызывает
+`ffn_pack_i4_row(dst, row, k)`; `tests/gemv.rs` сравнивает с ним каждую
+строку и биты масштаба:
+
+```sh
+cc -std=c99 -O2 -I myelin/dsp/hvx \
+   myelin/crates/myelin-pack/tests/c/gemv_ref.c -o /tmp/gemv_ref -lm
+# N K weights.f32 out.i4 scales.f32
+/tmp/gemv_ref 8 2048 rows.f32 ref.i4 ref.f32
+cargo test -p myelin-pack --test gemv matches_c_reference_on_real_tensors
+```
+
+Тест прогоняет `blk.0.shortconv.in_proj/out_proj` и
+`blk.2.attn_q/k/v/o` (8 строк каждого): **0 расхождений** по байтам и
+**совпадение `to_bits()`** масштабов.
+
+### Качество на реальных тензорах
+
+Полные тензоры LFM3, релизная сборка, `--min-cos 0.95`:
+
+| тензор | K × N | cos (весь) | cos строки min | max\|Δ\|/s | насыщение |
+|---|---:|---:|---:|---:|---:|
+| `blk.0.shortconv.in_proj` | 2048 × 6144 | 0.986761 | — | 0.5 | — |
+| `blk.0.shortconv.out_proj` | 2048 × 2048 | 0.986329 | — | 0.5 | — |
+| `blk.2.attn_q` | 2048 × 2048 | 0.985437 | 0.850636 | 0.5 | 0.0509 % |
+| `blk.2.attn_k` | 2048 × 512 | 0.983393 | — | 0.5 | — |
+| `blk.2.attn_v` | 2048 × 512 | 0.984536 | — | 0.5 | — |
+| `blk.2.attn_output` | 2048 × 2048 | 0.983538 | — | 0.5 | — |
+| `blk.2.attn_gate` | 2048 × 16 | 0.970144 | — | 0.5 | — |
+
+`max|Δ|` ровно полшага int4 — предел округления, раскладка ошибки не
+добавляет. Cos ниже, чем у int8 crownstone (0.9999): это свойство 4 бит на
+строку LFM3, а не упаковки. Худшая строка `attn_q` (0.8506) — тяжёлый хвост,
+где один выброс задаёт масштаб всей строки; общий cos и `max|Δ|/s` в норме.
+
 ## Shortconv: blob для команды `CONV`
 
 `myelin-pack conv` собирает ровно тот образ, который читает `LFM_CMD_CONV` в
@@ -356,6 +453,41 @@ Manifest: размеры и шаги каждой секции (`bytes`, `view_b
 `view_bytes`. V и KT в token-major дополнительных байт не требуют
 (`slots · 128` и `slots · 4` на голову).
 
+### Per-channel K, V-скейл и `view_bytes` (измерено)
+
+Реальные пост-RoPE K/V сняты CPU-эталоном LFM3 на слое 2, 8 позиций
+(`cargo run -p myelin-npu --example analyze_kv`):
+
+| схема K | cos(score) |
+|---|---:|
+| per-token (текущий формат) | **0.999203** |
+| per-channel (общий масштаб на измерение головы) | 0.999758 |
+| per-channel, свёрнутый в q + per-token `kt` | 0.995211 |
+
+Per-channel K даёт +0.00055 `cos`, но требует 128-широкого умножения q и
+повторной int8-квантизации; при честном folded-варианте становится **хуже**
+(0.9952), потому что q теряет разрядность. Вывод: **per-channel K не нужен**,
+формат остаётся per-token.
+
+V (пост-проекция, те же 8 позиций): `cos(V)` global **0.999820**,
+channel **0.999993**; `cos(PV)` global **0.999815**, channel **0.999992**.
+Выбран **per-channel**: 128 умножений после `ATTN` (до gate и o_proj) стоят
+дёшево и не добавляют RPC. Формат V при этом не меняется (int8 на измерение,
+масштабы в манифесте/рантайме).
+
+Два следствия для рантайма, которых нет в самом blob:
+
+* ядро хранит score в Q8 (`sc = dot(q8, code) * kt / 256`) и не делит на
+  `sqrt(head_dim)`. Поэтому в KV-образ пишется
+  `kt = (max|k|/7) * 65536 / (q_scale * sqrt(head_dim))`, иначе softmax
+  «холоднее» модели; на 4 токенах это стоило 0.91 против 0.965 `cos`;
+* `view_bytes`: `row` (то, что использует `exec`) — `heads*slots*128` на K и
+  V, `heads*slots*4` на KT, т.е. ровно размер файла. Token-major `page`
+  хранит K по 64 Б на токен (`heads*pages*2048`), но ядро считает шаг головы
+  как `wbytes/(heads*2)`, поэтому view обязан быть `heads*slots*128` —
+  вдвое больше файла (для 4 голов и 32 слотов: файл 8192 Б, view 16384 Б).
+  V/KT в token-major дополнительных байт не требуют.
+
 ### Качество на реальных данных
 
 Реальных KV-активаций без прогона модели нет; ниже — страница из первых
@@ -372,6 +504,80 @@ Int4 на токен даёт cos ≈ 0.99 (теоретический пред�
 данных ≈ 0.9977; тяжёлые хвосты весов ниже). V int8 — практически без
 потерь. На настоящих пост-RoPE K/V числа будут другими: их надо снять на
 устройстве после того, как проекции K/V начнут писать в кэш.
+
+## int4 GEMV: веса для `gemv` / `exec`
+
+`myelin-pack gemv` собирает ровно то, что читает `gemv_rows_m1_*` в
+`myelin/dsp/hvx/lfmgemv_impl.c`: row-major `[N][K/2]`, два signed int4 в
+байте (`lo` — чётный `k`, `hi` — нечётный), хранимый ниббл `w+8`. Ядро само
+вычитает `8 * sum(act)`; per-row масштаб `sw = max|w| / 7` передаётся через
+`set_scale` (f32) вместе с `sa`/`so`.
+
+| смещение | размер | поле |
+|---:|---:|---|
+| 0 | 4 | magic `MPG1` |
+| 4 | 2 | версия = 1 |
+| 6 | 1 | dtype = 4 (int4) |
+| 7 | 1 | flags: bit0 — K дополнен, bit1 — N дополнен |
+| 8 | 4 | K (исходный) |
+| 12 | 4 | N (исходный) |
+| 16 | 4 | K_padded |
+| 20 | 4 | N_padded |
+| 24 | 4 | row_bytes = K_padded/2 |
+| 28 | 4 | header_bytes = 128 |
+| 32 | 8 | weight_base = 128 |
+| 40 | 8 | weight_bytes |
+| 48 | 8 | scale_base |
+| 56 | 8 | scale_bytes |
+| 64 | 8 | scale_q16_base |
+| 72 | 8 | scale_q16_bytes |
+| 80 | 8 | build_id формата |
+| 88 | 40 | резерв |
+
+`K` дополняется до 256 (`lfmgemv_set_shape` отвергает `K % 256 != 0`),
+`N` — до 32. Дополненные веса и масштабы — нули, поэтому лишние выходы
+ядра тоже нулевые. `row_bytes` всегда кратен 128, строка выровнена под HVX.
+
+За `weight_bytes` идут две таблицы по `n_padded` значений: `sw` f32 (точное
+значение C-рецепта, его ждёт `set_scale`) и `round(sw * 65536)` i32 (Q16 для
+манифеста и хост-деквантования). `build_id = e7ac56da9cdb0f2e` не зависит от
+git и от тензора: он фиксирует раскладку, порядок нибблов и выравнивания,
+поэтому blob другого формата не пройдёт `gemv-verify`.
+
+### Побитовая сверка с C
+
+`tests/c/gemv_ref.c` подключает **настоящий** `ffn_ref.h` и вызывает
+`ffn_pack_i4_row()` — тот же рецепт, что у стенда. Тест
+`tests/gemv.rs::matches_c_reference_on_real_tensors` сравнивает веса и
+f32-масштабы на слоях 0 (`in_proj`, `out_proj`) и 2 (`attn_q/k/v/o`),
+а `matches_c_reference_on_synthetic` — на `K=100`, нулевой строке и
+экстремумах. Округление — `round_ties_even` (`lrintf`), не `round()`.
+
+Полные тензоры LFM3 (релизная сборка):
+
+| тензор | N × K | cos (весь) | cos строки min | max\|Δ\|/s | насыщение |
+|---|---:|---:|---:|---:|---:|
+| `blk.0.shortconv.in_proj` | 6144 × 2048 | 0.986761 | — | 0.5000 | — |
+| `blk.0.shortconv.out_proj` | 2048 × 2048 | 0.986329 | — | 0.5000 | — |
+| `blk.2.attn_q` | 2048 × 2048 | 0.985437 | 0.850636 | 0.5000 | 0.0509 % |
+| `blk.2.attn_k` | 512 × 2048 | 0.983393 | — | 0.5000 | — |
+| `blk.2.attn_v` | 512 × 2048 | 0.984536 | — | 0.5000 | — |
+| `blk.2.attn_output` | 2048 × 2048 | 0.983538 | — | 0.5000 | — |
+| `blk.2.attn_gate` | 16 × 2048 | 0.970144 | — | 0.5000 | — |
+
+`attn_q` целиком: `blob_fnv1a64 = 03e0bd1a1521ad1c`,
+`sha256 = 7d7077b9667c8ed874196cce9973d56931a2053de79193e7621c99977c7b6a92`.
+`max|Δ|/s` ровно 0.5 — предел int4-округления; насыщение — по одному коду
+на строку (глобальный максимум). Низкий `cos` у `attn_q` (0.985 против
+0.990+ у FFN) — тяжёлые хвосты Q4_K, а не ошибка упаковки; per-row min 0.85
+у отдельных строк.
+
+### Как это грузится на DSP
+
+`myelin-npu::gemv_weights::PackedGemv` загружает **только секцию весов**
+(`weight_base..weight_base+weight_bytes`), затем `set_shape(n_padded,
+k_padded, 1)`, `load_buf` чанками и `set_scale` с
+`[N][K][sa][so][sw × N]`. Заголовок и таблицы в DSP не уходят.
 
 ## kvarn: эталон, к DSP не подключён
 
@@ -464,6 +670,10 @@ cargo test -p myelin-pack
 * `tests/synthetic.rs` — случайная матрица, нули, единицы, `±max`, одиночный
   выброс, `K`/`N` не кратны 32 (дополнение и его нули), детерминизм,
   контрольные суммы, битые blob’ы и manifest, отказ на NaN и пустых строках.
+* `tests/gemv.rs` — int4 GEMV: заголовок/дополнение (K/N не кратны 32),
+  нули/экстремумы, round-trip, отказ на NaN/битый blob, CLI
+  `gemv`/`gemv-verify`/`gemv-unpack`, **побайтовая сверка с C** на синтетике
+  и на реальных тензорах (пропуск без `cc`/`myelin/dsp`).
 * `tests/real_model.rs` — Q4_K (`blk.2.attn_k.weight`, N=45 → N_padded=64) и
   Q6_K (`blk.0.ffn_down.weight`, K=7680), порог `cos >= 0.999`, нулевые
   padding-каналы, JSON-раундтрип manifest. Без файла модели тесты
@@ -472,6 +682,9 @@ cargo test -p myelin-pack
   H не кратна 16, NaN/Inf и плохие масштабы, manifest и порча blob’а,
   CLI `conv`/`conv-verify`; **побайтовая сверка с C** на синтетике и на
   слоях 0/5/23 (пропуск без `cc`), метрики на реальных слоях.
+* `tests/gemv.rs` — заголовок и дополнение K/N, round-trip, нули и
+  экстремумы, отказ на NaN, побитовая сверка с `ffn_pack_i4_row()` на
+  синтетике и реальных тензорах, CLI `gemv`/`gemv-verify`/`gemv-unpack`;
 * `tests/kvpage.rs` — обе раскладки дают одинаковый декод, cos/max|Δ|/насыщение,
   неполная последняя страница (нули и `kt = 0`), все-нули, предел `kt`,
   отказ на NaN/Inf и плохой геометрии, manifest и порча каждой секции,
