@@ -2491,6 +2491,274 @@ int mx4_i4pref(const unsigned char *Adata, int ALen,
 }
 
 
+/* ================================================================== */
+/* int4 prefill with per-block scales (REPORT24)                       */
+/* ================================================================== */
+/* Same operand shape as `i4pref`, but the weights carry one scale per
+ * G*32 values of K and the result is the real (float) GEMM output, so the
+ * block scales are actually applied.
+ *
+ *   A : M x K uint8 row major (activations, spatial padded to 64)
+ *   B : packed int4, tile t = N/32, (K/32) croutons of 512 B, same layout
+ *       as `i4pref` but quantised with one scale per 32*G values of K
+ *   S : float[N * ng], ng = K/(32*G) - the block scales themselves
+ *   C : float[M * N]
+ *
+ * How the scales are applied (measured in hexagon-sim, see REPORT24):
+ *   - one int4 packet = 32 K x 32 N x 64 spatial, so G packets accumulate
+ *     one partial sum per output element;
+ *   - the only partial store that covers all 64 spatial rows is
+ *     `:after:sat.ub = acc`: 2 KB, unsigned 8-bit, multiplied by
+ *     fp16(bias word)/512.  `.uh` writes only the odd 32 of the 64 rows, so
+ *     16-bit partials would cost twice the packets and twice the traffic;
+ *   - one extra all-constant packet adds the offset C0 to every lane, which
+ *     keeps the partial positive; the store multiplier is the fixed
+ *     m = 255/(2*C0), i.e. every partial uses the whole 0..255 range;
+ *   - the per-(n, group) block scale is applied in the combine: one
+ *     multiply-add per element per group.  That is the price of block-32
+ *     accuracy: ng multiply-adds and ng*2 KB of partial traffic per tile.
+ *
+ * mode bit0 : stage weights DDR->VTCM (double buffered, overlaps the HMX
+ *             stream), bit1 staging only, bit2 keep power/locks,
+ *      bit8 : write C, bit6 evict L2.
+ * info = {status, us_total, us_copy, pcyc, ntiles, mtiles, ncr, vtcm_bytes,
+ *         staged_bytes, mode, act_pack_us, combine_us, copycheck, reps,
+ *         copy_bytes, ng, 0, 0, 0}
+ */
+#define BLK_MAXK 8192
+#define BLK_MAXG 64
+
+/* .ub partial layout: out(s,n) = 128*(s>>2) + 4*n + (s&3).
+ * C[s][n] = (sum_g S[n][g] * (u + 0.5)) / m - C0 * sum_g S[n][g]
+ * The +0.5 removes the store's truncation bias (verified in hexagon-sim). */
+static void blk_emit(const uint8_t *part, int ng, const float *S, int sng,
+                     float m, float C0, float *C, int ldc, int rows, int n0)
+{
+    int s, n, g;
+    for (s = 0; s < rows; s++)
+        for (n = 0; n < 32; n++) {
+            float acc = 0, scs = 0;
+            for (g = 0; g < ng; g++) {
+                float sc = S[(size_t)(n0 + n) * sng + g];
+                acc += sc * ((float)part[(size_t)g * 2048u
+                              + 128u * (unsigned)(s >> 2) + 4u * (unsigned)n
+                              + (unsigned)(s & 3)] + 0.5f);
+                scs += sc;
+            }
+            C[(size_t)s * ldc + n0 + n] = acc / m - C0 * scs;
+        }
+}
+
+int mx4_blkpref(const unsigned char *Adata, int ALen,
+                const unsigned char *Bdata, int BLen,
+                const unsigned char *Sdata, int SLen,
+                int M, int N, int K, int G, int C0, int mode, int reps,
+                unsigned char *Cdata, int CLen, int *info, int infoLen)
+{
+    res_t r;
+    uint8_t *base, *vact, *vwgt, *vpart, *vbias, *voact, *vowgt;
+    const int8_t *A = (const int8_t *)Adata;
+    const float *S = (const float *)Sdata;
+    float *C = (float *)Cdata;
+    int ncr, ng, mt, nt, rc, i, rep, m, c, g, j;
+    unsigned aregion, wstrip, nbuf, need, wbytes, chunk;
+    uint64_t t0, t1, c0, c1, tc;
+    int copycheck = 0, Aq;
+    float mstore;
+
+    if (infoLen < 16) return -1;
+    memset(info, 0, sizeof(int) * infoLen);
+    if (K < 32 || K > BLK_MAXK || (K & 31)) return -2;
+    if (N < 32 || (N & 31)) return -3;
+    if (M < 1 || M > 256) return -4;
+    if (G < 1 || G > BLK_MAXG) return -5;
+    if (K % (32 * G)) return -6;
+    if (ALen < M * K) return -7;
+    if (BLen < (N / 32) * (K / 32) * 512) return -8;
+    ncr = K / 32;
+    ng = ncr / G;
+    if (SLen < (int)((size_t)N * ng * sizeof(float))) return -9;
+    if (C0 < 224 || (C0 % 224) != 0) return -10;   /* offset = 224*Aq */
+    Aq = C0 / 224;
+    if (Aq > 255) return -11;
+    if (mode & 256) {
+        if (CLen < M * N * (int)sizeof(float)) return -12;
+    }
+    if (reps < 1 || reps > 100) reps = 1;
+
+    mt = (M + 63) / 64;
+    nt = N / 32;
+    wstrip = 512u * (unsigned)ncr;
+    chunk = wstrip;
+    nbuf = (mode & 1) ? 2u : 1u;
+    wbytes = (unsigned)nt * wstrip;
+    mstore = 255.0f / (2.0f * (float)C0);
+
+    aregion = 2048u * (unsigned)ncr * (unsigned)mt;
+    need = aregion
+         + nbuf * align_up(chunk, 2048u)
+         + (unsigned)ng * 2048u + 2048u
+         + 512u + 2048u + 2048u + 512u;
+    rc = res_get(need, &r);
+    info[0] = rc;
+    if (rc) return 0;
+    info[7] = (int)r.size;
+
+    base = (uint8_t *)(((uintptr_t)r.base + 2047u) & ~(uintptr_t)2047u);
+    vact = base;
+    vwgt = vact + aregion;
+    vpart = vwgt + nbuf * align_up(chunk, 2048u);
+    vbias = vpart + (unsigned)ng * 2048u;
+    voact = vbias + 512u + 2048u;
+    vowgt = voact + 2048u;
+    memset(base, 0, need);
+    info[4] = nt; info[5] = mt; info[6] = ncr;
+    info[8] = (int)wbytes;
+    info[9] = mode;
+    info[13] = reps;
+    info[15] = ng;
+
+    t0 = HAP_perf_get_time_us();
+    pref_pack_act(vact, A, M, K, ncr);
+    info[10] = (int)(HAP_perf_get_time_us() - t0);
+    if (!(mode & 1))
+        i4p_copy(vwgt, Bdata, wstrip, 1);   /* resident reference strip */
+
+    /* constant packets: the offset adds C0 to every (s,n) lane; the bias
+     * block normalises the 8-bit store to the full range */
+    {
+        int s, k, n;
+        for (s = 0; s < 64; s++)
+            for (k = 0; k < 32; k++)
+                voact[128u * (unsigned)(s >> 2) + 4u * (unsigned)k
+                      + (unsigned)(s & 3)] = (uint8_t)Aq;
+        for (k = 0; k < 32; k++)
+            for (n = 0; n < 32; n++) {
+                unsigned off = 128u * (unsigned)(k >> 3) + 4u * (unsigned)n
+                             + (unsigned)(k & 3);
+                if ((k >> 2) & 1) vowgt[off] |= 0x70u;
+                else              vowgt[off] |= 0x07u;
+            }
+    }
+    {
+        uint32_t word;
+        __fp16 h = (__fp16)(mstore * 512.0f);
+        unsigned short bits;
+        __asm__ __volatile__("" ::: "memory");
+        memcpy(&bits, &h, 2);
+        word = (uint32_t)bits;
+        for (j = 0; j < 32; j++) {
+            ((uint32_t *)vbias)[j] = word;
+            ((uint32_t *)vbias)[64 + j] = word;
+        }
+    }
+
+    if (!(mode & 4)) {
+        qurt_hvx_lock(QURT_HVX_MODE_128B);
+        hmx_power(1);
+        if (compute_resource_hmx_lock) compute_resource_hmx_lock(r.ctx);
+    }
+    if (mode & 64) {
+        unsigned q, n = (16u << 20) / 128u;
+        uint8_t *scr = (uint8_t *)memalign(128, 16u << 20);
+        if (scr) {
+            const HVX_Vector *p = (const HVX_Vector *)scr;
+            HVX_Vector a0 = Q6_V_vzero(), a1 = Q6_V_vzero();
+            memset(scr, 0x33, 16u << 20);
+            for (q = 0; q + 1 < n; q += 2) {
+                a0 = Q6_Vw_vadd_VwVw(a0, p[q]);
+                a1 = Q6_Vw_vadd_VwVw(a1, p[q + 1]);
+            }
+            ((HVX_Vector *)vwgt)[0] = Q6_V_vxor_VV(a0, a1);
+            __asm__ __volatile__("syncht" ::: "memory");
+            __asm__ __volatile__("barrier" ::: "memory");
+            free(scr);
+        }
+    }
+
+    if ((mode & 1) && !(mode & 2)) {
+        /* prime slot 0 inside the honest timer */
+        tc = HAP_perf_get_time_us();
+        i4p_copy(vwgt, Bdata, wstrip, 1);
+        info[2] += (int)(HAP_perf_get_time_us() - tc);
+        info[14] += (int)wstrip;
+        if (!(mode & 256)) {
+            int q, bad = 0;
+            for (q = 0; q < (int)wstrip; q++) if (vwgt[q] != Bdata[q]) bad++;
+            copycheck = bad;
+        }
+    }
+
+    t0 = HAP_perf_get_time_us();
+    c0 = HAP_perf_get_pcycles();
+    for (rep = 0; rep < reps; rep++) {
+        for (i = 0; i < nt; i++) {
+            uint8_t *slot = (mode & 1)
+                ? vwgt + (unsigned)(i & 1) * align_up(chunk, 2048u) : vwgt;
+            if (mode & 2) {
+                /* staging only: no HMX stream, just the copies */
+                tc = HAP_perf_get_time_us();
+                i4p_copy(vwgt + (unsigned)(i & 1) * align_up(chunk, 2048u),
+                         Bdata + (size_t)i * wstrip, wstrip, 1);
+                info[2] += (int)(HAP_perf_get_time_us() - tc);
+                info[14] += (int)wstrip;
+                continue;
+            }
+            if (rep == 0 && i == 0) {
+                int q, bad = 0;
+                for (q = 0; q < (int)wstrip; q++)
+                    if (slot[q] != Bdata[q]) bad++;
+                copycheck = bad;
+            }
+            for (m = 0; m < mt; m++) {
+                int rows = (M - m * 64) < 64 ? (M - m * 64) : 64;
+                /* the group chain is deferred in the HMX queue, so the
+                 * staging copy below runs on HVX while the array works */
+                for (g = 0; g < ng; g++) {
+                    hmx_clr();
+                    i4_mul(voact, 0x3FFu, vowgt, 511u, 0);      /* +C0 */
+                    for (c = 0; c < G; c++)
+                        i4_mul(vact + (unsigned)(m * ncr + g * G + c) * 2048u,
+                               0x3FFu,
+                               slot + (unsigned)(g * G + c) * 512u, 511u, 0);
+                    hmx_bias(vbias);
+                    hmx_st_ub(vpart + (unsigned)g * 2048u, 0);
+                }
+                if (m + 1 == mt && (mode & 1) && i + 1 < nt) {
+                    uint8_t *nslot = vwgt
+                        + (unsigned)((i + 1) & 1) * align_up(chunk, 2048u);
+                    tc = HAP_perf_get_time_us();
+                    i4p_copy(nslot, Bdata + (size_t)(i + 1) * wstrip, wstrip, 1);
+                    info[2] += (int)(HAP_perf_get_time_us() - tc);
+                    info[14] += (int)wstrip;
+                }
+                hmx_sync();                    /* drain this tile's stores */
+                if (mode & 256) {
+                    tc = HAP_perf_get_time_us();
+                    blk_emit(vpart, ng, S, ng, mstore, (float)C0, C, N,
+                             rows, i * 32);
+                    info[11] += (int)(HAP_perf_get_time_us() - tc);
+                }
+            }
+        }
+    }
+    hmx_sync();
+    c1 = HAP_perf_get_pcycles();
+    t1 = HAP_perf_get_time_us();
+    info[1] = (int)(t1 - t0);
+    info[3] = (int)(c1 - c0);
+    info[12] = copycheck;
+
+    if (!(mode & 4)) {
+        if (compute_resource_hmx_unlock) compute_resource_hmx_unlock(r.ctx);
+        hmx_power(0);
+        qurt_hvx_unlock();
+    }
+    res_put(&r);
+    info[0] = 0;
+    return 0;
+}
+
 /* DDR / VTCM copy bandwidth probe.
  *   mode 0 : HVX read-sum of a DDR buffer            (read only)
  *   mode 1 : HVX read from DDR, store to DDR buffer  (read+write)

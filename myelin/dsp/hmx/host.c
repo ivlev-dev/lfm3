@@ -2344,6 +2344,145 @@ static int do_i4pref(int M, int N, int K, int mode, int reps)
     return 0;
 }
 
+/* int4 prefill with per-block scales (REPORT24).  Weights come from
+ * <name>.i4 / <name>.i4s written by `mkblob model tensor prefix G`.
+ *
+ * The host only owns the accumulator offset C0: it must clear the largest
+ * |partial| so the unsigned 8-bit partial store never clamps.  The store
+ * normalises every partial to 0..255 with the fixed multiplier 255/(2*C0);
+ * the per-(n,group) block scale is applied by the DSP in the combine. */
+static int do_blkpref(int M, int N, int K, int G, int mode, int reps)
+{
+    unsigned char *Bp, *A = 0;
+    float *S = 0, *C = 0;
+    int info[20];
+    int rc, s, n, k, g, ng = K / (32 * G);
+    size_t nbytes = (size_t)(N / 32) * (K / 32) * 512u;
+    double us, us_copy, gbps = 0;
+    float smax = 0, C0f;
+    int C0, Aq;
+    int8_t *q = 0;
+    int cols;
+
+    if (K % (32 * G) || N % 32 || K % 32) {
+        printf("blkpref: bad shape K=%d N=%d G=%d\n", K, N, G); return 2;
+    }
+    { char fn[128]; snprintf(fn, sizeof(fn), "%s.i4", i4_name()); Bp = load_blob(fn, nbytes, 0); }
+    if (!Bp) return 1;
+    {
+        char fn[128]; size_t got = 0;
+        snprintf(fn, sizeof(fn), "%s.i4s", i4_name());
+        S = (float *)load_blob(fn, (size_t)N * ng * sizeof(float), &got);
+        if (!S) { printf("blkpref: need %s with G=%d scales (regenerate the "
+                         "weights with mkblob ... %d)\n", fn, G, G);
+                  free(Bp); return 1; }
+    }
+    A = (unsigned char *)malloc((size_t)M * K);
+    C = (float *)malloc((size_t)M * N * sizeof(float));
+    q = unpack_i4(Bp, N, K, 0, N < 256 ? N : 256);
+    if (!A || !C || !q) { printf("alloc failed\n"); return 1; }
+    gen_act(A, M, K, 0);
+    for (n = 0; n < N * ng; n++) if (S[n] > smax) smax = S[n];
+
+    /* offset: worst partial over a 256-column sample, 25 % headroom */
+    {
+        double mx = 0;
+        int cols2 = N < 256 ? N : 256;
+        for (n = 0; n < cols2; n++)
+            for (s = 0; s < (M < 4 ? M : 4); s++)
+                for (g = 0; g < ng; g++) {
+                    long pacc = 0;
+                    for (k = 0; k < 32 * G; k++)
+                        pacc += (long)A[(size_t)s * K + g * 32 * G + k]
+                              * (long)q[(size_t)n * K + g * 32 * G + k];
+                    if (fabs((double)pacc) > mx) mx = fabs((double)pacc);
+                }
+        Aq = (int)(mx * 1.25 / 224.0) + 1;
+        if (Aq < 1) Aq = 1;
+        if (Aq > 255) Aq = 255;
+        C0 = 224 * Aq;
+        printf("blkpref: max|partial|(sample)=%.0f -> offset C0=%d (a_k=%d, q_k=7), "
+               "store m=%.5f\n", mx, C0, Aq, 255.0 / (2.0 * C0));
+    }
+    C0f = (float)C0;
+
+    rc = mx4_blkpref(A, M * K, Bp, (int)nbytes, (unsigned char *)S,
+                     N * ng * (int)sizeof(float), M, N, K, G, C0, mode, reps,
+                     (unsigned char *)C, M * N * (int)sizeof(float), info, 20);
+    if (rc || info[0]) {
+        printf("blkpref rc=%d st=%d\n", rc, info[0]);
+        free(Bp); free(A); free(C); free(q);
+        return 1;
+    }
+    us = (double)info[1] / reps;
+    us_copy = (double)info[2] / reps;
+    if (us_copy > 0) gbps = (double)info[14] / (double)info[2] / 1000.0;
+    printf("blkpref M=%d N=%d K=%d G=%d (B=%d K) mode=%d reps=%d\n",
+           M, N, K, G, 32 * G, mode, reps);
+    printf("  total/rep=%.1f us  copy/rep=%.1f us  compute/rep=%.1f us  "
+           "combine/rep=%.1f us  pcyc/rep=%d\n", us, us_copy, us - us_copy,
+           (double)info[11] / reps, info[3] / reps);
+    printf("  TMAC/s(total)=%.2f  stage=%.2f GB/s (%d B/rep)  tiles nt=%d mt=%d "
+           "ncr=%d ng=%d vtcm=%d copycheck=%d\n",
+           us > 0 ? (double)M * N * K / us * 1e-6 : 0.0, gbps,
+           info[14] / reps, info[4], info[5], info[6], info[15], info[7],
+           info[12]);
+    if (us > 0)
+        printf("  one matrix: %.3f us/token at batch %d -> %.0f tok/s; "
+               "FFN layer (x3) ~%.2f ms, 24 layers ~%.0f ms\n",
+               us / M, M, M * 1e6 / us, 3.0 * us / 1000.0,
+               72.0 * us / 1000.0);
+
+    if (mode & 256) {
+        double dot = 0, na = 0, nb = 0, mx = 0;
+        long cells = 0, bad = 0;
+        int chk = (M < 8) ? M : 8;
+        for (s = 0; s < chk; s++)
+            for (n = 0; n < N; n++) {
+                double ref = 0, got, e;
+                for (g = 0; g < ng; g++) {
+                    long pacc = 0;
+                    for (k = 0; k < 32 * G; k++)
+                        pacc += (long)A[(size_t)s * K + g * 32 * G + k]
+                              * (long)q[(size_t)n * K + g * 32 * G + k];
+                    ref += (double)S[(size_t)n * ng + g] * (double)pacc;
+                }
+                got = C[(size_t)s * N + n];
+                e = fabs(got - ref);
+                if (e > mx) mx = e;
+                if (e > 0.02 * (fabs(ref) + 1e-9)) bad++;
+                dot += got * ref; na += got * got; nb += ref * ref;
+                cells++;
+            }
+        printf("  check rows=0..%d x N=%d: cells=%ld  maxabs=%.3f  "
+               "cells>2%%rel=%ld  cos=%.7f%s\n", chk - 1, N, cells, mx, bad,
+               (na > 0 && nb > 0) ? dot / sqrt(na * nb) : 0.0,
+               (na > 0 && nb > 0 && dot / sqrt(na * nb) > 0.9995) ?
+               "   <== OK" : "");
+        mx = 0;
+        cols = (N > 64) ? 64 : 0;
+        for (s = 0; s < (M < 4 ? M : 4); s++)
+            for (n = cols; n < cols + 64 && n < N; n++) {
+                double ref = 0, e;
+                for (g = 0; g < ng; g++) {
+                    long pacc = 0;
+                    for (k = 0; k < 32 * G; k++)
+                        pacc += (long)A[(size_t)s * K + g * 32 * G + k]
+                              * (long)q[(size_t)n * K + g * 32 * G + k];
+                    ref += (double)S[(size_t)n * ng + g] * (double)pacc;
+                }
+                e = fabs(C[(size_t)s * N + n] - ref);
+                if (e > mx) mx = e;
+            }
+        printf("  slice s=0..%d n=%d..%d: maxabs=%.3f (8-bit partial store "
+               "quantises, not exact; see blkstat)\n",
+               (M < 4 ? M : 4) - 1, cols, cols + 63, mx);
+        (void)C0f;
+    }
+    free(Bp); free(A); free(C); free(q);
+    return 0;
+}
+
 /* Decode shape (N=1): the same real weights as an int4 row vs an int8 row,
  * one GEMV pass over K per rep.  Answers "does int4 help at N=1?". */
 static int do_dec(int K, int reps)
@@ -3103,6 +3242,13 @@ int main(int argc, char **argv)
                          argc > 4 ? atoi(argv[4]) : 2048,
                          argc > 5 ? (int)strtol(argv[5], 0, 0) : 1,
                          argc > 6 ? atoi(argv[6]) : 1);
+    if (!strcmp(cmd, "blkpref"))
+        return do_blkpref(argc > 2 ? atoi(argv[2]) : 128,
+                          argc > 3 ? atoi(argv[3]) : 7680,
+                          argc > 4 ? atoi(argv[4]) : 2048,
+                          argc > 5 ? atoi(argv[5]) : 4,
+                          argc > 6 ? (int)strtol(argv[6], 0, 0) : 1,
+                          argc > 7 ? atoi(argv[7]) : 1);
     if (!strcmp(cmd, "pref8"))
         return do_pref8(argc > 2 ? atoi(argv[2]) : 128,
                         argc > 3 ? atoi(argv[3]) : 7680,

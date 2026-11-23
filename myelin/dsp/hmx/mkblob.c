@@ -38,10 +38,11 @@ static double gauss(void)
 }
 
 static int8_t *q4;                 /* [N][K] */
-static float *sc4;                 /* [N][ncr] */
+static float *sc4;                 /* [N][ng] : one scale per G*32 K */
 static int8_t *q8;                 /* [N][K] */
 static float *sc8;                 /* [N] */
 static int N, K, ncr, nt;
+static int G = 1;                  /* croutons per block scale */
 
 static void write_file(const char *prefix, const char *suffix,
                        const void *data, size_t bytes)
@@ -66,7 +67,14 @@ int main(int argc, char **argv)
     int n, k;
 
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <model.gguf> <tensor> <out-prefix>\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> <tensor> <out-prefix> [G]\n"
+                        "  G = 32-K croutons per block scale (default 1)\n",
+                argv[0]);
+        return 2;
+    }
+    if (argc > 4) G = atoi(argv[4]);
+    if (G < 1 || G > 64 || (K % (32 * G))) {
+        fprintf(stderr, "bad G=%d (1..64, K must be a multiple of 32*G)\n", G);
         return 2;
     }
     gguf_open(argv[1]);
@@ -85,23 +93,24 @@ int main(int argc, char **argv)
 
     w = gguf_matrix(t, N, K);
 
-    /* ---- int4: симметрично, масштаб на каждый блок 32 K ---- */
+    /* ---- int4: симметрично, один масштаб на блок 32*G значений K ---- */
+    if (K % (32 * G)) { fprintf(stderr, "K=%d not a multiple of 32*G\n", K); return 1; }
     q4 = (int8_t *)malloc((size_t)N * K);
-    sc4 = (float *)malloc((size_t)N * ncr * sizeof(float));
+    sc4 = (float *)malloc((size_t)N * (K / (32 * G)) * sizeof(float));
     if (!q4 || !sc4) { fprintf(stderr, "oom\n"); return 1; }
     for (n = 0; n < N; n++) {
-        for (k = 0; k < ncr; k++) {
-            const float *wv = w + (size_t)n * K + (size_t)k * 32;
+        for (k = 0; k < K / (32 * G); k++) {
+            const float *wv = w + (size_t)n * K + (size_t)k * 32 * G;
             float amax = 0, sc;
             int l;
-            for (l = 0; l < 32; l++) { float a = fabsf(wv[l]); if (a > amax) amax = a; }
+            for (l = 0; l < 32 * G; l++) { float a = fabsf(wv[l]); if (a > amax) amax = a; }
             sc = amax > 0 ? amax / 7.0f : 0.0f;
-            sc4[(size_t)n * ncr + k] = sc;
-            for (l = 0; l < 32; l++) {
+            sc4[(size_t)n * (K / (32 * G)) + k] = sc;
+            for (l = 0; l < 32 * G; l++) {
                 int v = sc > 0 ? (int)lrintf(wv[l] / sc) : 0;
                 if (v > 7) v = 7;
                 if (v < -8) v = -8;
-                q4[(size_t)n * K + k * 32 + l] = (int8_t)v;
+                q4[(size_t)n * K + k * 32 * G + l] = (int8_t)v;
             }
         }
     }
@@ -161,7 +170,7 @@ int main(int argc, char **argv)
                 for (k = 0; k < K; k++) {
                     float av = a[k];
                     float ref = row[k] * av;
-                    float v4 = sc4[(size_t)n0 * ncr + k / 32] * (float)q4[(size_t)n0 * K + k] * av;
+                    float v4 = sc4[(size_t)n0 * (K / (32 * G)) + k / (32 * G)] * (float)q4[(size_t)n0 * K + k] * av;
                     float v4r = srow * (float)(srow > 0 ? (int)lrintf(row[k] / srow) : 0) * av;
                     float v8 = sc8[n0] * (float)q8[(size_t)n0 * K + k] * av;
                     nref += (double)ref * ref;
@@ -177,13 +186,13 @@ int main(int argc, char **argv)
         }
         c4 /= (rows * 32); c8 /= (rows * 32); c4row /= (rows * 32);
         printf("fidelity (f32 activations, %d rows x 32 cols):\n", rows);
-        printf("  int4 block-32 scale: cos=%.6f\n", c4);
+        printf("  int4 block-%d scale: cos=%.6f\n", 32 * G, c4);
         printf("  int4 per-row scale : cos=%.6f\n", c4row);
         printf("  int8 per-row scale : cos=%.6f\n", c8);
     }
 
     write_file(argv[3], ".i4", blob, (size_t)nt * ncr * 512u);
-    write_file(argv[3], ".i4s", sc4, (size_t)N * ncr * sizeof(float));
+    write_file(argv[3], ".i4s", sc4, (size_t)N * (K / (32 * G)) * sizeof(float));
     write_file(argv[3], ".i8", q8, (size_t)N * K);
     write_file(argv[3], ".i8s", sc8, (size_t)N * sizeof(float));
 
@@ -192,7 +201,7 @@ int main(int argc, char **argv)
     if (fm) {
         double mn = 1e30, mxs = 0, sum = 0;
         long cnt = 0, sat7 = 0;
-        for (n = 0; n < N * ncr; n++) {
+        for (n = 0; n < N * (K / (32 * G)); n++) {
             double v = sc4[n];
             if (v <= 0) continue;
             if (v < mn) mn = v;
@@ -200,7 +209,8 @@ int main(int argc, char **argv)
             sum += v; cnt++;
         }
         for (n = 0; n < N * K; n++) if (q4[n] == 7 || q4[n] == -8) sat7++;
-        fprintf(fm, "tensor=%s\nN=%d\nK=%d\nint4_block=32\nint4_range=-8..7\n", argv[2], N, K);
+        fprintf(fm, "tensor=%s\nN=%d\nK=%d\nint4_block=%d\nint4_range=-8..7\n"
+                    "int4_ng=%d\n", argv[2], N, K, 32 * G, K / (32 * G));
         fprintf(fm, "int8_per_row=1\n");
         fprintf(fm, "block_scale_min=%.8g\nblock_scale_max=%.8g\nblock_scale_mean=%.8g\n",
                 mn, mxs, cnt ? sum / cnt : 0);

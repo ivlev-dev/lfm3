@@ -56,5 +56,9 @@ $HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o mx4_test \
 # Системный cc: на телефоне она не нужна, SDK ей не требуется.
 cc -O2 -Wall -Wno-unused-function -o mkblob mkblob.c -lm
 
+# blkstat — dev-машина: точность и стоимость per-block масштабов (REPORT24).
+# Моделирует арифметику mx4_blkpref побитово, устройство не нужно.
+cc -O2 -Wall -Wno-unused-function -o blkstat blkstat.c -lm
+
 echo "BUILD OK"
-ls -la libmx4_skel.so mx4_test mkblob
+ls -la libmx4_skel.so mx4_test mkblob blkstat

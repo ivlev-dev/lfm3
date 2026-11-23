@@ -1,0 +1,113 @@
+=== Q4_K-free check: our int4/32 format, block size sweep (mkblob fidelity) ===
+REPORT23 reference: block-32 cos=0.995341, per-row cos=0.988286 (f32 activations)
+tensor blk.0.ffn_gate.weight: N=7680 K=2048 type=12  (62.91 MB f32)
+  int4 block-32 scale: cos=0.995341
+  int4 per-row scale : cos=0.988286
+  int8 per-row scale : cos=0.999964
+tensor blk.0.ffn_gate.weight: N=7680 K=2048 type=12  (62.91 MB f32)
+  int4 block-64 scale: cos=0.994274
+  int4 per-row scale : cos=0.988286
+  int8 per-row scale : cos=0.999964
+tensor blk.0.ffn_gate.weight: N=7680 K=2048 type=12  (62.91 MB f32)
+  int4 block-128 scale: cos=0.993111
+  int4 per-row scale : cos=0.988286
+  int8 per-row scale : cos=0.999964
+tensor blk.0.ffn_gate.weight: N=7680 K=2048 type=12  (62.91 MB f32)
+  int4 block-256 scale: cos=0.991891
+  int4 per-row scale : cos=0.988286
+  int8 per-row scale : cos=0.999964
+tensor blk.0.ffn_gate.weight: N=7680 K=2048 type=12  (62.91 MB f32)
+  int4 block-512 scale: cos=0.990665
+  int4 per-row scale : cos=0.988286
+  int8 per-row scale : cos=0.999964
+
+=== part 2: accuracy/cost model of the DSP path (blkstat, real weights) ===
+cos16 = exact 16-bit partial; cos8(unifKc) = 8-bit with one global store
+multiplier; cos8(perGrp) = 8-bit normalised per (n,group) -- the recipe
+mx4_blkpref implements.  Criterion: cos8(perGrp) >= 0.9995.
+tensor blk.0.ffn_gate.weight: N=7680 K=2048  rows=7680 activations=8
+
+G   B(K)  cos16(exact) cos8(unifKc) cos8(perGrp) maxabs8     cos xact/f32 max|part|
+1   32    1.0000000   0.9836603     0.9997916   8.02       0.9922779   6939     
+2   64    1.0000000   0.9865605     0.9997944   9.69       0.9910070   7440     
+4   128   1.0000000   0.9874120     0.9997720   8.30       0.9891725   12026    
+8   256   1.0000000   0.9920953     0.9998285   7.94       0.9873893   13681    
+16  512   1.0000000   0.9942164     0.9998551   10.93      0.9844289   16494    
+64  2048  1.0000000   0.9965511     0.9998874   8.26       0.9796488   23429    
+row -      0.9796488  
+
+cost model per matrix (M=128, N=7680, K=2048; 480 tiles of 32 N):
+G   B(K)   stores    store bytes   combine reads combine MACs extra acc. instr
+1   32     30720     62.9          62.9          63           +100%
+2   64     15360     31.5          31.5          31           +50%
+4   128    7680      15.7          15.7          16           +25%
+8   256    3840      7.9           7.9           8            +12%
+16  512    1920      3.9           3.9           4            +6%
+64  2048   480       1.0           1.0           1            +2%
+
+=== part 3: second FFN shape (down: N=2048 K=7680) ===
+tensor blk.0.ffn_down.weight: N=2048 K=7680  rows=2048 activations=8
+
+G   B(K)  cos16(exact) cos8(unifKc) cos8(perGrp) maxabs8     cos xact/f32 max|part|
+1   32    1.0000000   0.9737961     0.9997875   19.81      0.9947133   5893     
+2   64    1.0000000   0.9774743     0.9997885   12.93      0.9938010   6598     
+4   128   1.0000000   0.9860061     0.9998364   20.13      0.9923493   8592     
+8   256   1.0000000   0.9887072     0.9998463   16.19      0.9902186   9619     
+16  512   1.0000000   0.9912573     0.9998641   13.60      0.9885450   12317    
+64  2048  1.0000000   0.9953320     0.9999052   10.80      0.8775491   18151    
+row -      0.9815667  
+
+cost model per matrix (M=128, N=2048, K=7680; 128 tiles of 32 N):
+G   B(K)   stores    store bytes   combine reads combine MACs extra acc. instr
+1   32     30720     62.9          62.9          63           +100%
+2   64     15360     31.5          31.5          31           +50%
+4   128    7680      15.7          15.7          16           +25%
+8   256    3840      7.9           7.9           8            +12%
+16  512    1920      3.9           3.9           4            +6%
+64  2048   384       0.8           0.8           1            +2%
+
+=== part 4: hexagon-sim functional check of the full recipe ===
+(offset packet + 8-bit normalised store + per-group combine, CPU reference)
+hmx_blkscale_sim.c:134:27: warning: unused variable 'j' [-Wunused-variable]
+  134 |     int s, n, k, g, c, i, j;
+      |                           ^
+1 warning generated.
+hexagon-sim INFO: The rev_id used in the simulation is 0x00008d68 (v68n_1024)
+max|partial| over the tile = 19560  ->  C0 = 20608 (a_k=92, q_k=7)
+smax = 0.00428571   store m = 0.00619 (constant, block scale in the combine)
+
+check M=32 N=32 K=128 G=2: cos=0.9999529  maxabs=0.8417  cells>0.1%rel=962 / 1024
+   y[0][0]: ref=-30.805 got=-30.650 (delta 0.155)
+   y[1][7]: ref=30.762 got=30.692 (delta -0.070)
+   y[2][14]: ref=-24.450 got=-24.311 (delta 0.138)
+
+RESULT: OK
+
+Done!
+	T0: Insns=2821514 Packets=1171394
+	T1: Insns=0 Packets=0
+	T2: Insns=0 Packets=0
+	T3: Insns=0 Packets=0
+	T4: Insns=0 Packets=0
+	T5: Insns=0 Packets=0
+	Total: Insns=2821514 Pcycles=3514188
+
+=== part 5: HMX store semantics that forced this design ===
+scale-word scan: acc=32 (all ones, 32 K), .ub store
+   word=0x6000 -> out[0]=32
+   word=0x3c00 -> out[0]=0
+   word=0x3800 -> out[0]=0
+   word=0x4000 -> out[0]=0
+   word=0x7000 -> out[0]=255
+   word=0x5000 -> out[0]=2
+   word=0x2000 -> out[0]=0
+   word=0x6c00 -> out[0]=255
+   .ub : out[0]=32 out[1024]=32 out[2047]=32
+   .uh : h[0]=8192 h[1]=8192 h[2]=8192 h[3]=8192  h[2047]=0 h[2048]=0
+spatial identity through .ub (act(s,0)=s+1, w k==0 only)
+   rows matching = 64/64;  raw out[0..7]= 1 2 3 4 1 2 3 4
+   acc=-32 -> out[0]=0
+   acc=-32 -> .uh h[0]=0 h[1]=0
+out_bias test: scale word 0x6000, out_bias 100 at n=0
+
+written: research/run24-host.txt

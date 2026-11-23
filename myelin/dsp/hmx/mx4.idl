@@ -176,6 +176,20 @@ interface mx4 {
                in long K, in long mode, in long reps,
                rout sequence<octet> C, rout sequence<long> info);
 
+   /* int4 prefill with per-block scales (REPORT24): same operands as i4pref
+      plus S = float[N * K/(32*G)] block scales pre-multiplied by the store
+      normalisation Kc, G = 32-K croutons per scale, C0 = accumulator offset
+      (must be 224*Aq, Aq <= 255).  C = float[M*N] in Kc units.
+        mode bit0 stage weights DDR->VTCM, bit1 staging only, bit2 keep
+        power/locks, bit8 write C, bit6 evict L2.
+        info = {status, us_total, us_copy, pcyc, ntiles, mtiles, ncr,
+                vtcm_bytes, staged_bytes, mode, act_pack_us, combine_us,
+                copycheck, reps, copy_bytes, ng, 0, 0, 0} */
+   long blkpref(in sequence<octet> A, in sequence<octet> B, in sequence<octet> S,
+                in long M, in long N, in long K, in long G, in long C0,
+                in long mode, in long reps,
+                rout sequence<octet> C, rout sequence<long> info);
+
    /* int4 weights via weight.n.  A: M x K uint8, B: N x K int8 in [-8,7].
       wl 0..3 selects the nibble permutation candidate; bs is the bias/scale
       low word; mode bit0 chunked :deep activation, bit1 skip power/lock,
