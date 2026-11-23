@@ -145,7 +145,8 @@ fn main() {
         );
         let transport: Arc<dyn Transport> =
             Arc::new(Cdsprpc::load(CdsprpcConfig::default()).map_err(|error| error.to_string())?);
-        let client = HvxClient::open(Arc::clone(&transport), "lfmgemv")
+        let module = std::env::var("MYELIN_MODULE").unwrap_or_else(|_| "lfmgemv".to_owned());
+        let client = HvxClient::open(Arc::clone(&transport), &module)
             .map_err(|error| error.to_string())?;
         let handle = client.handle().expect("open handle");
         // The backend owns the handle from here; the client must not close it.
@@ -153,10 +154,16 @@ fn main() {
 
         let executor = Arc::new(Executor::new(Arc::clone(&transport)));
         let exec_dyn: Arc<dyn DspExecutor> = executor;
+        exec_dyn
+            .reserve_scratch(
+                handle,
+                myelin_core::backend::dsp::EXEC_SCRATCH_BYTES as i64,
+            )
+            .map_err(|error| error.to_string())?;
         let provider =
             ResidentWeights::with_ion(Arc::clone(&exec_dyn), handle, plan, Arc::clone(&transport));
         let mut backend =
-            DspBackend::with_handle(spec.clone(), Arc::clone(&exec_dyn), handle, "lfmgemv");
+            DspBackend::with_handle(spec.clone(), Arc::clone(&exec_dyn), handle, &module);
         let host = pack
             .host_weights(&args.pack)
             .map_err(|error| error.to_string())?;

@@ -100,7 +100,20 @@ fn run_exec_on<T: Transport + ?Sized>(
     handle: DspHandle,
     request: ExecRun<'_>,
 ) -> Result<ExecResult, DspError> {
+    if std::env::var_os("MYELIN_DEBUG").is_some() {
+        let head = &request.list[..request.list.len().min(32)];
+        eprintln!(
+            "exec: list={} n_cmds={} scratch={} head={:02x?}",
+            request.list.len(),
+            request.commands,
+            request.scratch_bytes,
+            head
+        );
+    }
     let (shared, arena) = map_list(transport, handle, request.list, None)?;
+    if std::env::var_os("MYELIN_DEBUG").is_some() {
+        eprintln!("exec: arena={arena} cmd_off=0");
+    }
     let result = exec_mapped(transport, handle, arena, 0, &request, true);
     drop(shared);
     unmap_arena(transport, handle, arena);
@@ -301,6 +314,14 @@ fn exec_mapped<T: Transport + ?Sized>(
     request: &ExecRun<'_>,
     full_sequences: bool,
 ) -> Result<ExecResult, DspError> {
+    if std::env::var_os("MYELIN_DEBUG").is_some() {
+        eprintln!(
+            "exec_mapped: arena={arena} cmd_off={cmd_off} list={} commands={} scratch={}",
+            request.list.len(),
+            request.commands,
+            request.scratch_bytes
+        );
+    }
     let mut out = vec![0u8; request.out_len];
     let mut times = [0i32; TIMES_VALUES];
     times[1] = -1;
@@ -318,17 +339,9 @@ fn exec_mapped<T: Transport + ?Sized>(
     let mut prim_out: [u8; 0] = [];
     let exec = {
         let mut in_bufs: [&[u8]; 2] = [request.act, &rt_bytes];
-        let in_bufs: &mut [&[u8]] = if request.rt.is_empty() {
-            &mut in_bufs[..1]
-        } else {
-            &mut in_bufs[..]
-        };
+        let in_bufs: &mut [&[u8]] = &mut in_bufs[..];
         let mut out_bufs: [&mut [u8]; 2] = [out.as_mut_slice(), i32_bytes_mut(&mut times)];
-        let out_bufs: &mut [&mut [u8]] = if full_sequences {
-            &mut out_bufs[..]
-        } else {
-            &mut out_bufs[..1]
-        };
+        let out_bufs: &mut [&mut [u8]] = &mut out_bufs[..];
         dispatch(
             transport,
             handle,
@@ -478,20 +491,12 @@ fn exec_shared(
             &buffers.act.as_slice()[..act_len],
             &buffers.rt.as_slice()[..rt_len],
         ];
-        let in_bufs: &mut [&[u8]] = if request.rt.is_empty() {
-            &mut in_bufs[..1]
-        } else {
-            &mut in_bufs[..]
-        };
+        let in_bufs: &mut [&[u8]] = &mut in_bufs[..];
         let mut out_bufs: [&mut [u8]; 2] = [
             &mut buffers.out.as_mut_slice()[..out_len],
             i32_bytes_mut(&mut times),
         ];
-        let out_bufs: &mut [&mut [u8]] = if full_sequences {
-            &mut out_bufs[..]
-        } else {
-            &mut out_bufs[..1]
-        };
+        let out_bufs: &mut [&mut [u8]] = &mut out_bufs[..];
         transport.invoke(
             handle,
             Call {
@@ -674,6 +679,15 @@ impl Executor {
         let mut cache = ListCache::lock(&self.exec_arenas);
         let arena = cache.arena_for(self.transport.as_ref(), handle, request.list)?;
         drop(cache);
+        if std::env::var_os("MYELIN_DEBUG").is_some() {
+            eprintln!(
+                "traced_exec: arena={arena} list={} commands={} scratch={} heap={}",
+                request.list.len(),
+                request.commands,
+                request.scratch_bytes,
+                self.heap_exec
+            );
+        }
         self.trace_map_micros
             .fetch_add(map_started.elapsed().as_micros() as i64, Ordering::Relaxed);
         let call_started = std::time::Instant::now();

@@ -309,6 +309,16 @@ impl Transport for Cdsprpc {
         for buffer in call.out_bufs.iter_mut() {
             push_arg(&mut args, &mut count, buffer.as_mut_ptr(), buffer.len())?;
         }
+        if std::env::var_os("MYELIN_DEBUG").is_some() {
+            eprintln!(
+                "invoke: method={} scalars={:#x} prim={:02x?} in={:?} out={:?}",
+                call.method,
+                call.scalars(),
+                call.prim_in,
+                call.in_bufs.iter().map(|b| b.len()).collect::<Vec<_>>(),
+                call.out_bufs.iter().map(|b| b.len()).collect::<Vec<_>>()
+            );
+        }
         // SAFETY: `args[..count]` is a contiguous `remote_arg[]` for the
         // duration of the call, and every pointer refers to a live Rust slice.
         let code = unsafe { (self.invoke)(handle, call.scalars(), args.as_mut_ptr()) };
