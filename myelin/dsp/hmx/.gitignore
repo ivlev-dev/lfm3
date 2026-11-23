@@ -1,1 +1,5 @@
-blkstat
+gemm_test
+libmx4_skel.so
+mx4.h
+mx4_stub.c
+mx4_skel.c

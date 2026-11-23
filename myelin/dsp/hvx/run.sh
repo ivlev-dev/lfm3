@@ -1,30 +1,55 @@
-#!/bin/bash
-# Пуш и запуск HVX-тестов на телефоне.
-#
-#   ./run.sh push                     — залить скелет и все тесты
-#   ./run.sh <binary> [args...]        — запустить тест (lfmgemv_test|ab_test|ffn_test|attn_test)
-#   ./run.sh attn_test 64 0 2          — пример: 64 страницы (ctx 2048), полное окно
-#
-# Серийник adb: переменная MADB (по умолчанию — первое устройство из `adb devices`).
-# Каталог на устройстве: переменная MDEV (по умолчанию /data/local/tmp/lfmgemv).
+#!/bin/sh
 set -e
 cd "$(dirname "$0")"
 
-BINS="liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test attach_test rpc_test exec_test"
-D=${MDEV:-/data/local/tmp/lfmgemv}
-if [ -z "$MADB" ]; then
-    MADB=$(adb devices | awk 'NR>1 && $2=="device" {print $1; exit}')
-fi
-[ -n "$MADB" ] || { echo "нет adb-устройства: задайте MADB=<серийник>" >&2; exit 1; }
+OUT=${OUT:-build}
+SIM_TIMEOUT=${SIM_TIMEOUT:-1200}
 
-adb -s "$MADB" shell mkdir -p "$D"
-if [ "$1" = "push" ]; then
-    adb -s "$MADB" push $BINS "$D/" >/dev/null
-    adb -s "$MADB" shell chmod 755 "$D"/liblfmgemv_skel.so "$D"/*_test
-    echo "pushed -> $D"
-    exit 0
+./build.sh
+
+rc=0
+echo "== gemv (host)"
+./"$OUT"/gemv_host || rc=1
+echo "== gemm (host)"
+./"$OUT"/gemm_host || rc=1
+
+find_hexagon_sim()
+{
+    for root in "$HEXAGON_SDK_ROOT" /opt/hexagon-sdk-6.7.0.0 /opt/hexagon-sdk; do
+        [ -n "$root" ] || continue
+        [ -d "$root/tools/HEXAGON_Tools" ] || continue
+        for s in "$root"/tools/HEXAGON_Tools/*/Tools/bin/hexagon-sim; do
+            if [ -x "$s" ]; then
+                echo "$s"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+HSIM=$(find_hexagon_sim || true)
+
+if [ -z "$HSIM" ] || [ ! -x "$OUT/gemv_sim" ]; then
+    echo "== dsp: hexagon-sim или DSP-бинарники отсутствуют, прогон пропущен"
+    exit $rc
 fi
 
-BIN=${1:-lfmgemv_test}
-shift || true
-adb -s "$MADB" shell "cd $D && ADSP_LIBRARY_PATH=\$PWD ./$BIN $*"
+for t in gemv gemm; do
+    echo "== $t (hexagon-sim)"
+    if timeout "$SIM_TIMEOUT" "$HSIM" -mv68 --simulated_returnval ./"$OUT"/"$t"_sim; then
+        :
+    else
+        echo "FAIL $t: hexagon-sim"
+        rc=1
+    fi
+    echo "== $t bench (hexagon-sim)"
+    if timeout "$SIM_TIMEOUT" "$HSIM" -mv68 --simulated_returnval ./"$OUT"/"$t"_sim -- bench; then
+        :
+    else
+        echo "FAIL $t bench: hexagon-sim"
+        rc=1
+    fi
+done
+
+exit $rc

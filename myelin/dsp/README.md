@@ -1,76 +1,106 @@
-# DSP-стенды: HMX, HVX, conv (Hexagon v68)
+# DSP-слой LFM3
 
-Отдельные C-стенды для проверки ядер на реальном CDSP (Snapdragon 888, v68).
-В cargo workspace не входят и на сборку Rust не влияют — собираются своими
-`build.sh` через Hexagon SDK и Android NDK.
+Слой целочисленных DSP-ядер LFM3: int4-веса с поворотом Hadamard, int8-активации,
+paged KV, HVX-путь для decode и HMX-путь для prefill. Ядра собираются как
+обычные C11-файлы: на хосте системным `cc`, на Hexagon — `hexagon-clang` из
+SDK.
+
+Текущее состояние проверок, известные зависания стендов и следующие шаги —
+в [STATUS.md](STATUS.md).
+
+## Структура
 
 ```
-hmx/          HMX-инструкции: fp16 и int8 матмул, замеры, research/
-hvx/          HVX-ядра: int4/int8 GEMV, SiLU/FFN, paged attention, PV
-conv/         depthwise shortconv k=7 + офлайн-симулятор (без устройства)
-qnn-reverse/  разбор QNN: геометрия int8-кроутонов, control-слова
+myelin/dsp/
+  CONTRACT.md         контракт форматов, ABI, ротации и гейтов
+  common/             header-only примитивы: fp16, q4, quant, rot, kvarn, page
+  hvx/                HVX-ядра (gemv/gemm/ffn/attn/kvcache/exec) и стенды *_main.c
+  hmx/                HMX-ядра (gemm i4/i8, prefill) и стенд gemm_main.c
+  tests/              test_common.c, эталон kvarn_case.h
+  sim/                общий стенд: shim QuRT/HVX, sim_main.c, build.sh, runner.sh
+  run_tests.sh        единая точка прогона
+  Makefile            цели test, host, dsp, build, clean
 ```
 
-## Что нужно
+Форматы данных, раскладка весов и KV, ABI команд и числовые гейты описаны в
+[CONTRACT.md](CONTRACT.md). Кратко: веса `int4` блоками по 32 со `scale` f16,
+активации `quantize_q8` блоками по 32, поворот `R = H128 D / sqrt(128)` для
+весов, активаций и KV, страница KV — 32 токена x 128 измерений на голову.
 
-| компонент | версия | зачем |
+## Сборка и запуск
+
+```sh
+cd myelin/dsp
+
+./run_tests.sh        # собрать и прогнать всё, сводка PASS/SKIP/FAIL
+make test             # то же
+make host             # только хостовые стенды
+make dsp              # только DSP-стенды (hexagon-sim/QEMU)
+make clean            # удалить sim/build
+```
+
+Раздельно:
+
+```sh
+./sim/build.sh        # собрать всё, что нашлось, в sim/build/
+./sim/runner.sh       # build.sh + прогон + сводка
+SKIP_BUILD=1 ./sim/runner.sh
+```
+
+`build.sh` сам находит существующие стенды:
+
+* `tests/test_common.c` — хостовый, всегда;
+* `hvx/*_main.c` — HVX, требует Hexagon (собирается только для DSP);
+* `hmx/*_main.c` — HMX, требует Hexagon/hexagon-sim.
+
+Если файла нет или символа стенда нет в образе, строка получает `SKIP`.
+Ненулевой код возврата, падение, таймаут или маркер `SIM RESULT: FAIL`
+дают `FAIL`; лог пишется в `sim/build/log/` и `sim/build/run/`.
+
+### Переменные окружения
+
+| Переменная | По умолчанию | Назначение |
 |---|---|---|
-| Hexagon SDK | 6.7.0.0 | `hexagon-clang` 21.0.04, `qaic`, qurt, `qhl_hmx`/`qhl_hvx` |
-| Android NDK | r27c | host-бинарники, `aarch64-linux-android31-clang` |
-| adb | — | запуск на телефоне (для сборки не нужен) |
+| `HOST_CC` | `cc` | компилятор хостовых стендов |
+| `HEXAGON_SDK_ROOT` | первый `/opt/hexagon-sdk-*` | SDK с `rtos/qurt/computev68` |
+| `HEXAGON_TOOLS_VERSION` | найденная | версия `HEXAGON_Tools` |
+| `LFM_SIM_MODES` | `host,dsp` | какие режимы собирать и запускать |
+| `LFM_SIM_DSP_ALL` | `0` | `1` — собирать DSP-вариант и для хостовых стендов |
+| `LFM_SIM_TIMEOUT` | `300` | таймаут одного стенда, секунды |
+| `LFM_SIM_USE_QEMU` | `0` | `1` — предпочесть `qemu-system-hexagon` вместо `hexagon-sim` |
+| `QEMU_BIN` | поиск в PATH | путь к `qemu-system-hexagon` |
+| `SKIP_BUILD` | `0` | `1` — не пересобирать перед прогоном |
 
-Пути задаются переменными, дефолты — из исследовательской среды:
+## Какие стенды требуют устройства
 
-```bash
-export HEXAGON_SDK_ROOT=/path/to/Hexagon_SDK/6.7.0.0   # дефолт /tmp/opencode/sdk/6.7.0.0
-export ANDROID_NDK_ROOT=/path/to/android-ndk-r27c      # дефолт /tmp/opencode/ndk/android-ndk-r27c
-# опционально: HEXAGON_TOOLS_VERSION=21.0.04, ANDROID_API=31
-```
+* `tests/test_common.c` проверяет `common/` (fp16, rot, kvarn, q4, page) и
+  проходит на хосте обычным `cc`.
+* `hvx/*` и `hmx/*` используют HVX/HMX-интринсики и QuRT. На хосте они
+  помечаются `SKIP (device-only)`, на DSP запускаются через `hexagon-sim`
+  (по умолчанию) или `qemu-system-hexagon -M V68N_1024` (если включён
+  `LFM_SIM_USE_QEMU=1` и QEMU поддерживает эту машину).
+* HMX под `qemu-system-hexagon` не работает; HMX-стенды рассчитаны на
+  `hexagon-sim`. Если симулятора нет, DSP-строки получают `SKIP`.
 
-Проприетарные части SDK **не вендорятся**: `qhl_hmx`/`qhl_hvx` подключаются
-заголовками/исходниками прямо из `$HEXAGON_SDK_ROOT`, `libcdsprpc.so` берётся
-из `$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64`, генераты
-`qaic` (`*_skel.c`, `*_stub.c`, `*.h`) создаются в процессе сборки и лежат в
-`myelin/.gitignore`.
+`runner.sh` копирует DSP-образ и конфиги симулятора в ASCII-каталог
+`${TMPDIR:-/tmp}/lfm3-dsp-sim-<pid>`: `runelf.pbn` из SDK не открывает образы
+по путям с не-ASCII символами.
 
-## Сборка
+## Устройство sim/
 
-```bash
-cd myelin/dsp/hmx  && ./build.sh   # libmx4_skel.so + mx4_test
-cd myelin/dsp/hvx  && ./build.sh   # liblfmgemv_skel.so + lfmgemv_test/ab_test/ffn_test/attn_test
-cd myelin/dsp/conv && ./build.sh   # liblfmgemv_skel.so + conv_sim (conv_test — если есть conv_main.c)
-```
+* `sim_main.c` — точка входа DSP-образа. Держит слабую extern-таблицу
+  стендов (`lfm_case_common`, `lfm_case_gemv`, ...): если символ не слинкован,
+  печатается `SKIP`, процесс не падает. Каждый стенд запускается в отдельном
+  потоке со стеком 1 МиБ; там же QuRT/HVX-shim (`sim_hvx_lock/unlock/units`,
+  потоки, таймер), статическая куча QuRT (56 МиБ) и `sim_ion_register`.
+* `sim_shim.h` — интерфейс shim и объявления слабых точек входа.
+* `shim_hap.c` — заглушки HAP power и `apps_mem_share_map/unmap` для QuRT.
+* `build.sh` — хостовые бинарники (`cc`) и DSP qexe (`hexagon-clang` + QuRT):
+  стенд компилируется с `-Dmain=lfm_case_<slug>`, ядра группы (`hvx/` или
+  `hmx/`) собираются в `libkernels.a` и линкуются только по нужным символам.
+* `runner.sh` — прогон manifest из `build/`, проверка кода возврата/маркера,
+  сводка и ненулевой код при `FAIL`.
 
-Все три собраны на SDK 6.7.0.0 + NDK r27c; устройство не требуется.
-
-## Запуск на телефоне
-
-```bash
-adb devices                                   # взять серийник
-export MADB=<серийник>                        # иначе берётся первое device из adb devices
-cd myelin/dsp/hmx && ./deploy.sh push && ./deploy.sh clk
-cd myelin/dsp/hvx && ./run.sh push && ./run.sh attn_test 64 0 2
-```
-
-Тесты сами запрашивают **unsigned PD** (`remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE)`,
-на устройстве это `fastrpc_shell_unsigned_3`). Скелет ищется на DSP через
-`ADSP_LIBRARY_PATH`, поэтому `deploy.sh`/`run.sh` выставляют его в каталог
-`/data/local/tmp/...`; `LD_LIBRARY_PATH=.` нужен hmx-драйверу.
-Root не требуется, но нужен рабочий `libcdsprpc.so` в системе и
-разрешённый unsigned PD (стандартно на userdebug/инженерных сборках; на
-production-прошивке запрос может вернуть ошибку — тогда только подписанный PD).
-
-## Статус
-
-| стенд | состояние | цифры |
-|---|---|---|
-| HMX fp16 | работает, cos=1.0 | K=32…256, N=32/64, err≤0.0075 |
-| HMX int8 | работает побитово (err=0) | 32×2048×32 — 1.075 мкс, 1.95 TMAC/s; 32×2048×64 — 1.612 мкс, 2.60 TMAC/s |
-| HVX GEMV int4 | работает | 7680×2048: 0.63 мс, 12.5 GB/s; 2 контекста — 347 мкс |
-| HVX FFN | работает, bit-exact | **1.45 мс** на слой (после 2 контекстов) |
-| HVX attention | работает | **1178 мкс** @ ctx 2048 |
-| conv | симулятор **FAIL по калибровке** (известное состояние) | ring/phase vs shift-register: 0 расхождений; cos(out) до −0.17 |
-
-Подробности и история — в `hmx/research/`, `hvx/README.md`, `conv/README.md`,
-`qnn-reverse/REPORT.md`. Пути `/tmp/opencode/...` внутри отчётов относятся к
-исходной исследовательской среде, а не к этому репозиторию.
+Чтобы добавить новый стенд, достаточно положить `<name>_main.c` в `hvx/`,
+`hmx/` или `tests/`; для нового имени нужно добавить slug в `slug_for()` в
+`sim/build.sh` и слабое объявление/строку таблицы в `sim/sim_main.c`.

@@ -1,440 +1,557 @@
-/*
- * Paged attention test: CPU f32 reference, correctness (cos / max_abs_err),
- * timings for ctx 512/2048 and 1/2 HVX contexts, plus an offline accuracy
- * check of the two integer exp variants.
- */
-#include "lfmgemv.h"
-
+#include <float.h>
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <time.h>
-#include <unistd.h>
-#include <math.h>
 
-static double now_us(void)
+#include "../common/fp16.h"
+#include "../common/kvarn.h"
+#include "../common/page.h"
+#include "../common/rot.h"
+#include "hvx_ops.h"
+
+#define D 128
+#define SCRATCH_FLOATS (2 * LFM_KVARN_PAGE_TOKENS * D)
+
+#if defined(__HEXAGON__)
+#define LFM_ATTN_NTOK 32u
+#define LFM_ATTN_NTOK_LONG 64u
+#define LFM_ATTN_NTOK_TWO 32u
+#define LFM_ATTN_NTOK_F16 32u
+#else
+#define LFM_ATTN_NTOK 96u
+#define LFM_ATTN_NTOK_LONG 192u
+#define LFM_ATTN_NTOK_TWO 64u
+#define LFM_ATTN_NTOK_F16 64u
+#endif
+
+static int failures;
+
+#define CHECK(cond, ...)                                                                           \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            failures++;                                                                            \
+            printf("FAIL %s:%d: ", __FILE__, __LINE__);                                            \
+            printf(__VA_ARGS__);                                                                   \
+            printf("\n");                                                                          \
+        }                                                                                          \
+    } while (0)
+
+typedef struct {
+    uint32_t s;
+} rng_t;
+
+static float rng_f(rng_t *r)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
-}
-static inline uint32_t lcg(uint32_t *st)
-{
-    uint32_t x = *st; x ^= x << 13; x ^= x >> 17; x ^= x << 5; *st = x; return x;
-}
-static int enable_unsigned(void)
-{
-    struct remote_rpc_control_unsigned_module um;
-    um.domain = CDSP_DOMAIN_ID; um.enable = 1;
-    return remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &um, (uint32_t)sizeof(um));
+    r->s = r->s * 1664525u + 1013904223u;
+    return ((float)(r->s >> 8) / 16777216.0f - 0.5f) * 3.0f;
 }
 
-/* Prints the DSP attention step ring only when a call fails (or ATTN_TRACE=1).
- * Stages: 1 publish, 2 worker wake, 3 hvx_lock, 4 pass1, 5 pass2, 6 syncht,
- * 7 unlock, 8 done_seq, 9 sem_up, 10 join, 11 range recomputed on main. */
-static void dump_trace(const char *why)
-{
-    static const char *nm[] = { "?", "publish", "wake", "hvx_lock", "pass1",
-                                "pass2", "syncht", "unlock", "done_seq",
-                                "sem_up", "join", "recompute" };
-    int st[8], ev[8], j, count;
+typedef struct {
+    int n_heads;
+    int kv_heads;
+    uint32_t ntok;
+    uint32_t start;
+    uint32_t window;
+} attn_cfg;
 
-    lfmgemv_probe(-1, 32, 0, st, 8);
-    count = st[0] < 64 ? st[0] : 64;
-    printf("attention trace (%s): %d events, workers=%d, fallbacks=%d\n",
-           why, st[0], st[2], st[1]);
-    for (j = 0; j < count; j += 8) {
-        lfmgemv_probe(-1, 31, (st[0] - count + j) & 63, ev, 8);
-        {
-            int i;
-            for (i = 0; i < 8 && j + i < count; i++) {
-                int stage = (ev[i] >> 8) & 0xff, arg = ev[i] & 0xff;
-                printf("  %2d: %-10s arg=%d\n", j + i,
-                       (stage >= 1 && stage <= 11) ? nm[stage] : "?", arg);
-            }
+typedef struct {
+    float *q;
+    float *qr;
+    float *k;
+    float *kr;
+    float *v;
+    float *vr;
+} attn_tensors;
+
+static void *xalloc(size_t n)
+{
+    void *p = calloc(1, n);
+    if (p == NULL) {
+        printf("FAIL: alloc %zu bytes\n", n);
+        exit(2);
+    }
+    return p;
+}
+
+static const char *fmt_name(lfm_kv_format fmt)
+{
+    switch (fmt) {
+    case LFM_KV_F16: return "f16";
+    case LFM_KVARN_K4V2: return "k4v2";
+    case LFM_KVARN_K4V4: return "k4v4";
+    default: return "?";
+    }
+}
+
+static size_t head_bytes_of(lfm_kv_format fmt)
+{
+    if (fmt == LFM_KV_F16)
+        return 2u * (size_t)LFM_KVARN_PAGE_TOKENS * D * 2u;
+    return lfm_kvarn_head_bytes(fmt);
+}
+
+static size_t page_bytes_of(lfm_kv_format fmt, int kv_heads)
+{
+    return (size_t)lfm_page_bytes((uint32_t)fmt, (uint32_t)kv_heads, (uint32_t)D);
+}
+
+static void tensors_init(attn_tensors *ts, const attn_cfg *c, uint32_t seed)
+{
+    size_t qn = (size_t)c->ntok * (size_t)c->n_heads * D;
+    size_t kn = (size_t)(c->start + c->ntok) * (size_t)c->kv_heads * D;
+    size_t i;
+    uint32_t t;
+    int h;
+    rng_t r;
+
+    r.s = seed;
+    ts->q = xalloc(qn * sizeof(float));
+    ts->qr = xalloc(qn * sizeof(float));
+    ts->k = xalloc(kn * sizeof(float));
+    ts->kr = xalloc(kn * sizeof(float));
+    ts->v = xalloc(kn * sizeof(float));
+    ts->vr = xalloc(kn * sizeof(float));
+
+    for (i = 0; i < qn; i++)
+        ts->q[i] = rng_f(&r);
+    for (i = 0; i < kn; i++) {
+        ts->k[i] = rng_f(&r);
+        ts->v[i] = rng_f(&r);
+    }
+
+    for (t = 0; t < c->ntok; t++) {
+        for (h = 0; h < c->n_heads; h++) {
+            size_t off = ((size_t)t * (size_t)c->n_heads + (size_t)h) * D;
+            memcpy(ts->qr + off, ts->q + off, sizeof(float) * D);
+            lfm_rot_fwd_f32(ts->qr + off, D);
+        }
+    }
+    for (t = 0; t < c->start + c->ntok; t++) {
+        int kh;
+        for (kh = 0; kh < c->kv_heads; kh++) {
+            size_t off = ((size_t)t * (size_t)c->kv_heads + (size_t)kh) * D;
+            memcpy(ts->kr + off, ts->k + off, sizeof(float) * D);
+            memcpy(ts->vr + off, ts->v + off, sizeof(float) * D);
+            lfm_rot_fwd_f32(ts->kr + off, D);
+            lfm_rot_fwd_f32(ts->vr + off, D);
         }
     }
 }
 
-#define HQ   16
-#define KVH  4
-#define D    128
-#define PAGE 32
-
-/* ---- the two integer exp variants, mirroring the DSP code ---- */
-static int exp_bit(int32_t xq)
+static void tensors_free(attn_tensors *ts)
 {
-    int32_t y, n, f, p;
-    if (xq < -16 * 65536) return 0;
-    if (xq > 0) xq = 0;
-    y = (xq * 94548) >> 16;
-    n = y >> 16;
-    f = (y - (n << 16)) >> 2;
-    p = 3637;
-    p = ((f * p) >> 14) + 15742;
-    p = ((f * p) >> 14) + 45426;
-    p = ((f * p) >> 14) + 65536;
-    n = -n;
-    if (n >= 15) return 0;
-    return (int32_t)((p >> n) >> 8);
-}
-static const int16_t exptab[33] = {
-    255, 155, 94, 57, 35, 21, 13, 8, 5, 3, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-};
-static int exp_tab(int32_t xq)
-{
-    int32_t y, n, f, r;
-    if (xq >= 0) return 255;
-    if (xq < -16 * 65536) return 0;
-    y = ((xq >> 16) * 94548) + ((((uint32_t)xq >> 8) & 0xFFu) * (uint32_t)94548 >> 8);
-    n = y >> 16;
-    f = (y >> 8) & 0xff;
-    r = (int32_t)(256.0 * pow(2.0, f / 256.0) + 0.5);
-    n = -n;
-    if (n >= 9) return 0;
-    r >>= n;
-    return r > 255 ? 255 : r;
+    free(ts->q);
+    free(ts->qr);
+    free(ts->k);
+    free(ts->kr);
+    free(ts->v);
+    free(ts->vr);
 }
 
-int main(int argc, char **argv)
+static void commit_pages(lfm_kv_format fmt, const attn_cfg *c, const attn_tensors *ts,
+                         uint8_t *arena, const uint32_t *tbl)
 {
-    int pages = (argc > 1) ? atoi(argv[1]) : 64;      /* 64 pages = 2048 tokens */
-    int win = (argc > 2) ? atoi(argv[2]) : 0;          /* 0 = full */
-    int threads = (argc > 3) ? atoi(argv[3]) : 2;
-    int slots = pages * PAGE;
-    int pos = slots - 1, seq = slots;
-    int hk = -1, hkt = -1, hv = -1, rc, i, qh, t, k, r;
-    int times[12], info[8];
-    size_t kbytes = (size_t)KVH * slots * 128;         /* int4 packed + 64B pad */
-    size_t ktbytes = (size_t)KVH * slots * 4;          /* Q16 per-token scales */
-    size_t vbytes = (size_t)KVH * slots * D;           /* int8 */
-    uint8_t *K, *V, *Kup, *Vup;
+    size_t pb = page_bytes_of(fmt, c->kv_heads);
+    uint32_t npages = (c->start + c->ntok) / LFM_KVARN_PAGE_TOKENS;
+    float khead[LFM_KVARN_PAGE_TOKENS * D];
+    float vhead[LFM_KVARN_PAGE_TOKENS * D];
+    uint32_t lp;
+    int kh;
+    int j;
 
-    int tm = getenv("ATTN_HG") ? 0 : 1;
-    int32_t *KT;
-    int8_t *q8;
-    int *tbl;
-    int32_t *out32;
-    uint32_t st = 0x1234567u;
-    int tok0, n;
-
-    setvbuf(stdout, NULL, _IONBF, 0);
-    printf("attn test: pages=%d slots=%d pos=%d window=%s threads=%d\n",
-           pages, slots, pos, win ? "sliding" : "full", threads);
-
-    /* ---------- exp accuracy (host, offline) ---------- */
-    {
-        double eb = 0, ep = 0;
-        double worstb = 0, worstp = 0;
-        for (i = 0; i <= 100000; i++) {
-            double x = -16.0 + 16.0 * i / 100000.0;
-            int32_t xq = (int32_t)llround(x * 65536.0);
-            double ref = exp(x);
-            double vb = exp_bit(xq) / 255.0;
-            double vp = exp_tab(xq) / 255.0;
-            double reb = fabs(vb - ref) / (ref + 1e-12);
-            double rep = fabs(vp - ref) / (ref + 1e-12);
-            if (ref > 1e-4) {           /* only where it matters */
-                if (reb > eb) { eb = reb; worstb = x; }
-                if (rep > ep) { ep = rep; worstp = x; }
+    for (lp = 0; lp < npages; lp++) {
+        uint8_t *page = arena + (size_t)tbl[lp] * pb;
+        for (kh = 0; kh < c->kv_heads; kh++) {
+            for (j = 0; j < LFM_KVARN_PAGE_TOKENS; j++) {
+                size_t src = ((size_t)(lp * LFM_KVARN_PAGE_TOKENS + (uint32_t)j) *
+                                  (size_t)c->kv_heads +
+                              (size_t)kh) *
+                             D;
+                memcpy(khead + (size_t)j * D, ts->kr + src, sizeof(float) * D);
+                memcpy(vhead + (size_t)j * D, ts->vr + src, sizeof(float) * D);
             }
-        }
-        printf("exp bit-trick : max rel err %.3e at x=%.3f\n", eb, worstb);
-        printf("exp table     : max rel err %.3e at x=%.3f\n", ep, worstp);
-    }
-
-    /* ---------- data ---------- */
-    K  = malloc(kbytes);       /* row-major (reference) */
-    Kup = malloc(kbytes);      /* layout for the selected kernel */
-    KT = malloc(ktbytes);
-    V  = malloc(vbytes);
-    Vup = malloc(vbytes);
-    q8 = malloc(HQ * D);
-    tbl = malloc(pages * sizeof(int));
-    out32 = malloc(HQ * D * sizeof(int32_t));
-
-    for (i = 0; i < pages; i++) tbl[i] = i;            /* page id == page index */
-    /* K: int4 offset-8 nibbles, random; V: int8 in [-2..1] */
-    for (k = 0; k < KVH; k++) {
-        for (t = 0; t < slots; t++) {
-            uint8_t *row = K + ((size_t)k * slots + t) * 128;
-            for (i = 64; i < 128; i++) row[i] = 0;
-            for (i = 0; i < 64; i++) {
-                int lo = (int)(lcg(&st) % 16);
-                int hi = (int)(lcg(&st) % 16);
-                row[i] = (uint8_t)(lo | (hi << 4));
-            }
-            KT[k * slots + t] = (int32_t)(65536.0 * (0.0009 + 0.0000005 * (t % 17)));
-            {
-                int8_t *vr = (int8_t *)(V + ((size_t)k * slots + t) * D);
-                for (i = 0; i < D; i++) vr[i] = (int8_t)((int)(lcg(&st) % 4) - 2);
-            }
+            lfm_hvx_kvcache_commit(fmt, page, khead, vhead, kh, D);
         }
     }
-    for (i = 0; i < HQ * D; i++) q8[i] = (int8_t)((int)(lcg(&st) % 255) - 127);
+}
 
-    /* token-major layout: [kv][page][dim-group g<16][128B], byte 4t+j holds
-       dims 8g+2j and 8g+2j+1 of token t (offset-8 nibbles) */
-    memset(Kup, 0, kbytes);
-    for (k = 0; k < KVH; k++)
-        for (i = 0; i < pages; i++)
-            for (t = 0; t < 32; t++) {
-                const uint8_t *rrow = K + ((size_t)k * slots + i * 32 + t) * 128;
-                int g, j;
-                for (g = 0; g < 16; g++)
-                    for (j = 0; j < 4; j++) {
-                        int d0 = 8 * g + 2 * j, d1 = d0 + 1;
-                        uint8_t lo = (d0 & 1) ? (uint8_t)(rrow[d0 >> 1] >> 4) : (uint8_t)(rrow[d0 >> 1] & 0xf);
-                        uint8_t hi = (uint8_t)(rrow[d1 >> 1] >> 4);
-                        Kup[((size_t)k * pages + i) * 16 * 128 + (size_t)g * 128 + 4 * t + j] =
-                            (uint8_t)((lo & 0xf) | ((hi & 0xf) << 4));
+static void decode_pages(lfm_kv_format fmt, const attn_cfg *c, const uint8_t *arena,
+                         const uint32_t *tbl, float *kd, float *vd)
+{
+    size_t pb = page_bytes_of(fmt, c->kv_heads);
+    size_t hb = head_bytes_of(fmt);
+    uint32_t npages = (c->start + c->ntok) / LFM_KVARN_PAGE_TOKENS;
+    uint32_t lp;
+    int kh;
+    int j;
+    int d;
+
+    for (lp = 0; lp < npages; lp++) {
+        const uint8_t *base = arena + (size_t)tbl[lp] * pb;
+        for (kh = 0; kh < c->kv_heads; kh++) {
+            const uint8_t *page = base + (size_t)kh * hb;
+            for (j = 0; j < LFM_KVARN_PAGE_TOKENS; j++) {
+                uint32_t pos = lp * LFM_KVARN_PAGE_TOKENS + (uint32_t)j;
+                size_t off = ((size_t)pos * (size_t)c->kv_heads + (size_t)kh) * D;
+                if (fmt == LFM_KV_F16) {
+                    for (d = 0; d < D; d++) {
+                        kd[off + (size_t)d] = lfm_f16_to_f32(
+                            lfm_f16_load(page + (size_t)j * D * 2u + (size_t)d * 2u));
+                        vd[off + (size_t)d] = lfm_f16_to_f32(lfm_f16_load(
+                            page + (size_t)LFM_KVARN_PAGE_TOKENS * D * 2u +
+                            (size_t)j * D * 2u + (size_t)d * 2u));
                     }
-            }
-
-    /* token-major V: per 32-token page, vector (g,c) = 32 dims x 4 tokens,
-       byte 4*d'+j = V[32g+d'][32c+j] */
-    for (k = 0; k < KVH; k++)
-        for (i = 0; i < pages; i++)
-            for (t = 0; t < 32; t++) {
-                const int8_t *vrow = (const int8_t *)(V + ((size_t)k * slots + i * 32 + t) * D);
-                int g2, j2, d2;
-                for (d2 = 0; d2 < D; d2++) {
-                    g2 = d2 >> 5;
-                    j2 = t & 3;
-                    Vup[((size_t)k * pages + i) * 4096 + (size_t)g2 * 1024
-                        + (size_t)(t >> 2) * 128 + 4 * (d2 & 31) + j2] = (uint8_t)vrow[d2];
+                } else {
+                    lfm_kvarn_decode_k(page, j, kd + off);
+                    lfm_kvarn_decode_v(fmt, page, j, vd + off);
                 }
             }
-
-    /* verify the transposed V layout round-trips */
-    if (tm) {
-        int mism = 0, g;
-        uint8_t *chkv = malloc(vbytes);
-        memset(chkv, 0, vbytes);
-        for (k = 0; k < KVH; k++)
-            for (i = 0; i < pages; i++)
-                for (t = 0; t < 32; t++)
-                    for (g = 0; g < D; g++) {
-                        int8_t val = (int8_t)Vup[((size_t)k * pages + i) * 4096
-                                     + (size_t)(g >> 5) * 1024 + (size_t)(t >> 2) * 128
-                                     + 4 * (g & 31) + (t & 3)];
-                        chkv[((size_t)k * slots + i * 32 + t) * D + g] = (uint8_t)val;
-                    }
-        for (i = 0; i < (int)vbytes; i++) if (chkv[i] != V[i]) mism++;
-        printf("V transpose round-trip: %d mismatching bytes of %d\n", mism, (int)vbytes);
-        free(chkv);
-    }
-
-    /* verify the transposed layout round-trips */
-    {
-        int mism = 0;
-        int g, j;
-        uint8_t *chk = calloc(kbytes, 1);
-        for (k = 0; k < KVH; k++)
-            for (i = 0; i < pages; i++)
-                for (t = 0; t < 32; t++)
-                    for (g = 0; g < 16; g++)
-                        for (j = 0; j < 4; j++) {
-                            int d0 = 8 * g + 2 * j, d1 = d0 + 1;
-                            uint8_t b = Kup[((size_t)k * pages + i) * 16 * 128 + (size_t)g * 128 + 4 * t + j];
-                            uint8_t *dst = chk + ((size_t)k * slots + i * 32 + t) * 128;
-                            dst[d0 >> 1] = (uint8_t)((dst[d0 >> 1] & (d0 & 1 ? 0x0f : 0xf0)) |
-                                                     ((d0 & 1) ? (uint8_t)((b & 0xf) << 4) : (uint8_t)(b & 0xf)));
-                            dst[d1 >> 1] = (uint8_t)((dst[d1 >> 1] & 0x0f) | (uint8_t)((b >> 4) << 4));
-                        }
-        for (i = 0; i < (int)kbytes; i++) if (chk[i] != K[i]) mism++;
-        printf("transpose round-trip: %d mismatching bytes of %d\n", mism, (int)kbytes);
-        free(chk);
-    }
-
-    if (enable_unsigned() != 0) { printf("unsigned PD failed\n"); return 10; }
-    if ((rc = lfmgemv_alloc_buf((int)kbytes, &hk)) != 0) { printf("alloc K rc=%d\n", rc); return 11; }
-    if ((rc = lfmgemv_alloc_buf((int)ktbytes, &hkt)) != 0) { printf("alloc KT rc=%d\n", rc); return 11; }
-    if ((rc = lfmgemv_alloc_buf((int)vbytes, &hv)) != 0) { printf("alloc V rc=%d\n", rc); return 11; }
-    {
-        size_t off = 0, chunk = 256 * 1024;
-        while (off < kbytes) {
-            size_t m = kbytes - off < chunk ? kbytes - off : chunk;
-            if ((rc = lfmgemv_load_buf(hk, (int)off, (tm ? Kup : K) + off, (int)m)) != 0) { printf("load K rc=%d\n", rc); return 12; }
-            off += m;
         }
-        off = 0;
-        while (off < vbytes) {
-            size_t m = vbytes - off < chunk ? vbytes - off : chunk;
-            if ((rc = lfmgemv_load_buf(hv, (int)off, (tm ? Vup : V) + off, (int)m)) != 0) { printf("load V rc=%d\n", rc); return 12; }
-            off += m;
-        }
-        if ((rc = lfmgemv_load_buf(hkt, 0, (uint8_t *)KT, (int)ktbytes)) != 0) { printf("load KT rc=%d\n", rc); return 12; }
     }
-    /* correctness runs with the requested thread count: on 2 contexts the
-       four kv heads are split main/worker, and each head is independent */
-    lfmgemv_probe(-1, 8, 8 | (2 << 8) | (1 << 16) | (threads << 24), times, 8);
-    lfmgemv_probe(-1, 27, tm, times, 8);
-    printf("kernel: %s, K layout: %s\n", tm ? "token-major" : "head-grouped",
-           tm ? "transposed" : "row-major");
+}
 
-    tok0 = (win > 0 && seq - win > 0) ? seq - win : 0;
-    n = seq - tok0;
+static double cos_head(const float *a, const float *b)
+{
+    double dot = 0.0;
+    double na = 0.0;
+    double nb = 0.0;
+    int i;
 
-    /* ---------- CPU reference (f32) ---------- */
-    {
-        float *out_ref = malloc(HQ * D * sizeof(float));
-        int tc;
-        for (qh = 0; qh < HQ; qh++) {
-            int kh = qh >> 2;
-            float *sc = malloc((size_t)n * sizeof(float));
-            float mx = -1e30f, lsum = 0;
-            double *accf = calloc(D, sizeof(double));
-            for (tc = 0; tc < n; tc++) {
-                int tok = tok0 + tc;
-                int slot = (tbl[tok >> 5] << 5) | (tok & 31);
-                const uint8_t *krow = K + ((size_t)kh * slots + slot) * 128;
-                int32_t dot = 0;
-                for (k = 0; k < 64; k++) {
-                    int lo = (int)(krow[k] & 0xf) - 8;
-                    int hi = (int)(krow[k] >> 4) - 8;
-                    dot += (int32_t)q8[qh * D + 2 * k] * lo;
-                    dot += (int32_t)q8[qh * D + 2 * k + 1] * hi;
+    for (i = 0; i < D; i++) {
+        dot += (double)a[i] * (double)b[i];
+        na += (double)a[i] * (double)a[i];
+        nb += (double)b[i] * (double)b[i];
+    }
+    if (na == 0.0 || nb == 0.0)
+        return 0.0;
+    return dot / sqrt(na * nb);
+}
+
+static void ref_attention(const attn_cfg *c, const float *q, const float *k, const float *v,
+                          float *out)
+{
+    int group = c->n_heads / c->kv_heads;
+    uint32_t t;
+    int h;
+    int d;
+
+    for (t = 0; t < c->ntok; t++) {
+        uint32_t pos = c->start + t;
+        uint32_t w0 = lfm_window_start(pos, c->window);
+        for (h = 0; h < c->n_heads; h++) {
+            int kh = h / group;
+            const float *qrow = q + ((size_t)t * (size_t)c->n_heads + (size_t)h) * D;
+            float *orow = out + ((size_t)t * (size_t)c->n_heads + (size_t)h) * D;
+            float mx = -FLT_MAX;
+            float sum = 0.0f;
+            uint32_t j;
+
+            for (j = w0; j <= pos; j++) {
+                const float *krow = k + ((size_t)j * (size_t)c->kv_heads + (size_t)kh) * D;
+                float s = 0.0f;
+                for (d = 0; d < D; d++)
+                    s += qrow[d] * krow[d];
+                s *= 1.0f / sqrtf((float)D);
+                if (s > mx)
+                    mx = s;
+            }
+            memset(orow, 0, sizeof(float) * D);
+            for (j = w0; j <= pos; j++) {
+                const float *krow = k + ((size_t)j * (size_t)c->kv_heads + (size_t)kh) * D;
+                const float *vrow = v + ((size_t)j * (size_t)c->kv_heads + (size_t)kh) * D;
+                float s = 0.0f;
+                float p;
+                for (d = 0; d < D; d++)
+                    s += qrow[d] * krow[d];
+                s *= 1.0f / sqrtf((float)D);
+                p = expf(s - mx);
+                sum += p;
+                for (d = 0; d < D; d++)
+                    orow[d] += p * vrow[d];
+            }
+            if (sum > 0.0f) {
+                float inv = 1.0f / sum;
+                for (d = 0; d < D; d++)
+                    orow[d] *= inv;
+            }
+        }
+    }
+}
+
+static void run_case(const char *tag, lfm_kv_format fmt, int n_heads, int kv_heads, uint32_t ntok,
+                     uint32_t start, uint32_t window, uint8_t *arena, uint32_t arena_pages,
+                     const uint32_t *tbl, uint32_t seed, double gate, double qual_gate,
+                     int trunc_check)
+{
+    attn_cfg c;
+    attn_tensors ts;
+    uint32_t total = start + ntok;
+    uint32_t npages = total / LFM_KVARN_PAGE_TOKENS;
+    size_t on;
+    size_t kn;
+    float *scratch;
+    float *out;
+    float *ref;
+    float *refq;
+    float *kd;
+    float *vd;
+    clock_t c0;
+    clock_t c1;
+    double mn = 1.0;
+    double sum = 0.0;
+    double qmn = 1.0;
+    uint32_t t;
+    int h;
+    uint32_t lp;
+
+    c.n_heads = n_heads;
+    c.kv_heads = kv_heads;
+    c.ntok = ntok;
+    c.start = start;
+    c.window = window;
+
+    CHECK(total % LFM_KVARN_PAGE_TOKENS == 0, "%s: total %u not page aligned", tag, total);
+    for (lp = 0; lp < npages; lp++)
+        CHECK(tbl[lp] < arena_pages, "%s: table entry %u out of arena %u", tag, tbl[lp],
+              arena_pages);
+
+    tensors_init(&ts, &c, seed);
+    commit_pages(fmt, &c, &ts, arena, tbl);
+
+    on = (size_t)ntok * (size_t)n_heads * D;
+    kn = (size_t)total * (size_t)kv_heads * D;
+    kd = xalloc(kn * sizeof(float));
+    vd = xalloc(kn * sizeof(float));
+    decode_pages(fmt, &c, arena, tbl, kd, vd);
+
+    scratch = xalloc((size_t)SCRATCH_FLOATS * sizeof(float));
+    out = xalloc(on * sizeof(float));
+
+    c0 = clock();
+    lfm_hvx_attn_flash(fmt, tbl, arena, kv_heads, n_heads, D, ts.qr, ntok, start, window, out,
+                       scratch);
+    c1 = clock();
+
+    ref = xalloc(on * sizeof(float));
+    ref_attention(&c, ts.qr, kd, vd, ref);
+    for (t = 0; t < ntok; t++) {
+        for (h = 0; h < n_heads; h++) {
+            size_t off = ((size_t)t * (size_t)n_heads + (size_t)h) * D;
+            double cc = cos_head(out + off, ref + off);
+            if (cc < mn)
+                mn = cc;
+            sum += cc;
+        }
+    }
+
+    refq = xalloc(on * sizeof(float));
+    ref_attention(&c, ts.qr, ts.kr, ts.vr, refq);
+    for (t = 0; t < ntok; t++) {
+        for (h = 0; h < n_heads; h++) {
+            size_t off = ((size_t)t * (size_t)n_heads + (size_t)h) * D;
+            double cc = cos_head(out + off, refq + off);
+            if (cc < qmn)
+                qmn = cc;
+        }
+    }
+
+    printf("[%s] fmt=%s heads=%d/%d ntok=%u start=%u window=%u cos_min=%.7f cos_mean=%.7f "
+           "qual_min=%.6f time=%.2f ms\n",
+           tag, fmt_name(fmt), n_heads, kv_heads, ntok, start, window, mn,
+           sum / ((double)ntok * (double)n_heads), qmn,
+           1000.0 * (double)(c1 - c0) / (double)CLOCKS_PER_SEC);
+
+    CHECK(mn >= gate, "%s: cos_min %.7f < %.4f", tag, mn, gate);
+    CHECK(qmn >= qual_gate, "%s: qual_min %.6f < %.4f", tag, qmn, qual_gate);
+
+    if (trunc_check) {
+        attn_cfg cf = c;
+        float *reffull = xalloc(on * sizeof(float));
+        float maxdiff = 0.0f;
+        cf.window = 0;
+        ref_attention(&cf, ts.qr, kd, vd, reffull);
+        for (t = 0; t < ntok; t++) {
+            for (h = 0; h < n_heads; h++) {
+                size_t off = ((size_t)t * (size_t)n_heads + (size_t)h) * D;
+                int d;
+                for (d = 0; d < D; d++) {
+                    float diff = fabsf(out[off + (size_t)d] - reffull[off + (size_t)d]);
+                    if (diff > maxdiff)
+                        maxdiff = diff;
                 }
-                sc[tc] = (float)dot * (float)KT[kh * slots + slot] / 65536.0f;
-                if (sc[tc] > mx) mx = sc[tc];
-            }
-            for (tc = 0; tc < n; tc++) {
-                int tok = tok0 + tc;
-                int slot = (tbl[tok >> 5] << 5) | (tok & 31);
-                const int8_t *vr = (const int8_t *)(V + ((size_t)kh * slots + slot) * D);
-                float p = expf(sc[tc] - mx);
-                lsum += p;
-                for (i = 0; i < D; i++) accf[i] += (double)p * (double)vr[i];
-            }
-            for (i = 0; i < D; i++) out_ref[qh * D + i] = (float)(accf[i] / (lsum > 0 ? lsum : 1));
-            free(sc); free(accf);
-        }
-        /* run on DSP and compare */
-        rc = lfmgemv_attn(hk, hkt, hv, 0, (const unsigned char *)q8, HQ * D,
-                          tbl, pages, pos, seq, win, 1, (unsigned char *)out32, HQ * D * 4, times, 12);
-        if (rc != 0) { dump_trace("correctness"); printf("attn rc=%d\n", rc); return 13; }
-        {
-            int dbg[8], z, hd2;
-            {
-                int hh2;
-                for (hh2 = 0; hh2 < 2; hh2++) {
-                    int d30[8], y;
-                    int hd3 = hh2 * 4;    /* head 0 and head 4 */
-                    if (lfmgemv_probe(hk, 30, hd3, d30, 8) != 0) continue;
-                    printf("uq head%d dsp:", hd3);
-                    for (y = 0; y < 8; y++) printf(" %08x", d30[y]);
-                    printf("\n");
-                    {
-                        uint32_t exp8[8];
-                        int gg, j2;
-                        for (gg = 0; gg < 4; gg++) {
-                            uint32_t lo2 = 0, hi2 = 0;
-                            for (j2 = 0; j2 < 4; j2++) {
-                                lo2 |= (uint32_t)(uint8_t)q8[hd3 * D + 8 * gg + 2 * j2] << (8 * j2);
-                                hi2 |= (uint32_t)(uint8_t)q8[hd3 * D + 8 * gg + 2 * j2 + 1] << (8 * j2);
-                            }
-                            exp8[2 * gg] = lo2; exp8[2 * gg + 1] = hi2;
-                        }
-                        printf("uq head%d cpu:", hd3);
-                        for (y = 0; y < 8; y++) printf(" %08x", exp8[y]);
-                        printf("\n");
-                    }
-                }
-            }
-            for (hd2 = 0; hd2 < 4; hd2++) {
-                printf("dbg head%d dsp [0..7]: ", hd2);
-                if (lfmgemv_probe(hk, 29, hd2 * 4096 + 0, dbg, 8) != 0) { printf("probe fail\n"); continue; }
-                for (z = 0; z < 8; z++) printf("%6d ", dbg[z]);
-                printf("\n");
-                printf("dbg head%d cpu [0..7]: ", hd2);
-                for (z = 0; z < 8; z++) {
-                    int tok = tok0 + z;
-                    int slot = (tbl[tok >> 5] << 5) | (tok & 31);
-                    const uint8_t *krow = K + ((size_t)(hd2 >> 2) * slots + slot) * 128;
-                    int32_t dt = 0;
-                    for (k = 0; k < 64; k++) {
-                        int lo2 = (int)(krow[k] & 0xf) - 8;
-                        int hi2 = (int)(krow[k] >> 4) - 8;
-                        dt += (int32_t)q8[hd2 * D + 2 * k] * lo2;
-                        dt += (int32_t)q8[hd2 * D + 2 * k + 1] * hi2;
-                    }
-                    printf("%6d ", (int)((float)dt * (float)KT[(hd2 >> 2) * slots + slot] / 65536.0f * 256.0f));
-                }
-                printf("\n");
             }
         }
-
-        {
-            double dot = 0, na = 0, nb = 0, mx = 0;
-            for (qh = 0; qh < HQ; qh++) {
-                for (i = 0; i < D; i++) {
-                    double a = out32[qh * D + i] / 4096.0;
-                    double b = out_ref[qh * D + i];
-                    dot += a * b; na += a * a; nb += b * b;
-                    if (fabs(a - b) > mx) mx = fabs(a - b);
-                }
-            }
-            printf("correctness: cos=%.6f  max_abs_err=%.4f  (tokens=%d)\n",
-                   dot / sqrt(na * nb + 1e-30), mx, n);
-            {
-                double c = dot / sqrt(na * nb + 1e-30);
-                double need = (n <= 256) ? 0.999 : (n <= 512 ? 0.999 : 0.998);
-                printf("VERDICT: cos %.6f vs threshold %.3f -> %s\n",
-                       c, need, (c >= need) ? "PASS" : "FAIL");
-            }
-            {
-                int hh;
-                printf("per-head cos:");
-                for (hh = 0; hh < HQ; hh++) {
-                    double d2 = 0, a2 = 0, b2 = 0;
-                    for (i = 0; i < D; i++) {
-                        double a = out32[hh * D + i] / 4096.0, b = out_ref[hh * D + i];
-                        d2 += a * b; a2 += a * a; b2 += b * b;
-                    }
-                    printf(" %d:%.3f", hh, d2 / sqrt(a2 * b2 + 1e-30));
-                }
-                printf("\n");
-            }
-        }
-        free(out_ref);
+        printf("[%s] window truncation vs full context: maxdiff=%.6f\n", tag, (double)maxdiff);
+        CHECK(maxdiff > 1e-2f, "%s: window did not truncate (maxdiff %.6f)", tag,
+              (double)maxdiff);
+        free(reffull);
     }
 
-    /* ---------- timing ---------- */
-    lfmgemv_probe(-1, 8, 8 | (2 << 8) | (1 << 16) | (threads << 24), times, 8);
-    {
-        int reps = 3;
-        double wmin = 1e18, kmin = 1e18;
-        for (r = 0; r < 8; r++) {
-            double t0 = now_us();
-            rc = lfmgemv_attn(hk, hkt, hv, 0, (const unsigned char *)q8, HQ * D,
-                              tbl, pages, pos, seq, win, reps, (unsigned char *)out32,
-                              HQ * D * 4, times, 12);
-            { double w = now_us() - t0; if (w < wmin) wmin = w; }
-            if (rc != 0) { dump_trace("timing"); printf("attn timing rc=%d\n", rc); break; }
-            if (times[0] < kmin) kmin = times[0];
-            usleep(20000);
+    free(scratch);
+    free(out);
+    free(ref);
+    free(refq);
+    free(kd);
+    free(vd);
+    tensors_free(&ts);
+}
+
+static void test_commit_layout(lfm_kv_format fmt)
+{
+    size_t hb = lfm_kvarn_head_bytes(fmt);
+    size_t voff = lfm_kvarn_vcode_off(fmt);
+    uint8_t *page = xalloc(hb * 3u);
+    uint8_t *want = xalloc(hb);
+    uint8_t *vpage = xalloc(hb);
+    float *k = xalloc((size_t)LFM_KVARN_PAGE_TOKENS * D * sizeof(float));
+    float *v = xalloc((size_t)LFM_KVARN_PAGE_TOKENS * D * sizeof(float));
+    uint16_t *f = xalloc((size_t)LFM_KVARN_PAGE_TOKENS * D * sizeof(uint16_t));
+    float *scr = xalloc((size_t)SCRATCH_FLOATS * sizeof(float));
+    rng_t r;
+    int i;
+    size_t z;
+    int zero = 1;
+
+    r.s = 99u;
+    for (i = 0; i < LFM_KVARN_PAGE_TOKENS * D; i++) {
+        k[i] = rng_f(&r);
+        v[i] = rng_f(&r);
+    }
+    printf("  commit-layout %s: start\n", fmt_name(fmt));
+    lfm_hvx_kvcache_commit(fmt, page, k, v, 1, D);
+    printf("  commit-layout %s: committed\n", fmt_name(fmt));
+
+    for (i = 0; i < LFM_KVARN_PAGE_TOKENS * D; i++)
+        f[i] = lfm_f32_to_f16(k[i]);
+    lfm_kvarn_commit_work(fmt, f, want, scr);
+    for (i = 0; i < LFM_KVARN_PAGE_TOKENS * D; i++)
+        f[i] = lfm_f32_to_f16(v[i]);
+    lfm_kvarn_commit_work(fmt, f, vpage, scr);
+    memcpy(want + voff, vpage + voff, hb - voff);
+
+    CHECK(memcmp(page + hb, want, hb) == 0, "%s: head 1 page does not match K|V merge",
+          fmt_name(fmt));
+    for (z = 0; z < hb; z++) {
+        if (page[hb + z] != want[z]) {
+            printf("  %s first diff at %zu (%s): %02x != %02x\n", fmt_name(fmt), z,
+                   z < voff ? "K" : "V", page[hb + z], want[z]);
+            break;
         }
-        printf("timing: kernel=%.0f us  wall=%.0f us | prep=%d heads=%d norm=%d us\n",
-               kmin, wmin, times[1], times[2], times[3]);
-        printf("        phase: QK^T=%d us  exp+PV=%d us  (tokens=%d)\n",
-               times[5], times[6], times[4]);
-        printf("        %.0f us / 1k tokens  team_fallbacks=%d\n",
-               1000.0 * kmin / n, times[8]);
-        if (getenv("ATTN_TRACE")) dump_trace("timing");
     }
-    lfmgemv_team_info(info, 8);
-    printf("team: created=%d hvx_units=%d\n", info[3], info[6]);
-    if (argc > 4 && strcmp(argv[4], "pwl") == 0) {
-        /* second run with the piecewise-linear exp */
-        lfmgemv_probe(-1, 26, 1, times, 8);
-        rc = lfmgemv_attn(hk, hkt, hv, 0, (const unsigned char *)q8, HQ * D,
-                          tbl, pages, pos, seq, win, 3, (unsigned char *)out32,
-                          HQ * D * 4, times, 12);
-        printf("pwl exp: kernel=%d us (tokens=%d)\n", times[0], times[4]);
+    for (z = 0; z < hb; z++) {
+        if (page[z] != 0 || page[2u * hb + z] != 0)
+            zero = 0;
     }
-    lfmgemv_release_buf(hk); lfmgemv_release_buf(hkt); lfmgemv_release_buf(hv);
-    printf("done\n");
+    CHECK(zero, "%s: commit touched neighbour heads", fmt_name(fmt));
+
+    free(page);
+    free(want);
+    free(vpage);
+    free(scr);
+}
+
+static void test_two_sequences(void)
+{
+    enum { NTOK = (int)LFM_ATTN_NTOK_TWO, PAGES = 4 };
+    static const uint32_t tbl_a[2] = {3u, 0u};
+    static const uint32_t tbl_b[2] = {2u, 1u};
+    int kv_heads = 4;
+    uint8_t *arena = xalloc(page_bytes_of(LFM_KVARN_K4V4, kv_heads) * PAGES);
+
+    run_case("seqA", LFM_KVARN_K4V4, 16, kv_heads, NTOK, 0u, 0u, arena, PAGES, tbl_a, 11u, 0.999,
+             0.95, 0);
+    run_case("seqB", LFM_KVARN_K4V4, 16, kv_heads, NTOK, 0u, 0u, arena, PAGES, tbl_b, 77u, 0.999,
+             0.95, 0);
+
+    free(arena);
+}
+
+static void test_f16(void)
+{
+    enum { NTOK = (int)LFM_ATTN_NTOK_F16, PAGES = 2 };
+    static const uint32_t tbl[2] = {1u, 0u};
+    int kv_heads = 4;
+    uint8_t *arena = xalloc(page_bytes_of(LFM_KV_F16, kv_heads) * PAGES);
+
+    run_case("f16", LFM_KV_F16, 16, kv_heads, NTOK, 0u, 0u, arena, PAGES, tbl, 5u, 0.9999, 0.999,
+             0);
+
+    free(arena);
+}
+
+int main(void)
+{
+    enum { NTOK = (int)LFM_ATTN_NTOK, PAGES = 3, KVH = 4, NH = 16 };
+    static const uint32_t tbl_a[3] = {2u, 0u, 1u};
+    static const uint32_t tbl_b[3] = {1u, 2u, 0u};
+    static const uint32_t tbl_w[3] = {2u, 0u, 1u};
+    static const uint32_t tbl_s[4] = {1u, 3u, 0u, 2u};
+    static const uint32_t tbl_d[3] = {1u, 2u, 0u};
+    static const uint32_t tbl_l[6] = {4u, 1u, 5u, 0u, 3u, 2u};
+#if defined(__HEXAGON__)
+    clock_t t0 = 0;
+#else
+    clock_t t0 = clock();
+#endif
+    uint8_t *arena;
+    size_t page_k4v4 = page_bytes_of(LFM_KVARN_K4V4, KVH);
+    size_t page_k4v2 = page_bytes_of(LFM_KVARN_K4V2, KVH);
+
+    printf("attn: host test, head_dim=%d scratch=%d floats\n", D, SCRATCH_FLOATS);
+
+    test_commit_layout(LFM_KVARN_K4V4);
+    test_commit_layout(LFM_KVARN_K4V2);
+
+#if defined(__HEXAGON__)
+    goto done;
+#endif
+
+    arena = xalloc(page_k4v4 * PAGES);
+    run_case("full-k4v4", LFM_KVARN_K4V4, NH, KVH, NTOK, 0u, 0u, arena, PAGES, tbl_a, 1234u,
+             0.999, 0.95, 0);
+    free(arena);
+
+    arena = xalloc(page_k4v2 * PAGES);
+    run_case("full-k4v2", LFM_KVARN_K4V2, NH, KVH, NTOK, 0u, 0u, arena, PAGES, tbl_b, 4321u,
+             0.995, 0.80, 0);
+    free(arena);
+
+    arena = xalloc(page_k4v4 * PAGES);
+    run_case("win64", LFM_KVARN_K4V4, NH, KVH, NTOK, 0u, 64u, arena, PAGES, tbl_w, 2468u, 0.999,
+             0.95, 1);
+    free(arena);
+
+    arena = xalloc(page_k4v4 * 4u);
+    run_case("start120-win32", LFM_KVARN_K4V4, NH, KVH, 8u, 120u, 32u, arena, 4u, tbl_s, 1357u,
+             0.999, 0.95, 0);
+    free(arena);
+
+    arena = xalloc(page_k4v2 * PAGES);
+    run_case("decode-k4v2", LFM_KVARN_K4V2, NH, KVH, 1u, 95u, 0u, arena, PAGES, tbl_d, 8642u,
+             0.995, 0.80, 0);
+    free(arena);
+
+    arena = xalloc(page_k4v4 * 6u);
+    run_case("long-win128", LFM_KVARN_K4V4, NH, KVH, LFM_ATTN_NTOK_LONG, 0u, 128u, arena, 6u, tbl_l, 9753u,
+             0.999, 0.95, 1);
+    free(arena);
+
+    test_two_sequences();
+    test_f16();
+
+done:
+    if (failures) {
+        printf("FAIL: %d check(s) failed\n", failures);
+        return 1;
+    }
+#if defined(__HEXAGON__)
+    printf("PASS: all checks passed\n");
+#else
+    printf("PASS: all checks passed in %.2f ms\n",
+           1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC);
+#endif
     return 0;
 }

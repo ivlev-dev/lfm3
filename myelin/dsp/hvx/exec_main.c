@@ -1,1271 +1,825 @@
-/*
- * Host stand for the one-RPC token pipeline (`exec`).
- *
- * The token graph is published once as a versioned command list in ION and a
- * single FastRPC call walks it on the DSP: 24 FFN + 11 attention + 13
- * shortconv layers, intermediate activations in one DSP-heap scratch.
- *
- * Checks (default run):
- *   1. bit-exactness, one op per RPC vs the same op inside `exec`:
- *        FFN layer   : lfmgemv_ffn(...)        vs exec(FFN)
- *        attention   : lfmgemv_attn(...)       vs exec(ATTN)
- *        shortconv   : host ring model          vs exec(CONV)
- *        conv counter: a3                       vs rt[rt_base]
- *        kv page     : 12 load_buf              vs kv_write
- *        quantise    : host int64 formula      vs exec(QUANT)
- *   2. weight handles: 24 layers x 3 tensors = 72 simultaneously mapped views
- *      of ONE arena, each verified against the host int4 dot (raw int32 GEMV).
- *   3. full graph: 85 commands (24 FFN + 11 ATTN + 11 QUANT + 13 x
- *      (in_proj GEMV + CONV + out_proj GEMV)), real LFM3 shapes, weights in
- *      ION.  Run (a) as one exec per token and (b) one exec per command
- *      (85 round trips).  Both must produce the same final int8 (0 mismatch).
- *      Prints DSP microseconds, wall and calls per token for both.
- *   4. reset_state(0) followed by one more token must reproduce the first
- *      token of the run bit for bit (no CONV ring leaking across sequences).
- *
- * Run on device: ./exec_test [tokens]        (default 5 tokens, full graph)
- *                ./exec_test 5 small        (one shared FFN layer, ~130 MB)
- *
- * Exit code: 0 pass, 2 bit-exactness failure, 10.. RPC failure.
- * Build: see build.sh.
- */
-#include "lfmgemv.h"
-#include "ffn_ref.h"
-#include "../conv/conv_math.h"
-
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <time.h>
-#include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <linux/dma-buf.h>
-#include "rpcmem.h"
 
-#define HID       2048
-#define FFN_W     7680
-#define NL        24
-#define N_ATTN    11
-#define N_CONV    13
+#include "../common/fp16.h"
+#include "../common/kvarn.h"
+#include "../common/page.h"
+#include "../common/q4.h"
+#include "../common/quant.h"
+#include "../common/rot.h"
 
-#define HQ        16
-#define HKV       4
-#define HD        128
-#define CTX       2048            /* attention context for the timing graph */
-#define PAGES     (CTX / 32)
+#include "exec.h"
+#include "hvx_ops.h"
 
-#define CONV_TAPS 7
-#define CONV_RING 8
+static int failures;
 
-/* ---- exec ABI mirror (must match lfmgemv_impl.c) ---- */
-#define LFM_EXEC_MAGIC 0x454D464Cu
-#define LFM_EXEC_VERSION 1u
-#define LFM_CMD_MAX 256
-enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
-       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_KVZERO = 22 };
-enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
-enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
+#define CHECK(cond, ...)                                                                           \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            failures++;                                                                            \
+            printf("FAIL %s:%d: ", __FILE__, __LINE__);                                            \
+            printf(__VA_ARGS__);                                                                   \
+            printf("\n");                                                                          \
+        }                                                                                          \
+    } while (0)
 
-typedef struct {
-    uint32_t magic, version, n_cmds, cmd_size, list_bytes, scratch_bytes;
-    uint32_t flags, hdr_size;
-    uint64_t reserved[4];
-} exec_hdr_t;
+static unsigned g_seed = 12345u;
 
-typedef struct {
-    uint32_t type, src, dst, pad;
-    int32_t h0, h1, h2, h3, dst_h;
-    int32_t src_off, src_len, dst_off, dst_len;
-    int32_t tbl_h, tbl_len, tbl_off;
-    int32_t a0, a1, a2, a3, rt_base;
-    int32_t reserved[3];
-} exec_cmd_t;
-
-typedef char exec_hdr_size_check[(sizeof(exec_hdr_t) == 64) ? 1 : -1];
-typedef char exec_cmd_size_check[(sizeof(exec_cmd_t) == 96) ? 1 : -1];
-
-/* ---- scratch layout (byte offsets, 128 B aligned) ---- */
-#define S_ACT     0
-#define S_Q       4096
-#define S_ATTN32  8192                    /* 16*128*4 */
-#define S_Y8      16384                   /* HID */
-#define S_BCX     20480                   /* 3*HID */
-#define S_CY      32768                   /* HID */
-#define S_STATE   34816                   /* 14 * 2*HID*8 */
-#define SCRATCH   (S_STATE + 16 * 2 * HID * 8 + 4096)
-
-/* ---- command buffer layout (one small ION mapping) ---- */
-#define OFF_FFN    256
-#define OFF_ATTN   1024
-#define OFF_CONV   2048
-#define OFF_QUANT  3072
-#define OFF_ALL    4096
-#define OFF_SINGLE 16384
-#define SINGLE_STRIDE 160
-#define CMD_BYTES  (65536)
-
-static double now_us(void)
+static float rnd(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+    g_seed = g_seed * 1664525u + 1013904223u;
+    return (float)(g_seed >> 8) / 16777216.0f - 0.5f;
 }
 
-static int enable_unsigned(void)
+static float rndn(void)
 {
-    struct remote_rpc_control_unsigned_module um;
-    um.domain = CDSP_DOMAIN_ID;
-    um.enable = 1;
-    return remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &um,
-                                  (uint32_t)sizeof(um));
+    return (rnd() + rnd() + rnd()) * 1.2f;
 }
 
-/* ---------------- host ION buffer ---------------- */
-
-typedef struct {
-    void *p;
-    int   fd;
-    int   bytes;
-} ionbuf_t;
-
-static int ion_alloc(ionbuf_t *b, size_t bytes)
+static float dot_f32(const float *a, const float *b, int n)
 {
-    size_t n = (bytes + 4095) & ~(size_t)4095;
-    b->p = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, n);
-    if (!b->p) { b->fd = -1; b->bytes = 0; return -1; }
-    b->fd = rpcmem_to_fd(b->p);
-    b->bytes = (int)n;
-    return 0;
+    float s = 0.0f;
+    int i;
+    for (i = 0; i < n; i++)
+        s += a[i] * b[i];
+    return s;
 }
 
-static void ion_free(ionbuf_t *b)
+static float cos_f32(const float *a, const float *b, int n)
 {
-    if (b->p) rpcmem_free(b->p);
-    b->p = 0; b->fd = -1; b->bytes = 0;
-}
-
-/* ---------------- arena builder ---------------- */
-
-typedef struct {
-    uint8_t *base;
-    size_t   bytes;
-    size_t   off;
-} arena_build_t;
-
-static size_t ab_take(arena_build_t *a, size_t bytes)
-{
-    size_t at = (a->off + 127) & ~(size_t)127;
-    if (at + bytes > a->bytes) { printf("arena overflow\n"); exit(1); }
-    a->off = at + bytes;
-    return at;
-}
-
-static void ab_put(arena_build_t *a, size_t off, const void *src, size_t bytes)
-{
-    memcpy(a->base + off, src, bytes);
-}
-
-static void fill_i4(uint8_t *dst, size_t bytes, uint32_t seed)
-{
-    size_t i;
-    for (i = 0; i < bytes; i++) {
-        seed = seed * 1103515245u + 12345u;
-        dst[i] = (uint8_t)(seed >> 24);
-    }
-}
-
-static void fill_i8(int8_t *dst, size_t n, uint32_t seed)
-{
-    size_t i;
+    float d = 0.0f;
+    float na = 0.0f;
+    float nb = 0.0f;
+    int i;
     for (i = 0; i < n; i++) {
-        seed = seed * 1103515245u + 12345u;
-        dst[i] = (int8_t)((seed >> 24) % 255 - 127);
+        d += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if (na == 0.0f || nb == 0.0f)
+        return 0.0f;
+    {
+        float c = d / sqrtf(na * nb);
+        return c > 1.0f ? 1.0f : c;
     }
 }
 
-static int dma_sync(int fd, uint64_t flags)
+static uint8_t *make_image(const float *w, int n, int k)
 {
-    struct dma_buf_sync arg;
-    arg.flags = flags;
-    return ioctl(fd, DMA_BUF_IOCTL_SYNC, &arg);
+    uint8_t *img = (uint8_t *)malloc(lfm_q4_image_bytes(n, k));
+    if (img == NULL)
+        return NULL;
+    memset(img, 0, lfm_q4_image_bytes(n, k));
+    lfm_q4_pack_matrix(w, n, k, img, 128);
+    return img;
 }
 
-/* ---------------- weight setup helper ---------------- */
-
-static int set_scale_of(int h, int N, int K, float sa, float so, const float *sw)
+static void test_ffn(int N, int K)
 {
-    unsigned char *sbuf = (unsigned char *)malloc(16 + (size_t)N * sizeof(float));
-    int rc;
-    if (!sbuf) return AEE_ENOMEMORY;
-    memcpy(sbuf + 0, &N, 4);
-    memcpy(sbuf + 4, &K, 4);
-    memcpy(sbuf + 8, &sa, 4);
-    memcpy(sbuf + 12, &so, 4);
-    memcpy(sbuf + 16, sw, (size_t)N * sizeof(float));
-    rc = lfmgemv_set_scale(h, sbuf, 16 + N * (int)sizeof(float));
-    free(sbuf);
-    return rc;
-}
+    size_t kn = (size_t)K;
+    size_t nn = (size_t)N;
+    float *wg = (float *)malloc(nn * kn * sizeof(float));
+    float *wu = (float *)malloc(nn * kn * sizeof(float));
+    float *wd = (float *)malloc(nn * kn * sizeof(float));
+    float *x = (float *)malloc(kn * sizeof(float));
+    float *xhat = (float *)malloc(kn * sizeof(float));
+    float *row = (float *)malloc(kn * sizeof(float));
+    float *midh = (float *)malloc(nn * sizeof(float));
+    float *mid = (float *)malloc(nn * sizeof(float));
+    float *ref = (float *)malloc(nn * sizeof(float));
+    float *refq = (float *)malloc(nn * sizeof(float));
+    float *out = (float *)malloc(nn * sizeof(float));
+    int8_t *xq = (int8_t *)malloc(kn);
+    float *xs = (float *)malloc((size_t)(K / 32) * sizeof(float));
+    int8_t *mq = (int8_t *)malloc(nn);
+    float *ms = (float *)malloc((size_t)(N / 32) * sizeof(float));
+    uint8_t *ig;
+    uint8_t *iu;
+    uint8_t *id;
+    float c_true;
+    float c_q;
+    int i;
+    int r;
 
-/* ---------------- host int4 reference (same recipe as the DSP) ---------------- */
-
-static int32_t host_i4_dot(const uint8_t *row, const int8_t *act, int K)
-{
-    int32_t acc = 0;
-    int k;
-    for (k = 0; k < K; k++) {
-        uint8_t byte = row[k >> 1];
-        int u = (k & 1) ? (int)(byte >> 4) : (int)(byte & 0xf);
-        acc += u * (int32_t)act[k];
+    CHECK(wg && wu && wd && x && xhat && row && midh && mid && ref && refq && out && xq && xs &&
+              mq && ms,
+          "ffn alloc");
+    if (!(wg && wu && wd && x && xhat && row && midh && mid && ref && refq && out && xq && xs &&
+          mq && ms))
+        return;
+    g_seed = 4242u;
+    for (i = 0; i < N * K; i++) {
+        wg[i] = rndn();
+        wu[i] = rndn();
+        wd[i] = rndn();
     }
-    return acc - 8 * (int32_t)ffn_sum_i8(act, K);
-}
+    for (i = 0; i < K; i++)
+        x[i] = rndn();
+    ig = make_image(wg, N, K);
+    iu = make_image(wu, N, K);
+    id = make_image(wd, N, K);
+    CHECK(ig && iu && id, "ffn images");
+    if (!(ig && iu && id))
+        return;
 
-/* ---------------- command lists ---------------- */
+    CHECK(lfm_act_i8_rot(x, K, 128, xq, xs) == 0, "ffn act quant");
+    lfm_hvx_ffn_i4(ig, N, K, iu, id, xq, xs, out);
 
-typedef struct {
-    exec_hdr_t *hdr;
-    exec_cmd_t *cmd;
-    int         n;
-} list_t;
+    for (i = 0; i < N; i++) {
+        float g = dot_f32(wg + (size_t)i * K, x, K);
+        float u = dot_f32(wu + (size_t)i * K, x, K);
+        mid[i] = (g / (1.0f + expf(-g))) * u;
+    }
+    for (r = 0; r < N; r++)
+        ref[r] = dot_f32(wd + (size_t)r * K, mid, K);
+    c_true = cos_f32(out, ref, N);
 
-static void list_init(uint8_t *buf, size_t off, int n, list_t *l)
-{
-    size_t bytes = sizeof(exec_hdr_t) + (size_t)n * sizeof(exec_cmd_t);
-    l->hdr = (exec_hdr_t *)(buf + off);
-    l->cmd = (exec_cmd_t *)(buf + off + sizeof(exec_hdr_t));
-    l->n = n;
-    memset(l->hdr, 0, bytes);
-    l->hdr->magic = LFM_EXEC_MAGIC;
-    l->hdr->version = LFM_EXEC_VERSION;
-    l->hdr->n_cmds = (uint32_t)n;
-    l->hdr->cmd_size = sizeof(exec_cmd_t);
-    l->hdr->list_bytes = (uint32_t)bytes;
-    l->hdr->scratch_bytes = SCRATCH;
-    l->hdr->hdr_size = sizeof(exec_hdr_t);
-}
-
-static exec_cmd_t *cmd_at(list_t *l, int index)
-{
-    exec_cmd_t *c = &l->cmd[index];
-    memset(c, 0, sizeof(*c));
-    c->h0 = c->h1 = c->h2 = c->h3 = -1;
-    c->dst_h = -1;
-    c->tbl_h = -1;
-    c->rt_base = -1;
-    return c;
-}
-
-static void mk_quant(exec_cmd_t *c, int32_t src_off, int32_t dst_off, int32_t n,
-                     int32_t m, int32_t dst_kind)
-{
-    c->type = LFM_CMD_QUANT;
-    c->src = LFM_SRC_SCRATCH; c->dst = dst_kind;
-    c->src_off = src_off; c->src_len = n * 4;
-    c->dst_off = dst_off; c->dst_len = n;
-    c->a0 = m;
-}
-
-static void mk_gemv(exec_cmd_t *c, int32_t h, int32_t src_off, int32_t dst_off,
-                    int32_t dst_kind, int32_t dst_len)
-{
-    c->type = LFM_CMD_GEMV;
-    c->src = LFM_SRC_SCRATCH; c->dst = dst_kind;
-    c->h0 = h; c->a0 = 1; c->a1 = 1;
-    c->src_off = src_off; c->src_len = HID;
-    c->dst_off = dst_off; c->dst_len = dst_len;
-}
-
-static void mk_ffn(exec_cmd_t *c, int32_t hg, int32_t hu, int32_t hd,
-                   int32_t src_off, int32_t dst_kind, int32_t dst_off)
-{
-    c->type = LFM_CMD_FFN;
-    c->src = LFM_SRC_SCRATCH; c->dst = dst_kind;
-    c->h0 = hg; c->h1 = hu; c->h2 = hd;
-    c->src_off = src_off; c->src_len = HID;
-    c->dst_off = dst_off; c->dst_len = HID;
-}
-
-static void mk_attn(exec_cmd_t *c, int32_t hk, int32_t hkt, int32_t hv,
-                    int32_t tbl_h, int32_t ntok, int32_t rt_base,
-                    int32_t src_off, int32_t dst_off, int32_t dst_kind)
-{
-    c->type = LFM_CMD_ATTN;
-    c->src = LFM_SRC_SCRATCH; c->dst = dst_kind;
-    c->h0 = hk; c->h1 = hkt; c->h2 = hv; c->h3 = 0;
-    c->src_off = src_off; c->src_len = HQ * HD;
-    c->dst_off = dst_off; c->dst_len = HQ * HD * 4;
-    c->tbl_h = tbl_h; c->tbl_len = ntok;
-    c->rt_base = rt_base;
-}
-
-static void mk_conv(exec_cmd_t *c, int32_t blob, int32_t H, int32_t ksh,
-                    int32_t state_off, int32_t src_off, int32_t dst_off,
-                    int32_t dst_kind)
-{
-    c->type = LFM_CMD_CONV;
-    c->src = LFM_SRC_SCRATCH; c->dst = dst_kind;
-    c->h0 = blob;
-    c->src_off = src_off; c->src_len = 3 * H;
-    c->dst_off = dst_off; c->dst_len = H;
-    c->tbl_off = state_off;
-    c->a0 = H; c->a1 = ksh; c->a2 = 0; c->a3 = 100;
-}
-
-static int exec_list(int ah_cmd, size_t off, const list_t *l, const int8_t *act,
-                     int act_len, const int32_t *rt, int rt_n,
-                     unsigned char *out, int out_len, int *times)
-{
-    return lfmgemv_exec(ah_cmd, (int)off, l->n, (const unsigned char *)act, act_len,
-                        (const int *)rt, rt_n, out, out_len, times, 8);
-}
-
-/* ---------------- shortconv blob builder (mirrors ../conv/conv_init) ---------------- */
-
-typedef struct {
-    int8_t *blob;      /* 8*H*8 rotated weights + kq[H] */
-    int8_t *wq1;       /* [H][7] unrotated, for the host reference */
-    int     H, ksh;
-} conv_blob_t;
-
-static int conv_blob_build(conv_blob_t *b, int H, float s_bc, float s_y,
-                           const float *wf)
-{
-    double kmax = 0.0;
-    int ch, j, s, p, g;
-
-    b->H = H;
-    b->blob = (int8_t *)malloc((size_t)8 * H * 8 + (size_t)4 * H);
-    b->wq1 = (int8_t *)malloc((size_t)H * CONV_TAPS);
-    if (!b->blob || !b->wq1) return -1;
-    for (ch = 0; ch < H; ch++) {
-        const float *w = wf + (size_t)ch * CONV_TAPS;
-        float m = 0.0f, sw;
-        for (j = 0; j < CONV_TAPS; j++) {
-            float a = w[j] < 0.0f ? -w[j] : w[j];
-            if (a > m) m = a;
-        }
-        if (!(m > 0.0f)) m = 1.0f;
-        sw = m / 127.0f;
-        for (j = 0; j < CONV_TAPS; j++)
-            b->wq1[(size_t)ch * CONV_TAPS + j] = (int8_t)conv_wq(w[j], sw);
-        {
-            double K = conv_K((double)m, (double)s_bc, (double)s_y);
-            if (K > kmax) kmax = K;
+    lfm_deq_i8_group32(xq, xs, xhat, K);
+    for (i = 0; i < N; i++) {
+        float g;
+        float u;
+        lfm_q4_dequant_row(lfm_q4_row_qs(ig, N, K, i), lfm_q4_row_scales(ig, N, K, i), K, row);
+        g = dot_f32(row, xhat, K);
+        lfm_q4_dequant_row(lfm_q4_row_qs(iu, N, K, i), lfm_q4_row_scales(iu, N, K, i), K, row);
+        u = dot_f32(row, xhat, K);
+        midh[i] = (g / (1.0f + expf(-g))) * u;
+    }
+    CHECK(lfm_act_i8_rot(midh, N, 128, mq, ms) == 0, "ffn mid quant");
+    {
+        int g;
+        for (g = 0; g < N / 32; g++) {
+            for (i = 0; i < 32; i++)
+                mid[g * 32 + i] = (float)mq[g * 32 + i] * ms[g];
         }
     }
-    b->ksh = conv_pick_ksh(kmax);
-    for (ch = 0; ch < H; ch++) {
-        const float *w = wf + (size_t)ch * CONV_TAPS;
-        float m = 0.0f;
-        for (j = 0; j < CONV_TAPS; j++) {
-            float a = w[j] < 0.0f ? -w[j] : w[j];
-            if (a > m) m = a;
-        }
-        if (!(m > 0.0f)) m = 1.0f;
-        ((int32_t *)(b->blob + (size_t)8 * H * 8))[ch] =
-            conv_make_kq(conv_K((double)m, (double)s_bc, (double)s_y), b->ksh);
+    for (r = 0; r < N; r++) {
+        lfm_q4_dequant_row(lfm_q4_row_qs(id, N, N, r), lfm_q4_row_scales(id, N, N, r), N, row);
+        refq[r] = dot_f32(row, mid, N);
     }
-    for (p = 0; p < CONV_RING; p++) {
-        for (g = 0; g < H / 16; g++) {
-            for (j = 0; j < 16; j++) {
-                int c = g * 16 + j;
-                int8_t *dst = b->blob + ((size_t)p * (H / 16) + g) * 128 + (size_t)j * 8;
-                for (s = 0; s < CONV_RING; s++) {
-                    int tap = conv_slot_tap(p, s);
-                    dst[s] = (tap < CONV_TAPS) ? b->wq1[(size_t)c * CONV_TAPS + tap] : 0;
-                }
-            }
+    c_q = cos_f32(out, refq, N);
+
+    printf("ffn[%dx%d]: cos(int4 kernel vs f32 pipeline on dequantised weights/act)=%.7f\n", N, K,
+           c_q);
+    printf("ffn[%dx%d]: cos(kernel vs original f32 weights/input)=%.7f (4-bit format limit)\n", N, K,
+           c_true);
+    CHECK(c_q >= 0.998f, "ffn quant-emulation cos %.7f < 0.998", c_q);
+    CHECK(c_true >= 0.98f, "ffn true-f32 cos %.7f < 0.98", c_true);
+
+    free(wg);
+    free(wu);
+    free(wd);
+    free(x);
+    free(xhat);
+    free(row);
+    free(midh);
+    free(mid);
+    free(ref);
+    free(refq);
+    free(out);
+    free(xq);
+    free(xs);
+    free(mq);
+    free(ms);
+    free(ig);
+    free(iu);
+    free(id);
+}
+
+enum {
+    T_H = 64,
+    T_F = 128,
+    T_V = 128,
+    T_NL = 2,
+    T_D = 128,
+    T_HQ = 1,
+    T_HKV = 1,
+    T_CTX = 64,
+    T_WIN = 8,
+    T_KSTAGE = 64,
+    T_MAXSEQ = 2,
+    T_POOL = 2
+};
+
+static float *g_embed;
+static float *g_out_norm;
+static float *g_lm_head;
+static float *g_an[T_NL];
+static float *g_pan[T_NL];
+static float *g_fnn[T_NL];
+static float *g_pfn[T_NL];
+static float *g_cw[T_NL];
+static float *g_qn[T_NL];
+static float *g_kn[T_NL];
+static uint8_t *g_fg[T_NL];
+static uint8_t *g_fu[T_NL];
+static uint8_t *g_fd[T_NL];
+static uint8_t *g_wq[T_NL];
+static uint8_t *g_wk[T_NL];
+static uint8_t *g_wv[T_NL];
+static uint8_t *g_wg[T_NL];
+static uint8_t *g_wo[T_NL];
+static uint8_t *g_cin[T_NL];
+static uint8_t *g_cout[T_NL];
+
+static float *make_vec(int n, float base, float spread)
+{
+    float *v = (float *)malloc((size_t)n * sizeof(float));
+    int i;
+    if (v == NULL)
+        return NULL;
+    for (i = 0; i < n; i++)
+        v[i] = base + spread * rnd();
+    return v;
+}
+
+static float *make_mat(int n, int k, float spread)
+{
+    float *v = (float *)malloc((size_t)n * (size_t)k * sizeof(float));
+    int i;
+    if (v == NULL)
+        return NULL;
+    for (i = 0; i < n * k; i++)
+        v[i] = spread * rnd();
+    return v;
+}
+
+static uint8_t *pack_mat(float *w, int n, int k)
+{
+    uint8_t *img = make_image(w, n, k);
+    free(w);
+    return img;
+}
+
+static int build_model(lfm_exec_model *m)
+{
+    int l;
+    g_seed = 2024u;
+    memset(m, 0, sizeof *m);
+    g_embed = make_mat(T_V, T_H, 0.5f);
+    g_out_norm = make_vec(T_H, 1.0f, 0.1f);
+    g_lm_head = make_mat(T_V, T_H, 0.5f);
+    m->embed = g_embed;
+    m->out_norm = g_out_norm;
+    m->lm_head = g_lm_head;
+    m->n_layers = T_NL;
+    m->layer_kind[0] = LFM_LAYER_CONV;
+    m->layer_kind[1] = LFM_LAYER_SLIDING;
+    for (l = 0; l < T_NL; l++) {
+        lfm_exec_layer *w = &m->layer[l];
+        g_an[l] = make_vec(T_H, 1.0f, 0.1f);
+        g_pan[l] = make_vec(T_H, 1.0f, 0.1f);
+        g_fnn[l] = make_vec(T_H, 1.0f, 0.1f);
+        g_pfn[l] = make_vec(T_H, 1.0f, 0.1f);
+        w->attn_norm = g_an[l];
+        w->post_attn_norm = g_pan[l];
+        w->ffn_norm = g_fnn[l];
+        w->post_ffw_norm = g_pfn[l];
+        g_fg[l] = pack_mat(make_mat(T_F, T_H, 0.5f), T_F, T_H);
+        g_fu[l] = pack_mat(make_mat(T_F, T_H, 0.5f), T_F, T_H);
+        g_fd[l] = pack_mat(make_mat(T_H, T_F, 0.5f), T_H, T_F);
+        w->ffn_gate = g_fg[l];
+        w->ffn_up = g_fu[l];
+        w->ffn_down = g_fd[l];
+        if (l == 0) {
+            g_cin[l] = pack_mat(make_mat(3 * T_H, T_H, 0.5f), 3 * T_H, T_H);
+            g_cout[l] = pack_mat(make_mat(T_H, T_H, 0.5f), T_H, T_H);
+            g_cw[l] = make_mat(T_H, LFM_EXEC_CONV_TAPS, 0.4f);
+            w->conv_in = g_cin[l];
+            w->conv_out = g_cout[l];
+            w->conv_w = g_cw[l];
+        } else {
+            g_wq[l] = pack_mat(make_mat(T_HQ * T_D, T_H, 0.5f), T_HQ * T_D, T_H);
+            g_wk[l] = pack_mat(make_mat(T_HKV * T_D, T_H, 0.5f), T_HKV * T_D, T_H);
+            g_wv[l] = pack_mat(make_mat(T_HKV * T_D, T_H, 0.5f), T_HKV * T_D, T_H);
+            g_wg[l] = pack_mat(make_mat(T_HQ, T_H, 0.5f), T_HQ, T_H);
+            g_wo[l] = pack_mat(make_mat(T_H, T_HQ * T_D, 0.5f), T_H, T_HQ * T_D);
+            g_qn[l] = make_vec(T_D, 1.0f, 0.1f);
+            g_kn[l] = make_vec(T_D, 1.0f, 0.1f);
+            w->attn_q = g_wq[l];
+            w->attn_k = g_wk[l];
+            w->attn_v = g_wv[l];
+            w->attn_gate = g_wg[l];
+            w->attn_out = g_wo[l];
+            w->q_norm = g_qn[l];
+            w->k_norm = g_kn[l];
         }
+    }
+    if (!m->embed || !m->out_norm || !m->lm_head)
+        return -1;
+    for (l = 0; l < T_NL; l++) {
+        const lfm_exec_layer *w = &m->layer[l];
+        if (!w->attn_norm || !w->post_attn_norm || !w->ffn_norm || !w->post_ffw_norm ||
+            !w->ffn_gate || !w->ffn_up || !w->ffn_down)
+            return -1;
     }
     return 0;
 }
 
-/* Host ring model on a zero-initialised history: only tap 6 (current token)
- * is non-zero, every other ring position stays 0, exactly as the fresh DSP
- * scratch state.  Same operations as xconv_bx_write/dot/pack_y. */
-static void conv_ref_first(const conv_blob_t *b, const int8_t *bcx, int8_t *y)
+static void free_model(void)
 {
-    int H = b->H, ch;
-    for (ch = 0; ch < H; ch++) {
-        int32_t out32 = (int32_t)b->wq1[(size_t)ch * CONV_TAPS + CONV_TAPS - 1] *
-                        (int32_t)((int32_t)bcx[ch] * (int32_t)bcx[2 * H + ch]);
-        y[ch] = conv_glue(out32, bcx[H + ch],
-                          ((const int32_t *)(b->blob + (size_t)8 * H * 8))[ch],
-                          b->ksh);
+    int l;
+    free(g_embed);
+    free(g_out_norm);
+    free(g_lm_head);
+    g_embed = NULL;
+    g_out_norm = NULL;
+    g_lm_head = NULL;
+    for (l = 0; l < T_NL; l++) {
+        free(g_an[l]);
+        free(g_pan[l]);
+        free(g_fnn[l]);
+        free(g_pfn[l]);
+        free(g_cw[l]);
+        free(g_qn[l]);
+        free(g_kn[l]);
+        free(g_fg[l]);
+        free(g_fu[l]);
+        free(g_fd[l]);
+        free(g_wq[l]);
+        free(g_wk[l]);
+        free(g_wv[l]);
+        free(g_wg[l]);
+        free(g_wo[l]);
+        free(g_cin[l]);
+        free(g_cout[l]);
     }
 }
 
-/* ---------------- main ---------------- */
-
-typedef struct {
-    int ffn[NL][3];
-    int k[N_ATTN], v[N_ATTN], kt[N_ATTN], tbl[N_ATTN];
-    int ci[N_CONV], co[N_CONV], cb[N_CONV];
-} handles_t;
-
-int main(int argc, char **argv)
+static void fill_desc(lfm_model_desc *d)
 {
-    static ionbuf_t arena, cmd_ion;
-    static handles_t H;
-    static list_t all, one_ffn, one_attn, one_conv, one_quant;
-    static list_t singles[LFM_CMD_MAX];
-    static size_t single_off[LFM_CMD_MAX];
-    int32_t rt[4];
-    int ah_model = -1, ah_cmd = -1, rc, i, l, k, bad, c;
-    int tokens = (argc > 1) ? atoi(argv[1]) : 5;
-    int small = (argc > 2 && strcmp(argv[2], "small") == 0);
-    int times[8];
-    int failures = 0;
-    int n_ffn_layers;
+    memset(d, 0, sizeof *d);
+    d->hidden = T_H;
+    d->ffn = T_F;
+    d->n_layers = T_NL;
+    d->n_heads = T_HQ;
+    d->head_dim = T_D;
+    d->kv_dim = T_HKV * T_D;
+    d->vocab = T_V;
+    d->ctx = T_CTX;
+    d->conv_cache = LFM_EXEC_CONV_HISTORY;
+    d->sliding_window = T_WIN;
+    d->kv_layers = T_NL;
+    d->kv_heads = T_HKV;
+    d->kv_pool = T_POOL;
+    d->kv_stage = T_KSTAGE;
+    d->max_seqs = T_MAXSEQ;
+    d->kv_format = LFM_KV_F16;
+}
 
-    setvbuf(stdout, NULL, _IONBF, 0);
-    if (tokens < 1) tokens = 1;
-    if (tokens > 12) tokens = 12;
-
-    const size_t ffn_row_g = (size_t)FFN_W * (HID / 2);     /* [FFN_W][HID] */
-    const size_t ffn_row_d = (size_t)HID * (FFN_W / 2);     /* [HID][FFN_W] */
-    const size_t kv_k  = (size_t)HKV * CTX * 128;
-    const size_t kv_v  = (size_t)HKV * CTX * 128;
-    const size_t kv_kt = (size_t)HKV * CTX * 4;
-    const size_t conv_in  = (size_t)(3 * HID) * (HID / 2);
-    const size_t conv_out = (size_t)HID * (HID / 2);
-    const size_t conv_blob_sz = (size_t)8 * HID * 8 + (size_t)4 * HID;
-
-    n_ffn_layers = small ? 1 : NL;
-
-    /* view table, allocated before the arena is sized */
-    typedef struct { size_t off; int bytes; } view_t;
-    static view_t v_ffn[NL][3];
-    static view_t v_k[N_ATTN], v_v[N_ATTN], v_kt[N_ATTN], v_tbl[N_ATTN];
-    static view_t v_ci[N_CONV], v_co[N_CONV], v_cb[N_CONV];
-    static view_t v_small[72];
-    static conv_blob_t blobs[N_CONV];
-
-    size_t need = 0;
-    need += 128;
-    need += (size_t)n_ffn_layers * 3 * ffn_row_g;
-    need += (size_t)N_ATTN * (kv_k + kv_v + kv_kt) + 512;
-    need += (size_t)N_CONV * (conv_in + conv_out + conv_blob_sz);
-    need += 72 * (size_t)256 * 128;
-    need += 1 << 20;                             /* alignment + slack */
-
-    printf("exec stand: tokens=%d %s, arena %.1f MiB\n", tokens,
-           small ? "(shared FFN layer)" : "(24 distinct FFN layers)",
-           (double)need / (1024.0 * 1024.0));
-    if (enable_unsigned() != 0) { printf("unsigned PD failed\n"); return 10; }
-    if (ion_alloc(&arena, need) != 0) { printf("ION alloc failed\n"); return 1; }
-    memset(arena.p, 0x88, (size_t)arena.bytes);  /* valid int4 default */
-    arena_build_t ab = { (uint8_t *)arena.p, (size_t)arena.bytes, 128 };
-
-    float *swbuf = (float *)malloc((size_t)3 * HID * sizeof(float));
-    float *cwf = (float *)malloc((size_t)HID * CONV_TAPS * sizeof(float));
-    int8_t *act = (int8_t *)malloc(HID);
-    int8_t *dst_ref = (int8_t *)malloc(HID);
-    int8_t *out_all = (int8_t *)malloc(HID);
-    int8_t *out_one = (int8_t *)malloc(HID);
-    int8_t *out_exec = (int8_t *)malloc(HID);
-    int32_t *tbl = (int32_t *)malloc((size_t)PAGES * 4);
-    int32_t *attn_ref = (int32_t *)malloc((size_t)HQ * HD * 4);
-    int32_t *attn_dev = (int32_t *)malloc((size_t)HQ * HD * 4);
-    int8_t *q = (int8_t *)malloc(HQ * HD);
-    int8_t *bcx = (int8_t *)malloc(3 * HID);
-    int8_t *y_ref = (int8_t *)malloc(HID);
-    int8_t *y_dev = (int8_t *)malloc(HID);
-    int8_t *first_out = (int8_t *)malloc(HID);
-    int8_t *quant_dev = (int8_t *)malloc(HQ * HD);
-    int8_t *quant_src = (int8_t *)malloc(HQ * HD * 4);
-    uint32_t seed = 0x1234567u;
-
-    if (!swbuf || !cwf || !act || !dst_ref || !out_all || !out_one || !out_exec ||
-        !tbl || !attn_ref || !attn_dev || !q || !bcx || !y_ref || !y_dev ||
-        !first_out || !quant_dev || !quant_src) {
-        printf("host alloc failed\n"); return 1;
+static int run_rows(const lfm_model_desc *d, void *arena, const lfm_row *rows, uint32_t n,
+                    uint32_t window, float *logits)
+{
+    lfm_step step;
+    uint32_t i;
+    memset(&step, 0, sizeof step);
+    step.n_rows = n;
+    step.window = window;
+    step.max_rows = T_MAXSEQ;
+    for (i = 0; i < n; i++) {
+        step.ntok += rows[i].ntok;
+        if (rows[i].ntok > 1u)
+            step.flags |= LFM_FLAG_PREFILL;
     }
+    return lfm_hvx_exec(d, &step, rows, arena, logits);
+}
 
-    /* ---------- 1. lay out and fill the model arena (before mapping) -------- */
-    for (l = 0; l < n_ffn_layers; l++)
-        for (k = 0; k < 3; k++) {
-            size_t sz = (k == 2) ? ffn_row_d : ffn_row_g;
-            v_ffn[l][k].off = ab_take(&ab, sz);
-            v_ffn[l][k].bytes = (int)sz;
+static void ref_rms(const float *x, const float *w, int n, float *y)
+{
+    float acc = 0.0f;
+    float inv;
+    int i;
+    for (i = 0; i < n; i++)
+        acc += x[i] * x[i];
+    inv = 1.0f / sqrtf(acc / (float)n + 1e-5f);
+    for (i = 0; i < n; i++)
+        y[i] = x[i] * inv * w[i];
+}
+
+static void ref_rope(float *v, uint32_t pos, int dim, int pairs, double theta)
+{
+    int half = dim / 2;
+    int i;
+    for (i = 0; i < pairs; i++) {
+        double inv = 1.0 / pow(theta, (2.0 * (double)i) / (double)dim);
+        double a = (double)pos * inv;
+        float sn = (float)sin(a);
+        float cs = (float)cos(a);
+        float x0 = v[i];
+        float x1 = v[i + half];
+        v[i] = x0 * cs - x1 * sn;
+        v[i + half] = x1 * cs + x0 * sn;
+    }
+}
+
+static void ref_head_norm(float *v, const float *w, int dim)
+{
+    float acc = 0.0f;
+    float inv;
+    int i;
+    for (i = 0; i < dim; i++)
+        acc += v[i] * v[i];
+    inv = 1.0f / sqrtf(acc / (float)dim + 1e-5f);
+    for (i = 0; i < dim; i++)
+        v[i] = v[i] * inv * w[i];
+}
+
+static void ref_proj(const uint8_t *img, int n, int k, const float *x, float *y)
+{
+    int8_t *q = (int8_t *)malloc((size_t)k);
+    float *s = (float *)malloc((size_t)(k / 32) * sizeof(float));
+    if (q == NULL || s == NULL) {
+        free(q);
+        free(s);
+        return;
+    }
+    if (lfm_act_i8_rot(x, k, 128, q, s) == 0)
+        lfm_hvx_gemv_i4(img, n, k, q, s, y);
+    free(q);
+    free(s);
+}
+
+static void ref_forward(const lfm_model_desc *d, const lfm_exec_model *m, void *arena,
+                        const lfm_row *row, float *logits)
+{
+    const int h = T_H;
+    const int f = T_F;
+    const int dim = T_D;
+    const int hq = T_HQ;
+    const int hkv = T_HKV;
+    const int qd = hq * dim;
+    const int kd = hkv * dim;
+    float *x = (float *)calloc((size_t)h, sizeof(float));
+    float *res = (float *)calloc((size_t)h, sizeof(float));
+    float *nrm = (float *)calloc((size_t)h, sizeof(float));
+    float *blk = (float *)calloc((size_t)h, sizeof(float));
+    float *mrg = (float *)calloc((size_t)h, sizeof(float));
+    float *tmp = (float *)calloc((size_t)h, sizeof(float));
+    float *q = (float *)calloc((size_t)qd, sizeof(float));
+    float *k = (float *)calloc((size_t)kd, sizeof(float));
+    float *v = (float *)calloc((size_t)kd, sizeof(float));
+    float *gat = (float *)calloc((size_t)hq, sizeof(float));
+    float *att = (float *)calloc((size_t)qd, sizeof(float));
+    float *mix = (float *)calloc((size_t)3 * h, sizeof(float));
+    float *cvg = (float *)calloc((size_t)h, sizeof(float));
+    float *cin = (float *)calloc((size_t)h, sizeof(float));
+    float *cvout = (float *)calloc((size_t)h, sizeof(float));
+    float *fa = (float *)calloc((size_t)f, sizeof(float));
+    float *fu = (float *)calloc((size_t)f, sizeof(float));
+    float *mid = (float *)calloc((size_t)f, sizeof(float));
+    float *scratch =
+        (float *)calloc((size_t)(4 * (T_CTX + LFM_EXEC_CHUNK) * dim + 4096), sizeof(float));
+    uint32_t *tbl = lfm_exec_table(d, arena, row->seq);
+    uint32_t pos = row->pos;
+    float *hist = lfm_exec_conv_state(d, arena, row->seq);
+    int i;
+    int l;
+    int hh;
+
+    for (i = 0; i < h; i++)
+        x[i] = m->embed[(size_t)row->token * h + i];
+    for (l = 0; l < (int)d->n_layers; l++) {
+        const lfm_exec_layer *w = &m->layer[l];
+        uint32_t kind = m->layer_kind[l];
+        memcpy(res, x, (size_t)h * sizeof(float));
+        ref_rms(x, w->attn_norm, h, nrm);
+        if (kind == LFM_LAYER_CONV) {
+            int j;
+            ref_proj(w->conv_in, 3 * h, h, nrm, mix);
+            for (i = 0; i < h; i++)
+                cin[i] = mix[i] * mix[2 * h + i];
+            for (i = 0; i < h; i++) {
+                float acc = w->conv_w[(size_t)i * LFM_EXEC_CONV_TAPS + 6] * cin[i];
+                for (j = 0; j < LFM_EXEC_CONV_HISTORY; j++)
+                    acc += w->conv_w[(size_t)i * LFM_EXEC_CONV_TAPS + j] * hist[(size_t)j * h + i];
+                cvout[i] = acc;
+            }
+            memmove(hist, hist + h, (size_t)(LFM_EXEC_CONV_HISTORY - 1) * h * sizeof(float));
+            memcpy(hist + (size_t)(LFM_EXEC_CONV_HISTORY - 1) * h, cin, (size_t)h * sizeof(float));
+            for (i = 0; i < h; i++)
+                cvg[i] = mix[h + i] * cvout[i];
+            ref_proj(w->conv_out, h, h, cvg, blk);
+        } else {
+            int pairs = kind == LFM_LAYER_FULL ? dim / 4 : dim / 2;
+            double theta = kind == LFM_LAYER_FULL ? 1e6 : 1e4;
+            uint32_t win = kind == LFM_LAYER_SLIDING ? d->sliding_window : 0u;
+            ref_proj(w->attn_q, qd, h, nrm, q);
+            ref_proj(w->attn_k, kd, h, nrm, k);
+            ref_proj(w->attn_v, kd, h, nrm, v);
+            ref_proj(w->attn_gate, hq, h, nrm, gat);
+            for (hh = 0; hh < hq; hh++) {
+                float *qh = q + (size_t)hh * dim;
+                ref_head_norm(qh, w->q_norm, dim);
+                ref_rope(qh, pos, dim, pairs, theta);
+                if (dim == 128)
+                    lfm_rot_fwd_f32(qh, dim);
+            }
+            for (hh = 0; hh < hkv; hh++) {
+                float *kh = k + (size_t)hh * dim;
+                float *vh = v + (size_t)hh * dim;
+                ref_head_norm(kh, w->k_norm, dim);
+                ref_rope(kh, pos, dim, pairs, theta);
+                if (dim == 128) {
+                    lfm_rot_fwd_f32(kh, dim);
+                    lfm_rot_fwd_f32(vh, dim);
+                }
+            }
+            for (hh = 0; hh < hkv; hh++) {
+                uint32_t slot = pos & 31u;
+                uint8_t *stage = lfm_exec_kv_stage(d, arena, row->seq, (uint32_t)l, (uint32_t)hh);
+                float *sbuf = (float *)stage;
+                if (slot == 0u)
+                    memset(sbuf, 0, 2u * LFM_PAGE_TOKENS * (size_t)dim * sizeof(float));
+                memcpy(sbuf + (size_t)slot * dim, k + (size_t)hh * dim,
+                       (size_t)dim * sizeof(float));
+                memcpy(sbuf + (size_t)LFM_PAGE_TOKENS * dim + (size_t)slot * dim,
+                       v + (size_t)hh * dim, (size_t)dim * sizeof(float));
+                lfm_hvx_kvcache_commit((lfm_kv_format)d->kv_format,
+                                       lfm_exec_kv_pages(d, arena, (uint32_t)l) +
+                                           (size_t)tbl[pos >> 5] * lfm_page_bytes(d->kv_format,
+                                                                                  d->kv_heads,
+                                                                                  d->head_dim),
+                                       sbuf, sbuf + (size_t)LFM_PAGE_TOKENS * dim, hh, dim);
+            }
+            lfm_hvx_attn_flash((lfm_kv_format)d->kv_format, tbl,
+                               lfm_exec_kv_pages(d, arena, (uint32_t)l), hkv, hq, dim, q, 1, pos,
+                               win, att, scratch);
+            for (hh = 0; hh < hq; hh++) {
+                float *oh = att + (size_t)hh * dim;
+                float g = 1.0f / (1.0f + expf(-gat[hh]));
+                for (i = 0; i < dim; i++)
+                    oh[i] *= g;
+                if (dim == 128)
+                    lfm_rot_inv_f32(oh, dim);
+            }
+            ref_proj(w->attn_out, h, qd, att, blk);
         }
-    for (l = 0; l < N_ATTN; l++) {
-        v_k[l].off = ab_take(&ab, kv_k);   v_k[l].bytes = (int)kv_k;
-        v_v[l].off = ab_take(&ab, kv_v);   v_v[l].bytes = (int)kv_v;
-        v_kt[l].off = ab_take(&ab, kv_kt); v_kt[l].bytes = (int)kv_kt;
-        v_tbl[l].off = ab_take(&ab, (size_t)PAGES * 4);
-        v_tbl[l].bytes = PAGES * 4;
+        ref_rms(blk, w->post_attn_norm, h, tmp);
+        for (i = 0; i < h; i++)
+            mrg[i] = res[i] + tmp[i];
+        ref_rms(mrg, w->ffn_norm, h, nrm);
+        ref_proj(w->ffn_gate, f, h, nrm, fa);
+        ref_proj(w->ffn_up, f, h, nrm, fu);
+        for (i = 0; i < f; i++)
+            mid[i] = (fa[i] / (1.0f + expf(-fa[i]))) * fu[i];
+        ref_proj(w->ffn_down, h, f, mid, blk);
+        ref_rms(blk, w->post_ffw_norm, h, tmp);
+        for (i = 0; i < h; i++)
+            x[i] = mrg[i] + tmp[i];
     }
-    for (l = 0; l < N_CONV; l++) {
-        v_ci[l].off = ab_take(&ab, conv_in);      v_ci[l].bytes = (int)conv_in;
-        v_co[l].off = ab_take(&ab, conv_out);     v_co[l].bytes = (int)conv_out;
-        v_cb[l].off = ab_take(&ab, conv_blob_sz); v_cb[l].bytes = (int)conv_blob_sz;
-    }
-    for (i = 0; i < 72; i++) {
-        v_small[i].off = ab_take(&ab, (size_t)256 * 128);
-        v_small[i].bytes = 256 * 128;
-    }
+    ref_rms(x, m->out_norm, h, tmp);
+    for (i = 0; i < T_V; i++)
+        logits[i] = dot_f32(m->lm_head + (size_t)i * h, tmp, h);
 
+    free(x);
+    free(res);
+    free(nrm);
+    free(blk);
+    free(mrg);
+    free(tmp);
+    free(q);
+    free(k);
+    free(v);
+    free(gat);
+    free(att);
+    free(mix);
+    free(cvg);
+    free(cin);
+    free(cvout);
+    free(fa);
+    free(fu);
+    free(mid);
+    free(scratch);
+}
+
+static const char *fmt_name(lfm_kv_format fmt)
+{
+    if (fmt == LFM_KVARN_K4V2)
+        return "k4v2";
+    if (fmt == LFM_KVARN_K4V4)
+        return "k4v4";
+    return "f16";
+}
+
+static void test_exec(lfm_kv_format fmt)
+{
+    lfm_model_desc desc;
+    lfm_exec_model model;
+    size_t arena_bytes;
+    uint8_t *arena0;
+    uint8_t *arena_j;
+    uint8_t *play;
+    float logits_a[2 * T_V];
+    float logits_b[T_V];
+    float logits_c[T_V];
+    float logits_d[2 * T_V];
+    float logits_e[2 * T_V];
+    float ref_logits[T_V];
+    lfm_row warm[1];
+    lfm_row rows[2];
+    uint32_t *tok;
+    int rc;
+
+    fill_desc(&desc);
+    desc.kv_format = fmt;
+    if (build_model(&model) != 0) {
+        CHECK(0, "exec model build");
+        return;
+    }
+    rc = lfm_hvx_exec_bind(&model);
+    CHECK(rc == LFM_EXEC_OK, "bind rc=%d", rc);
+    arena_bytes = lfm_exec_arena_bytes(&desc);
+    CHECK(arena_bytes > 0u, "arena bytes");
+    printf("exec[%s]: arena=%zu B hidden=%u ffn=%u layers=%u heads=%u/%u dim=%u ctx=%u window=%u\n",
+           fmt_name(fmt), arena_bytes, desc.hidden, desc.ffn, desc.n_layers, desc.n_heads,
+           desc.kv_heads, desc.head_dim, desc.ctx, desc.sliding_window);
+    arena0 = (uint8_t *)malloc(arena_bytes);
+    arena_j = (uint8_t *)malloc(arena_bytes);
+    play = (uint8_t *)malloc(arena_bytes);
+    CHECK(arena0 != NULL && arena_j != NULL && play != NULL, "arena alloc");
+    if (arena0 == NULL || arena_j == NULL || play == NULL)
+        return;
+    memset(arena0, 0, arena_bytes);
+    lfm_exec_init_tables(&desc, arena0);
+
+    memset(&warm[0], 0, sizeof warm[0]);
+    warm[0].seq = 0;
+    warm[0].pos = 0;
+    warm[0].ntok = 34;
+    warm[0].kv_off = 0;
+    warm[0].tbl_off = 0;
+    tok = lfm_exec_tokens(&desc, arena0, 0);
+    for (rc = 0; rc < 34; rc++)
+        tok[rc] = (uint32_t)((rc * 7 + 3) % T_V);
+    rc = run_rows(&desc, arena0, warm, 1, 0, NULL);
+    CHECK(rc == LFM_EXEC_OK, "warm seq0 rc=%d", rc);
+
+    memset(&warm[0], 0, sizeof warm[0]);
+    warm[0].seq = 1;
+    warm[0].pos = 0;
+    warm[0].ntok = 2;
+    warm[0].kv_off = T_KSTAGE;
+    warm[0].tbl_off = lfm_max_pages(T_CTX, T_POOL);
+    tok = lfm_exec_tokens(&desc, arena0, 0);
+    tok[0] = 7;
+    tok[1] = 9;
+    rc = run_rows(&desc, arena0, warm, 1, 0, NULL);
+    CHECK(rc == LFM_EXEC_OK, "warm seq1 rc=%d", rc);
+
+    memset(&rows[0], 0, sizeof rows[0]);
+    rows[0].token = 91;
+    rows[0].seq = 0;
+    rows[0].pos = 34;
+    rows[0].ntok = 1;
+    rows[0].kv_off = 0;
+    rows[0].tbl_off = 0;
+    memset(&rows[1], 0, sizeof rows[1]);
+    rows[1].seq = 1;
+    rows[1].pos = 2;
+    rows[1].ntok = 3;
+    rows[1].kv_off = T_KSTAGE;
+    rows[1].tbl_off = lfm_max_pages(T_CTX, T_POOL);
+
+    memcpy(play, arena0, arena_bytes);
+    tok = lfm_exec_tokens(&desc, play, 1);
+    tok[0] = 11;
+    tok[1] = 23;
+    tok[2] = 37;
+    rc = run_rows(&desc, play, rows, 2, 0, logits_a);
+    CHECK(rc == LFM_EXEC_OK, "joint step rc=%d", rc);
+    memcpy(arena_j, play, arena_bytes);
+
+    memcpy(play, arena0, arena_bytes);
+    rc = run_rows(&desc, play, &rows[0], 1, 0, logits_b);
+    CHECK(rc == LFM_EXEC_OK, "seq0 alone rc=%d", rc);
+
+    memcpy(play, arena0, arena_bytes);
+    tok = lfm_exec_tokens(&desc, play, 0);
+    tok[0] = 11;
+    tok[1] = 23;
+    tok[2] = 37;
+    rc = run_rows(&desc, play, &rows[1], 1, 0, logits_c);
+    CHECK(rc == LFM_EXEC_OK, "seq1 alone rc=%d", rc);
+
+    memcpy(play, arena0, arena_bytes);
     {
-        uint8_t *base = (uint8_t *)arena.p;
-        for (l = 0; l < N_ATTN; l++) {
-            fill_i4(base + v_k[l].off, kv_k, seed ^ (uint32_t)l);
-            fill_i8((int8_t *)(base + v_v[l].off), kv_v, seed + 77u + (uint32_t)l);
-            for (i = 0; i < HKV * CTX; i++)
-                ((int32_t *)(base + v_kt[l].off))[i] = 30000 + (int32_t)(i % 4096);
-            for (i = 0; i < PAGES; i++) ((int32_t *)(base + v_tbl[l].off))[i] = i;
-        }
-        fill_i8(act, HID, seed);
-        fill_i8(q, HQ * HD, seed ^ 0x55u);
-        for (i = 0; i < HQ * HD; i++)
-            ((int32_t *)quant_src)[i] = (int32_t)((i * 2654435761u) & 0x3ffff) - 0x1ffff;
-        fill_i8(bcx, 3 * HID, 0x77u);
-        for (l = 0; l < N_CONV; l++) {
-            for (i = 0; i < HID * CONV_TAPS; i++) {
-                seed = seed * 1103515245u + 12345u;
-                cwf[i] = ((float)((int)(seed >> 20) % 2001) - 1000.0f) * 1.0e-3f;
-            }
-            if (conv_blob_build(&blobs[l], HID, 0.01f, 0.05f, cwf) != 0) {
-                printf("conv blob failed\n"); return 1;
-            }
-            ab_put(&ab, v_cb[l].off, blobs[l].blob, conv_blob_sz);
-        }
-        /* real int4 for layer 0 (the FFN bit-exactness check) */
-        fill_i4(base + v_ffn[0][0].off, ffn_row_g, 0xa1u);
-        fill_i4(base + v_ffn[0][1].off, ffn_row_g, 0xa2u);
-        fill_i4(base + v_ffn[0][2].off, ffn_row_d, 0xa3u);
+        lfm_row perm[2];
+        perm[0] = rows[1];
+        perm[1] = rows[0];
+        tok = lfm_exec_tokens(&desc, play, 0);
+        tok[0] = 11;
+        tok[1] = 23;
+        tok[2] = 37;
+        rc = run_rows(&desc, play, perm, 2, 0, logits_d);
+        CHECK(rc == LFM_EXEC_OK, "permuted step rc=%d", rc);
     }
 
-    /* ---------- 2. map once, register views and shapes ---------- */
-    if ((rc = lfmgemv_map_arena(arena.fd, arena.bytes, &ah_model)) != 0) {
-        printf("map_arena rc=%d (%.1f MiB)\n", rc, (double)arena.bytes / 1048576.0);
-        return 10;
-    }
-    printf("arena %d: %.1f MiB mapped once\n", ah_model, (double)arena.bytes / 1048576.0);
-
+    CHECK(memcmp(logits_a, logits_b, sizeof logits_b) == 0,
+          "joint seq0 differs from solo (max %.3g)",
+          memcmp(logits_a, logits_b, sizeof logits_b) == 0
+              ? 0.0
+              : (double)cos_f32(logits_a, logits_b, T_V));
+    CHECK(memcmp(logits_a + T_V, logits_c, sizeof logits_c) == 0, "joint seq1 differs from solo");
+    CHECK(memcmp(logits_d, logits_c, sizeof logits_c) == 0, "permuted seq1 differs");
+    CHECK(memcmp(logits_d + T_V, logits_b, sizeof logits_b) == 0, "permuted seq0 differs");
     {
-        int h_ffn[NL][3];
-        for (l = 0; l < n_ffn_layers; l++) {
-            for (k = 0; k < 3; k++) {
-                if ((rc = lfmgemv_alloc_view(ah_model, (int)v_ffn[l][k].off,
-                                             v_ffn[l][k].bytes, &h_ffn[l][k])) != 0) {
-                    printf("view ffn rc=%d\n", rc); return 10;
-                }
-                if (k == 2) {
-                    if ((rc = lfmgemv_set_shape(h_ffn[l][k], HID, FFN_W, 1)) != 0) {
-                        printf("shape down rc=%d\n", rc); return 10;
-                    }
-                    for (i = 0; i < HID; i++) swbuf[i] = 1.1e-3f;
-                    if ((rc = set_scale_of(h_ffn[l][k], HID, FFN_W, 0.02f, 0.03f,
-                                           swbuf)) != 0) {
-                        printf("scale down rc=%d\n", rc); return 10;
-                    }
-                } else {
-                    if ((rc = lfmgemv_set_shape(h_ffn[l][k], FFN_W, HID, 1)) != 0) {
-                        printf("shape gate/up rc=%d\n", rc); return 10;
-                    }
-                    for (i = 0; i < FFN_W; i++) swbuf[i] = 1.0e-3f;
-                    if ((rc = set_scale_of(h_ffn[l][k], FFN_W, HID, 0.005f, 1.0f,
-                                           swbuf)) != 0) {
-                        printf("scale gate/up rc=%d\n", rc); return 10;
-                    }
-                }
-            }
-        }
-        for (l = 0; l < NL; l++)
-            for (k = 0; k < 3; k++)
-                H.ffn[l][k] = h_ffn[small ? 0 : l][k];
-
-        for (l = 0; l < N_ATTN; l++) {
-            if ((rc = lfmgemv_alloc_view(ah_model, (int)v_k[l].off, v_k[l].bytes, &H.k[l])) != 0 ||
-                (rc = lfmgemv_alloc_view(ah_model, (int)v_v[l].off, v_v[l].bytes, &H.v[l])) != 0 ||
-                (rc = lfmgemv_alloc_view(ah_model, (int)v_kt[l].off, v_kt[l].bytes, &H.kt[l])) != 0 ||
-                (rc = lfmgemv_alloc_view(ah_model, (int)v_tbl[l].off, v_tbl[l].bytes, &H.tbl[l])) != 0) {
-                printf("view attn rc=%d\n", rc); return 10;
-            }
-        }
-        for (l = 0; l < N_CONV; l++) {
-            if ((rc = lfmgemv_alloc_view(ah_model, (int)v_ci[l].off, v_ci[l].bytes, &H.ci[l])) != 0 ||
-                (rc = lfmgemv_alloc_view(ah_model, (int)v_co[l].off, v_co[l].bytes, &H.co[l])) != 0 ||
-                (rc = lfmgemv_alloc_view(ah_model, (int)v_cb[l].off, v_cb[l].bytes, &H.cb[l])) != 0) {
-                printf("view conv rc=%d\n", rc); return 10;
-            }
-            if ((rc = lfmgemv_set_shape(H.ci[l], 3 * HID, HID, 1)) != 0 ||
-                (rc = lfmgemv_set_shape(H.co[l], HID, HID, 1)) != 0) {
-                printf("shape conv rc=%d\n", rc); return 10;
-            }
-            for (i = 0; i < 3 * HID; i++) swbuf[i] = 1.2e-3f;
-            if ((rc = set_scale_of(H.ci[l], 3 * HID, HID, 0.01f, 0.05f, swbuf)) != 0) {
-                printf("scale in_proj rc=%d\n", rc); return 10;
-            }
-            for (i = 0; i < HID; i++) swbuf[i] = 1.4e-3f;
-            if ((rc = set_scale_of(H.co[l], HID, HID, 0.01f, 0.05f, swbuf)) != 0) {
-                printf("scale out_proj rc=%d\n", rc); return 10;
-            }
-        }
-        printf("handles: %d views of arena %d (one mapping for the model)\n",
-               3 * n_ffn_layers + 4 * N_ATTN + 3 * N_CONV, ah_model);
-    }
-    if ((rc = lfmgemv_reserve_scratch(SCRATCH)) != 0) {
-        printf("reserve_scratch rc=%d\n", rc); return 10;
+        size_t state_bytes = (size_t)((uint8_t *)lfm_exec_tokens(&desc, arena0, 0) - arena0);
+        CHECK(memcmp(play, arena_j, state_bytes) == 0, "permuted arena state differs");
     }
 
-    /* ---------- 3. build the command lists (host memory, before mapping) ---- */
+    memcpy(play, arena0, arena_bytes);
+    tok = lfm_exec_tokens(&desc, play, 1);
+    tok[0] = 11;
+    tok[1] = 23;
+    tok[2] = 37;
+    rc = run_rows(&desc, play, rows, 2, 0, logits_e);
+    CHECK(rc == LFM_EXEC_OK, "repeat step rc=%d", rc);
+    CHECK(memcmp(logits_e, logits_a, sizeof logits_a) == 0, "repeat logits differ");
+    CHECK(memcmp(play, arena_j, arena_bytes) == 0, "repeat arena state differs");
+
+    memcpy(play, arena0, arena_bytes);
     {
-        uint8_t *cb = (uint8_t *)calloc(1, CMD_BYTES);
-        int n_cmd = NL + 2 * N_ATTN + 3 * N_CONV;
-        if (!cb) { printf("cmd buffer alloc failed\n"); return 1; }
-
-        /* FFN: RPC-equivalent single command, result to the out sequence */
-        list_init(cb, OFF_FFN, 1, &one_ffn);
-        mk_ffn(cmd_at(&one_ffn, 0), H.ffn[0][0], H.ffn[0][1], H.ffn[0][2],
-               S_ACT, LFM_DST_OUT, 0);
-
-        /* attention: q comes through act -> scratch[0] */
-        list_init(cb, OFF_ATTN, 1, &one_attn);
-        mk_attn(cmd_at(&one_attn, 0), H.k[0], H.kt[0], H.v[0], H.tbl[0],
-                PAGES, -1, S_ACT, 0, LFM_DST_OUT);
-        one_attn.cmd[0].a0 = CTX - 1; one_attn.cmd[0].a1 = CTX;
-        one_attn.cmd[0].a2 = 0;       one_attn.cmd[0].a3 = 1;
-
-        /* shortconv: bcx through act -> scratch[0], fresh state at slot 15 */
-        list_init(cb, OFF_CONV, 1, &one_conv);
-        mk_conv(cmd_at(&one_conv, 0), H.cb[0], HID, blobs[0].ksh,
-                S_STATE + (size_t)15 * 2 * HID * 8, S_ACT, 0, LFM_DST_OUT);
-
-        /* quantise: int32 pattern through act -> scratch[0] */
-        list_init(cb, OFF_QUANT, 1, &one_quant);
-        mk_quant(cmd_at(&one_quant, 0), S_ACT, 0, HQ * HD, 4096, LFM_DST_OUT);
-
-        /* the full token graph */
-        list_init(cb, OFF_ALL, n_cmd, &all);
-        c = 0;
-        for (l = 0; l < NL; l++)
-            mk_ffn(cmd_at(&all, c++), H.ffn[l][0], H.ffn[l][1], H.ffn[l][2],
-                   S_ACT, (l == NL - 1) ? LFM_DST_OUT : LFM_DST_SCRATCH,
-                   (l == NL - 1) ? 0 : S_Y8);
-        for (l = 0; l < N_ATTN; l++) {
-            mk_attn(cmd_at(&all, c++), H.k[l], H.kt[l], H.v[l], H.tbl[l],
-                    PAGES, 0, S_Q, S_ATTN32, LFM_DST_SCRATCH);
-            mk_quant(cmd_at(&all, c++), S_ATTN32, S_Y8, HQ * HD, 4096,
-                     LFM_DST_SCRATCH);
+        lfm_row dec;
+        float lg[T_V];
+        float c;
+        float md = 0.0f;
+        int exact = 1;
+        int i;
+        memset(&dec, 0, sizeof dec);
+        dec.seq = 1;
+        dec.ntok = 1;
+        dec.kv_off = T_KSTAGE;
+        dec.tbl_off = lfm_max_pages(T_CTX, T_POOL);
+        dec.token = 11;
+        dec.pos = 2;
+        rc = run_rows(&desc, play, &dec, 1, 0, lg);
+        CHECK(rc == LFM_EXEC_OK, "split decode rc=%d", rc);
+        dec.token = 23;
+        dec.pos = 3;
+        rc = run_rows(&desc, play, &dec, 1, 0, lg);
+        CHECK(rc == LFM_EXEC_OK, "split decode rc=%d", rc);
+        dec.token = 37;
+        dec.pos = 4;
+        rc = run_rows(&desc, play, &dec, 1, 0, lg);
+        CHECK(rc == LFM_EXEC_OK, "split decode rc=%d", rc);
+        c = cos_f32(lg, logits_c, T_V);
+        for (i = 0; i < T_V; i++) {
+            float diff = fabsf(lg[i] - logits_c[i]);
+            if (diff > md)
+                md = diff;
+            if (diff != 0.0f)
+                exact = 0;
         }
-        for (l = 0; l < N_CONV; l++) {
-            mk_gemv(cmd_at(&all, c++), H.ci[l], S_ACT, S_BCX,
-                    LFM_DST_SCRATCH, 3 * HID);
-            mk_conv(cmd_at(&all, c++), H.cb[l], HID, blobs[l].ksh,
-                    S_STATE + (size_t)l * 2 * HID * 8, S_BCX, S_CY,
-                    LFM_DST_SCRATCH);
-            mk_gemv(cmd_at(&all, c++), H.co[l], S_CY, S_Y8,
-                    LFM_DST_SCRATCH, HID);
-        }
-        if (c != n_cmd) { printf("cmd count %d != %d\n", c, n_cmd); return 1; }
-
-        /* one single-command list per graph command, for the 85-RPC run */
-        for (i = 0; i < n_cmd; i++) {
-            size_t off = OFF_SINGLE + (size_t)i * SINGLE_STRIDE;
-            list_init(cb, off, 1, &singles[i]);
-            singles[i].cmd[0] = all.cmd[i];
-            single_off[i] = off;
-            if (off + SINGLE_STRIDE > (size_t)CMD_BYTES) {
-                printf("single list overflow\n"); return 1;
-            }
-        }
-
-        if (ion_alloc(&cmd_ion, CMD_BYTES) != 0) {
-            printf("cmd ION alloc failed\n"); return 1;
-        }
-        memcpy(cmd_ion.p, cb, CMD_BYTES);
-        free(cb);
-        if ((rc = lfmgemv_map_arena(cmd_ion.fd, cmd_ion.bytes, &ah_cmd)) != 0) {
-            printf("map cmd arena rc=%d\n", rc); return 10;
-        }
-        printf("graph: %d commands (%d FFN, %d ATTN+QUANT, %d conv x 3), "
-               "list %.1f KiB\n", n_cmd, NL, N_ATTN, N_CONV,
-               (double)(sizeof(exec_hdr_t) + (size_t)n_cmd * sizeof(exec_cmd_t)) / 1024.0);
-
-        /* wq1 for the host conv reference */
-
-        /* ---------- 4. bit-exact: FFN RPC vs exec ---------- */
-        {
-            int8_t mid[FFN_W];
-            static ionbuf_t obuf;
-            rc = lfmgemv_ffn(H.ffn[0][0], H.ffn[0][1], H.ffn[0][2],
-                             (const unsigned char *)act, HID, 1,
-                             (unsigned char *)dst_ref, HID,
-                             (unsigned char *)mid, FFN_W, times, 8);
-            if (rc != 0) { printf("ffn rc=%d\n", rc); return 10; }
-            rc = exec_list(ah_cmd, OFF_FFN, &one_ffn, act, HID, 0, 0,
-                           (unsigned char *)out_exec, HID, times);
-            if (rc != 0) { printf("exec ffn rc=%d cmd=%d\n", rc, times[1]); return 10; }
-            bad = 0;
-            for (i = 0; i < HID; i++) if (dst_ref[i] != out_exec[i]) bad++;
-            printf("bit-exact FFN : rpc vs exec mismatches=%d/%d dsp=%d us\n",
-                   bad, HID, times[0]);
-            failures += bad != 0;
-
-            /* same FFN written straight into an attach_out ION buffer */
-            if (ion_alloc(&obuf, 8192) == 0) {
-                list_t att;
-                uint8_t *cb = (uint8_t *)calloc(1, 512);
-                list_init(cb, 0, 1, &att);
-                mk_ffn(cmd_at(&att, 0), H.ffn[0][0], H.ffn[0][1], H.ffn[0][2],
-                       S_ACT, LFM_DST_ATTACHED, 0);
-                att.cmd[0].dst_h = H.ffn[0][0];
-                /* the attached buffer is listed on the same arena as the
-                   command list: map a tiny second ION arena for the command */
-                {
-                    ionbuf_t cl;
-                    int ah2 = -1;
-                    ion_alloc(&cl, 512);
-                    memcpy(cl.p, cb, 512);
-                    free(cb);
-                    rc = lfmgemv_map_arena(cl.fd, cl.bytes, &ah2);
-                    if (rc == 0)
-                        rc = lfmgemv_attach_out(H.ffn[0][0], obuf.fd, obuf.bytes);
-                    if (rc == 0)
-                        rc = exec_list(ah2, 0, &att, act, HID, 0, 0, 0, 0, times);
-                    if (rc == 0) {
-                        dma_sync(obuf.fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
-                        bad = memcmp(obuf.p, dst_ref, HID) != 0;
-                        dma_sync(obuf.fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
-                        printf("bit-exact FFN : attach_out dst mismatches=%d/%d\n",
-                               bad ? 1 : 0, HID);
-                        failures += bad;
-                    } else {
-                        printf("attach_out dst rc=%d (skipped)\n", rc);
-                        failures += 1;
-                    }
-                    lfmgemv_detach_out(H.ffn[0][0]);
-                    if (ah2 >= 0) lfmgemv_unmap_arena(ah2);
-                    ion_free(&cl);
-                }
-                ion_free(&obuf);
-            }
-        }
-
-        /* ---------- 5. bit-exact: attention RPC vs exec ---------- */
-        {
-            for (i = 0; i < PAGES; i++) tbl[i] = i;
-            rc = lfmgemv_attn(H.k[0], H.kt[0], H.v[0], 0,
-                              (const unsigned char *)q, HQ * HD,
-                              (const int *)tbl, PAGES, CTX - 1, CTX, 0, 1,
-                              (unsigned char *)attn_ref, HQ * HD * 4, times, 8);
-            if (rc != 0) { printf("attn rc=%d\n", rc); return 10; }
-            rc = exec_list(ah_cmd, OFF_ATTN, &one_attn, q, HQ * HD, 0, 0,
-                           (unsigned char *)attn_dev, HQ * HD * 4, times);
-            if (rc != 0) { printf("exec attn rc=%d cmd=%d\n", rc, times[1]); return 10; }
-            bad = memcmp(attn_ref, attn_dev, (size_t)HQ * HD * 4) != 0;
-            printf("bit-exact ATTN: rpc vs exec mismatches=%d dsp=%d us\n",
-                   bad ? 1 : 0, times[0]);
-            failures += bad;
-        }
-
-        /* ---------- 6. bit-exact: shortconv host model vs exec ---------- */
-        {
-            rc = exec_list(ah_cmd, OFF_CONV, &one_conv, bcx, 3 * HID, 0, 0,
-                           (unsigned char *)y_dev, HID, times);
-            if (rc != 0) { printf("exec conv rc=%d cmd=%d\n", rc, times[1]); return 10; }
-            conv_ref_first(&blobs[0], bcx, y_ref);
-            bad = 0;
-            for (i = 0; i < HID; i++) if (y_ref[i] != y_dev[i]) bad++;
-            printf("bit-exact CONV: ring model vs exec mismatches=%d/%d dsp=%d us\n",
-                   bad, HID, times[0]);
-            failures += bad != 0;
-
-            /* Same list, but the token counter comes from rt[] (a3 = 0,
-               rt_base = 0). Slot 14 has a fresh ring, like slot 15 above. */
-            {
-                list_t conv_rt;
-                static uint8_t cb_rt[512];
-                int32_t rt_conv[1] = { 100 };
-                memset(cb_rt, 0, sizeof(cb_rt));
-                list_init(cb_rt, 0, 1, &conv_rt);
-                conv_rt.cmd[0] = one_conv.cmd[0];
-                conv_rt.cmd[0].a3 = 0;
-                conv_rt.cmd[0].rt_base = 0;
-                ionbuf_t cl;
-                int ah2 = -1;
-                if (ion_alloc(&cl, 512) == 0) {
-                    memcpy(cl.p, cb_rt, 512);
-                    if ((rc = lfmgemv_map_arena(cl.fd, cl.bytes, &ah2)) == 0)
-                        rc = exec_list(ah2, 0, &conv_rt, bcx, 3 * HID, rt_conv, 1,
-                                       (unsigned char *)y_dev, HID, times);
-                    if (rc == 0) {
-                        bad = 0;
-                        for (i = 0; i < HID; i++) if (y_ref[i] != y_dev[i]) bad++;
-                        printf("bit-exact CONV: counter via rt mismatches=%d/%d\n",
-                               bad, HID);
-                        failures += bad != 0;
-                    } else {
-                        printf("conv rt rc=%d (skipped)\n", rc);
-                        failures += 1;
-                    }
-                    if (ah2 >= 0) lfmgemv_unmap_arena(ah2);
-                    ion_free(&cl);
-                }
-            }
-        }
-
-        /* ---------- 6b. bit-exact: kv_write vs 12 load_buf ---------- */
-        {
-            enum { KVH = 4, KV_SLOTS = 8, KV_ROW = 128 };
-            const int k_head = 64, kt_head = 4, v_head = 128;
-            int hk1 = -1, hkt1 = -1, hv1 = -1, hk2 = -1, hkt2 = -1, hv2 = -1;
-            uint8_t *k_full = (uint8_t *)calloc(1, (size_t)KVH * KV_SLOTS * KV_ROW);
-            uint8_t *kt_full = (uint8_t *)calloc(1, (size_t)KVH * KV_SLOTS * 4);
-            uint8_t *v_full = (uint8_t *)calloc(1, (size_t)KVH * KV_SLOTS * KV_ROW);
-            uint8_t *k_rows = (uint8_t *)malloc((size_t)KVH * k_head);
-            uint8_t *kt_rows = (uint8_t *)malloc((size_t)KVH * kt_head);
-            uint8_t *v_rows = (uint8_t *)malloc((size_t)KVH * v_head);
-            int32_t tbl1[1] = { 0 };
-            int32_t *attn1 = (int32_t *)malloc((size_t)HQ * HD * 4);
-            int32_t *attn2 = (int32_t *)malloc((size_t)HQ * HD * 4);
-            int h;
-            rc = 0;
-            if (!k_full || !kt_full || !v_full || !k_rows || !kt_rows || !v_rows ||
-                !attn1 || !attn2) {
-                printf("kv_write test alloc failed\n"); return 1;
-            }
-            for (i = 0; i < KVH * k_head; i++) k_rows[i] = (uint8_t)(0x10 + i);
-            for (i = 0; i < KVH * kt_head; i++) kt_rows[i] = (uint8_t)(0x40 + i);
-            for (i = 0; i < KVH * v_head; i++) v_rows[i] = (uint8_t)((i * 7) & 0x7f);
-            if ((rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * KV_ROW), &hk1)) == 0 &&
-                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * 4), &hkt1)) == 0 &&
-                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * KV_ROW), &hv1)) == 0 &&
-                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * KV_ROW), &hk2)) == 0 &&
-                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * 4), &hkt2)) == 0 &&
-                (rc = lfmgemv_alloc_buf((int)(KVH * KV_SLOTS * KV_ROW), &hv2)) == 0) {
-                int kb = (int)(KVH * KV_SLOTS * KV_ROW);
-                int ktb = (int)(KVH * KV_SLOTS * 4);
-                rc = lfmgemv_load_buf(hk1, 0, k_full, kb);
-                if (!rc) rc = lfmgemv_load_buf(hkt1, 0, kt_full, ktb);
-                if (!rc) rc = lfmgemv_load_buf(hv1, 0, v_full, kb);
-                if (!rc) rc = lfmgemv_load_buf(hk2, 0, k_full, kb);
-                if (!rc) rc = lfmgemv_load_buf(hkt2, 0, kt_full, ktb);
-                if (!rc) rc = lfmgemv_load_buf(hv2, 0, v_full, kb);
-                for (h = 0; h < KVH && !rc; h++) {
-                    int row = h * KV_SLOTS + 3;
-                    rc = lfmgemv_load_buf(hk1, row * KV_ROW, k_rows + h * k_head, k_head);
-                    if (!rc) rc = lfmgemv_load_buf(hkt1, row * 4, kt_rows + h * kt_head, kt_head);
-                    if (!rc) rc = lfmgemv_load_buf(hv1, row * KV_ROW, v_rows + h * v_head, v_head);
-                }
-                if (!rc)
-                    rc = lfmgemv_kv_write(hk2, hkt2, hv2, KV_SLOTS, 3, k_rows,
-                                          KVH * k_head, kt_rows, KVH * kt_head,
-                                          v_rows, KVH * v_head);
-                if (!rc)
-                    rc = lfmgemv_attn(hk1, hkt1, hv1, 0, (const unsigned char *)q, HQ * HD,
-                                      tbl1, 1, 3, 4, 0, 1, (unsigned char *)attn1,
-                                      HQ * HD * 4, times, 8);
-                if (!rc)
-                    rc = lfmgemv_attn(hk2, hkt2, hv2, 0, (const unsigned char *)q, HQ * HD,
-                                      tbl1, 1, 3, 4, 0, 1, (unsigned char *)attn2,
-                                      HQ * HD * 4, times, 8);
-            }
-            if (rc == 0) {
-                bad = memcmp(attn1, attn2, (size_t)HQ * HD * 4) != 0;
-                printf("bit-exact KVWRT: load_buf vs kv_write mismatches=%d\n",
-                       bad ? 1 : 0);
-                failures += bad;
-            } else {
-                printf("kv_write rc=0x%x (skipped)\n", rc);
-                failures += 1;
-            }
-            if (hk1 >= 0) lfmgemv_release_buf(hk1);
-            if (hkt1 >= 0) lfmgemv_release_buf(hkt1);
-            if (hv1 >= 0) lfmgemv_release_buf(hv1);
-            if (hk2 >= 0) lfmgemv_release_buf(hk2);
-            if (hkt2 >= 0) lfmgemv_release_buf(hkt2);
-            if (hv2 >= 0) lfmgemv_release_buf(hv2);
-            free(k_full); free(kt_full); free(v_full);
-            free(k_rows); free(kt_rows); free(v_rows);
-            free(attn1); free(attn2);
-        }
-
-        /* ---------- 6c. KV pages: scratch table, page crossing, reset ---------
-         * The model path (`DspBackend::attention_layer_full`) writes one token
-         * per `kv_write` at the *global* slot `pos`, then runs ATTN with
-         * `tbl_len = cache_pages` and the identity table in `act` (scratch),
-         * not in a view.  From position 32 on it crosses a page.  This section
-         * is the same path: it must match the direct call bit for bit and the
-         * head of the sequence must survive a `reset_state` (with and without
-         * `KVZERO`) unchanged. */
-        {
-            enum { KVP = 8, KVSL = KVP * 32, KVH = 4 };
-            const int kbytes2 = KVH * KVSL * 128;
-            const int ktbytes2 = KVH * KVSL * 4;
-            const int vbytes2 = KVH * KVSL * 128;
-            const int TBL2 = HQ * HD;          /* table right behind q in act */
-            const int POS2 = 64;               /* two full pages */
-            const int HEAD2 = 8;
-            int hkx = -1, hktx = -1, hvx = -1, ah2 = -1;
-            uint8_t *krow = NULL, *zeros = NULL, *act2 = NULL;
-            int32_t *ktrow = NULL, *dev2 = NULL, *ref2 = NULL;
-            int8_t *qrow = NULL, *vrow = NULL, *firstv = NULL, *replayv = NULL;
-            int tblhost[KVP];
-            int page_bad[2] = { 0, 0 };
-            int pass, pos2;
-            ionbuf_t cl;
-            int have_ion = 0;
-
-            memset(&cl, 0, sizeof(cl));
-            krow = (uint8_t *)calloc(1, KVH * 64);
-            ktrow = (int32_t *)calloc(1, KVH * sizeof(int32_t));
-            vrow = (int8_t *)calloc(1, KVH * HD);
-            qrow = (int8_t *)calloc(1, HQ * HD);
-            act2 = (uint8_t *)calloc(1, TBL2 + 64);
-            dev2 = (int32_t *)calloc(1, HQ * HD * sizeof(int32_t));
-            ref2 = (int32_t *)calloc(1, HQ * HD * sizeof(int32_t));
-            firstv = (int8_t *)calloc(1, HEAD2 * HQ * HD * 4);
-            replayv = (int8_t *)calloc(1, HEAD2 * HQ * HD * 4);
-            zeros = (uint8_t *)calloc(1, kbytes2);
-            if (!krow || !ktrow || !vrow || !qrow || !act2 || !dev2 || !ref2 ||
-                !firstv || !replayv || !zeros) {
-                printf("kv page test alloc failed\n");
-                return 1;
-            }
-            for (pos2 = 0; pos2 < KVP; pos2++) tblhost[pos2] = pos2;
-            /* identity table lives in the act blob, right behind q */
-            for (pos2 = 0; pos2 < KVP; pos2++) {
-                int32_t id = pos2;
-                memcpy(act2 + TBL2 + 4 * pos2, &id, 4);
-            }
-
-            rc = lfmgemv_alloc_buf(kbytes2, &hkx);
-            if (rc == 0) rc = lfmgemv_alloc_buf(ktbytes2, &hktx);
-            if (rc == 0) rc = lfmgemv_alloc_buf(vbytes2, &hvx);
-            if (rc == 0) rc = lfmgemv_load_buf(hkx, 0, zeros, kbytes2);
-            if (rc == 0) rc = lfmgemv_load_buf(hktx, 0, zeros, ktbytes2);
-            if (rc == 0) rc = lfmgemv_load_buf(hvx, 0, zeros, vbytes2);
-            if (rc == 0) { ion_alloc(&cl, 512); have_ion = 1; }
-            if (rc == 0) {
-                /* one ATTN command: q from act, table from scratch[TBL2] */
-                list_t list;
-                exec_cmd_t *cc;
-                list_init((uint8_t *)cl.p, 0, 1, &list);
-                cc = cmd_at(&list, 0);
-                mk_attn(cc, hkx, hktx, hvx, -1, KVP, -1, 0, 0, LFM_DST_OUT);
-                cc->tbl_off = TBL2;
-                rc = lfmgemv_map_arena(cl.fd, cl.bytes, &ah2);
-                if (rc == 0) {
-                    for (pos2 = 0; pos2 < POS2; pos2++) {
-                        int i2;
-                        for (i2 = 0; i2 < KVH * 64; i2++)
-                            krow[i2] = (uint8_t)(pos2 * 131 + i2 * 17 + (i2 >> 3) * 29);
-                        for (i2 = 0; i2 < KVH; i2++)
-                            ktrow[i2] = 20000 + (pos2 * 7919 + i2 * 104729) % 40000;
-                        for (i2 = 0; i2 < KVH * HD; i2++)
-                            vrow[i2] = (int8_t)((pos2 * 53 + i2 * 7) % 251 - 125);
-                        for (i2 = 0; i2 < HQ * HD; i2++)
-                            qrow[i2] = (int8_t)((pos2 * 37 + i2 * 11) % 61 - 30);
-                        memcpy(act2, qrow, HQ * HD);
-
-                        rc = lfmgemv_kv_write(hkx, hktx, hvx, KVSL, pos2,
-                                              krow, KVH * 64,
-                                              (const uint8_t *)ktrow, KVH * 4,
-                                              (const uint8_t *)vrow, KVH * HD);
-                        if (rc != 0) {
-                            printf("kv page kv_write pos=%d rc=0x%x\n", pos2, rc);
-                            break;
-                        }
-                        rc = exec_list(ah2, 0, &list, (const int8_t *)act2,
-                                       TBL2 + KVP * 4, 0, 0,
-                                       (unsigned char *)dev2, HQ * HD * 4, times);
-                        if (rc != 0) {
-                            printf("kv page exec pos=%d rc=0x%x cmd=%d\n",
-                                   pos2, rc, times[1]);
-                            break;
-                        }
-                        rc = lfmgemv_attn(hkx, hktx, hvx, 0,
-                                          (const unsigned char *)qrow, HQ * HD,
-                                          tblhost, KVP, pos2, pos2 + 1, 0, 1,
-                                          (unsigned char *)ref2, HQ * HD * 4,
-                                          times, 8);
-                        if (rc != 0) {
-                            printf("kv page direct pos=%d rc=0x%x\n", pos2, rc);
-                            break;
-                        }
-                        for (i2 = 0; i2 < HQ * HD; i2++)
-                            if (dev2[i2] != ref2[i2]) page_bad[pos2 >> 5]++;
-                        if (pos2 < HEAD2)
-                            memcpy(firstv + (size_t)pos2 * HQ * HD * 4, dev2,
-                                   HQ * HD * 4);
-                    }
-                }
-            }
-            if (rc == 0) {
-                printf("bit-exact KVPAGE: exec vs direct mismatches=%d page0=%d "
-                       "page1=%d (%d positions)\n",
-                       page_bad[0] + page_bad[1], page_bad[0], page_bad[1], POS2);
-                failures += (page_bad[0] + page_bad[1]) != 0;
-
-                for (pass = 0; pass < 2; pass++) {
-                    int mismatches = 0;
-                    int use_kvzero = (pass == 1);
-                    rc = lfmgemv_reset_state(0);
-                    if (rc == 0 && use_kvzero) {
-                        /* second reset in a row: idempotence */
-                        list_t list;
-                        exec_cmd_t *cc;
-                        rc = lfmgemv_reset_state(0);
-                        list_init((uint8_t *)cl.p, 0, 1, &list);
-                        cc = cmd_at(&list, 0);
-                        cc->type = LFM_CMD_KVZERO;
-                        cc->h0 = hkx; cc->h1 = hktx; cc->h2 = hvx;
-                        cc->a0 = KVSL;
-                        if (rc == 0)
-                            rc = exec_list(ah2, 0, &list, (const int8_t *)act2,
-                                           TBL2 + KVP * 4, 0, 0,
-                                           (unsigned char *)dev2, HQ * HD * 4, times);
-                    }
-                    if (rc != 0) { printf("kv page reset rc=0x%x\n", rc); break; }
-                    for (pos2 = 0; pos2 < HEAD2 && rc == 0; pos2++) {
-                        int i2;
-                        for (i2 = 0; i2 < KVH * 64; i2++)
-                            krow[i2] = (uint8_t)(pos2 * 131 + i2 * 17 + (i2 >> 3) * 29);
-                        for (i2 = 0; i2 < KVH; i2++)
-                            ktrow[i2] = 20000 + (pos2 * 7919 + i2 * 104729) % 40000;
-                        for (i2 = 0; i2 < KVH * HD; i2++)
-                            vrow[i2] = (int8_t)((pos2 * 53 + i2 * 7) % 251 - 125);
-                        for (i2 = 0; i2 < HQ * HD; i2++)
-                            qrow[i2] = (int8_t)((pos2 * 37 + i2 * 11) % 61 - 30);
-                        memcpy(act2, qrow, HQ * HD);
-                        rc = lfmgemv_kv_write(hkx, hktx, hvx, KVSL, pos2,
-                                              krow, KVH * 64,
-                                              (const uint8_t *)ktrow, KVH * 4,
-                                              (const uint8_t *)vrow, KVH * HD);
-                        {
-                            list_t list;
-                            exec_cmd_t *cc;
-                            list_init((uint8_t *)cl.p, 0, 1, &list);
-                            cc = cmd_at(&list, 0);
-                            mk_attn(cc, hkx, hktx, hvx, -1, KVP, -1, 0, 0, LFM_DST_OUT);
-                            cc->tbl_off = TBL2;
-                            if (rc == 0)
-                                rc = exec_list(ah2, 0, &list, (const int8_t *)act2,
-                                               TBL2 + KVP * 4, 0, 0,
-                                               (unsigned char *)replayv + (size_t)pos2 * HQ * HD * 4,
-                                               HQ * HD * 4, times);
-                        }
-                    }
-                    if (rc == 0) {
-                        int i2;
-                        for (i2 = 0; i2 < HEAD2 * HQ * HD * 4; i2++)
-                            if (replayv[i2] != firstv[i2]) mismatches++;
-                    }
-                    printf("bit-exact KVRESET: %-18s mismatches=%d/%d\n",
-                           use_kvzero ? "+ KVZERO" : "(reset_state only)",
-                           mismatches, HEAD2 * HQ * HD * 4);
-                    failures += (rc != 0) || mismatches != 0;
-                }
-            } else {
-                printf("kv page test rc=0x%x (skipped)\n", rc);
-                failures += 1;
-            }
-            if (ah2 >= 0) lfmgemv_unmap_arena(ah2);
-            if (have_ion) ion_free(&cl);
-            if (hkx >= 0) lfmgemv_release_buf(hkx);
-            if (hktx >= 0) lfmgemv_release_buf(hktx);
-            if (hvx >= 0) lfmgemv_release_buf(hvx);
-            free(krow); free(ktrow); free(vrow); free(qrow); free(act2);
-            free(dev2); free(ref2); free(firstv); free(replayv); free(zeros);
-        }
-        /* ---------- 7. bit-exact: QUANT formula ---------- */
-        {
-            rc = exec_list(ah_cmd, OFF_QUANT, &one_quant, quant_src, HQ * HD * 4,
-                           0, 0, (unsigned char *)quant_dev, HQ * HD, times);
-            if (rc != 0) { printf("exec quant rc=%d\n", rc); return 10; }
-            bad = 0;
-            for (i = 0; i < HQ * HD; i++) {
-                int64_t v = ((int64_t)((int32_t *)quant_src)[i] * 4096 + 32768) >> 16;
-                if (v > 127) v = 127;
-                if (v < -127) v = -127;
-                if ((int8_t)v != quant_dev[i]) bad++;
-            }
-            printf("bit-exact QUANT: formula vs exec mismatches=%d/%d\n",
-                   bad, HQ * HD);
-            failures += bad != 0;
-        }
-
-        /* ---------- 8. 24 layers x 3 views, raw int32 GEMV ---------- */
-        {
-            int8_t a256[256];
-            int32_t acc[256];
-            int bad_rows = 0, bad_layers = 0, vi = 0;
-            fill_i8(a256, 256, 0x999u);
-            for (l = 0; l < NL; l++) {
-                for (k = 0; k < 3; k++) {
-                    int h;
-                    rc = lfmgemv_alloc_view(ah_model, (int)v_small[vi].off,
-                                            v_small[vi].bytes, &h);
-                    if (rc != 0) { printf("small view rc=%d\n", rc); return 10; }
-                    rc = lfmgemv_set_shape(h, 256, 256, 0);
-                    if (rc != 0) { printf("small shape rc=%d\n", rc); return 10; }
-                    rc = lfmgemv_gemv(h, 1, (const unsigned char *)a256, 256, 1,
-                                      (unsigned char *)acc, 256 * 4, times, 8);
-                    if (rc != 0) { printf("small gemv rc=%d\n", rc); return 10; }
-                    {
-                        const uint8_t *w = (const uint8_t *)arena.p + v_small[vi].off;
-                        int r, lb = 0;
-                        for (r = 0; r < 256; r++)
-                            if (acc[r] != host_i4_dot(w + (size_t)r * 128, a256, 256))
-                                lb++;
-                        if (lb) { bad_layers++; bad_rows += lb; }
-                    }
-                    vi++;
-                }
-            }
-            printf("handles/arena: 24 layers x 3 views read: layers_bad=%d rows_bad=%d\n",
-                   bad_layers, bad_rows);
-            failures += bad_layers != 0;
-        }
-
-        /* ---------- 9. full graph: one exec vs one exec per command -------- */
-        {
-            double wall_all[16], wall_one[16], dsp_all[16], dsp_one[16];
-            int n_all = 0, n_one = 0, t;
-            int one_runs = (tokens < 3 ? tokens : 3);
-
-            rt[0] = CTX - 1; rt[1] = CTX; rt[2] = 0; rt[3] = 1;
-
-            /* walk the singles once, in order: reports the first bad command
-               by index and type before the timing loops hide it */
-            {
-                double slow_wall[5] = { 0 }, slow_dsp[5] = { 0 };
-                int slow_idx[5] = { -1, -1, -1, -1, -1 };
-                double type_dsp[5] = { 0 };
-                int type_n[5] = { 0 };
-                for (i = 0; i < n_cmd; i++) {
-                    double w0 = now_us(), w;
-                    unsigned ty;
-                    rc = exec_list(ah_cmd, single_off[i], &singles[i],
-                                   (i == 0) ? act : 0, (i == 0) ? HID : 0,
-                                   rt, 4, (unsigned char *)out_exec, HID, times);
-                    w = now_us() - w0;
-                    if (rc != 0) {
-                        printf("single cmd %d (type %u) rc=0x%x\n", i,
-                               singles[i].cmd[0].type, rc);
-                        return 10;
-                    }
-                    ty = singles[i].cmd[0].type;
-                    if (ty <= LFM_CMD_CONV) { type_dsp[ty] += times[0]; type_n[ty]++; }
-                    {
-                        int j, worst = 4;
-                        if (w > slow_wall[worst]) {
-                            for (j = 3; j >= 0 && w > slow_wall[j]; j--) {
-                                slow_wall[j + 1] = slow_wall[j];
-                                slow_dsp[j + 1] = slow_dsp[j];
-                                slow_idx[j + 1] = slow_idx[j];
-                            }
-                            j++;
-                            slow_wall[j] = w;
-                            slow_dsp[j] = times[0];
-                            slow_idx[j] = i;
-                        }
-                    }
-                }
-                for (i = 0; i < 5; i++)
-                    if (slow_idx[i] >= 0)
-                        printf("  slow cmd %3d type %u: wall=%.0f dsp=%d us\n",
-                               slow_idx[i], singles[slow_idx[i]].cmd[0].type,
-                               slow_wall[i], (int)slow_dsp[i]);
-                printf("DSP by type: FFN %.1f us x%d | ATTN %.0f us x%d | "
-                       "QUANT %.0f us x%d | GEMV %.0f us x%d | CONV %.0f us x%d\n",
-                       type_dsp[LFM_CMD_FFN] / (type_n[LFM_CMD_FFN] ? type_n[LFM_CMD_FFN] : 1),
-                       type_n[LFM_CMD_FFN],
-                       type_dsp[LFM_CMD_ATTN] / (type_n[LFM_CMD_ATTN] ? type_n[LFM_CMD_ATTN] : 1),
-                       type_n[LFM_CMD_ATTN],
-                       type_dsp[LFM_CMD_QUANT] / (type_n[LFM_CMD_QUANT] ? type_n[LFM_CMD_QUANT] : 1),
-                       type_n[LFM_CMD_QUANT],
-                       type_dsp[LFM_CMD_GEMV] / (type_n[LFM_CMD_GEMV] ? type_n[LFM_CMD_GEMV] : 1),
-                       type_n[LFM_CMD_GEMV],
-                       type_dsp[LFM_CMD_CONV] / (type_n[LFM_CMD_CONV] ? type_n[LFM_CMD_CONV] : 1),
-                       type_n[LFM_CMD_CONV]);
-            }
-
-            for (t = 0; t <= tokens; t++) {
-                int8_t *o = (t == 0) ? out_exec : out_all;
-                double w0 = now_us();
-                rc = exec_list(ah_cmd, OFF_ALL, &all, act, HID, rt, 4,
-                               (unsigned char *)o, HID, times);
-                if (rc != 0) { printf("exec all rc=%d cmd=%d\n", rc, times[1]); return 10; }
-                if (t == 0) memcpy(first_out, o, HID);
-                if (t > 0) { dsp_all[n_all] = times[0]; wall_all[n_all] = now_us() - w0; n_all++; }
-            }
-            memcpy(out_all, out_exec, HID);
-
-            for (t = 0; t <= one_runs; t++) {
-                int8_t *o = (t == 0) ? out_exec : out_one;
-                double w0 = now_us(), dsum = 0;
-                for (i = 0; i < n_cmd; i++) {
-                    rc = exec_list(ah_cmd, single_off[i], &singles[i],
-                                   (i == 0) ? act : 0, (i == 0) ? HID : 0,
-                                   rt, 4, (unsigned char *)o, HID, times);
-                    if (rc != 0) { printf("exec one rc=%d cmd=%d\n", rc, times[1]); return 10; }
-                    dsum += times[0];
-                }
-                if (t > 0) { dsp_one[n_one] = dsum; wall_one[n_one] = now_us() - w0; n_one++; }
-            }
-
-            bad = memcmp(out_all, out_one, HID) != 0;
-            printf("graph bit-exact: 1 exec vs %d execs mismatches=%d\n",
-                   n_cmd, bad ? 1 : 0);
-            failures += bad;
-
-            {
-                double ma = 0, mo = 0, da = 0, d1 = 0;
-                double wmin_a = 1e18, wmin_o = 1e18, dmin_a = 1e18, dmin_o = 1e18;
-                int j;
-                for (j = 0; j < n_all; j++) {
-                    ma += wall_all[j];
-                    da += dsp_all[j];
-                    if (wall_all[j] < wmin_a) wmin_a = wall_all[j];
-                    if (dsp_all[j] < dmin_a) dmin_a = dsp_all[j];
-                }
-                for (j = 0; j < n_one; j++) {
-                    mo += wall_one[j];
-                    d1 += dsp_one[j];
-                    if (wall_one[j] < wmin_o) wmin_o = wall_one[j];
-                    if (dsp_one[j] < dmin_o) dmin_o = dsp_one[j];
-                }
-                ma /= n_all; mo /= n_one; da /= n_all; d1 /= n_one;
-                printf("\nper token:            1 exec      %d execs\n", n_cmd);
-                printf("  DSP (sum of cmds) : %7.0f us  %7.0f us\n", da, d1);
-                printf("  wall (mean)      : %7.0f us  %7.0f us\n", ma, mo);
-                printf("  wall (min)       : %7.0f us  %7.0f us\n", wmin_a, wmin_o);
-                printf("  RPC calls        : %7d     %7d\n", 1, n_cmd);
-                printf("  RPC overhead(min): %7.0f us  %7.0f us\n",
-                       wmin_a - dmin_a, wmin_o - dmin_o);
-                printf("  tok/s (wall min) : %7.2f     %7.2f\n",
-                       1e6 / wmin_a, 1e6 / wmin_o);
-                printf("  vs 54.3 ms report: %+6.1f %% (wall min)\n",
-                       (wmin_a / 54300.0 - 1.0) * 100.0);
-            }
-
-            /* ---------- 10. reset_state returns a fresh sequence ---------- */
-            {
-                int8_t *after = out_one;
-                double w0;
-                rc = lfmgemv_reset_state(0);
-                if (rc != 0) { printf("reset_state rc=%d\n", rc); return 10; }
-                w0 = now_us();
-                rc = exec_list(ah_cmd, OFF_ALL, &all, act, HID, rt, 4,
-                               (unsigned char *)after, HID, times);
-                if (rc != 0) { printf("exec after reset rc=%d cmd=%d\n", rc, times[1]); return 10; }
-                bad = memcmp(first_out, after, HID) != 0;
-                printf("reset identity: after reset mismatches=%d/%d dsp=%d us wall=%.0f us\n",
-                       bad ? 1 : 0, HID, times[0], now_us() - w0);
-                failures += bad;
-            }
-        }
+        printf("exec[%s]: prefill-chunk(3) vs tokenwise-decode cos=%.7f max_abs=%.3g exact=%d\n",
+               fmt_name(fmt), c, md, exact);
+        CHECK(c >= 0.9999f, "prefill vs tokenwise cos %.7f", c);
     }
 
-    lfmgemv_reserve_scratch(0);
-    printf("\n%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
-    return failures ? 2 : 0;
+    memcpy(play, arena0, arena_bytes);
+    ref_forward(&desc, &model, play, &rows[0], ref_logits);
+    {
+        float c = cos_f32(ref_logits, logits_b, T_V);
+        float md = 0.0f;
+        int i;
+        int exact = 1;
+        for (i = 0; i < T_V; i++) {
+            float diff = fabsf(ref_logits[i] - logits_b[i]);
+            if (diff > md)
+                md = diff;
+            if (diff != 0.0f)
+                exact = 0;
+        }
+        printf("exec[%s]: decode-vs-gemv cos=%.7f max_abs=%.3g exact=%d\n", fmt_name(fmt), c, md,
+               exact);
+        CHECK(c >= 0.9999f, "decode vs gemv cos %.7f", c);
+        CHECK(md <= 1e-5f, "decode vs gemv max abs %.3g", md);
+    }
+
+    printf("exec[%s]: joint-vs-solo bitwise, permute-invariant, repeat-deterministic "
+           "(%ux%u tokens)\n",
+           fmt_name(fmt), rows[0].ntok, rows[1].ntok);
+
+    free(arena0);
+    free(arena_j);
+    free(play);
+    lfm_hvx_exec_unbind();
+    lfm_hvx_exec_release();
+    free_model();
+}
+
+int main(void)
+{
+    test_ffn(256, 256);
+    test_ffn(160, 160);
+    test_exec(LFM_KV_F16);
+    test_exec(LFM_KVARN_K4V2);
+    test_exec(LFM_KVARN_K4V4);
+    if (failures != 0) {
+        printf("FAILURES: %d\n", failures);
+        return 1;
+    }
+    printf("hvx exec/ffn: all checks passed\n");
+    return 0;
 }

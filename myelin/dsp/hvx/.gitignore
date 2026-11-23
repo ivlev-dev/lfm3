@@ -1,4 +1,1 @@
-# host-бинарники офлайн-стендов (собираются build.sh)
-/ffn_sim
-/ffn_real_study
-/exec_test
+build/

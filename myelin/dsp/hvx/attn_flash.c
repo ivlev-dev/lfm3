@@ -1,250 +1,149 @@
-/*
- * attn_flash: fused paged attention, online softmax, one pass over KV.
- * Format and scales follow attn_core (lfmgemv_impl.c): int4 K with per-token
- * Q16 scales, int8 V, 16 q heads / 4 kv heads, 32-token pages.
- *
- * The softmax (running max, exp, l, rescale factors, normalisation) is f32.
- * v68 has no IEEE f32 vector SIMD: sf vadd/vmpy and every vconv are v73+ and
- * the qf32 accumulator does not hold a whole window, so acc = sum_j p_j v_j
- * runs in int32.  p is f32 and enters the MAC as Q12, exact enough for the
- * int8 V of this model; l stays f32.
- */
-#include "attn_flash.h"
-
-#include <hexagon_types.h>
-#include "hvx_hexagon_protos.h"
-#include "hexagon_protos.h"
-
-#include <stdint.h>
+#include <float.h>
+#include <math.h>
+#include <stddef.h>
 #include <string.h>
 
-#define AF_HQ 16
-#define AF_KV 4
-#define AF_D  128
+#include "hvx_ops.h"
 
-#define AF_LOG2E      1.4426950408889634f
-#define AF_LN2        0.6931471805599453f
-#define AF_INV_SQRT_D 0.08838834764831845f
-#define AF_MIN_EXP    (-87.0f)
+#define LFM_ATTN_DIM 128
+#define LFM_ATTN_PAGE LFM_KVARN_PAGE_TOKENS
+#define LFM_ATTN_GQA_MAX 32
+#define LFM_ATTN_SCRATCH_FLOATS (2 * LFM_ATTN_PAGE * LFM_ATTN_DIM)
+#define LFM_ATTN_F16_BLOCK ((size_t)LFM_ATTN_PAGE * LFM_ATTN_DIM * 2u)
+#define LFM_ATTN_F16_HEAD (2u * LFM_ATTN_F16_BLOCK)
+#define LFM_ATTN_INV_SQRT_D 0.08838834764831845f
 
-#define AF_PS 4096              /* Q12 weight scale, halved for long windows */
-
-typedef union { HVX_Vector v; int32_t w[32]; float f[32]; } af_vec;
-typedef union { HVX_VectorPair p; HVX_Vector v[2]; } af_pair;
-
-static int8_t  g_qe[AF_HQ][AF_D] __attribute__((aligned(128)));
-static int8_t  g_qo[AF_HQ][AF_D] __attribute__((aligned(128)));
-static int32_t g_sumq[AF_HQ];
-static float   g_qf[AF_HQ];
-
-/* lane gather after AF_VSUM5: keep word 0/1/2/3 of the rotated vectors */
-static const int32_t g_l1[32] __attribute__((aligned(128))) = { -1 };
-static const int32_t g_l2[32] __attribute__((aligned(128))) = { 0, -1 };
-static const int32_t g_l3[32] __attribute__((aligned(128))) = { 0, 0, -1 };
-static const int32_t g_l4[32] __attribute__((aligned(128))) = { 0, 0, 0, -1 };
-
-#define AF_VSUM5(v) do {                                      \
-        (v) = Q6_Vw_vadd_VwVw((v), Q6_V_vror_VR((v), 64));     \
-        (v) = Q6_Vw_vadd_VwVw((v), Q6_V_vror_VR((v), 32));     \
-        (v) = Q6_Vw_vadd_VwVw((v), Q6_V_vror_VR((v), 16));     \
-        (v) = Q6_Vw_vadd_VwVw((v), Q6_V_vror_VR((v), 8));      \
-        (v) = Q6_Vw_vadd_VwVw((v), Q6_V_vror_VR((v), 4));      \
-    } while (0)
-
-/* scalar -> both halfwords of every word (operand of vmpy(Vu.w, Vv.h)) */
-static inline HVX_Vector af_splat_h(int32_t v)
+static void attn_decode(lfm_kv_format fmt, const uint8_t *page, uint32_t first, uint32_t last,
+                        float *kb, float *vb)
 {
-    return Q6_V_vsplat_R((uint32_t)v * 0x00010001u);
-}
+    uint32_t j;
+    int d;
 
-/* exp(x) for x <= 0: 2^round(y) * poly(2^frac), y = x * log2(e). */
-static inline float af_exp(float x)
-{
-    union { float f; uint32_t u; } sc;
-    float y, f, p;
-    int i;
-
-    if (x <= AF_MIN_EXP) return 0.0f;
-    y = x * AF_LOG2E;
-    i = (int)(y + (y >= 0.0f ? 0.5f : -0.5f));
-    f = (y - (float)i) * AF_LN2;
-    p = 1.0f / 720.0f;
-    p = p * f + 1.0f / 120.0f;
-    p = p * f + 1.0f / 24.0f;
-    p = p * f + 1.0f / 6.0f;
-    p = p * f + 0.5f;
-    p = p * f + 1.0f;
-    p = p * f + 1.0f;
-    sc.u = (uint32_t)(i + 127) << 23;
-    return p * sc.f;
-}
-
-static void af_group(int kh, const int8_t *k, const int32_t *ks,
-                     const int8_t *v, const float *vscale,
-                     const int *tbl, int slots, int tok0, int n, float *out)
-{
-    const int8_t *kb = k + (size_t)kh * (size_t)slots * AF_D;
-    const int32_t *ktp = ks + (size_t)kh * (size_t)slots;
-    const int8_t *vb = v + (size_t)kh * (size_t)slots * AF_D;
-    const float *vs = vscale ? vscale + kh * AF_D : 0;
-    HVX_Vector qa[4][2], acc[4][4];
-    float m[4], l[4];
-    int32_t pq[4];
-    float pscale = (float)AF_PS;
-    int h, q, t, d, psh;
-
-    /* |acc| = pscale * 127 * n must stay inside int32 */
-    for (psh = 0; psh < 8 && (n >> psh) > 2048; psh++) pscale *= 0.5f;
-
-    for (h = 0; h < 4; h++) {
-        qa[h][0] = *(const HVX_Vector *)((const int8_t *)g_qe +
-                                        (size_t)(kh * 4 + h) * AF_D);
-        qa[h][1] = *(const HVX_Vector *)((const int8_t *)g_qo +
-                                        (size_t)(kh * 4 + h) * AF_D);
-        m[h] = -1.0e30f;
-        l[h] = 0.0f;
-        pq[h] = 0;
-        for (q = 0; q < 4; q++) acc[h][q] = Q6_V_vzero();
+    if (fmt == LFM_KV_F16) {
+        for (j = first; j <= last; j++) {
+            const uint8_t *ks = page + (size_t)j * LFM_ATTN_DIM * 2u;
+            const uint8_t *vs = page + LFM_ATTN_F16_BLOCK + (size_t)j * LFM_ATTN_DIM * 2u;
+            float *kd = kb + (size_t)(j - first) * LFM_ATTN_DIM;
+            float *vd = vb + (size_t)(j - first) * LFM_ATTN_DIM;
+            for (d = 0; d < LFM_ATTN_DIM; d++) {
+                kd[d] = lfm_f16_to_f32(lfm_f16_load(ks + (size_t)d * 2u));
+                vd[d] = lfm_f16_to_f32(lfm_f16_load(vs + (size_t)d * 2u));
+            }
+        }
+        return;
     }
 
-    for (t = 0; t < n; t++) {
-        int tok = tok0 + t;
-        int slot = (tbl[tok >> 5] << 5) | (tok & 31);
-        HVX_Vector krow, lo, hi, a[4], g;
-        af_vec u;
-        float kc, sc[4], pp[4];
-        int32_t d4[4];
+    for (j = first; j <= last; j++) {
+        lfm_kvarn_decode_k(page, (int)j, kb + (size_t)(j - first) * LFM_ATTN_DIM);
+        lfm_kvarn_decode_v(fmt, page, (int)j, vb + (size_t)(j - first) * LFM_ATTN_DIM);
+    }
+}
 
-        if (slot < 0 || slot >= slots) continue;
+void lfm_hvx_attn_flash(lfm_kv_format fmt, const uint32_t *tbl, const uint8_t *kv_pages,
+                        int kv_heads, int n_heads, int head_dim, const float *q_rot, uint32_t ntok,
+                        uint32_t start, uint32_t window, float *out_rot, float *scratch)
+{
+    size_t head_bytes;
+    size_t page_bytes;
+    float *kblk;
+    float *vblk;
+    int group;
+    int kh;
+    int g;
+    int d;
+    uint32_t t;
 
-        krow = *(const HVX_Vector *)(kb + (size_t)slot * AF_D);
-        lo = Q6_V_vand_VV(krow, Q6_V_vsplat_R(0x0f0f0f0fu));
-        hi = Q6_V_vand_VV(Q6_Vub_vlsr_VubR(krow, 4), Q6_V_vsplat_R(0x0f0f0f0fu));
-        kc = (float)ktp[slot] * (AF_INV_SQRT_D / 65536.0f);
+    if (fmt != LFM_KV_F16 && fmt != LFM_KVARN_K4V2 && fmt != LFM_KVARN_K4V4)
+        return;
+    if (tbl == NULL || kv_pages == NULL || q_rot == NULL || out_rot == NULL || scratch == NULL)
+        return;
+    if (kv_heads <= 0 || n_heads <= 0 || head_dim != LFM_ATTN_DIM)
+        return;
+    if (n_heads % kv_heads != 0)
+        return;
+    group = n_heads / kv_heads;
+    if (group > LFM_ATTN_GQA_MAX)
+        return;
 
-#pragma unroll
-        for (h = 0; h < 4; h++) {
-            a[h] = Q6_Vw_vrmpyacc_VwVubVb(Q6_V_vzero(), lo, qa[h][0]);
-            a[h] = Q6_Vw_vrmpyacc_VwVubVb(a[h], hi, qa[h][1]);
-            AF_VSUM5(a[h]);
-        }
-        g = Q6_V_vor_VV(
-              Q6_V_vor_VV(Q6_V_vand_VV(a[0], *(const HVX_Vector *)g_l1),
-                          Q6_V_vand_VV(Q6_V_vror_VR(a[1], 124),
-                                       *(const HVX_Vector *)g_l2)),
-              Q6_V_vor_VV(Q6_V_vand_VV(Q6_V_vror_VR(a[2], 120),
-                                       *(const HVX_Vector *)g_l3),
-                          Q6_V_vand_VV(Q6_V_vror_VR(a[3], 116),
-                                       *(const HVX_Vector *)g_l4)));
-        u.v = g;
-        for (h = 0; h < 4; h++) d4[h] = u.w[h];
+    head_bytes = fmt == LFM_KV_F16 ? LFM_ATTN_F16_HEAD : lfm_kvarn_head_bytes(fmt);
+    page_bytes = head_bytes * (size_t)kv_heads;
+    kblk = scratch;
+    vblk = scratch + LFM_ATTN_PAGE * LFM_ATTN_DIM;
 
-#pragma unroll
-        for (h = 0; h < 4; h++)
-            sc[h] = (float)(d4[h] - 8 * g_sumq[kh * 4 + h]) *
-                    g_qf[kh * 4 + h] * kc;
+    for (t = 0; t < ntok; t++) {
+        uint32_t pos = start + t;
+        uint32_t k0 = lfm_window_start(pos, window);
+        uint32_t p0 = k0 >> 5;
+        uint32_t p1 = pos >> 5;
 
-#pragma unroll
-        for (h = 0; h < 4; h++) {
-            if (sc[h] > m[h]) {
-                float c = af_exp(m[h] - sc[h]);
-                int f15 = (int)(c * 32768.0f + 0.5f);
-                if (f15 > 32767) f15 = 32767;
-                l[h] *= c;
-                m[h] = sc[h];
-                if (f15 < 32767) {
-                    HVX_Vector cv = af_splat_h(f15);
-#pragma unroll
-                    for (q = 0; q < 4; q++)
-                        acc[h][q] = Q6_Vw_vmpyo_VwVh_s1_rnd_sat(acc[h][q], cv);
+        for (kh = 0; kh < kv_heads; kh++) {
+            float mrun[LFM_ATTN_GQA_MAX];
+            float lrun[LFM_ATTN_GQA_MAX];
+            float *acc[LFM_ATTN_GQA_MAX];
+            uint32_t lp;
+
+            for (g = 0; g < group; g++) {
+                size_t h = (size_t)kh * (size_t)group + (size_t)g;
+                acc[g] = out_rot + ((size_t)t * (size_t)n_heads + h) * LFM_ATTN_DIM;
+                memset(acc[g], 0, sizeof(float) * LFM_ATTN_DIM);
+                mrun[g] = -FLT_MAX;
+                lrun[g] = 0.0f;
+            }
+
+            for (lp = p0; lp <= p1; lp++) {
+                uint32_t first = lp == p0 ? (k0 & 31u) : 0u;
+                uint32_t last = lp == p1 ? (pos & 31u) : 31u;
+                uint32_t cnt = last - first + 1u;
+                uint32_t j;
+                const uint8_t *page = kv_pages + (size_t)tbl[lp] * page_bytes +
+                                      (size_t)kh * head_bytes;
+
+                attn_decode(fmt, page, first, last, kblk, vblk);
+
+                for (g = 0; g < group; g++) {
+                    size_t h = (size_t)kh * (size_t)group + (size_t)g;
+                    const float *q = q_rot + ((size_t)t * (size_t)n_heads + h) * LFM_ATTN_DIM;
+                    float mg = mrun[g];
+                    float lg = lrun[g];
+                    float *a = acc[g];
+
+                    for (j = 0; j < cnt; j++) {
+                        const float *krow = kblk + (size_t)j * LFM_ATTN_DIM;
+                        const float *vrow = vblk + (size_t)j * LFM_ATTN_DIM;
+                        float s = 0.0f;
+
+                        for (d = 0; d < LFM_ATTN_DIM; d++)
+                            s += q[d] * krow[d];
+                        s *= LFM_ATTN_INV_SQRT_D;
+
+                        if (s > mg) {
+                            float alpha = expf(mg - s);
+                            lg *= alpha;
+                            for (d = 0; d < LFM_ATTN_DIM; d++)
+                                a[d] *= alpha;
+                            mg = s;
+                            lg += 1.0f;
+                            for (d = 0; d < LFM_ATTN_DIM; d++)
+                                a[d] += vrow[d];
+                        } else {
+                            float p = expf(s - mg);
+                            lg += p;
+                            for (d = 0; d < LFM_ATTN_DIM; d++)
+                                a[d] += p * vrow[d];
+                        }
+                    }
+
+                    mrun[g] = mg;
+                    lrun[g] = lg;
                 }
             }
-        }
 
-        pp[0] = af_exp(sc[0] - m[0]);
-        pp[1] = af_exp(sc[1] - m[1]);
-        pp[2] = af_exp(sc[2] - m[2]);
-        pp[3] = af_exp(sc[3] - m[3]);
-#pragma unroll
-        for (h = 0; h < 4; h++) {
-            l[h] += pp[h];
-            pq[h] = (int32_t)(pp[h] * pscale + 0.5f);
-        }
-
-        if (!(pq[0] | pq[1] | pq[2] | pq[3]))
-            continue;
-        {
-            af_pair b, w0, w1;
-            HVX_Vector vw[4];
-            HVX_Vector vv = *(const HVX_Vector *)(vb + (size_t)slot * AF_D);
-
-            b.p = Q6_Wh_vunpack_Vb(vv);
-            w0.p = Q6_Ww_vunpack_Vh(b.v[0]);
-            w1.p = Q6_Ww_vunpack_Vh(b.v[1]);
-            vw[0] = w0.v[0];
-            vw[1] = w0.v[1];
-            vw[2] = w1.v[0];
-            vw[3] = w1.v[1];
-#pragma unroll
-            for (h = 0; h < 4; h++) {
-                HVX_Vector ps;
-                if (!pq[h]) continue;
-                ps = af_splat_h(pq[h]);
-#pragma unroll
-                for (q = 0; q < 4; q++)
-                    acc[h][q] = Q6_Vw_vmpyieacc_VwVwVh(acc[h][q], vw[q], ps);
+            for (g = 0; g < group; g++) {
+                float inv = lrun[g] > 0.0f ? 1.0f / lrun[g] : 0.0f;
+                float *a = acc[g];
+                for (d = 0; d < LFM_ATTN_DIM; d++)
+                    a[d] *= inv;
             }
         }
     }
-
-    /* int32 -> f32 is scalar: v68 has no vector conversion */
-    for (h = 0; h < 4; h++) {
-        float inv = l[h] > 0.0f ? (1.0f / l[h]) / pscale : 0.0f;
-        float *dst = out + (size_t)(kh * 4 + h) * AF_D;
-        for (q = 0; q < 4; q++) {
-            af_vec u;
-            u.v = acc[h][q];
-            if (vs) {
-                for (d = 0; d < 32; d++)
-                    dst[q * 32 + d] = (float)u.w[d] * inv * vs[q * 32 + d];
-            } else {
-                for (d = 0; d < 32; d++)
-                    dst[q * 32 + d] = (float)u.w[d] * inv;
-            }
-        }
-    }
-}
-
-void attn_flash(const int8_t *q, const int32_t *qscale,
-                const int8_t *k, const int32_t *ks,
-                const int8_t *v, const float *vscale,
-                const int *tbl, int slots, int pos, int window, int reps,
-                float *out)
-{
-    int h, d, kh, r, tok0, n;
-
-    if (!q || !k || !ks || !v || !tbl || !out) return;
-    if (slots < 1 || pos < 0) return;
-    if (reps < 1) reps = 1;
-
-    for (h = 0; h < AF_HQ; h++) {
-        const int8_t *qp = q + (size_t)h * AF_D;
-        int32_t sq = 0;
-        memset(g_qe[h], 0, AF_D);
-        memset(g_qo[h], 0, AF_D);
-        for (d = 0; d < AF_D; d++) sq += qp[d];
-        for (d = 0; d < AF_D / 2; d++) {
-            g_qe[h][d] = qp[2 * d];
-            g_qo[h][d] = qp[2 * d + 1];
-        }
-        g_sumq[h] = sq;
-        g_qf[h] = qscale ? (float)qscale[h] * (1.0f / 65536.0f) : 1.0f;
-    }
-
-    tok0 = (window > 0 && pos + 1 - window > 0) ? pos + 1 - window : 0;
-    n = pos + 1 - tok0;
-
-    for (r = 0; r < reps; r++)
-        for (kh = 0; kh < AF_KV; kh++)
-            af_group(kh, k, ks, v, vscale, tbl, slots, tok0, n, out);
 }
