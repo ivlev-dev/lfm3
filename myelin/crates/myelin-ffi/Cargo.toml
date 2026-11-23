@@ -15,9 +15,7 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
-myelin-core = { workspace = true, features = ["hf-tokenizer"] }
-lfm-chat = { path = "../../../crates/infra-chat" }
-lfm-domain = { path = "../../../crates/domain" }
+myelin-core.workspace = true
 myelin-npu.workspace = true
 uniffi = { workspace = true, features = ["cli"] }
 
