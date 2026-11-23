@@ -2083,6 +2083,310 @@ static int do_pref(int M, int N, int K, int mode, int reps)
     return 0;
 }
 
+/* ---- int4 prefill on real GGUF weights (mkblob blobs) ----------------- */
+/* Files (in $I4DIR, default "."):
+ *   gate.i4  packed int4, byte(t,k,n) = t*ncr*512 + 512*(k>>5)
+ *            + 128*((k&31)>>3) + 4*n + (k&3), nibble high iff ((k>>2)&1)
+ *   gate.i8  row-major int8 quantisation of the same tensor (N x K)
+ */
+static const char *i4_dir(void)
+{
+    const char *d = getenv("I4DIR");
+    return (d && *d) ? d : ".";
+}
+
+/* weight blob prefix inside $I4DIR: "gate" by default, "down" for the
+ * N=2048/K=7680 FFN down matrix. */
+static const char *i4_name(void)
+{
+    const char *n = getenv("WNAME");
+    return (n && *n) ? n : "gate";
+}
+
+static unsigned char *load_blob(const char *name, size_t want, size_t *got)
+{
+    char path[512];
+    FILE *f;
+    unsigned char *p;
+    long n;
+
+    snprintf(path, sizeof(path), "%s/%s", i4_dir(), name);
+    f = fopen(path, "rb");
+    if (!f) { printf("cannot open %s\n", path); return 0; }
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); printf("%s: empty\n", path); return 0; }
+    if (want && (size_t)n < want) {
+        printf("%s: %ld bytes, need %zu\n", path, n, want);
+        fclose(f);
+        return 0;
+    }
+    p = (unsigned char *)malloc((size_t)n);
+    if (!p) { fclose(f); printf("oom\n"); return 0; }
+    if (fread(p, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(p); return 0; }
+    fclose(f);
+    if (got) *got = (size_t)n;
+    return p;
+}
+
+/* Realistic activations for the int4 path.  HMX `activation.ub` is *unsigned*,
+ * so the quantiser is uint8 with a zero point of 0: kind 0 shifts the
+ * SiLU-like distribution to non-negative values and scales each row to 255;
+ * kind 1 is a sparse {0,1} pattern (kept positive for the same reason, and it
+ * exercises every K crouton). */
+static void gen_act(unsigned char *A, int M, int K, int kind)
+{
+    int s, k;
+    for (s = 0; s < M; s++) {
+        if (kind == 1) {
+            for (k = 0; k < K; k++)
+                A[(size_t)s * K + k] = (unsigned char)((rnd() % 8) == 0 ? 1 : 0);
+            continue;
+        }
+        {
+            float mx = 0, *row = (float *)malloc((size_t)K * sizeof(float));
+            for (k = 0; k < K; k++) {
+                double u1 = ((double)(rnd() % 100000u) + 1.0) / 100001.0;
+                double u2 = ((double)(rnd() % 100000u) + 1.0) / 100001.0;
+                double z = sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+                double y = z / (1.0 + exp(-z)) + 0.35;      /* SiLU(z) >= -0.28 */
+                row[k] = (float)y;
+                if (fabs(y) > mx) mx = (float)fabs(y);
+            }
+            for (k = 0; k < K; k++) {
+                double q = mx > 0 ? (double)row[k] / mx * 255.0 : 0.0;
+                int v = (int)lrint(q);
+                if (v > 255) v = 255;
+                if (v < 0) v = 0;
+                A[(size_t)s * K + k] = (unsigned char)v;
+            }
+            free(row);
+        }
+    }
+}
+
+/* unpack the packed int4 blob to int8 values in [-8,7] (N x K) */
+static int8_t *unpack_i4(const unsigned char *blob, int N, int K, int n0, int nn)
+{
+    int8_t *q = (int8_t *)malloc((size_t)nn * K);
+    int ncr = K / 32, n, k;
+    if (!q) return 0;
+    for (n = 0; n < nn; n++) {
+        int gn = n0 + n;
+        const unsigned char *tile = blob + (size_t)(gn / 32) * (size_t)ncr * 512u;
+        int nn32 = gn & 31;
+        for (k = 0; k < K; k++) {
+            unsigned off = 512u * (unsigned)(k >> 5)
+                         + 128u * (unsigned)((k & 31) >> 3)
+                         + 4u * (unsigned)nn32 + (unsigned)(k & 3);
+            unsigned b = tile[off];
+            unsigned v = ((k >> 2) & 1) ? (b >> 4) : (b & 0xF);
+            q[(size_t)n * K + k] = (int8_t)((v & 8) ? (int)v - 16 : (int)v);
+        }
+    }
+    return q;
+}
+
+/* int8 prefill on the same real weights (gate.i8, row-major N x K). */
+static int do_pref8(int M, int N, int K, int mode, int reps)
+{
+    unsigned char *B, *C;
+    unsigned char *A;
+    int info[16];
+    int rc, s, n, k, bad = 0, sat = 0;
+    double us, macs = (double)M * N * K;
+    int sparse = (mode & 256) ? 1 : 0;
+
+    { char fn[128]; snprintf(fn, sizeof(fn), "%s.i8", i4_name()); B = load_blob(fn, (size_t)N * K, 0); }
+    if (!B) return 1;
+    A = (unsigned char *)malloc((size_t)M * K);
+    C = (unsigned char *)malloc((size_t)M * N);
+    if (!A || !C) { printf("alloc failed\n"); return 1; }
+    gen_act(A, M, K, sparse);
+
+    rc = mx4_pref(A, M * K, B, N * K, M, N, K, mode, reps, C, M * N, info, 16);
+    if (rc || info[0]) { printf("pref8 rc=%d st=%d\n", rc, info[0]); return 1; }
+    us = (double)info[1] / reps;
+    printf("pref8 M=%d N=%d K=%d mode=%d reps=%d act=%s -> us/rep=%.1f pcyc=%d "
+           "TMAC/s=%.2f (nt=%d mt=%d ncr=%d vtcm=%d wgt=%d copy_us=%.1f copychk=%d)\n",
+           M, N, K, mode, reps, sparse ? "sparse" : "silu-int8", us, info[2] / reps,
+           us > 0 ? macs / us * 1e-6 : 0.0, info[3], info[4], info[5], info[10],
+           info[11], (double)info[15] / reps, info[12]);
+    if (us > 0)
+        printf("  one matrix: %.3f us/token at batch %d -> %.0f tok/s; "
+               "LFM3 FFN layer (x3) ~%.2f ms, 24 layers ~%.0f ms\n",
+               us / M, M, M * 1e6 / us, 3.0 * us / 1000.0, 72.0 * us / 1000.0);
+    if ((mode & 8) && !(mode & 512)) {
+        const int chkrows = (M < 8) ? M : 8;
+        double dot = 0, na = 0, nb = 0, mx = 0;
+        long cells = 0;
+        for (s = 0; s < chkrows; s++)
+            for (n = 0; n < N; n++) {
+                int ref = 0, got = C[(size_t)s * N + n], e;
+                for (k = 0; k < K; k++)
+                    ref += (int)A[(size_t)s * K + k] * (int)(int8_t)B[(size_t)n * K + k];
+                if (ref > 255) { ref = 255; sat++; }
+                if (ref < 0) ref = 0;
+                e = got - ref; if (e < 0) e = -e;
+                if (e > mx) mx = (double)e;
+                if (e) bad++;
+                dot += (double)got * ref; na += (double)got * got;
+                nb += (double)ref * ref;
+                cells++;
+            }
+        printf("  check rows=0..%d x N=%d: cells=%ld maxerr=%.0f bad=%d sat=%d cos=%.7f%s\n",
+               chkrows - 1, N, cells, mx, bad, sat,
+               (na > 0 && nb > 0) ? dot / sqrt(na * nb) : 0.0,
+               bad ? "" : "   <== MATCH");
+    }
+    free(A); free(B); free(C);
+    return 0;
+}
+
+static int do_i4pref(int M, int N, int K, int mode, int reps)
+{
+    unsigned char *Bp, *C = 0, *A = 0;
+    int info[16];
+    int rc, s, n, k;
+    size_t need = (size_t)(N / 32) * (K / 32) * 512u;
+    int sparse = (mode & 256) ? 1 : 0;
+    int nocheck = (mode & 512) ? 1 : 0;
+    double us, us_copy, gbps = 0;
+
+    if (K % 32 || N % 32) { printf("i4pref: N and K must be multiples of 32\n"); return 2; }
+    { char fn[128]; snprintf(fn, sizeof(fn), "%s.i4", i4_name()); Bp = load_blob(fn, need, 0); }
+    if (!Bp) return 1;
+    A = (unsigned char *)malloc((size_t)M * K);
+    C = (unsigned char *)malloc((size_t)M * N);
+    if (!A || !C) { printf("alloc failed\n"); free(Bp); free(A); free(C); return 1; }
+    gen_act(A, M, K, sparse);
+    if (mode & 1024) memset(A, 0, (size_t)M * K);
+
+    rc = mx4_i4pref(A, M * K, Bp, (int)need, M, N, K, mode, reps,
+                    C, M * N, info, 16);
+    if (rc || info[0]) {
+        printf("i4pref M=%d N=%d K=%d rc=%d st=%d\n", M, N, K, rc, info[0]);
+        free(Bp); free(A); free(C);
+        return 1;
+    }
+    us = (double)info[1] / (double)info[13];
+    us_copy = (double)info[2] / (double)info[13];
+    if (us_copy > 0) gbps = (double)info[14] / (double)info[2] / 1000.0;
+    printf("i4pref M=%d N=%d K=%d mode=%d reps=%d act=%s depth=%d\n", M, N, K, mode,
+           info[13], sparse ? "sparse" : "silu-int8", ((mode >> 12) & 15) + 1);
+    printf("  total/rep=%.1f us  copy/rep=%.1f us (%.0f%%)  compute/rep=%.1f us  "
+           "pcyc/rep=%d\n", us, us_copy, us > 0 ? 100.0 * us_copy / us : 0.0,
+           us - us_copy, info[3] / info[13]);
+    printf("  TMAC/s(total)=%.2f  stage=%.2f GB/s (%d B/rep)  tiles: nt=%d mt=%d ncr=%d\n",
+           us > 0 ? (double)M * N * K / us * 1e-6 : 0.0, gbps, info[14] / info[13],
+           info[4], info[5], info[6]);
+    printf("  vtcm=%d act_pack_us=%d wheap_copy_us=%d copycheck(bad)=%d sat_cells=%d\n",
+           info[7], info[10], info[11], info[12], info[15]);
+    if (us > 0)
+        printf("  one matrix: %.3f us/token at batch %d -> %.0f tok/s; "
+               "LFM3 FFN layer (x3) ~%.2f ms, 24 layers ~%.0f ms\n",
+               us / M, M, M * 1e6 / us, 3.0 * us / 1000.0, 72.0 * us / 1000.0);
+
+    if ((mode & 8) && !nocheck) {
+        const int n0 = (N > 64) ? 64 : 0;
+        const int chkrows = (M < 8) ? M : 8;
+        double dot = 0, na = 0, nb = 0, mx = 0;
+        long cells = 0, sat = 0;
+        int8_t *q;
+        int bad = 0;
+
+        q = unpack_i4(Bp, N, K, 0, N);          /* full 7.9 MB -> 15.7 MB */
+        if (!q) { printf("  check: oom\n"); }
+        else {
+            /* exact slice: 4 x 64 cells */
+            for (s = 0; s < (M < 4 ? M : 4); s++) {
+                for (n = n0; n < n0 + 64 && n < N; n++) {
+                    int ref = 0, got = C[(size_t)s * N + n], e;
+                    for (k = 0; k < K; k++)
+                        ref += (int)A[(size_t)s * K + k] * (int)q[(size_t)n * K + k];
+                    if (ref > 255) ref = 255;
+                    if (ref < 0) ref = 0;
+                    e = got - ref; if (e < 0) e = -e;
+                    if (e > mx) mx = (double)e;
+                    if (e) { if (bad < 4) printf("  [bad s=%d n=%d got=%d ref=%d] ", s, n, got, ref); bad++; }
+                    cells++;
+                }
+            }
+            printf("  slice s=0..%d n=%d..%d: cells=%ld maxerr=%.0f bad=%d%s\n",
+                   (M < 4 ? M : 4) - 1, n0, n0 + 63, cells, mx, bad,
+                   bad ? "" : "   <== exact");
+            /* cos over chkrows rows x all N */
+            dot = na = nb = 0; mx = 0; cells = 0; sat = 0; bad = 0;
+            for (s = 0; s < chkrows; s++) {
+                for (n = 0; n < N; n++) {
+                    int ref = 0, got = C[(size_t)s * N + n], e;
+                    for (k = 0; k < K; k++)
+                        ref += (int)A[(size_t)s * K + k] * (int)q[(size_t)n * K + k];
+                    if (ref > 255) { ref = 255; sat++; }
+                    if (ref < 0) ref = 0;
+                    e = got - ref; if (e < 0) e = -e;
+                    if (e > mx) mx = (double)e;
+                    if (e) bad++;
+                    dot += (double)got * ref; na += (double)got * got;
+                    nb += (double)ref * ref;
+                    cells++;
+                }
+            }
+            printf("  check rows=0..%d x N=%d: cells=%ld maxerr=%.0f bad=%d sat=%ld "
+                   "cos=%.7f%s\n", chkrows - 1, N, cells, mx, bad, sat,
+                   (na > 0 && nb > 0) ? dot / sqrt(na * nb) : 0.0,
+                   bad ? "" : "   <== MATCH");
+            free(q);
+        }
+    }
+    free(Bp); free(A); free(C);
+    return 0;
+}
+
+/* Decode shape (N=1): the same real weights as an int4 row vs an int8 row,
+ * one GEMV pass over K per rep.  Answers "does int4 help at N=1?". */
+static int do_dec(int K, int reps)
+{
+    unsigned char *Bp;
+    int8_t *row4, *row8;
+    unsigned char *A;
+    int info[16];
+    unsigned char raw[4096];
+    int rc, N = 1;
+    double us4, us8;
+    int pc4, pc8;
+
+    { char fn[128]; snprintf(fn, sizeof(fn), "%s.i4", i4_name()); Bp = load_blob(fn, (size_t)(1) * (K / 32) * 512u, 0); }
+    if (!Bp) return 1;
+    row4 = unpack_i4(Bp, 32, K, 0, 1);
+    free(Bp);
+    { char fn[128]; snprintf(fn, sizeof(fn), "%s.i8", i4_name()); row8 = (int8_t *)load_blob(fn, (size_t)K, 0); }
+    if (!row4 || !row8) { printf("no gate.i4 / gate.i8\n"); return 1; }
+    A = (unsigned char *)malloc(64 * (size_t)K);
+    gen_act(A, 32, K, 1);
+
+    rc = mx4_i4(A, 64 * K, (unsigned char *)row4, K,
+                32, N, K, 4, 0x3FF, 511, 0x6000, 0, reps, 0, -1, 0, 0,
+                raw, 4096, info, 16);
+    if (rc || info[0]) { printf("dec i4 rc=%d st=%d\n", rc, info[0]); return 1; }
+    us4 = (double)info[1] / reps;
+    pc4 = info[2];
+
+    rc = mx4_i8(A, 64 * K, (unsigned char *)row8, K,
+                N, K, 3, 3, 0x3FF, 1023, 0, 0, 0, 0x6000, 0, reps,
+                raw, 4096, info, 16);
+    if (rc || info[0]) { printf("dec i8 rc=%d st=%d\n", rc, info[0]); return 1; }
+    us8 = (double)info[1] / reps;
+    pc8 = info[2];
+
+    printf("dec N=1 K=%d reps=%d real row0 of blk.0.ffn_gate.weight\n", K, reps);
+    printf("  int4: %.3f us  pcyc=%d   int8: %.3f us  pcyc=%d   delta=%+.1f%%\n",
+           us4, pc4, us8, pc8, us8 > 0 ? (us4 - us8) / us8 * 100.0 : 0.0);
+    free(row4); free(row8); free(A);
+    return 0;
+}
+
 /* ---- int4 weights (weight.n) ------------------------------------------ */
 static int do_i4(int M, int N, int K, int wl, int bs, int amax, int mode, int reps, int astep, int wstep, int aoff, int woff)
 {
@@ -2793,6 +3097,21 @@ int main(int argc, char **argv)
                          argc > 5 ? atoi(argv[5]) : 0,
                          argc > 6 ? atoi(argv[6]) : 0,
                          argc > 7 ? atoi(argv[7]) : 20);
+    if (!strcmp(cmd, "i4pref"))
+        return do_i4pref(argc > 2 ? atoi(argv[2]) : 128,
+                         argc > 3 ? atoi(argv[3]) : 7680,
+                         argc > 4 ? atoi(argv[4]) : 2048,
+                         argc > 5 ? (int)strtol(argv[5], 0, 0) : 1,
+                         argc > 6 ? atoi(argv[6]) : 1);
+    if (!strcmp(cmd, "pref8"))
+        return do_pref8(argc > 2 ? atoi(argv[2]) : 128,
+                        argc > 3 ? atoi(argv[3]) : 7680,
+                        argc > 4 ? atoi(argv[4]) : 2048,
+                        argc > 5 ? (int)strtol(argv[5], 0, 0) : 1,
+                        argc > 6 ? atoi(argv[6]) : 1);
+    if (!strcmp(cmd, "dec"))
+        return do_dec(argc > 2 ? atoi(argv[2]) : 2048,
+                      argc > 3 ? atoi(argv[3]) : 2000);
     if (!strcmp(cmd, "pref"))
         return do_pref(argc > 2 ? atoi(argv[2]) : 128,
                        argc > 3 ? atoi(argv[3]) : 128,

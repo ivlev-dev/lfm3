@@ -17,6 +17,13 @@
 
 # host-бинарники стендов
 /dsp/hmx/mx4_test
+/dsp/hmx/mkblob
+# блобы весов из GGUF (генерирует ./deploy.sh weights)
+/dsp/hmx/*.i4
+/dsp/hmx/*.i8
+/dsp/hmx/*.i4s
+/dsp/hmx/*.i8s
+/dsp/hmx/*.meta
 /dsp/hvx/lfmgemv_test
 /dsp/hvx/ab_test
 /dsp/hvx/ffn_test

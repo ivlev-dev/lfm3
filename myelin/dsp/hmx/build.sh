@@ -52,5 +52,9 @@ $HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o mx4_test \
     host.c mx4_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm \
     -Wl,-rpath,'$ORIGIN'
 
+# mkblob — утилита dev-машины (GGUF -> int4/int8 блобы для i4pref).
+# Системный cc: на телефоне она не нужна, SDK ей не требуется.
+cc -O2 -Wall -Wno-unused-function -o mkblob mkblob.c -lm
+
 echo "BUILD OK"
-ls -la libmx4_skel.so mx4_test
+ls -la libmx4_skel.so mx4_test mkblob

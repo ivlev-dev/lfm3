@@ -2,6 +2,7 @@
 # Пуш и запуск стенда HMX на телефоне.
 #
 #   ./deploy.sh push           — залить libmx4_skel.so и mx4_test
+#   ./deploy.sh weights        — сгенерировать блобы весов из GGUF и залить их
 #   ./deploy.sh <args...>      — выполнить mx4_test <args> на устройстве
 #
 # Серийник adb: переменная MADB (по умолчанию — первое устройство из `adb devices`).
@@ -22,4 +23,18 @@ if [ "$1" = "push" ]; then
     echo "pushed -> $D"
     exit 0
 fi
-adb -s "$MADB" shell "cd $D && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=\$PWD ./mx4_test $*"
+if [ "$1" = "weights" ]; then
+    # GGUF читается здесь, на dev-машине; на телефон уезжают только блобы.
+    MODEL=${MODEL:-../../../models/LFM3-1.7B-Q4_K_M.gguf}
+    TENSOR=${TENSOR:-blk.0.ffn_gate.weight}
+    WOUT=${WOUT:-/tmp/opencode/hmxw}
+    NAME=${WBLOB:-gate}
+    mkdir -p "$WOUT"
+    [ -x ./mkblob ] || ./build.sh >/dev/null
+    ./mkblob "$MODEL" "$TENSOR" "$WOUT/$NAME"
+    adb -s "$MADB" push "$WOUT/$NAME.i4" "$WOUT/$NAME.i8" \
+        "$WOUT/$NAME.meta" "$D/" >/dev/null
+    echo "weights -> $D/$NAME.{i4,i8} (from $WOUT)"
+    exit 0
+fi
+adb -s "$MADB" shell "cd $D && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=\$PWD WNAME=${WNAME:-gate} ./mx4_test $*"

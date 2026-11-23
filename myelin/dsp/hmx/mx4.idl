@@ -155,6 +155,27 @@ interface mx4 {
              in long K, in long mode, in long reps,
              rout sequence<octet> C, rout sequence<long> info);
 
+   /* Honest int4 FFN prefill: real (packed) int4 weights staged DDR->VTCM
+      per 32-N tile, then the verified 32-K x 32-N `weight.n` stream.
+        A : M x K int8 row major (activations, spatial padded to 64)
+        B : packed int4, N/32 tiles of (K/32)*512 bytes:
+            byte(t,k,n) = t*(K/32)*512 + 512*(k>>5) + 128*((k&31)>>3)
+                          + 4*n + (k&3), nibble high iff ((k>>2)&1),
+            4-bit two's complement
+        mode bit0 stage weights DDR->VTCM per tile (honest), bit1 staging only,
+             bit2 keep power/locks, bit3 collect C, bit4 double-buffered
+             staging, bit5 stage straight from the FastRPC buffer (else a
+             DSP-heap copy), bit6 evict L2 before the timed loop (cold DDR
+             baseline), bits 12..15 staging depth - 1 (32-N tiles per
+             DDR->VTCM copy).
+        C : M*N uint8 (read back only when mode bit3).
+        info = {status, us_total, us_copy, pcyc_total, ntiles, mtiles, ncr,
+                vtcm_bytes, staged_bytes, mode, act_pack_us, wheap_copy_us,
+                copycheck, reps, copy_bytes, sat} */
+   long i4pref(in sequence<octet> A, in sequence<octet> B, in long M, in long N,
+               in long K, in long mode, in long reps,
+               rout sequence<octet> C, rout sequence<long> info);
+
    /* int4 weights via weight.n.  A: M x K uint8, B: N x K int8 in [-8,7].
       wl 0..3 selects the nibble permutation candidate; bs is the bias/scale
       low word; mode bit0 chunked :deep activation, bit1 skip power/lock,

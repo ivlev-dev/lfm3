@@ -2237,6 +2237,260 @@ int mx4_pref(const unsigned char *Adata, int ALen,
 }
 
 
+/* ================================================================== */
+/* int4 prefill: real packed int4 weights staged DDR -> VTCM           */
+/* ================================================================== */
+/* Same shape rules as `pref` but 32 output channels per tile (int4 weight
+ * crouton = 512 B = 32 K x 32 N) and half the weight traffic.
+ *
+ *   A : M x K int8 row major, M <= 256, spatial padded to 64 rows per tile
+ *   B : packed int4, tile t = N/32 block, (K/32) croutons of 512 B each:
+ *         byte(t,k,n) = t*(K/32)*512 + 512*(k>>5) + 128*((k&31)>>3)
+ *                       + 4*n + (k&3)
+ *       nibble high iff ((k>>2)&1), 4-bit two's complement
+ *
+ *   mode bit0 : stage weights DDR->VTCM per tile (honest cost); off = the
+ *               first strip stays resident (compute-only reference)
+ *        bit1 : skip the HMX stream (staging only)
+ *        bit2 : keep HMX power / HVX lock across reps
+ *        bit3 : collect C (adds a sync per tile, correctness runs only)
+ *        bit4 : double-buffered staging (copy tile i+1 into the other slot
+ *               while the HMX works on tile i)
+ *        bit5 : stage straight from the FastRPC buffer (else the weights are
+ *               copied once into a DSP-heap buffer first, like `pref`)
+ *        bit6 : evict L2 (16 MB read) before the timed loop, cold DDR baseline
+ *        bits 12..15 : staging depth - 1 (32-N tiles copied per DDR->VTCM
+ *               step; 1 tile = K*512/32 bytes per step)
+ *
+ * Staging uses HVX 128 B vector copies: DSP libc memcpy into VTCM runs at
+ * ~0.9 GB/s, the vector loop at ~5 GB/s on the same buffers.
+ *
+ * info = {status, us_total, us_copy, pcyc_total, ntiles, mtiles, ncr,
+ *         vtcm_bytes, staged_bytes, mode, act_pack_us, wheap_copy_us,
+ *         copycheck, reps, copy_bytes, sat}
+ */
+#define I4P_MAXK 8192
+
+static inline void i4_mul(const void *act, uint32_t art,
+                          const void *wgt, uint32_t wc, int deep);
+
+static void i4p_copy(uint8_t *dst, const uint8_t *src, unsigned bytes, int hvx)
+{
+    if (hvx && !(bytes & 2047u)) {
+        unsigned i;
+        for (i = 0; i < bytes; i += 2048u)
+            copy_v2048(dst + i, src + i);
+    } else {
+        memcpy(dst, src, bytes);
+    }
+    /* VTCM visibility: same barrier sequence as `pref` */
+    __asm__ __volatile__("syncht" ::: "memory");
+    __asm__ __volatile__("barrier" ::: "memory");
+}
+
+int mx4_i4pref(const unsigned char *Adata, int ALen,
+               const unsigned char *Bdata, int BLen,
+               int M, int N, int K, int mode, int reps,
+               unsigned char *Cdata, int CLen, int *info, int infoLen)
+{
+    res_t r;
+    uint8_t *base, *vact, *vwgt, *vout, *vbias, *wheap = 0;
+    const int8_t *A = (const int8_t *)Adata;
+    int ncr, mt, nt, rc, i, rep, m, c, g, depth, ngroups;
+    unsigned aregion, wstrip, nbuf, need, wbytes, chunk, tbytes;
+    uint64_t t0, t1, c0, c1, tc;
+    int sat = 0;
+    const uint8_t *wsrc;
+
+    if (infoLen < 16) return -1;
+    memset(info, 0, sizeof(int) * infoLen);
+    if (K < 32 || K > I4P_MAXK || (K & 31)) return -2;
+    if (N < 32 || (N & 31)) return -3;
+    if (M < 1 || M > 256) return -4;
+    if (ALen < M * K) return -5;
+    if (BLen < (N / 32) * (K / 32) * 512) return -6;
+    if (mode & 8) {
+        if (CLen < M * N) return -7;
+    }
+    if (reps < 1 || reps > 100) reps = 1;
+
+    ncr = K / 32;
+    mt = (M + 63) / 64;
+    nt = N / 32;
+    wstrip = 512u * (unsigned)ncr;          /* one 32-N tile, all K */
+    depth = ((mode >> 12) & 15) + 1;        /* 32-N tiles per staging step */
+    if (depth > nt) depth = nt;
+    ngroups = (nt + depth - 1) / depth;
+    chunk = (unsigned)depth * wstrip;
+    nbuf = (mode & 16) ? 2u : 1u;
+    wbytes = (unsigned)nt * wstrip;
+
+    aregion = 2048u * (unsigned)ncr * (unsigned)mt;
+    need = aregion + nbuf * align_up(chunk, 2048u) + 2048u + 2048u + 512u + 2048u;
+    rc = res_get(need, &r);
+    info[0] = rc;
+    if (rc) return 0;
+    info[7] = (int)r.size;
+
+    base = (uint8_t *)(((uintptr_t)r.base + 2047u) & ~(uintptr_t)2047u);
+    vact = base;
+    vwgt = vact + aregion;
+    vout = vwgt + nbuf * align_up(chunk, 2048u);
+    vbias = vout + 2048u + 2048u;           /* store slot 2 KB aligned */
+    memset(base, 0, need);
+    info[4] = nt; info[5] = mt; info[6] = ncr;
+    info[8] = (int)wbytes;
+    info[9] = mode;
+    info[13] = reps;
+
+    t0 = HAP_perf_get_time_us();
+    pref_pack_act(vact, A, M, K, ncr);
+    {
+        uint32_t *bl = (uint32_t *)vbias;
+        for (i = 0; i < 128; i++) bl[i] = 0;
+        for (i = 0; i < 32; i++) { bl[i] = 0x6000u; bl[64 + i] = 0x6000u; }
+    }
+    info[10] = (int)(HAP_perf_get_time_us() - t0);
+    if (!(mode & 32)) {
+        /* prod-like: weights resident in a DSP-heap (DDR) buffer */
+        wheap = (uint8_t *)memalign(128, wbytes + 128u);
+        if (!wheap) { res_put(&r); info[0] = -8; return 0; }
+        t0 = HAP_perf_get_time_us();
+        memcpy(wheap, Bdata, wbytes);
+        info[11] = (int)(HAP_perf_get_time_us() - t0);
+        wsrc = wheap;
+    } else {
+        wsrc = Bdata;
+    }
+
+    if (!(mode & 1)) {
+        /* resident mode: stage the first chunk once, outside the timer */
+        i4p_copy(vwgt, wsrc, chunk < wbytes ? chunk : wbytes, 1);
+    }
+
+    if (!(mode & 4)) {
+        qurt_hvx_lock(QURT_HVX_MODE_128B);
+        hmx_power(1);
+        if (compute_resource_hmx_lock) compute_resource_hmx_lock(r.ctx);
+    }
+
+    if (mode & 64) {
+        /* evict L2 so the staged read really comes from DDR (cold baseline) */
+        unsigned i, n = (16u << 20) / 128u;
+        uint8_t *scr = (uint8_t *)memalign(128, 16u << 20);
+        if (scr) {
+            const HVX_Vector *p = (const HVX_Vector *)scr;
+            HVX_Vector a0 = Q6_V_vzero(), a1 = Q6_V_vzero();
+            memset(scr, 0x33, 16u << 20);
+            for (i = 0; i + 1 < n; i += 2) {
+                a0 = Q6_Vw_vadd_VwVw(a0, p[i]);
+                a1 = Q6_Vw_vadd_VwVw(a1, p[i + 1]);
+            }
+            ((HVX_Vector *)vwgt)[0] = Q6_V_vxor_VV(a0, a1);
+            __asm__ __volatile__("syncht" ::: "memory");
+            __asm__ __volatile__("barrier" ::: "memory");
+            free(scr);
+        }
+    }
+
+    t0 = HAP_perf_get_time_us();
+    c0 = HAP_perf_get_pcycles();
+    for (rep = 0; rep < reps; rep++) {
+        if ((mode & 1) && (mode & 16)) {
+            /* prime slot 0 of the double buffer (inside the honest timer) */
+            tbytes = chunk < wbytes ? chunk : wbytes;
+            tc = HAP_perf_get_time_us();
+            i4p_copy(vwgt, wsrc, tbytes, 1);
+            info[2] += (int)(HAP_perf_get_time_us() - tc);
+            info[14] += (int)tbytes;
+        }
+        for (g = 0; g < ngroups; g++) {
+            int i0 = g * depth;
+            int ncell = (nt - i0) < depth ? (nt - i0) : depth;
+            uint8_t *slot = (mode & 16)
+                ? (vwgt + (unsigned)(g & 1) * align_up(chunk, 2048u)) : vwgt;
+            tbytes = (unsigned)ncell * wstrip;
+            if ((mode & 1) && !(mode & 16)) {
+                tc = HAP_perf_get_time_us();
+                i4p_copy(slot, wsrc + (size_t)i0 * wstrip, tbytes, 1);
+                info[2] += (int)(HAP_perf_get_time_us() - tc);
+                info[14] += (int)tbytes;
+                if (rep == 0 && g == 0) {
+                    int q, bad = 0;
+                    for (q = 0; q < (int)tbytes; q++)
+                        if (slot[q] != wsrc[q]) bad++;
+                    info[12] = bad;             /* reused as copycheck on rep 0 */
+                }
+            }
+            if (mode & 2) {
+                /* staging only: still pipeline the copies */
+                if ((mode & 16) && (mode & 1) && g + 1 < ngroups) {
+                    int i1 = (g + 1) * depth;
+                    unsigned nb = (unsigned)((nt - i1) < depth ? (nt - i1) : depth) * wstrip;
+                    tc = HAP_perf_get_time_us();
+                    i4p_copy(vwgt + (unsigned)((g + 1) & 1) * align_up(chunk, 2048u),
+                             wsrc + (size_t)i1 * wstrip, nb, 1);
+                    info[2] += (int)(HAP_perf_get_time_us() - tc);
+                    info[14] += (int)nb;
+                }
+                continue;
+            }
+            for (i = 0; i < ncell; i++) {
+                int tile = i0 + i;
+                for (m = 0; m < mt; m++) {
+                    if (!(mode & 128)) hmx_clr();
+                    for (c = 0; c < ncr; c++)
+                        i4_mul(vact + (unsigned)(m * ncr + c) * 2048u, 0x3FFu,
+                               slot + (unsigned)i * wstrip + (unsigned)c * 512u,
+                               511u, (mode & 128) ? 2 : 0);
+                    hmx_bias(vbias);
+                    i8_store(vout, 0, 0);
+                    if (mode & 8) {
+                        int rows = (M - m * 64) < 64 ? (M - m * 64) : 64;
+                        int s, n;
+                        hmx_sync();
+                        pref_unpack(vout, Cdata, N, m * 64, tile * 32, rows, 32);
+                        for (s = 0; s < rows; s++)
+                            for (n = 0; n < 32; n++)
+                                if (Cdata[(size_t)(m * 64 + s) * N + tile * 32 + n] == 255)
+                                    sat++;
+                    }
+                }
+            }
+            if ((mode & 1) && (mode & 16) && g + 1 < ngroups) {
+                /* the next chunk goes into the slot of group g-1: wait for that
+                 * compute only, then copy while group g is still running */
+                int i1 = (g + 1) * depth;
+                unsigned nb = (unsigned)((nt - i1) < depth ? (nt - i1) : depth) * wstrip;
+                if (mode & 2) { /* staging-only: nothing to wait for */ }
+                else if (g > 0) hmx_sync();
+                tc = HAP_perf_get_time_us();
+                i4p_copy(vwgt + (unsigned)((g + 1) & 1) * align_up(chunk, 2048u),
+                         wsrc + (size_t)i1 * wstrip, nb, 1);
+                info[2] += (int)(HAP_perf_get_time_us() - tc);
+                info[14] += (int)nb;
+            }
+        }
+    }
+    hmx_sync();
+    c1 = HAP_perf_get_pcycles();
+    t1 = HAP_perf_get_time_us();
+    info[1] = (int)(t1 - t0);
+    info[3] = (int)(c1 - c0);
+    info[15] = sat;
+
+    if (!(mode & 4)) {
+        if (compute_resource_hmx_unlock) compute_resource_hmx_unlock(r.ctx);
+        hmx_power(0);
+        qurt_hvx_unlock();
+    }
+    free(wheap);
+    res_put(&r);
+    info[0] = 0;
+    return 0;
+}
+
+
 /* DDR / VTCM copy bandwidth probe.
  *   mode 0 : HVX read-sum of a DDR buffer            (read only)
  *   mode 1 : HVX read from DDR, store to DDR buffer  (read+write)
