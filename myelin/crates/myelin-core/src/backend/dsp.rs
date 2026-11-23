@@ -1911,6 +1911,10 @@ impl DspBackend {
         });
 
         // q/k RMSNorm per head, then rope, exactly like the CPU oracle.
+        if std::env::var("MYELIN_DUMP_ATTN").ok().as_deref() == Some(&call.layer.to_string()) {
+            let v: Vec<u8> = value.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let _ = std::fs::write("/data/local/tmp/dsp_attn_v.bin", &v);
+        }
         let rope_spec = match call.kind {
             AttentionKind::Sliding => self
                 .spec
@@ -2015,6 +2019,12 @@ impl DspBackend {
                 real *= gates[qh];
             }
             *slot = real;
+        }
+        if std::env::var("MYELIN_DUMP_ATTN").ok().as_deref() == Some(&call.layer.to_string()) {
+            let a: Vec<u8> = attended.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let g: Vec<u8> = gates.as_ref().map(|g| g.iter().flat_map(|x| x.to_le_bytes()).collect()).unwrap_or_default();
+            let _ = std::fs::write("/data/local/tmp/dsp_attn_attended.bin", &a);
+            let _ = std::fs::write("/data/local/tmp/dsp_attn_gate.bin", &g);
         }
         let attended_int8 = quantize_act(&attended, stage.o_act_scale);
         let mut list = exec::List::new(EXEC_SCRATCH_BYTES);

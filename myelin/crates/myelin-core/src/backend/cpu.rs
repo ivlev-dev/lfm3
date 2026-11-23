@@ -459,6 +459,9 @@ impl Backend for CpuBackend {
         attention.query.multiply(call.input, &mut scratch.query)?;
         attention.key.multiply(call.input, &mut scratch.key)?;
         attention.value.multiply(call.input, &mut scratch.value)?;
+        if std::env::var("MYELIN_CPU_DUMP_ATTN").ok().as_deref() == Some(&call.layer.to_string()) {
+            let _ = std::fs::write("/tmp/opencode/cpu_attn_v.bin", scratch.value.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        }
 
         let eps = self.spec.norm_eps;
         for head in 0..dims.heads {
@@ -499,6 +502,12 @@ impl Backend for CpuBackend {
             for value in head_slice.iter_mut() {
                 *value *= gate;
             }
+        }
+        if std::env::var("MYELIN_CPU_DUMP_ATTN").ok().as_deref() == Some(&call.layer.to_string()) {
+            let g: Vec<u8> = scratch.gates.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let a: Vec<u8> = scratch.attended.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write("/tmp/opencode/cpu_attn_gate.bin", g);
+            let _ = std::fs::write("/tmp/opencode/cpu_attn_attended.bin", a);
         }
         attention.output.multiply(&scratch.attended, out)
     }
