@@ -171,7 +171,7 @@ int main(int argc, char **argv)
     }
 
     if (plain) {
-        for (i = 0; i < N * K; i++) q[i] = 7;
+        for (i = 0; i < N * K; i++) q[i] = (plain == 2) ? 0 : 7;
         for (i = 0; i < N * ng; i++) S[i] = 1.0f;
     }
     for (i = 0; i < M * K; i++) {
