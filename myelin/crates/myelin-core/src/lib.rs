@@ -21,6 +21,7 @@ pub mod error;
 pub mod gguf;
 pub mod kv;
 pub mod ops;
+pub mod radix;
 pub mod sampling;
 pub mod session;
 pub mod spec;
@@ -36,6 +37,7 @@ pub use error::{CoreError, RuntimeError};
 pub use gguf::{GgufMeta, MetaValue};
 pub use kv::{KvCache, PagePool, PagedKvCache, PAGE_TOKENS};
 pub use ops::RopeTable;
+pub use radix::{block_hash, chain_hashes, RadixCache, RadixStats};
 pub use sampling::{Sampler, SamplingParams};
 pub use session::{GenerateConfig, Generation, Model, Session, StopReason};
 pub use spec::{
