@@ -5,6 +5,8 @@
 //! DSP port: weights are the same values the device will hold, only the storage
 //! layout differs.
 
+use std::sync::Mutex;
+
 use lfm_gguf::{GgufFile, TensorInfo};
 
 use crate::backend::{AttentionCall, Backend, BackendError, NormSlot, NormWeights};
@@ -20,6 +22,9 @@ pub struct Matrix {
     rows: usize,
     cols: usize,
     data: Vec<f32>,
+    /// Hadamard block the rows are rotated by (`0` = natural basis). See
+    /// [`WeightFormat`]; inputs are rotated by the same block before the dot.
+    had: usize,
 }
 
 impl Matrix {
@@ -31,7 +36,12 @@ impl Matrix {
                 data.len()
             )));
         }
-        Ok(Self { rows, cols, data })
+        Ok(Self {
+            rows,
+            cols,
+            data,
+            had: 0,
+        })
     }
 
     pub fn rows(&self) -> usize {
@@ -62,7 +72,14 @@ impl Matrix {
                 got: out.len(),
             });
         }
-        ops::matvec(&self.data, self.rows, self.cols, x, out);
+        if self.had == 0 {
+            ops::matvec(&self.data, self.rows, self.cols, x, out);
+        } else {
+            // `W' = W H`, `x' = H x` and `H H = I`, so `W' x' = W x`.
+            let mut rotated = x.to_vec();
+            hadamard_blocks(&mut rotated, self.had);
+            ops::matvec(&self.data, self.rows, self.cols, &rotated, out);
+        }
         Ok(())
     }
 }
@@ -141,6 +158,14 @@ impl CpuBackend {
 
     /// Load tensors from an already opened checkpoint.
     pub fn from_gguf(file: &GgufFile, spec: &ModelSpec) -> Result<Self, RuntimeError> {
+        let opts = weight_opts();
+        *WEIGHT_STATS.lock().expect("weight stats") = WeightStats::default();
+        if opts.active() {
+            eprintln!(
+                "cpu experiment: format={:?} had={} conv16={} head_f32={} kvk={:?} kvv={:?}",
+                opts.format, opts.had, opts.conv16, opts.head_f32, opts.k_format, opts.v_format
+            );
+        }
         let dims = &spec.dims;
         let hidden = dims.hidden;
         let kv_dim = dims.kv_dim();
@@ -277,6 +302,7 @@ impl CpuBackend {
             conv_output: vec![0.0; hidden],
             conv_gated: vec![0.0; hidden],
         };
+        report_weight_stats(dims.hidden);
         Ok(Self {
             spec: spec.clone(),
             embedding,
@@ -286,7 +312,6 @@ impl CpuBackend {
             scratch,
         })
     }
-
     fn norm_weight(&self, weights: NormWeights) -> Result<&[f32], BackendError> {
         match weights {
             NormWeights::Layer { layer, slot } => {
@@ -343,6 +368,11 @@ impl Backend for CpuBackend {
             });
         }
         out.copy_from_slice(self.embedding.row(token));
+        if self.embedding.had != 0 {
+            // Rows are stored rotated (`e H`); the embedding lookup returns the
+            // natural vector, so undo the rotation for this one row.
+            hadamard_blocks(out, self.embedding.had);
+        }
         Ok(())
     }
 
@@ -440,6 +470,16 @@ impl Backend for CpuBackend {
             let head_slice = &mut scratch.key[head * dims.head_dim..(head + 1) * dims.head_dim];
             norm_one_head(head_slice, &attention.key_norm, eps);
             attention.rope.apply(head_slice, call.position);
+        }
+        let kv_opts = weight_opts();
+        if let Some(levels) = kv_levels(kv_opts.k_format) {
+            // DSP `kvpage`: int4 per head per token.
+            quantize_symmetric(&mut scratch.key, dims.head_dim, levels);
+        }
+        if let Some(levels) = kv_levels(kv_opts.v_format) {
+            // DSP `kvpage` stores V int8 with a scale constant over tokens;
+            // the CPU control uses one scale per token vector instead.
+            quantize_symmetric(&mut scratch.value, kv_dim, levels);
         }
         kv.append(&scratch.key, &scratch.value)?;
         ops::attention(
@@ -560,28 +600,416 @@ fn tensor<'a>(file: &'a GgufFile, name: &str) -> Result<&'a TensorInfo, RuntimeE
 /// (one scale per vector, absmax/110), so the host can reproduce the device's
 /// intermediate quantisation without the device.
 fn maybe_quantize_i8(values: &mut [f32]) {
-    if std::env::var_os("MYELIN_CPU_INT8_ACT").is_none() {
-        return;
-    }
-    let max = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    if max <= 0.0 {
-        return;
-    }
-    let step = max / 110.0;
-    for value in values.iter_mut() {
-        *value = (*value / step).round().clamp(-127.0, 127.0) * step;
+    let group: usize = match std::env::var("MYELIN_CPU_ACT_GROUP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        Some(group) if group > 0 => group,
+        _ if std::env::var_os("MYELIN_CPU_INT8_ACT").is_some() => values.len(),
+        _ => return,
+    };
+    for chunk in values.chunks_mut(group) {
+        let max = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        if max <= 0.0 {
+            continue;
+        }
+        let step = max / 110.0;
+        for value in chunk.iter_mut() {
+            *value = (*value / step).round().clamp(-127.0, 127.0) * step;
+        }
     }
 }
 
-fn quantize_int4_rows(data: &mut [f32], n: usize, k: usize) {
-    for row in 0..n {
-        let values = &mut data[row * k..(row + 1) * k];
-        let max = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let step = if max > 0.0 { max / 7.0 } else { 1.0 };
-        for value in values.iter_mut() {
-            *value = (*value / step).round().clamp(-8.0, 7.0) * step;
+/// Temporary quantisation experiments for the int4 quality question.
+///
+/// All of these are read once from the environment when the checkpoint is
+/// loaded and are **not** part of the production format. The controls are:
+///
+/// * `MYELIN_CPU_INT4=1` — symmetric int4 (absmax/7) per row, the format the
+///   DSP currently gets (`myelin-pack` `gemv`), which reproduces the loop.
+/// * `MYELIN_CPU_WBLOCK=32|64|128|256|row` — same int4 but one scale per block
+///   of that many inputs instead of one per row. Implies int4.
+/// * `MYELIN_CPU_WASYM=1` — asymmetric int4 with a min term in the same block
+///   (`w = step*q + min`, `q` in `0..=15`); the CPU model of a Q4_K-style
+///   min term. Combines with `WBLOCK`.
+/// * `MYELIN_CPU_WHAD=32|128` — rotate each weight row and its input by a
+///   normalised block Hadamard before quantising (`W H`, `H x`).
+/// * `MYELIN_CPU_Q4K=1` — leave the GGUF values alone (this checkpoint is
+///   Q4_K: per-256 blocks with a min term and f32 combine). Upper bound.
+/// * `MYELIN_CPU_KVK=f32|int8|int4` / `MYELIN_CPU_KVV=f32|int8|int4` —
+///   store K/V quantised at append time (int4 = absmax/7, int8 = absmax/127).
+///   K uses one scale per `head_dim` block, V one per token vector, which is
+///   the CPU analogue of the DSP `kvpage` layout, not bit-identical.
+/// * `MYELIN_CPU_CONV16=1` — shortconv matrices use int16 per row instead of
+///   int4 (CPU analogue of the DSP `CONV16`/Y16 path, not bit-identical).
+/// * `MYELIN_CPU_WHF32=1` — leave the tied embedding/head matrix unquantised,
+///   to separate "body format" from "logits format" in the diagnosis.
+/// * `MYELIN_CPU_WSTATS=1` — always print the weight cosine for the chosen
+///   format, even when it is the native one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeightFormat {
+    /// Values as stored in the GGUF (native Q4_K for the shipped checkpoint).
+    Native,
+    /// Symmetric int4, `block` values share one `absmax/7` scale (`0` = row).
+    Int4 { block: usize },
+    /// Asymmetric int4 with a min term: `w = step * q + min`, `q` in `0..=15`.
+    /// One `(step, min)` pair per `block` values (`0` = row).
+    Asym4 { block: usize },
+    /// Symmetric int16, one `absmax/32767` scale per row.
+    Int16Row,
+}
+
+impl WeightFormat {
+    fn bytes_per_weight(self, cols: usize) -> f64 {
+        let per_group = |block: usize| {
+            let block = if block == 0 { cols } else { block };
+            block as f64
+        };
+        match self {
+            Self::Native => 144.0 / 256.0,
+            Self::Int4 { block } => 0.5 + 4.0 / per_group(block),
+            // One f32 scale and one f32 min per group.
+            Self::Asym4 { block } => 0.5 + 8.0 / per_group(block),
+            Self::Int16Row => 2.0 + 4.0 / cols as f64,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvFormat {
+    F32,
+    Int8,
+    Int4,
+}
+
+impl KvFormat {
+    fn parse(name: &str, value: &str) -> Self {
+        match value {
+            "f32" => Self::F32,
+            "int8" | "i8" => Self::Int8,
+            "int4" | "i4" => Self::Int4,
+            other => {
+                eprintln!("warning: {name}={other} is not f32|int8|int4, ignored");
+                Self::F32
+            }
+        }
+    }
+
+    fn active(self) -> bool {
+        self != Self::F32
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WeightOpts {
+    format: WeightFormat,
+    /// Hadamard block for weights and activations (`0` = off).
+    had: usize,
+    conv16: bool,
+    /// Leave the tied embedding / output head in the GGUF precision.
+    head_f32: bool,
+    k_format: KvFormat,
+    v_format: KvFormat,
+    stats: bool,
+}
+
+impl WeightOpts {
+    fn from_env() -> Self {
+        let flag = |name: &str| std::env::var_os(name).is_some();
+        let q4k = flag("MYELIN_CPU_Q4K");
+        let int4 = flag("MYELIN_CPU_INT4");
+        let block = match std::env::var("MYELIN_CPU_WBLOCK").ok().as_deref() {
+            Some("row") | Some("ROW") => Some(0),
+            Some(value) => match value.parse::<usize>() {
+                Ok(block) if block > 0 => Some(block),
+                _ => {
+                    eprintln!(
+                        "warning: MYELIN_CPU_WBLOCK={value} is not 32|64|128|256|row, ignored"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let format = if q4k {
+            WeightFormat::Native
+        } else if flag("MYELIN_CPU_WASYM") {
+            WeightFormat::Asym4 {
+                block: block.unwrap_or(0),
+            }
+        } else if let Some(block) = block {
+            WeightFormat::Int4 { block }
+        } else if int4 {
+            WeightFormat::Int4 { block: 0 }
+        } else {
+            WeightFormat::Native
+        };
+        let had = match std::env::var("MYELIN_CPU_WHAD").ok().as_deref() {
+            Some("0") | None => 0,
+            Some("32") => 32,
+            Some("128") => 128,
+            Some(other) => {
+                eprintln!("warning: MYELIN_CPU_WHAD={other} is not 0|32|128, ignored");
+                0
+            }
+        };
+        let kv = |name: &str| {
+            std::env::var(name)
+                .map(|value| KvFormat::parse(name, &value))
+                .unwrap_or(KvFormat::F32)
+        };
+        Self {
+            format,
+            had,
+            conv16: flag("MYELIN_CPU_CONV16"),
+            head_f32: flag("MYELIN_CPU_WHF32"),
+            k_format: kv("MYELIN_CPU_KVK"),
+            v_format: kv("MYELIN_CPU_KVV"),
+            stats: flag("MYELIN_CPU_WSTATS"),
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.format != WeightFormat::Native
+            || self.had != 0
+            || self.k_format.active()
+            || self.v_format.active()
+            || self.stats
+    }
+}
+
+fn weight_opts() -> WeightOpts {
+    static OPTS: std::sync::OnceLock<WeightOpts> = std::sync::OnceLock::new();
+    *OPTS.get_or_init(WeightOpts::from_env)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WeightStats {
+    dot: f64,
+    orig_sq: f64,
+    dec_sq: f64,
+    err_sq: f64,
+    max_rel: f64,
+    values: usize,
+}
+
+impl WeightStats {
+    fn add(&mut self, other: Self) {
+        self.dot += other.dot;
+        self.orig_sq += other.orig_sq;
+        self.dec_sq += other.dec_sq;
+        self.err_sq += other.err_sq;
+        self.max_rel = self.max_rel.max(other.max_rel);
+        self.values += other.values;
+    }
+
+    fn cosine(&self) -> f64 {
+        if self.orig_sq == 0.0 || self.dec_sq == 0.0 {
+            return 1.0;
+        }
+        self.dot / (self.orig_sq.sqrt() * self.dec_sq.sqrt())
+    }
+
+    /// `||w - w_hat|| / ||w||`: unlike cosine this is not dominated by the
+    /// few largest weights, which is what exposes a too-coarse per-row scale.
+    fn relative_rmse(&self) -> f64 {
+        if self.orig_sq == 0.0 {
+            return 0.0;
+        }
+        (self.err_sq / self.orig_sq).sqrt()
+    }
+}
+
+static WEIGHT_STATS: Mutex<WeightStats> = Mutex::new(WeightStats {
+    dot: 0.0,
+    orig_sq: 0.0,
+    dec_sq: 0.0,
+    err_sq: 0.0,
+    max_rel: 0.0,
+    values: 0,
+});
+
+/// Normalised block Hadamard transform (fast Walsh-Hadamard) in place.
+///
+/// `block` must be a power of two and divide `values.len()`.
+fn hadamard_blocks(values: &mut [f32], block: usize) {
+    if block <= 1 {
+        return;
+    }
+    debug_assert_eq!(values.len() % block, 0);
+    let scale = 1.0 / (block as f32).sqrt();
+    for chunk in values.chunks_mut(block) {
+        let mut span = 1;
+        while span < block {
+            let mut base = 0;
+            while base < block {
+                for index in base..base + span {
+                    let a = chunk[index];
+                    let b = chunk[index + span];
+                    chunk[index] = a + b;
+                    chunk[index + span] = a - b;
+                }
+                base += 2 * span;
+            }
+            span *= 2;
+        }
+        for value in chunk.iter_mut() {
+            *value *= scale;
+        }
+    }
+}
+
+/// Quantise one row to fixed point and measure the round trip.
+///
+/// Symmetric uses `step = max|w| / levels` and codes in `[-levels-1, levels]`
+/// (7 or 32767, matching the existing `absmax/7` control and the DSP
+/// offset-8 code range `[-8, 7]`). Asymmetric uses `step = (max - min) / 15`
+/// and codes in `0..=15` decoded as `step*q + min` — the min term Q4_K has.
+fn quantize_row_blocks(values: &mut [f32], block: usize, levels: f32, asym: bool) -> WeightStats {
+    let mut stats = WeightStats::default();
+    for chunk in values.chunks_mut(block) {
+        let (low, step) = if asym {
+            let mut low = f32::INFINITY;
+            let mut high = f32::NEG_INFINITY;
+            for value in chunk.iter() {
+                low = low.min(*value);
+                high = high.max(*value);
+            }
+            let span = high - low;
+            if !span.is_finite() || span <= 0.0 {
+                for value in chunk.iter_mut() {
+                    *value = low;
+                }
+                continue;
+            }
+            (low, span / 15.0)
+        } else {
+            let max = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            if max <= 0.0 {
+                continue;
+            }
+            (0.0, max / levels)
+        };
+        for value in chunk.iter_mut() {
+            let original = *value as f64;
+            let quantized = if asym {
+                ((*value - low) / step).round().clamp(0.0, 15.0) * step + low
+            } else {
+                (*value / step).round().clamp(-levels - 1.0, levels) * step
+            };
+            *value = quantized;
+            let decoded = quantized as f64;
+            stats.dot += original * decoded;
+            stats.orig_sq += original * original;
+            stats.dec_sq += decoded * decoded;
+            stats.err_sq += (original - decoded) * (original - decoded);
+            let relative = (original - decoded).abs() / step as f64;
+            stats.max_rel = stats.max_rel.max(relative);
+            stats.values += 1;
+        }
+    }
+    stats
+}
+
+/// Symmetric fixed-point round trip of one vector, one `absmax/levels` scale
+/// per `group` values. Used for the KV-store experiment.
+fn quantize_symmetric(values: &mut [f32], group: usize, levels: f32) {
+    for chunk in values.chunks_mut(group) {
+        let max = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        if max <= 0.0 {
+            continue;
+        }
+        let step = max / levels;
+        for value in chunk.iter_mut() {
+            *value = (*value / step).round().clamp(-levels, levels) * step;
+        }
+    }
+}
+
+fn kv_levels(format: KvFormat) -> Option<f32> {
+    match format {
+        KvFormat::F32 => None,
+        KvFormat::Int8 => Some(127.0),
+        KvFormat::Int4 => Some(7.0),
+    }
+}
+
+/// Apply the selected experimental format to one dequantised matrix.
+///
+/// Returns `None` for the untouched native path.
+struct Prepared {
+    stats: WeightStats,
+    had: usize,
+}
+
+fn prepare_weights(name: &str, data: &mut [f32], rows: usize, cols: usize) -> Option<Prepared> {
+    let opts = weight_opts();
+    if opts.head_f32 && (name == "token_embd.weight" || name == "output.weight") {
+        return None;
+    }
+    let mut format = opts.format;
+    if opts.conv16 && name.contains(".shortconv.") {
+        format = WeightFormat::Int16Row;
+    }
+    if format == WeightFormat::Native && opts.had == 0 {
+        return None;
+    }
+    // A transform that does not tile the row is skipped for that matrix
+    // (only the tiny `shortconv.conv` template hits this).
+    let had = if opts.had != 0 && cols % opts.had == 0 {
+        opts.had
+    } else {
+        0
+    };
+    let block = match format {
+        WeightFormat::Int4 { block } | WeightFormat::Asym4 { block }
+            if block != 0 && cols % block == 0 =>
+        {
+            block
+        }
+        WeightFormat::Int4 { .. } | WeightFormat::Asym4 { .. } => cols,
+        WeightFormat::Int16Row => cols,
+        WeightFormat::Native => cols,
+    };
+    let (levels, asym) = match format {
+        WeightFormat::Int4 { .. } => (7.0, false),
+        WeightFormat::Asym4 { .. } => (15.0, true),
+        WeightFormat::Int16Row => (32_767.0, false),
+        WeightFormat::Native => (0.0, false),
+    };
+    let mut stats = WeightStats::default();
+    for row in 0..rows {
+        let values = &mut data[row * cols..(row + 1) * cols];
+        if had != 0 {
+            hadamard_blocks(values, had);
+        }
+        if format != WeightFormat::Native {
+            stats.add(quantize_row_blocks(values, block, levels, asym));
+        }
+    }
+    Some(Prepared { stats, had })
+}
+
+fn report_weight_stats(hidden: usize) {
+    let opts = weight_opts();
+    if !opts.active() {
+        return;
+    }
+    let stats = *WEIGHT_STATS.lock().expect("weight stats");
+    let format = if opts.conv16 {
+        format!("{:?}+conv16", opts.format)
+    } else {
+        format!("{:?}", opts.format)
+    };
+    eprintln!(
+        "wstats: format={format} had={} cos={:.5} relrmse={:.4} maxrel={:.3} values={} bytes/weight={:.4}",
+        opts.had,
+        stats.cosine(),
+        stats.relative_rmse(),
+        stats.max_rel,
+        stats.values,
+        opts.format.bytes_per_weight(hidden),
+    );
 }
 
 fn load_matrix(
@@ -606,10 +1034,20 @@ fn load_matrix(
         .tensor_bytes(name)
         .map_err(|error| RuntimeError::Gguf(error.to_string()))?;
     let mut data = dequantize(info, bytes, count)?;
-    if std::env::var_os("MYELIN_CPU_INT4").is_some() && rows > 0 {
-        quantize_int4_rows(&mut data, rows, cols);
+    let mut had = 0;
+    if let Some(prepared) = prepare_weights(name, &mut data, rows, cols) {
+        had = prepared.had;
+        WEIGHT_STATS
+            .lock()
+            .expect("weight stats")
+            .add(prepared.stats);
     }
-    Ok(Matrix { rows, cols, data })
+    Ok(Matrix {
+        rows,
+        cols,
+        data,
+        had,
+    })
 }
 
 fn load_vector(file: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>, RuntimeError> {
@@ -639,4 +1077,59 @@ fn dequantize(info: &TensorInfo, bytes: &[u8], count: usize) -> Result<Vec<f32>,
             ggml_type: format!("{:?}", info.ggml_type),
         },
     })
+}
+
+#[cfg(test)]
+mod experiment_tests {
+    use super::*;
+
+    fn deterministic_row(len: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / 8_388_608.0) - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hadamard_is_its_own_inverse() {
+        let original = deterministic_row(64, 7);
+        let mut values = original.clone();
+        hadamard_blocks(&mut values, 32);
+        hadamard_blocks(&mut values, 32);
+        for (a, b) in original.iter().zip(&values) {
+            assert!((a - b).abs() < 1e-5, "{a} != {b}");
+        }
+    }
+
+    #[test]
+    fn asymmetric_codes_span_min_to_max() {
+        let mut values = vec![-3.0, -1.0, 0.5, 2.0, 4.0];
+        let len = values.len();
+        let stats = quantize_row_blocks(&mut values, len, 15.0, true);
+        assert_eq!(stats.values, 5);
+        assert!(values[0] >= -3.0 - 1e-5);
+        assert!(values[4] <= 4.0 + 1e-5);
+        assert!(stats.relative_rmse() < 0.11);
+    }
+
+    #[test]
+    fn block_scale_beats_row_scale_on_outliers() {
+        // One large outlier sets a per-row absmax that is far too coarse for
+        // the quiet values; a 32-wide block keeps them in their own range.
+        let mut row = deterministic_row(256, 11);
+        row[100] = 40.0;
+        let mut per_row = row.clone();
+        let mut blocked = row.clone();
+        let row_stats = quantize_row_blocks(&mut per_row, 256, 7.0, false);
+        let block_stats = quantize_row_blocks(&mut blocked, 32, 7.0, false);
+        assert!(
+            block_stats.relative_rmse() < row_stats.relative_rmse(),
+            "block {} >= row {}",
+            block_stats.relative_rmse(),
+            row_stats.relative_rmse()
+        );
+    }
 }
