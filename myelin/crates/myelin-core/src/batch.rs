@@ -361,10 +361,7 @@ mod tests {
         let spec = PositionBackend::spec(eos);
         Model::from_backend(
             spec.clone(),
-            Box::new(PositionBackend {
-                spec,
-                position: 0,
-            }),
+            Box::new(PositionBackend { spec, position: 0 }),
         )
         .expect("model")
     }
