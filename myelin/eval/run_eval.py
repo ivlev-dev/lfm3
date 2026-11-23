@@ -20,6 +20,7 @@ import csv
 import json
 import math
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -92,6 +93,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--corpus", type=Path, default=EVAL_DIR / "corpus.jsonl")
     parser.add_argument("--max-tokens", type=int, default=40, help="greedy tokens per prompt")
     parser.add_argument("--jobs", type=int, default=2, help="formats evaluated concurrently")
+    parser.add_argument(
+        "--pin",
+        action="store_true",
+        help="pin every worker to its own CPU subset with taskset (recommended with --jobs > 1)",
+    )
     parser.add_argument("--out-dir", type=Path, default=EVAL_DIR / "results")
     parser.add_argument(
         "--formats",
@@ -173,6 +179,7 @@ def run_format(
     max_tokens: int,
     out_dir: Path,
     no_ppl: bool,
+    cpu_set: str | None = None,
 ) -> dict:
     out_file = out_dir / f"{fmt['id']}.jsonl"
     log_file = out_dir / f"{fmt['id']}.log"
@@ -195,6 +202,8 @@ def run_format(
     ]
     if no_ppl:
         command.append("--no-ppl")
+    if cpu_set:
+        command = ["taskset", "-c", cpu_set, *command]
 
     started = time.time()
     with log_file.open("w") as log:
@@ -515,11 +524,29 @@ def main() -> int:
         raise SystemExit(f"reference format {args.reference!r} is not selected")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    cpu_sets: list[str | None] = [None] * len(selected)
+    if args.pin:
+        if not shutil.which("taskset"):
+            raise SystemExit("--pin needs taskset")
+        cores = os.cpu_count() or 1
+        for index in range(len(selected)):
+            lane = index % args.jobs
+            start = lane * cores // args.jobs
+            end = (lane + 1) * cores // args.jobs - 1
+            cpu_sets[index] = str(start) if start == end else f"{start}-{end}"
     print(
         f"evaluating {len(selected)} formats x {args.max_tokens} tokens, "
         f"{args.jobs} jobs, out {args.out_dir}",
         flush=True,
     )
+    if args.pin:
+        print(
+            "pinned: "
+            + ", ".join(
+                f"{fmt['id']}->{cpu_set}" for fmt, cpu_set in zip(selected, cpu_sets)
+            ),
+            flush=True,
+        )
 
     results: list[dict] = []
     if args.from_cache:
@@ -537,8 +564,9 @@ def main() -> int:
                     args.max_tokens,
                     args.out_dir,
                     args.no_ppl,
+                    cpu_sets[index],
                 ): fmt
-                for fmt in selected
+                for index, fmt in enumerate(selected)
             }
             for future, fmt in futures.items():
                 result = future.result()
