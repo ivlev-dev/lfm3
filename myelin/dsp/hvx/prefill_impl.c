@@ -4,6 +4,7 @@
  * dropped: operands are pointers into the caller's resident buffers.
  */
 #include "prefill_impl.h"
+#include "emit_impl.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -156,27 +157,6 @@ static void pref_pack_act(uint8_t *dst, const int8_t *A, int M, int K, int ncr)
                 (uint8_t)A[(size_t)g * K + c];
 }
 
-static void pref_emit(const uint8_t *part, int ng, const float *S,
-                      const float *Q, float m, int Aq, int mode_shift, float *C,
-                      int ldc, int rows, int s0, int n0)
-{
-    int s, n, g;
-    (void)m; (void)Aq; (void)mode_shift;
-    for (s = 0; s < rows; s++)
-        for (n = 0; n < 32; n++) {
-            float acc = 0.0f;
-            for (g = 0; g < ng; g++) {
-                float aq = Q ? Q[g] : 0.0f;
-                float u = (float)part[(size_t)g * 2048u
-                            + 128u * (unsigned)(s >> 2) + 4u * (unsigned)n
-                            + (unsigned)(s & 3)];
-                acc += S[(size_t)(n0 + n) * ng + g] * aq *
-                       (7.02745f * (u + 0.5f) - 448.0f);
-            }
-            C[(size_t)(s0 + s) * ldc + n0 + n] = acc;
-        }
-}
-
 static void pref_emit16(const uint8_t *part, int ng, const float *S,
                         const float *Q, float *C, int ldc, int rows, int n0)
 {
@@ -196,6 +176,8 @@ static void pref_emit16(const uint8_t *part, int ng, const float *S,
             C[(size_t)s * ldc + n0 + n] = acc;
         }
 }
+
+static float g_svec[128 * 64] __attribute__((aligned(128)));
 
 int lfm_prefill(const int8_t *A, const uint8_t *B, const float *S,
                 const float *Q, int M, int N, int K, int G, int C0, int mode,
@@ -402,8 +384,8 @@ int lfm_prefill(const int8_t *A, const uint8_t *B, const float *S,
                         if (!Q) return -13;
                         pref_emit16(vpart, ng, S, Q, C, N, rows, i * 32);
                     } else {
-                        pref_emit(vpart, ng, S, Q, mstore, Aq,
-                                  (mode & 32) != 0, C, N, rows, m * 64, i * 32);
+                        pref_emit(vpart, ng, S, Q, g_svec, C, N, rows, m * 64,
+                                  i * 32);
                     }
                     info[11] += (int)(HAP_perf_get_time_us() - tc);
                 }
