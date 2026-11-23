@@ -172,7 +172,7 @@ static void pref_emit(const uint8_t *part, int ng, const float *S,
                 scs += sc;
                 qs += sc * (Q ? Q[(size_t)(n0 + n) * ng + g] : 0.0f);
             }
-            C[(size_t)s * ldc + n0 + n] = 2.0f * acc / m - 448.0f * (float)Aq * scs
+            C[(size_t)s * ldc + n0 + n] = -(2.0f * acc / m - 448.0f * (float)Aq * scs)
                                          - ((mode_shift) ? 128.0f * qs : 0.0f);
         }
 }

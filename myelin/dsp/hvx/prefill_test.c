@@ -100,6 +100,7 @@ int main(int argc, char **argv)
     int info[20], times[8];
     int C0, Aq;
     double cos, dot = 0, na = 0, nb = 0, mx = 0;
+    double dot2 = 0, na2 = 0, nb2 = 0;
     long cells = 0, bad = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -200,7 +201,7 @@ int main(int argc, char **argv)
                 for (g = 0; g < ng; g++) {
                     long pacc = 0;
                     for (k = 0; k < 32 * G; k++)
-                        pacc -= (long)((int)Au[(size_t)s * K + g * 32 * G + k] - 128)
+                        pacc += (long)Au[(size_t)s * K + g * 32 * G + k]
                               * (long)q[(size_t)n * K + g * 32 * G + k];
                     if (fabs((double)pacc) > mxs) mxs = fabs((double)pacc);
                 }
@@ -281,7 +282,7 @@ int main(int argc, char **argv)
                 for (g = 0; g < ng; g++) {
                     long pacc = 0;
                     for (k = 0; k < 32 * G; k++)
-                        pacc -= (long)((int)Au[(size_t)s * K + g * 32 * G + k] - 128)
+                        pacc += (long)((int)Au[(size_t)s * K + g * 32 * G + k] - 128)
                               * (long)q[(size_t)n * K + g * 32 * G + k];
                     ref += (double)S[(size_t)n * ng + g] * (double)pacc;
                 }
@@ -294,9 +295,14 @@ int main(int argc, char **argv)
                 dot += got * ref;
                 na += got * got;
                 nb += ref * ref;
+                dot2 += got * (-ref);
+                na2 += got * got;
+                nb2 += ref * ref;
                 cells++;
             }
         cos = (na > 0 && nb > 0) ? dot / sqrt(na * nb) : 0.0;
+        printf("  cos(+ref)=%.7f cos(-ref)=%.7f\n", cos,
+               (na2 > 0 && nb2 > 0) ? dot2 / sqrt(na2 * nb2) : 0.0);
         printf("  vs integer reference: cells=%ld maxabs=%.3f bad>2%%=%ld cos=%.7f %s\n",
                cells, mx, bad, cos, cos >= PASS_COS ? "OK" : "FAIL");
     }
