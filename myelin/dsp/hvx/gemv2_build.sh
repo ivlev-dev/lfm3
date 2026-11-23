@@ -16,7 +16,7 @@ echo "[1/2] host check"
 ${HOSTCC:-cc} -O2 -march=native -DGEMV2_HOST -I. -o "$OUT/gemv2_host" gemv2_main.c gemv2.c -lm
 "$OUT/gemv2_host"
 echo "[2/2] qexe"
-CFLAGS="-mv68 -mhvx -mhvx-length=128b -G0 -O3 -Wall -I$S/incs -I$S/incs/stddef -I$TD/target/hexagon/include -I. -I$QU -I$QU/qurt -I$QU/posix"
+CFLAGS="$EXTRA_DEFS -mv68 -mhvx -mhvx-length=128b -G0 -O3 -Wall -I$S/incs -I$S/incs/stddef -I$TD/target/hexagon/include -I. -I$QU -I$QU/qurt -I$QU/posix"
 $CC $CFLAGS -c gemv2.c -o "$OUT/gemv2.o"
 $CC $CFLAGS -c gemv2_main.c -o "$OUT/gemv2_main.o"
 $CC -mv68 -g -nodefaultlibs -nostdlib -Wl,--section-start,.interp=0x23000000 \

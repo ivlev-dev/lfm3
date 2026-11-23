@@ -49,7 +49,15 @@ static inline HVX_Vector codes32(const uint8_t *p)
     HVX_Vector v = *(const HVX_Vector *)p;
     HVX_Vector lo = Q6_V_vand_VV(v, Q6_V_vsplat_R(0x0f0f0f0f));
     HVX_Vector hi = Q6_Vub_vlsr_VubR(v, 4);
+#if GEMV2_SHUFFLE == 0
     HVX_Vector packed = Q6_Vb_vshuffe_VbVb(lo, hi);
+#elif GEMV2_SHUFFLE == 1
+    HVX_Vector packed = Q6_Vb_vshuffe_VbVb(hi, lo);
+#elif GEMV2_SHUFFLE == 2
+    HVX_Vector packed = Q6_Vb_vshuffo_VbVb(lo, hi);
+#else
+    HVX_Vector packed = Q6_Vb_vshuffo_VbVb(hi, lo);
+#endif
     /* nibble + 8 form is offset-8 unsigned; the dot needs signed codes */
     return Q6_Vb_vsub_VbVb(packed, Q6_V_vsplat_R(0x08080808));
 }
@@ -66,9 +74,9 @@ void gemv2_hvx(const gemv2_matrix *m, const int8_t *xq, const float *sa,
                             (double)m->seg_ratio[(size_t)n * m->seg_max + b] / 128.0;
             for (g = 0; g < 8; g++) {
                 int base = b * GEMV2_BLOCK + g * GEMV2_GROUP;
-                int8_t qbuf[128] __attribute__((aligned(128)));
                 HVX_Vector codes;
                 HVX_Vector x = *(const HVX_Vector *)(xq + base);
+                int8_t qbuf[128] __attribute__((aligned(128)));
                 for (i = 0; i < 32; i++)
                     qbuf[i] = (int8_t)q_of(row, base + i);
                 codes = *(const HVX_Vector *)qbuf;
