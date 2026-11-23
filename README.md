@@ -156,3 +156,21 @@ tools/bench_check.sh amd --server   # плюс смоук сервера
 - `docs/backends.md` — ядра, KV, TP/pipeline, замеры.
 - `docs/architecture.md` — устройство кода.
 - `benchmarks/machine.md` — история замеров и методика.
+
+## Myelin: рантайм для Android / Hexagon DSP
+
+В `myelin/` живёт второй, независимый путь инференса — **без QNN и без GPU**,
+на собственных HVX/HMX-ядрах Qualcomm Hexagon v68 (Snapdragon 888).
+Продуктовый формат весов — **штатный Q4_K из GGUF** (4.75 бита, текст
+идентичен 9-битному int8); prefill — на HMX (паритет с QNN: 2.37 мс против
+2.44 мс на матрицу 7680×2048), decode — на HVX.
+
+Начинать с двух документов:
+
+- `myelin/docs/SETUP.md` — установка с нуля: Hexagon SDK 6.7, Android NDK,
+  QEMU для Hexagon v68, модель, стенды, телефон, частые ошибки.
+- `myelin/docs/HANDOVER.md` — что работает, какие решения приняты и почему,
+  измеренные цифры, открытые задачи и порядок работ.
+
+Остальное — `myelin/docs/README.md` (индекс), `myelin/dsp/*/research/REPORT*.md`
+(журнал экспериментов с числами).
