@@ -1683,23 +1683,51 @@ impl DspBackend {
             SCRATCH_BCX,
             3 * hidden,
         ));
-        list.push(
-            exec::Command::conv(
-                stage.conv,
-                hidden,
-                stage.ksh,
-                0,
-                0,
-                stage.state_off,
-                SCRATCH_BCX,
-                SCRATCH_CY,
-            )
-            .with_rt_base(0),
-        );
-        list.push(
-            exec::Command::gemv(stage.out_proj, 1, stage.reps, SCRATCH_CY, hidden, 0, hidden)
+        let conv16 = std::env::var_os("MYELIN_CONV16").is_some();
+        if conv16 {
+            list.push(
+                exec::Command::conv16(
+                    stage.conv,
+                    hidden,
+                    stage.ksh,
+                    0,
+                    0,
+                    stage.state_off,
+                    SCRATCH_BCX,
+                    SCRATCH_CY,
+                )
+                .with_rt_base(0),
+            );
+            list.push(
+                exec::Command::gemv16(
+                    stage.out_proj,
+                    stage.reps,
+                    SCRATCH_CY,
+                    2 * hidden,
+                    0,
+                    hidden,
+                )
                 .with_dst(exec::dst::OUT, 0),
-        );
+            );
+        } else {
+            list.push(
+                exec::Command::conv(
+                    stage.conv,
+                    hidden,
+                    stage.ksh,
+                    0,
+                    0,
+                    stage.state_off,
+                    SCRATCH_BCX,
+                    SCRATCH_CY,
+                )
+                .with_rt_base(0),
+            );
+            list.push(
+                exec::Command::gemv(stage.out_proj, 1, stage.reps, SCRATCH_CY, hidden, 0, hidden)
+                    .with_dst(exec::dst::OUT, 0),
+            );
+        }
         // The token counter is the only per-token value; keeping it out of the
         // command makes the list byte-identical between tokens, so the host
         // executor can keep one arena mapped for the whole generation.
@@ -1710,8 +1738,13 @@ impl DspBackend {
                 "exec returned the wrong output length",
             ));
         }
+        let dequant = if std::env::var_os("MYELIN_CONV16").is_some() {
+            stage.out_scale / 256.0
+        } else {
+            stage.out_scale
+        };
         for (dst, &code) in out.iter_mut().zip(&result.out) {
-            *dst = (code as i8) as f32 * stage.out_scale;
+            *dst = (code as i8) as f32 * dequant;
         }
         if std::env::var_os("MYELIN_DUMP_CONV").is_some() {
             let already = self.conv_dumped.get(layer).copied().unwrap_or(true);

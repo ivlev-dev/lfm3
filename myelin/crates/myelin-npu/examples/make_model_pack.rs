@@ -59,6 +59,7 @@ struct Args {
     /// Keep the old one-scale-per-row int4 pack (no `<blob>.seg` sidecars).
     int4_row: bool,
     rot: usize,
+    conv16: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -72,6 +73,7 @@ fn parse_args() -> Result<Args, String> {
     let mut calib_tokens = 8usize;
     let mut int4_row = false;
     let mut rot = 0usize;
+    let mut conv16 = false;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -82,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "--calib-tokens must be a positive integer".to_owned())?;
             }
             "--int4-row" => int4_row = true,
+            "--conv16" => conv16 = true,
             "--rot" => {
                 rot = value()?
                     .parse()
@@ -103,6 +106,7 @@ fn parse_args() -> Result<Args, String> {
         calib_tokens,
         int4_row,
         rot,
+        conv16,
     })
 }
 
@@ -671,6 +675,7 @@ fn host_logits(
 fn main() {
     let args = parse_args().expect("arguments");
     ROT.store(args.rot, std::sync::atomic::Ordering::Relaxed);
+    CONV16.store(args.conv16, std::sync::atomic::Ordering::Relaxed);
     std::fs::create_dir_all(&args.out).expect("pack directory");
 
     let text = std::fs::read_to_string(&args.tokens).expect("prompt token file");
@@ -1048,6 +1053,7 @@ fn pack_blobs(
 }
 
 static ROT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CONV16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn rotated(matrix: &Matrix) -> Matrix {
     let rot = ROT.load(std::sync::atomic::Ordering::Relaxed);
@@ -1070,8 +1076,14 @@ fn write_gemv(dir: &Path, packed: &PackGemv, matrix: &Matrix, kind: &str) -> u64
         source: None,
     };
     let path = dir.join(&packed.file);
+    // `gemv16` (16-bit shortconv output) needs per-row scales, so the conv
+    // out_proj skips the per-256 sidecar when `--conv16` is on.
+    let force_row = CONV16.load(std::sync::atomic::Ordering::Relaxed)
+        && kind.contains("conv")
+        && kind.ends_with("_out");
     // Per-256 is the production format: one `absmax/7` per 256 inputs, nibble
     // layout and blob header unchanged, scales described by the sidecar.
+    if !force_row {
     if let Some(seg_file) = &packed.seg_scales {
         let seg = segment::build(matrix).expect("pack gemv per-256");
         let manifest = GemvManifest::from_blob(&meta, &seg.gemv_blob());
@@ -1092,6 +1104,7 @@ fn write_gemv(dir: &Path, packed: &PackGemv, matrix: &Matrix, kind: &str) -> u64
             seg.segments.ratios().len() as f64 / 1024.0
         );
         return (seg.blob.len() + seg.segments.encode().len()) as u64;
+    }
     }
     let blob = gemv::build(matrix, &meta).expect("pack gemv");
     let manifest = GemvManifest::from_blob(&meta, &blob);
