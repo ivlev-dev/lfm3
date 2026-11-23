@@ -27,6 +27,7 @@
 #include "ffn_ref.h"
 #include "sim_shim.h"
 #include "../conv/conv_math.h"
+#include "../quant/quant.h"
 
 #include <qurt_alloc.h>
 #include <stdio.h>
@@ -726,6 +727,147 @@ static lfm_cmd *cmd_at(list_t *l, int index)
     return c;
 }
 
+/* ================= activation rotation (Hadamard-32/128) ================ */
+
+static int test_rot(void)
+{
+    const int K = 2048;
+    const int G = K / 32;
+    int bad = 0, rc, ah = -1, i, rot, r;
+    uint8_t *arena = NULL;
+    float *x = NULL, *wr = NULL, *xr = NULL, *ref = NULL;
+    uint8_t *act = NULL, *out = NULL;
+    int res[8];
+    static const int ROTS[3] = { 0, 32, 128 };
+
+    arena = (uint8_t *)memalign(128, 262144);
+    x   = (float *)malloc((size_t)K * 4);
+    wr  = (float *)malloc((size_t)K * 4);
+    xr  = (float *)malloc((size_t)K * 4);
+    ref = (float *)malloc((size_t)K * 4);
+    act = (uint8_t *)malloc((size_t)K * 4);
+    out = (uint8_t *)malloc((size_t)K + (size_t)G * 4 + 128);
+    if (!arena || !x || !wr || !xr || !ref || !act || !out) {
+        printf("SIM [rot] allocation failed\n");
+        bad = 1;
+        goto out;
+    }
+    {
+        uint32_t st = 0xc0ffee11u;
+        for (i = 0; i < K; i++) {
+            st = st * 1664525u + 1013904223u;
+            x[i] = (float)((int)((st >> 8) % 2000u) - 1000) / 300.0f;
+        }
+        x[7] = 12.5f; x[100] = -9.0f;   /* explicit outliers */
+        memcpy(act, x, (size_t)K * 4);
+    }
+
+    printf("SIM [rot] K=%d, HVX rotation + per-group-32 int8 (canonical quantiser)\n", K);
+    for (r = 0; r < 3; r++) {
+        rot = ROTS[r];
+        rc = lfmgemv_probe(-1, 50, rot, res, 8);
+        if (rc != 0) { printf("SIM [rot] probe(50, rot=%d) rc=%d\n", rot, rc); bad = 1; continue; }
+        printf("SIM [rot] rot=%-3d: %d pcycles/token, HVX-vs-scalar mismatches=%d, "
+               "clamps=%d, nonzero=%d\n", rot, res[2], res[3], res[4], res[5]);
+        if (res[3] != 0) bad = 1;
+    }
+
+    if (lfmgemv_probe(-1, 51, 200, res, 8) == 0)
+        printf("SIM [rot] canonical quantiser only: %d pcycles/token\n", res[2]);
+    if (lfmgemv_probe(-1, 50, 0, res, 8) == 0)
+        printf("SIM [rot] copy baseline (8 KB): %d pcycles/token\n", res[2]);
+
+    /* one-command exec list: f32 -> ROTQ -> int8 + f32 scales */
+    memset(arena, 0, 262144);
+    {
+        int fd = sim_ion_register(arena, 262144);
+        rc = lfmgemv_map_arena(fd, 262144, &ah);
+        if (rc != 0) {
+            printf("SIM [rot] map_arena rc=%d fd=%d base=%p\n", rc, fd, (void *)arena);
+            bad = 1; goto out;
+        }
+    }
+    for (r = 0; r < 3; r++) {
+        list_t list;
+        lfm_cmd *c;
+        int nq = 0, nsc = 0, maxq = 0;
+        rot = ROTS[r];
+        list_init(arena, 0, 1, &list);
+        c = cmd_at(&list, 0);
+        c->type = 9;                    /* LFM_CMD_ROTQ */
+        c->src = LFM_SRC_SCRATCH;
+        c->dst = LFM_DST_OUT;
+        c->src_off = 0;
+        c->src_len = K * 4;
+        c->dst_off = 0;
+        c->dst_len = K + G * 4;
+        c->a0 = rot;
+        memset(out, 0xCD, (size_t)K + (size_t)G * 4);
+        rc = lfmgemv_exec(ah, 0, 1, act, K * 4, NULL, 0, out,
+                          K + G * 4, NULL, 0);
+        if (rc != 0) { printf("SIM [rot] exec ROTQ rot=%d rc=%d\n", rot, rc); bad = 1; continue; }
+        /* independent scalar reference: normalised rotation + canonical quant */
+        for (i = 0; i < K; i += (rot ? rot : K)) {
+            int blk = rot ? rot : K, g, j;
+            memcpy(ref, x + i, (size_t)blk * 4);
+            lfm_rot_blocks_f32(ref, blk, rot);
+            {
+                int8_t qref[2048];
+                float sref[64];
+                (void)lfm_quant_i8_group32(ref, blk, qref, sref);
+                for (j = 0; j < blk; j++) {
+                    int d = (int)(int8_t)out[i + j] - (int)qref[j];
+                    if (d < 0) d = -d;
+                    if (d > maxq) maxq = d;
+                    if (d) nq++;
+                }
+                for (g = 0; g < blk / 32; g++) {
+                    float a = ((float *)(out + K))[i / 32 + g];
+                    float e = a - sref[g];
+                    if (e < 0) e = -e;
+                    if (e > 1e-5f * (sref[g] < 0 ? -sref[g] : sref[g]) + 1e-7f) nsc++;
+                }
+            }
+        }
+        printf("SIM [rot] exec rot=%-3d: q mismatches=%d (max |d|=%d), "
+               "scale mismatches=%d\n", rot, nq, maxq, nsc);
+        if (nq || nsc) bad = 1;
+        (void)rc;
+    }
+
+    /* orthogonality: <R w, R x> == <w, x> for the same R (f32) */
+    {
+        uint32_t st = 0x5eed1234u;
+        double d0 = 0.0, d1 = 0.0, mag = 0.0;
+        for (i = 0; i < K; i++) {
+            st = st * 1664525u + 1013904223u;
+            wr[i] = (float)((int)((st >> 8) % 2000u) - 1000) / 700.0f;
+        }
+        memcpy(xr, x, (size_t)K * 4);
+        for (i = 0; i < K; i++) {
+            d0 += (double)wr[i] * x[i];
+            mag += (double)x[i] * x[i];
+        }
+        lfm_rot_blocks_f32(wr, K, 32);
+        lfm_rot_blocks_f32(xr, K, 32);
+        for (i = 0; i < K; i++) d1 += (double)wr[i] * xr[i];
+        {
+            double err = d0 != 0.0 ? (d1 - d0) / (d0 < 0 ? -d0 : d0) : 0.0;
+            if (err < 0) err = -err;
+            printf("SIM [rot] orthogonality H32: dot=%.4f rotated=%.4f rel=%.2e\n",
+                   d0, d1, err);
+            if (err > 1e-5) bad = 1;
+        }
+    }
+
+out:
+    if (ah >= 0) lfmgemv_unmap_arena(ah);
+    free(arena); free(x); free(wr); free(xr); free(ref); free(act); free(out);
+    group_result("rot", bad);
+    return bad;
+}
+
+
 static int set_scale_of(int h, int N, int Kdim, float sa, float so, const float *sw)
 {
     unsigned char *sbuf = (unsigned char *)malloc(16 + (size_t)N * sizeof(float));
@@ -1240,6 +1382,7 @@ int main(void)
     test_gemv();
     test_ffn();
     test_exec();
+    test_rot();
     test_team();
 
     printf("\nSIM RESULT: %s (%d/%d groups failed)\n",

@@ -77,6 +77,20 @@ int main(int argc, char **argv)
     size_t wbytes = (size_t)N * (K / 2);
     size_t chunk = 256 * 1024;
     int reps = (argc > 1) ? atoi(argv[1]) : 20;
+    if (argc > 1 && strcmp(argv[1], "rot") == 0) {
+        int res[8], rot, r;
+        static const int ROTS[3] = { 0, 32, 128 };
+        for (r = 0; r < 3; r++) {
+            rot = ROTS[r];
+            if (lfmgemv_probe(-1, 50, rot, res, 8) != 0) return 1;
+            printf("rot=%d rotation: %d pcycles/token (%.3f us @1133MHz)\n",
+                   rot, res[2], res[2] / 1133.0);
+        }
+        if (lfmgemv_probe(-1, 51, 200, res, 8) != 0) return 1;
+        printf("quantise K=2048 (canonical int8/32): %d pcycles/token (%.3f us)\n",
+               res[2], res[2] / 1133.0);
+        return 0;
+    }
     int i, m, r;
     int times[8];
     float *srow;

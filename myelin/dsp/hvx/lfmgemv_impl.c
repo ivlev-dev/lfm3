@@ -30,6 +30,7 @@
 #include "silu_lut.h"
 #include "exptab.h"
 #include "apps_mem.h"
+#include "../quant/quant.h"
 
 typedef void *Address;
 
@@ -2386,7 +2387,7 @@ int lfmgemv_kv_write(int hk, int hkt, int hv, int slots, int slot,
     bv = &g_buf[hv];
     if (!bk->used || !bt->used || !bv->used) return AEE_EBADPARM;
     if (!bk->w || !bt->w || !bv->w) return AEE_EBADPARM;
-    if (slots < 1 || slot < 0 || slot >= 32 || slot >= slots) return AEE_EBADPARM;
+    if (slots < 1 || slot < 0 || slot >= slots) return AEE_EBADPARM;
     if (kLen <= 0 || (kLen & 63) != 0 || ktLen < 0 || (ktLen & 3) != 0 ||
         vLen < 0 || (vLen & 127) != 0)
         return AEE_EBADPARM;
@@ -2620,6 +2621,24 @@ int lfmgemv_gemv_resident(int h, int M, const unsigned char *act, int actLen,
                           int reps, int *times, int timesLen)
 {
     return gemv_impl(h, M, act, actLen, reps, 0, 0, times, timesLen, 1);
+}
+
+/* f32 activations -> rotate -> per-group-32 int8 (canonical quantiser).
+ * Non-destructive.  The Hadamard itself is the scalar quant.h routine; the
+ * HVX-vector prototype (vror/select butterflies) is left out of the prod path
+ * until it can be validated lane-exact (see REPORT25).  Returns clamps. */
+static int rotq_f32(const float *x, int K, int rot, int8_t *q, float *sc)
+{
+    int b, clamped = 0;
+    if (rot != 32 && rot != 128)
+        return lfm_quant_i8_group32(x, K, q, sc);
+    for (b = 0; b < K; b += rot) {
+        float buf[128];
+        memcpy(buf, x + b, (size_t)rot * 4);
+        lfm_rot_fwd_f32(buf, rot);
+        clamped += lfm_quant_i8_group32(buf, rot, q + b, sc + b / 32);
+    }
+    return clamped;
 }
 
 /* ---------------- micro benchmarks ---------------- */
@@ -3016,6 +3035,36 @@ int lfmgemv_probe(int h, int kind, int arg, int *res, int resLen)
         res[6] = done;
         break;
     }
+    case 50: { /* rotation only: arg = rot (0 = copy baseline, 32, 128)
+                  res[2] = pcycles/token (copy + rotate) */
+        static float rx[2048], ry[2048];
+        int rot = arg, reps = 500;
+        for (i = 0; i < 2048; i++)
+            rx[i] = (float)((i * 37) % 101) * 0.01f - 0.5f;
+        pc0 = HAP_perf_get_pcycles();
+        for (i = 0; i < reps; i++) {
+            memcpy(ry, rx, 2048 * 4);
+            if (rot) lfm_rot_blocks_f32(ry, 2048, rot);
+        }
+        pc1 = HAP_perf_get_pcycles();
+        res[2] = (int)((pc1 - pc0) / (unsigned)reps);
+        res[3] = 0;
+        break;
+    }
+    case 51: { /* canonical quantiser only (no rotation), arg = reps */
+        static float rx[2048];
+        static int8_t rq[2048];
+        static float rs[64];
+        int reps = arg > 0 ? arg : 100;
+        for (i = 0; i < 2048; i++)
+            rx[i] = (float)((i * 53) % 101) * 0.01f - 0.5f;
+        pc0 = HAP_perf_get_pcycles();
+        for (i = 0; i < reps; i++) sum += (uint32_t)lfm_quant_i8_group32(rx, 2048, rq, rs);
+        pc1 = HAP_perf_get_pcycles();
+        res[2] = (int)((pc1 - pc0) / (unsigned)reps);
+        res[3] = 0;
+        break;
+    }
     case 8: { /* set tuning: arg = pf_kb | (rows<<8) | (usepf<<16) | (threads<<24) */
         g_pf_kb = arg & 0xff;
         g_rows  = (arg >> 8) & 0xff;
@@ -3249,7 +3298,7 @@ int lfmgemv_release_buf(int h)
 #define LFM_CMD_MAX       256
 
 enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
-       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5, LFM_CMD_FFN16 = 6, LFM_CMD_CONV16 = 7, LFM_CMD_GEMV16 = 8 };
+       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5, LFM_CMD_FFN16 = 6, LFM_CMD_CONV16 = 7, LFM_CMD_GEMV16 = 8, LFM_CMD_ROTQ = 9 };
 enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
 enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
 
@@ -3466,7 +3515,7 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
     uint8_t *dp = 0;
     int rc, reps, n;
 
-    if (c->type > LFM_CMD_GEMV16) return AEE_EBADPARM;
+    if (c->type > LFM_CMD_ROTQ) return AEE_EBADPARM;
     rc = lfm_src_ptr(c, out, outLen, &sp);
     if (rc != 0) return rc;
     rc = lfm_dst_ptr(c, out, outLen, &dp);
@@ -3489,6 +3538,18 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
             if (v < -127) v = -127;
             d[i] = (int8_t)v;
         }
+        return 0;
+    }
+    case LFM_CMD_ROTQ: {
+        /* f32[K] -> rotate (a0 = 0|32|128) -> int8 q[K] + f32 scale[K/32] */
+        const float *s = (const float *)sp;
+        int8_t *d = (int8_t *)dp;
+        int K = c->src_len / 4, rot = c->a0, i;
+        if (c->src_len < 0 || (c->src_len & 3) || K < 256 || (K & 127))
+            return AEE_EBADPARM;
+        if (c->dst_len < K + (K / 32) * 4) return AEE_EBADPARM;
+        rotq_f32(s, K, rot, d, (float *)(d + K));
+        (void)i;
         return 0;
     }
     case LFM_CMD_GEMV:
