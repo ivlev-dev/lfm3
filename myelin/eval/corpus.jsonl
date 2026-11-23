@@ -1,0 +1,6 @@
+{"id":"prose-france","lang":"en","text":"The capital of France is Paris, a city on the Seine with a population of about two million people. France is known for its art, cuisine and history, and Paris attracts millions of visitors every year."}
+{"id":"prose-rain","lang":"en","text":"She opened the window and listened to the rain. It had been falling since morning, and the streets were empty. Somewhere in the distance a dog barked, and then everything was quiet again."}
+{"id":"dialog-train","lang":"en","text":"User: I need to book a train to Berlin for tomorrow morning.\nAssistant: Sure. There are three direct trains, at 7:15, 9:40 and 13:05. Which one would you like?"}
+{"id":"instr-omelette","lang":"en","text":"To make a simple omelette, beat three eggs with salt, heat butter in a pan, pour in the eggs and cook for two minutes. Fold the omelette and serve it immediately."}
+{"id":"code-fib","lang":"en","text":"def fibonacci(n):\n    if n < 2:\n        return n\n    return fibonacci(n - 1) + fibonacci(n - 2)\n\nprint(fibonacci(10))"}
+{"id":"ru-moscow","lang":"ru","text":"Столица России — Москва. Это крупнейший город страны, в котором находятся правительство, университеты и главные музеи. Зимой здесь часто идёт снег."}

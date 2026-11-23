@@ -50,10 +50,7 @@ fn main() {
         logits = gpu.logits().expect("logits");
         pos += 1;
     }
-    println!(
-        "FIRST {}",
-        out.first().copied().unwrap_or_default()
-    );
+    println!("FIRST {}", out.first().copied().unwrap_or_default());
     let decode = t0.elapsed().as_secs_f64() - prefill;
     println!(
         "TOKENS {}",

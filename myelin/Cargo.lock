@@ -697,6 +697,7 @@ dependencies = [
  "lfm-gguf",
  "lfm-quant",
  "lfm-tokenizer",
+ "serde_json",
 ]
 
 [[package]]
