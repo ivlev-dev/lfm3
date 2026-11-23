@@ -158,22 +158,22 @@ static void pref_pack_act(uint8_t *dst, const int8_t *A, int M, int K, int ncr)
 
 static void pref_emit(const uint8_t *part, int ng, const float *S,
                       const float *Q, float m, int Aq, int mode_shift, float *C,
-                      int ldc, int rows, int n0)
+                      int ldc, int rows, int s0, int n0)
 {
     int s, n, g;
+    (void)m; (void)Aq; (void)mode_shift;
     for (s = 0; s < rows; s++)
         for (n = 0; n < 32; n++) {
-            float acc = 0.0f, scs = 0.0f, qs = 0.0f;
+            float acc = 0.0f;
             for (g = 0; g < ng; g++) {
-                float sc = S[(size_t)(n0 + n) * ng + g];
-                acc += sc * ((float)part[(size_t)g * 2048u
-                              + 128u * (unsigned)(s >> 2) + 4u * (unsigned)n
-                              + (unsigned)(s & 3)] + 0.5f);
-                scs += sc;
-                qs += sc * (Q ? Q[(size_t)(n0 + n) * ng + g] : 0.0f);
+                float aq = Q ? Q[g] : 0.0f;
+                float u = (float)part[(size_t)g * 2048u
+                            + 128u * (unsigned)(s >> 2) + 4u * (unsigned)n
+                            + (unsigned)(s & 3)];
+                acc += S[(size_t)(n0 + n) * ng + g] * aq *
+                       (7.02745f * (u + 0.5f) - 448.0f);
             }
-            C[(size_t)s * ldc + n0 + n] = -(2.0f * acc / m - 448.0f * (float)Aq * scs)
-                                         - ((mode_shift) ? 128.0f * qs : 0.0f);
+            C[(size_t)(s0 + s) * ldc + n0 + n] = acc;
         }
 }
 
@@ -333,6 +333,30 @@ int lfm_prefill(const int8_t *A, const uint8_t *B, const float *S,
             for (m = 0; m < mt; m++) {
                 int rows = (M - m * 64) < 64 ? (M - m * 64) : 64;
                 for (g = 0; g < ng; g++) {
+                    int aq = Q ? (int)Q[g] : Aq;
+                    if (aq < 0) aq = 0;
+                    if (aq > 255) aq = 255;
+                    if (Q) {
+                        int ss2, kk2;
+                        for (ss2 = 0; ss2 < 64; ss2++)
+                            for (kk2 = 0; kk2 < 32; kk2++)
+                                voact[128u * (unsigned)(ss2 >> 2)
+                                      + 4u * (unsigned)kk2
+                                      + (unsigned)(ss2 & 3)] = (uint8_t)aq;
+                    }
+                    if (Q) {
+                        float mg = 145.7142857f / (float)(aq < 1 ? 1 : aq);
+                        __fp16 hh = (__fp16)mg;
+                        unsigned short bb;
+                        uint32_t ww;
+                        int jj;
+                        memcpy(&bb, &hh, 2);
+                        ww = (uint32_t)bb;
+                        for (jj = 0; jj < 32; jj++) {
+                            ((uint32_t *)vbias)[jj] = ww;
+                            ((uint32_t *)vbias)[64 + jj] = ww;
+                        }
+                    }
                     pref_hmx_clr();
                     pref_i4_mul(voact, 0x3FFu, vowgt, 511u);
                     for (c = 0; c < G; c++)
@@ -379,7 +403,7 @@ int lfm_prefill(const int8_t *A, const uint8_t *B, const float *S,
                         pref_emit16(vpart, ng, S, Q, C, N, rows, i * 32);
                     } else {
                         pref_emit(vpart, ng, S, Q, mstore, Aq,
-                                  (mode & 32) != 0, C, N, rows, i * 32);
+                                  (mode & 32) != 0, C, N, rows, m * 64, i * 32);
                     }
                     info[11] += (int)(HAP_perf_get_time_us() - tc);
                 }

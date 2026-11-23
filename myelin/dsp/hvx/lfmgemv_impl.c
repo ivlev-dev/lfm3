@@ -4361,11 +4361,13 @@ int lfmgemv_prefill(int hw, int hs, int hq, const unsigned char *act,
     ng = (size_t)(K / 32) / (size_t)G;
     wneed = (size_t)(N / 32) * (size_t)(K / 32) * 512u;
     sneed = (size_t)N * ng * sizeof(float);
+    (void)sneed;
     if (wneed > bw->wbytes || sneed > bs->wbytes) return AEE_EBADPARM;
-    if (st16) {
-        if (hq < 0 || hq >= MAXBUF) return AEE_EBADPARM;
+    if (hq >= 0) {
+        if (hq >= MAXBUF) return AEE_EBADPARM;
         bq = &g_buf[hq];
-        if (!bq->used || !bq->w || sneed > bq->wbytes) return AEE_EBADPARM;
+        if (!bq->used || !bq->w || ng * sizeof(float) > bq->wbytes)
+            return AEE_EBADPARM;
         Q = (const float *)bq->w;
     }
     if ((mode & 8) && outLen < M * N * 4) return AEE_EBADPARM;

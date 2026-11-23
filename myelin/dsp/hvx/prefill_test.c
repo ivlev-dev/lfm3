@@ -158,6 +158,24 @@ int main(int argc, char **argv)
             }
         }
     }
+    /* zero-mean codes per (n,g): removes the 128*sum(q) term of the unsigned
+     * activation shift, so the 8-bit partial carries only the useful signal */
+    for (n = 0; n < N; n++)
+        for (g = 0; g < ng; g++) {
+            int8_t *row = q + (size_t)n * K + g * 32 * G;
+            int len = 32 * G, sum = 0, it;
+            for (it = 0; it < len; it++) sum += row[it];
+            while (sum != 0) {
+                int best = -1, bv = 0, it2;
+                for (it2 = 0; it2 < len; it2++) {
+                    if (sum > 0 && row[it2] > 0 && row[it2] > bv) { bv = row[it2]; best = it2; }
+                    if (sum < 0 && row[it2] < 0 && row[it2] < bv) { bv = row[it2]; best = it2; }
+                }
+                if (best < 0) break;
+                row[best] = (int8_t)(row[best] + (sum > 0 ? -1 : 1));
+                sum += (sum > 0 ? -1 : 1);
+            }
+        }
     for (n = 0; n < N; n++) {
         int tile = n / 32, nn = n & 31;
         for (k = 0; k < K; k++) {
@@ -183,13 +201,23 @@ int main(int argc, char **argv)
             Au[i] = (unsigned char)(A[i] + 128);
         }
     }
-    for (n = 0; n < N; n++)
-        for (g = 0; g < ng; g++) {
-            long acc = 0;
-            for (k = 0; k < 32 * G; k++)
-                acc += q[(size_t)n * K + g * 32 * G + k];
-            Q[(size_t)n * ng + g] = (float)acc;
+    for (g = 0; g < ng; g++) {
+        double pm = 0;
+        for (n = 0; n < N; n++)
+            for (s = 0; s < (M < 8 ? M : 8); s++) {
+                long acc = 0;
+                for (k = 0; k < 32 * G; k++)
+                    acc += (long)Au[(size_t)s * K + g * 32 * G + k]
+                         * (long)q[(size_t)n * K + g * 32 * G + k];
+                if (fabs((double)acc) > pm) pm = fabs((double)acc);
+            }
+        {
+            int aq = (int)(pm * 1.25 / 448.0) + 1;
+            if (aq < 1) aq = 1;
+            if (aq > 255) aq = 255;
+            Q[g] = (float)aq;
         }
+    }
 
 
     /* C0 = 224*Aq from a sample of partial sums (same rule as the stand) */
@@ -213,13 +241,13 @@ int main(int argc, char **argv)
 
     rc = upload(blob, (int)wbytes, &hw);
     if (!rc) rc = upload((const uint8_t *)S, (int)sbytes, &hs);
-    if (!rc) rc = upload((const uint8_t *)Q, (int)sbytes, &hq);
+    if (!rc) rc = upload((const uint8_t *)Q, ng * (int)sizeof(float), &hq);
     if (rc != 0) {
         printf("upload rc=%d\n", rc);
         return 10 + (rc & 7);
     }
     rc = lfmgemv_prefill(hw, hs, hq, (const unsigned char *)Au, M * K, M, N, K,
-                         G, C0, 1 | 8 | 32 | (dump ? 16 : 0) | (store << 8), 1,
+                         G, C0, 1 | 8 | (dump ? 16 : 0) | (store << 8), 1,
                          (unsigned char *)C, M * N * 4, info, 20);
     if (rc != 0) {
         printf("prefill rc=%d info0=%d info1=%d\n", rc, info[0], info[1]);
