@@ -569,7 +569,8 @@ fn backend_loads_an_ffn_stage_lazily_and_caches_it() {
         })
     });
     bench.mock.set_handler(method_id::EXEC, move |call| {
-        assert_eq!(call.out_lens, vec![hidden, 32]);
+        // `times` is only sent under MYELIN_TRACE.
+        assert_eq!(call.out_lens, vec![hidden]);
         Ok(MockReply {
             prim_out: Vec::new(),
             out_bufs: vec![vec![1u8; hidden], vec![0u8; 32]],

@@ -433,6 +433,10 @@ pub mod exec {
         Attn = 3,
         /// Depthwise shortconv step.
         Conv = 4,
+        /// Copy one token's packed K/KT/V rows into the resident caches.
+        KvStore = 20,
+        /// `q12 * v_scale[dim] * gate[head]` -> int8 for `o_proj`.
+        AttnScale = 21,
     }
 
     fn put_i32(out: &mut [u8], offset: usize, value: i32) {
@@ -588,13 +592,62 @@ pub mod exec {
             command
         }
 
+        /// `KVSTORE`: scatter one token's packed K/KT/V rows from
+        /// `scratch[src_off .. src_off + src_len]` into the resident images.
+        /// `args = [slots, slot, k_bytes, kt_bytes]`; with `rt_base >= 0`,
+        /// `slot` is taken from `rt[rt_base]`.
+        #[allow(clippy::too_many_arguments)]
+        pub const fn kvstore(
+            keys: i32,
+            key_scales: i32,
+            values: i32,
+            slots: i32,
+            slot: i32,
+            k_bytes: i32,
+            kt_bytes: i32,
+            src_off: i32,
+            src_len: i32,
+        ) -> Self {
+            let mut command = Self::empty(Op::KvStore);
+            command.h = [keys, key_scales, values, -1];
+            command.args = [slots, slot, k_bytes, kt_bytes];
+            command.src_off = src_off;
+            command.src_len = src_len;
+            command
+        }
+
+        /// `ATTN_SCALE`: V channel scale + head gate + int8 quant.
+        ///
+        /// `h0` is the resident V-scale table (`-1`: none), `tbl_off` the
+        /// `heads` f32 gate vector in scratch, `a0`/`a1` the bit patterns of
+        /// `attn_out_scale`/`o_act_scale`, `a2` the gate length (`0` = no
+        /// gate).
+        pub const fn attn_scale(
+            value_scales: i32,
+            gate_off: i32,
+            gate_len: i32,
+            attn_out_scale_bits: i32,
+            o_act_scale_bits: i32,
+            src_off: i32,
+            dst_off: i32,
+        ) -> Self {
+            let mut command = Self::empty(Op::AttnScale);
+            command.h[0] = value_scales;
+            command.tbl_off = gate_off;
+            command.args = [attn_out_scale_bits, o_act_scale_bits, gate_len, 0];
+            command.src_off = src_off;
+            command.src_len = 16 * 128 * 4;
+            command.dst_off = dst_off;
+            command.dst_len = 16 * 128;
+            command
+        }
+
         /// Override the destination selector and offset.
         pub const fn with_dst(mut self, kind: u32, offset: i32) -> Self {
             self.dst = kind;
             self.dst_off = offset;
             self
         }
-
         /// Set `dst_h` for [`dst::ATTACHED`].
         pub const fn with_dst_handle(mut self, handle: i32) -> Self {
             self.dst_h = handle;
@@ -696,6 +749,16 @@ mod exec_tests {
         );
         ours.push(Command::attn(1, 2, 3, 4, -1, 16, 0, 0, 8192));
         ours.push(Command::conv(9, 2048, 18, 0, 100, 34816, 0, 16384));
+        ours.push(Command::kvstore(1, 2, 3, 256, 7, 256, 16, 2048, 784));
+        ours.push(Command::attn_scale(
+            4,
+            2896,
+            16,
+            0x3f80_0000u32 as i32,
+            0x3f00_0000u32 as i32,
+            4096,
+            16384,
+        ));
 
         let mut theirs = core_exec::List::new(1 << 20);
         theirs.push(core_exec::Command::quant(0, 1024, 2048, 4096));
@@ -707,6 +770,18 @@ mod exec_tests {
         theirs.push(core_exec::Command::attn(1, 2, 3, 4, -1, 16, 0, 0, 8192));
         theirs.push(core_exec::Command::conv(
             9, 2048, 18, 0, 100, 34816, 0, 16384,
+        ));
+        theirs.push(core_exec::Command::kvstore(
+            1, 2, 3, 256, 7, 256, 16, 2048, 784,
+        ));
+        theirs.push(core_exec::Command::attn_scale(
+            4,
+            2896,
+            16,
+            0x3f80_0000u32 as i32,
+            0x3f00_0000u32 as i32,
+            4096,
+            16384,
         ));
         assert_eq!(ours.to_bytes(), theirs.to_bytes());
     }

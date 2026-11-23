@@ -35,6 +35,11 @@ type SessionControlFn = unsafe extern "C" fn(u32, *mut c_void, u32) -> c_int;
 type RpcmemAllocFn = unsafe extern "C" fn(i32, u32, i32) -> *mut c_void;
 type RpcmemFreeFn = unsafe extern "C" fn(*mut c_void);
 type RpcmemToFdFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+/// `remote_register_buf(void *buf, int size, int fd)`; returns `void` in the
+/// SDK header (`__QAIC_RETURN void`), and `fd = -1` deregisters.
+type RegisterBufFn = unsafe extern "C" fn(*mut c_void, c_int, c_int);
+/// `remote_register_buf_attr(void *buf, int size, int fd, int attr)`.
+type RegisterBufAttrFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -140,6 +145,9 @@ pub struct Cdsprpc {
     rpcmem_alloc: RpcmemAllocFn,
     rpcmem_free: RpcmemFreeFn,
     rpcmem_to_fd: RpcmemToFdFn,
+    /// Optional: older FastRPC builds may omit the registration API.
+    register_buf: Option<RegisterBufFn>,
+    register_buf_attr: Option<RegisterBufAttrFn>,
     unsigned_enabled: AtomicBool,
 }
 
@@ -184,6 +192,10 @@ impl Cdsprpc {
         let rpcmem_alloc = unsafe { resolve::<RpcmemAllocFn>(&library, "rpcmem_alloc")? };
         let rpcmem_free = unsafe { resolve::<RpcmemFreeFn>(&library, "rpcmem_free")? };
         let rpcmem_to_fd = unsafe { resolve::<RpcmemToFdFn>(&library, "rpcmem_to_fd")? };
+        let register_buf =
+            unsafe { resolve_optional::<RegisterBufFn>(&library, "remote_register_buf") };
+        let register_buf_attr =
+            unsafe { resolve_optional::<RegisterBufAttrFn>(&library, "remote_register_buf_attr") };
 
         Ok(Self {
             library,
@@ -195,6 +207,8 @@ impl Cdsprpc {
             rpcmem_alloc,
             rpcmem_free,
             rpcmem_to_fd,
+            register_buf,
+            register_buf_attr,
             unsigned_enabled: AtomicBool::new(false),
         })
     }
@@ -342,6 +356,39 @@ impl Transport for Cdsprpc {
             Arc::new(owner),
         ))
     }
+
+    fn register_shared(&self, buffer: &SharedBuffer) {
+        if std::env::var_os("MYELIN_NO_REGISTER").is_some() {
+            return;
+        }
+        let Some(len) = i32::try_from(buffer.len()).ok() else {
+            return;
+        };
+        let ptr = buffer.as_ptr().cast::<c_void>();
+        let attr = std::env::var("MYELIN_REG_ATTR")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(self.config.map_attributes);
+        // SAFETY: `ptr` is a live rpcmem allocation of `len` bytes; both
+        // entry points only record the mapping.
+        unsafe {
+            if let Some(register) = self.register_buf_attr {
+                register(ptr, len, buffer.fd(), attr);
+            } else if let Some(register) = self.register_buf {
+                register(ptr, len, buffer.fd());
+            }
+        }
+    }
+
+    fn unregister_shared(&self, buffer: &SharedBuffer) {
+        let (Some(len), Some(register)) = (i32::try_from(buffer.len()).ok(), self.register_buf)
+        else {
+            return;
+        };
+        // SAFETY: `fd = -1` is the documented deregistration form; the buffer
+        // is still alive for the duration of the call.
+        unsafe { register(buffer.as_ptr().cast::<c_void>(), len, -1) };
+    }
 }
 
 fn remote_buf(ptr: *mut u8, len: usize) -> RemoteArg {
@@ -388,18 +435,20 @@ fn dlerror() -> Option<String> {
 }
 
 unsafe fn resolve<T: Copy>(library: &Library, symbol: &'static str) -> Result<T, TransportError> {
-    let name = CString::new(symbol).map_err(|_| TransportError::SymbolMissing {
+    unsafe { resolve_optional(library, symbol) }.ok_or(TransportError::SymbolMissing {
         library: "libcdsprpc.so".to_owned(),
         symbol,
-    })?;
+    })
+}
+
+/// Resolve a symbol, returning `None` when the loaded library omits it.
+unsafe fn resolve_optional<T: Copy>(library: &Library, symbol: &'static str) -> Option<T> {
+    let name = CString::new(symbol).ok()?;
     // SAFETY: `library.handle` is a live dlopen handle.
     let pointer = unsafe { libc::dlsym(library.handle, name.as_ptr()) };
     if pointer.is_null() {
-        return Err(TransportError::SymbolMissing {
-            library: "libcdsprpc.so".to_owned(),
-            symbol,
-        });
+        return None;
     }
     // SAFETY: the caller names the exact FastRPC signature for `symbol`.
-    Ok(unsafe { std::mem::transmute_copy(&pointer) })
+    Some(unsafe { std::mem::transmute_copy(&pointer) })
 }

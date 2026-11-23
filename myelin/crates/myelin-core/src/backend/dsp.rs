@@ -584,6 +584,10 @@ impl AttentionFullStage {
 const SCRATCH_ACT: i32 = 0;
 const SCRATCH_BCX: i32 = 4096;
 const SCRATCH_CY: i32 = 12288;
+/// `ATTN` int32 Q12 output inside the fused attention list (8192 bytes).
+const SCRATCH_ATTN_Q12: i32 = 4096;
+/// `ATTN_SCALE` int8 output feeding `o_proj` (`hidden` bytes).
+const SCRATCH_ATTN_I8: i32 = 16384;
 const CONV_STATE_BASE: i32 = 1 << 20;
 const CONV_STATE_STRIDE: i32 = 1 << 18;
 
@@ -641,6 +645,10 @@ pub mod exec {
         Ffn16 = 6,
         Conv16 = 7,
         Gemv16 = 8,
+        /// Copy the packed K/KT/V rows of one token into the resident caches.
+        KvStore = 20,
+        /// `q12 * v_scale[dim] * gate[head]` -> int8 for `o_proj`.
+        AttnScale = 21,
     }
 
     fn put_i32(out: &mut [u8], offset: usize, value: i32) {
@@ -877,6 +885,61 @@ pub mod exec {
             command
         }
 
+        /// `KVSTORE`: scatter one token's packed K/KT/V rows from
+        /// `scratch[src_off .. src_off + src_len]` into the resident images.
+        ///
+        /// The block is `K (heads*64) | KT (heads*4) | V (heads*128)`;
+        /// `args = [slots, slot, k_bytes, kt_bytes]`, so `v_bytes` is
+        /// `src_len - k_bytes - kt_bytes`. With `rt_base >= 0`, `slot` is
+        /// taken from `rt[rt_base]`, which keeps the list stable between
+        /// tokens.
+        #[allow(clippy::too_many_arguments)]
+        pub const fn kvstore(
+            keys: i32,
+            key_scales: i32,
+            values: i32,
+            slots: i32,
+            slot: i32,
+            k_bytes: i32,
+            kt_bytes: i32,
+            src_off: i32,
+            src_len: i32,
+        ) -> Self {
+            let mut command = Self::empty(Op::KvStore);
+            command.h = [keys, key_scales, values, -1];
+            command.args = [slots, slot, k_bytes, kt_bytes];
+            command.src_off = src_off;
+            command.src_len = src_len;
+            command
+        }
+
+        /// `ATTN_SCALE`: per-channel V scale + per-head gate + int8 quant.
+        ///
+        /// `h0` is the resident `kv_heads * head_dim` f32 V-scale table
+        /// (`-1`: no table, global scale folded into `a0`), `tbl_off` is the
+        /// `heads` f32 gate vector in scratch, `a0`/`a1` are the bit patterns
+        /// of `attn_out_scale` and `o_act_scale`, `a2` is the gate length
+        /// (`0` = no gate). `src` is int32 Q12, `dst` is int8.
+        pub const fn attn_scale(
+            value_scales: i32,
+            gate_off: i32,
+            gate_len: i32,
+            attn_out_scale_bits: i32,
+            o_act_scale_bits: i32,
+            src_off: i32,
+            dst_off: i32,
+        ) -> Self {
+            let mut command = Self::empty(Op::AttnScale);
+            command.h[0] = value_scales;
+            command.tbl_off = gate_off;
+            command.args = [attn_out_scale_bits, o_act_scale_bits, gate_len, 0];
+            command.src_off = src_off;
+            command.src_len = 16 * 128 * 4;
+            command.dst_off = dst_off;
+            command.dst_len = 16 * 128;
+            command
+        }
+
         pub const fn with_dst(mut self, kind: u32, offset: i32) -> Self {
             self.dst = kind;
             self.dst_off = offset;
@@ -1007,6 +1070,9 @@ pub struct DspBackend {
     weights: Option<Box<dyn StageProvider>>,
     host: Option<HostWeights>,
     lm_head: Option<LmHeadStage>,
+    /// `MYELIN_ATTN_FUSED=1`: run `KVSTORE + ATTN + ATTN_SCALE + o_proj` as
+    /// one `exec`. Cleared automatically if the deployed skeleton rejects it.
+    attn_fused: bool,
     last_error: Option<DspError>,
     last_exec_times: Option<[i32; 8]>,
 }
@@ -1020,6 +1086,45 @@ const MISSING_ATTENTION_STAGE: &str =
 const MISSING_LM_HEAD_STAGE: &str =
     "FastRPC vocabulary projection is not staged; attach a StageProvider with `lm_head_stage`";
 const MISSING_HOST: &str = "host tensors are not attached; call DspBackend::attach_host first";
+
+/// Identity block table: logical page `p` lives in physical page `p`.
+///
+/// The table is sized for the whole resident cache, not for the pages in use:
+/// `attn_core` only checks `(pos >> 5) < tblLen` and indexes `tbl[pos >> 5]`,
+/// so a full identity table keeps the `ATTN` command byte-identical between
+/// tokens instead of growing one `tbl_len` variant per 32-token page.
+fn identity_table(cache_pages: usize) -> Vec<i32> {
+    (0..cache_pages)
+        .map(|page| i32::try_from(page).unwrap_or(i32::MAX))
+        .collect()
+}
+
+/// The single-command paged-attention list.
+///
+/// It carries no per-token values: position/sequence/window/reps come from
+/// `rt` and the block table is injected in `act` at `table_off`. Because
+/// `tbl_len` is the resident page count, the bytes are stable for the whole
+/// generation, which is what lets the executor keep one mapped arena per
+/// layer (O2).
+fn attention_exec_list(caches: &AttentionStage, table_off: i32) -> exec::List {
+    let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
+    list.push(
+        exec::Command::attn(
+            caches.keys,
+            caches.key_scales,
+            caches.values,
+            caches.value_scales,
+            -1,
+            caches.cache_pages as i32,
+            0,
+            SCRATCH_ACT,
+            0,
+        )
+        .with_dst(exec::dst::OUT, 0)
+        .with_table_offset(table_off),
+    );
+    list
+}
 
 impl DspBackend {
     /// Adopt a validated spec without a transport.
@@ -1043,6 +1148,7 @@ impl DspBackend {
             weights: None,
             host: None,
             lm_head: None,
+            attn_fused: std::env::var_os("MYELIN_ATTN_FUSED").is_some(),
             last_error: None,
             last_exec_times: None,
         }
@@ -1112,6 +1218,16 @@ impl DspBackend {
     /// Whether an on-demand weight provider is attached.
     pub fn has_weight_provider(&self) -> bool {
         self.weights.is_some()
+    }
+
+    /// Enable or disable the one-list attention path (`KVSTORE + ATTN +
+    /// ATTN_SCALE + o_proj`).
+    ///
+    /// `DspBackend::new` reads `MYELIN_ATTN_FUSED`; this hook lets diagnostics
+    /// and tests flip it without touching the process environment. The path
+    /// disables itself on the first unsupported-skeleton error.
+    pub fn set_attention_fused(&mut self, enabled: bool) {
+        self.attn_fused = enabled;
     }
 
     /// Attach the host-resident tensors: token embedding, RMSNorm weights and
@@ -1327,12 +1443,7 @@ impl DspBackend {
                 stage.cache_pages
             )));
         }
-        let table: Vec<i32> = (0..pages)
-            .map(|page| {
-                i32::try_from(page)
-                    .map_err(|_| BackendError::Kv("page id does not fit i32".to_owned()))
-            })
-            .collect::<Result<_, _>>()?;
+        let table = identity_table(stage.cache_pages);
 
         let q = quantize(call.input, stage.q_scale);
         let mut outp = vec![0u8; dims.q_dim() * 4];
@@ -1712,17 +1823,43 @@ impl DspBackend {
 
         // The paged-attention kernel takes an int8 q and pre-quantised K/V.
         let q_int8 = quantize(&query, stage.attn_q_scale);
-        self.write_kv_token(&executor, handle, stage, &key, &value, call.position, &dims)?;
+        // The block table travels to both `kv_write` (through `kv_slot`) and
+        // the attention kernel, so a physical page id is resolved exactly once
+        // in one place. It covers the whole resident cache, so `tbl_len` does
+        // not grow with the context (O2).
+        let table = identity_table(stage.caches.cache_pages);
+        if self.attn_fused
+            && self.attention_fused(
+                stage,
+                &dims,
+                call.position,
+                call.start,
+                call.kind,
+                &q_int8,
+                &key,
+                &value,
+                gates.as_deref(),
+                &table,
+                out,
+            )?
+        {
+            kv.append(&key, &value)?;
+            return Ok(());
+        }
+        self.write_kv_token(
+            &executor,
+            handle,
+            stage,
+            &table,
+            &key,
+            &value,
+            call.position,
+            &dims,
+        )?;
         kv.append(&key, &value)?;
 
         // 2. paged attention. q and the block table travel in one activation
         // sequence: q at 0, table at `hidden`.
-        let table: Vec<i32> = (0..pages)
-            .map(|page| {
-                i32::try_from(page)
-                    .map_err(|_| BackendError::Kv("page id does not fit i32".to_owned()))
-            })
-            .collect::<Result<_, _>>()?;
         let table_bytes = i32_bytes(&table);
         let mut attention_act = Vec::with_capacity(q_int8.len() + table_bytes.len());
         attention_act.extend_from_slice(&q_int8);
@@ -1736,22 +1873,7 @@ impl DspBackend {
             AttentionKind::Sliding => i32::try_from(call.position + 1 - call.start)
                 .map_err(|_| BackendError::Kv("window does not fit i32".to_owned()))?,
         };
-        let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
-        list.push(
-            exec::Command::attn(
-                stage.caches.keys,
-                stage.caches.key_scales,
-                stage.caches.values,
-                stage.caches.value_scales,
-                -1,
-                pages as i32,
-                0,
-                SCRATCH_ACT,
-                0,
-            )
-            .with_dst(exec::dst::OUT, 0)
-            .with_table_offset(hidden as i32),
-        );
+        let list = attention_exec_list(&stage.caches, hidden as i32);
         let rt = [position, seq, window, stage.reps];
         let attended_q12 = self.run_exec(&list, &attention_act, &rt, q_dim * 4)?;
         if attended_q12.out.len() != q_dim * 4 {
@@ -1816,60 +1938,21 @@ impl DspBackend {
         executor: &Arc<dyn DspExecutor>,
         handle: DspHandle,
         stage: &AttentionFullStage,
+        table: &[i32],
         key: &[f32],
         value: &[f32],
         position: usize,
         dims: &crate::spec::Dims,
     ) -> Result<(), BackendError> {
         let slots = stage.caches.cache_pages * crate::kv::PAGE_TOKENS;
-        let slot = position % crate::kv::PAGE_TOKENS;
-        let head_dim = dims.head_dim;
-        let heads = dims.kv_heads;
-        // One RPC carries every kv head: k (int4), kt (Q16) and v (int8) are
-        // laid out head after head and scattered by the DSP at head*slots+slot.
-        let mut k_bytes = Vec::with_capacity(heads * 64);
-        let mut kt_bytes = Vec::with_capacity(heads * 4);
-        let mut v_bytes = Vec::with_capacity(heads * 128);
-        for head in 0..heads {
-            let row = &key[head * head_dim..(head + 1) * head_dim];
-            let mut max_abs = 0.0f32;
-            for &value in row {
-                max_abs = max_abs.max(value.abs());
-            }
-            let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 0.0 };
-            // The kernel stores scores in Q8: `sc = dot(q8, code) * kt / 256`,
-            // and the model's dot product is scaled by `1 / sqrt(head_dim)`
-            // before the softmax. `q8 = round(q * attn_q_scale)`, so `kt` is
-            // divided by both the q scale and `sqrt(head_dim)`; then `sc` is
-            // Q8 of the exact CPU score.
-            let kt =
-                (scale * 65536.0 / (stage.attn_q_scale * (head_dim as f32).sqrt())).round() as i32;
-            if kt > 4_194_303 {
-                return Err(BackendError::Kv(format!(
-                    "K scale {kt} exceeds the Q16 kernel limit (|k|/q_scale must stay below 448)"
-                )));
-            }
-            let mut codes = [0u8; 64];
-            for (dim, &value) in row.iter().enumerate() {
-                let code = if scale > 0.0 {
-                    (value / scale).round().clamp(-7.0, 7.0) as i32
-                } else {
-                    0
-                };
-                codes[dim / 2] |= (((code + 8) & 0x0f) as u8) << (4 * (dim % 2));
-            }
-            k_bytes.extend_from_slice(&codes);
-            kt_bytes.extend_from_slice(&kt.to_le_bytes());
-
-            let row = &value[head * head_dim..(head + 1) * head_dim];
-            let mut v_codes = [0u8; 128];
-            for (dim, &value) in row.iter().enumerate() {
-                let scale = stage.v_quant.scale(head * head_dim + dim);
-                let code = (value / scale).round().clamp(-127.0, 127.0) as i8;
-                v_codes[dim] = code as u8;
-            }
-            v_bytes.extend_from_slice(&v_codes);
+        let slot = kv_slot(table, position)?;
+        if slot >= slots {
+            return Err(BackendError::Kv(format!(
+                "kv slot {slot} for position {position} exceeds the {slots} resident slots"
+            )));
         }
+        let rows = pack_kv_rows(stage, dims, key, value)?;
+        let (k_bytes, kt_bytes, v_bytes) = (rows.key, rows.key_scales, rows.value);
 
         let slots = id_len(slots, "dsp kv slots")?;
         let slot = id_len(slot, "dsp kv slot")?;
@@ -1894,9 +1977,157 @@ impl DspBackend {
             out_bufs: &mut no_out,
         };
         if let Err(error) = executor.invoke(handle, call) {
+            if std::env::var_os("MYELIN_TRACE").is_some() {
+                eprintln!(
+                    "kv_write failed at position {position}: slots={slots} slot={slot} k={} kt={} v={} err={error:?}",
+                    k_bytes.len(),
+                    kt_bytes.len(),
+                    v_bytes.len()
+                );
+            }
             return Err(self.fail("kv_write", error));
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_fused(
+        &mut self,
+        stage: &AttentionFullStage,
+        dims: &crate::spec::Dims,
+        position: usize,
+        start: usize,
+        kind: AttentionKind,
+        q_int8: &[u8],
+        key: &[f32],
+        value: &[f32],
+        gates: Option<&[f32]>,
+        table: &[i32],
+        out: &mut [f32],
+    ) -> Result<bool, BackendError> {
+        let (v_scale_handle, attn_out_scale) = match &stage.v_quant {
+            VQuant::Channel(_) if stage.caches.value_scales > 0 => {
+                (stage.caches.value_scales, stage.attn_out_scale)
+            }
+            VQuant::Global(scale) => (-1, stage.attn_out_scale * scale),
+            // A per-channel V quant without a resident table cannot be done on
+            // the DSP yet; the legacy three-call path stays in charge.
+            _ => return Ok(false),
+        };
+        let slots = stage.caches.cache_pages * crate::kv::PAGE_TOKENS;
+        let slot = kv_slot(table, position)?;
+        if slot >= slots {
+            return Err(BackendError::Kv(format!(
+                "kv slot {slot} for position {position} exceeds the {slots} resident slots"
+            )));
+        }
+        let position_i32 = id_len(position, "dsp attn position")?;
+        let seq = id_len(position + 1, "dsp attn seq")?;
+        let window = match kind {
+            AttentionKind::Full => 0,
+            AttentionKind::Sliding => id_len(position + 1 - start, "dsp attn window")?,
+        };
+
+        let rows = pack_kv_rows(stage, dims, key, value)?;
+        let (k_bytes, kt_bytes, v_bytes) = (rows.key, rows.key_scales, rows.value);
+        let mut act = Vec::with_capacity(
+            q_int8.len()
+                + k_bytes.len()
+                + kt_bytes.len()
+                + v_bytes.len()
+                + gates.map_or(0, |gates| gates.len() * 4)
+                + table.len() * 4,
+        );
+        act.extend_from_slice(q_int8);
+        let kv_off = id_len(act.len(), "dsp kv off")?;
+        let k_len = id_len(k_bytes.len(), "dsp kv k")?;
+        let kt_len = id_len(kt_bytes.len(), "dsp kv kt")?;
+        act.extend_from_slice(&k_bytes);
+        act.extend_from_slice(&kt_bytes);
+        act.extend_from_slice(&v_bytes);
+        let gate_off = id_len(act.len(), "dsp attn gate off")?;
+        let mut gate_len = 0i32;
+        if let Some(gates) = gates {
+            for gate in gates {
+                act.extend_from_slice(&gate.to_le_bytes());
+            }
+            gate_len = id_len(gates.len(), "dsp attn gate")?;
+        }
+        let table_off = id_len(act.len(), "dsp attn table off")?;
+        for page in table {
+            act.extend_from_slice(&page.to_le_bytes());
+        }
+        let kv_len = id_len(k_bytes.len() + kt_bytes.len() + v_bytes.len(), "dsp kv len")?;
+
+        let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
+        list.push(
+            exec::Command::kvstore(
+                stage.caches.keys,
+                stage.caches.key_scales,
+                stage.caches.values,
+                id_len(slots, "dsp kv slots")?,
+                0,
+                k_len,
+                kt_len,
+                kv_off,
+                kv_len,
+            )
+            .with_rt_base(4),
+        );
+        list.push(
+            exec::Command::attn(
+                stage.caches.keys,
+                stage.caches.key_scales,
+                stage.caches.values,
+                stage.caches.value_scales,
+                -1,
+                id_len(stage.caches.cache_pages, "dsp attn pages")?,
+                0,
+                SCRATCH_ACT,
+                SCRATCH_ATTN_Q12,
+            )
+            .with_table_offset(table_off),
+        );
+        list.push(exec::Command::attn_scale(
+            v_scale_handle,
+            gate_off,
+            gate_len,
+            attn_out_scale.to_bits() as i32,
+            stage.o_act_scale.to_bits() as i32,
+            SCRATCH_ATTN_Q12,
+            SCRATCH_ATTN_I8,
+        ));
+        list.push(
+            exec::Command::gemv(
+                stage.output,
+                1,
+                stage.reps,
+                SCRATCH_ATTN_I8,
+                dims.q_dim() as i32,
+                0,
+                dims.hidden as i32,
+            )
+            .with_dst(exec::dst::OUT, 0),
+        );
+        let rt = [position_i32, seq, window, stage.reps, slot as i32];
+        let result = match self.run_exec(&list, &act, &rt, dims.hidden) {
+            Ok(result) => result,
+            Err(error) => {
+                if std::env::var_os("MYELIN_TRACE").is_some() {
+                    eprintln!("fused attention unsupported, falling back: {error}");
+                }
+                self.attn_fused = false;
+                return Ok(false);
+            }
+        };
+        if result.out.len() != dims.hidden {
+            self.attn_fused = false;
+            return Ok(false);
+        }
+        for (dst, &code) in out.iter_mut().zip(&result.out) {
+            *dst = (code as i8) as f32 * stage.out_scale;
+        }
+        Ok(true)
     }
 
     fn ensure_scratch(&mut self) -> Result<(), BackendError> {
@@ -2149,6 +2380,101 @@ fn id_len(count: usize, what: &'static str) -> Result<i32, BackendError> {
     })
 }
 
+/// Packed rows of one token for `kv_write` / `KVSTORE`.
+struct KvRows {
+    key: Vec<u8>,
+    key_scales: Vec<u8>,
+    value: Vec<u8>,
+}
+
+/// Pack one token's K/KT/V rows exactly like the `kv_write` RPC does:
+/// int4 K with per-token head scale (Q16), and int8 V with the model's
+/// per-channel scale. The three blobs are laid out head after head, which is
+/// the layout both `kv_write` and the `KVSTORE` command expect.
+fn pack_kv_rows(
+    stage: &AttentionFullStage,
+    dims: &crate::spec::Dims,
+    key: &[f32],
+    value: &[f32],
+) -> Result<KvRows, BackendError> {
+    let head_dim = dims.head_dim;
+    let heads = dims.kv_heads;
+    let mut k_bytes = Vec::with_capacity(heads * 64);
+    let mut kt_bytes = Vec::with_capacity(heads * 4);
+    let mut v_bytes = Vec::with_capacity(heads * 128);
+    for head in 0..heads {
+        let row = &key[head * head_dim..(head + 1) * head_dim];
+        let mut max_abs = 0.0f32;
+        for &value in row {
+            max_abs = max_abs.max(value.abs());
+        }
+        let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 0.0 };
+        // The kernel stores scores in Q8: `sc = dot(q8, code) * kt / 256`,
+        // and the model's dot product is scaled by `1 / sqrt(head_dim)`
+        // before the softmax. `q8 = round(q * attn_q_scale)`, so `kt` is
+        // divided by both the q scale and `sqrt(head_dim)`; then `sc` is
+        // Q8 of the exact CPU score.
+        let kt = (scale * 65536.0 / (stage.attn_q_scale * (head_dim as f32).sqrt())).round() as i32;
+        if kt > 4_194_303 {
+            return Err(BackendError::Kv(format!(
+                "K scale {kt} exceeds the Q16 kernel limit (|k|/q_scale must stay below 448)"
+            )));
+        }
+        let mut codes = [0u8; 64];
+        for (dim, &value) in row.iter().enumerate() {
+            let code = if scale > 0.0 {
+                (value / scale).round().clamp(-7.0, 7.0) as i32
+            } else {
+                0
+            };
+            codes[dim / 2] |= (((code + 8) & 0x0f) as u8) << (4 * (dim % 2));
+        }
+        k_bytes.extend_from_slice(&codes);
+        kt_bytes.extend_from_slice(&kt.to_le_bytes());
+
+        let row = &value[head * head_dim..(head + 1) * head_dim];
+        let mut v_codes = [0u8; 128];
+        for (dim, &value) in row.iter().enumerate() {
+            let scale = stage.v_quant.scale(head * head_dim + dim);
+            let code = (value / scale).round().clamp(-127.0, 127.0) as i8;
+            v_codes[dim] = code as u8;
+        }
+        v_bytes.extend_from_slice(&v_codes);
+    }
+    Ok(KvRows {
+        key: k_bytes,
+        key_scales: kt_bytes,
+        value: v_bytes,
+    })
+}
+
+/// Global resident slot for `position`, resolved through the block table that
+/// the attention call also receives.
+///
+/// `kv_write` addresses a row as `head * slots + slot`, where `slots` is the
+/// total number of slots (`cache_pages * PAGE_TOKENS`), so `slot` must be the
+/// global index `table[position / 32] * 32 + position % 32`, not a page-local
+/// offset.
+fn kv_slot(table: &[i32], position: usize) -> Result<usize, BackendError> {
+    let page = position / crate::kv::PAGE_TOKENS;
+    let offset = position % crate::kv::PAGE_TOKENS;
+    let physical = *table.get(page).ok_or_else(|| {
+        BackendError::Kv(format!(
+            "kv slot: page {page} of position {position} is outside the {}-entry block table",
+            table.len()
+        ))
+    })?;
+    let physical = usize::try_from(physical).map_err(|_| {
+        BackendError::Kv(format!(
+            "kv slot: page {page} has negative physical id {physical}"
+        ))
+    })?;
+    physical
+        .checked_mul(crate::kv::PAGE_TOKENS)
+        .and_then(|base| base.checked_add(offset))
+        .ok_or_else(|| BackendError::Kv(format!("kv slot overflows usize for page {page}")))
+}
+
 fn quantize(x: &[f32], scale: f32) -> Vec<u8> {
     x.iter()
         .map(|value| {
@@ -2392,6 +2718,41 @@ mod exec_encoder_tests {
     }
 
     #[test]
+    fn attention_list_is_stable_across_context_growth() {
+        use super::{attention_exec_list, identity_table, AttentionStage};
+
+        let caches = AttentionStage {
+            keys: 1,
+            key_scales: 2,
+            values: 3,
+            value_scales: -1,
+            q_scale: 1.0,
+            out_scale: 1.0,
+            reps: 1,
+            cache_pages: 64,
+            preprojected: true,
+        };
+        let table = identity_table(caches.cache_pages);
+        assert_eq!(table.len(), 64, "the table covers the resident cache");
+        assert_eq!(table[..4], [0, 1, 2, 3]);
+        assert_eq!(table[63], 63);
+
+        // The list carries no per-token page count: the same bytes are used
+        // at position 0 and at position 2047.
+        let first = attention_exec_list(&caches, 1 << 11).to_bytes();
+        let second = attention_exec_list(&caches, 1 << 11).to_bytes();
+        assert_eq!(first, second);
+        let command = &first[super::exec::HEADER_BYTES..];
+        // `tbl_len` is the resident capacity, not `(position / 32) + 1`.
+        assert_eq!(
+            &command[56..60],
+            &64i32.to_le_bytes(),
+            "tbl_len stays at cache_pages"
+        );
+        assert_eq!(&command[80..84], &0i32.to_le_bytes(), "rt_base is fixed");
+    }
+
+    #[test]
     fn conv_counter_travels_in_rt_to_keep_the_list_stable() {
         let first = Command::conv(9, 2_048, 40, 0, 0, 34816, 0, 8192).with_rt_base(0);
         let second = Command::conv(9, 2_048, 40, 0, 0, 34816, 0, 8192).with_rt_base(0);
@@ -2404,5 +2765,36 @@ mod exec_encoder_tests {
         let mut list = List::new(4 << 20);
         list.push(first);
         assert_eq!(list.to_bytes(), list.to_bytes());
+    }
+}
+
+#[cfg(test)]
+mod kv_slot_tests {
+    use super::kv_slot;
+
+    #[test]
+    fn identity_table_maps_position_to_global_slot() {
+        let table: Vec<i32> = (0..8).collect();
+        for position in 0..256 {
+            assert_eq!(kv_slot(&table, position).unwrap(), position);
+        }
+    }
+
+    #[test]
+    fn physical_page_is_multiplied_by_page_tokens() {
+        // Radix: page 1 lives at physical page 3, page 2 at physical page 0.
+        let table = [3, 0, 5];
+        assert_eq!(kv_slot(&table, 0).unwrap(), 3 * 32);
+        assert_eq!(kv_slot(&table, 31).unwrap(), 3 * 32 + 31);
+        assert_eq!(kv_slot(&table, 32).unwrap(), 0);
+        assert_eq!(kv_slot(&table, 64).unwrap(), 5 * 32);
+        assert_eq!(kv_slot(&table, 79).unwrap(), 5 * 32 + 15);
+    }
+
+    #[test]
+    fn missing_and_negative_pages_are_typed_errors() {
+        let table = [0, 1];
+        assert!(kv_slot(&table, 64).is_err());
+        assert!(kv_slot(&[-1], 0).is_err());
     }
 }

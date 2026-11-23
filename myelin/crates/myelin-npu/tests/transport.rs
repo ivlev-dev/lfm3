@@ -345,9 +345,10 @@ fn backend_ffn_quantises_calls_and_dequantises() {
     });
     mock.set_handler(method_id::EXEC, move |call| {
         // `ExecWire`: arena, cmd_off, n_cmds, act_len, rt_len, out_len, times_len.
+        // `times` is only sent under MYELIN_TRACE (off in tests).
         assert_eq!(
             call.prim_in,
-            i32_bytes(&[5, 0, 1, hidden as i32, 0, hidden as i32, 8])
+            i32_bytes(&[5, 0, 1, hidden as i32, 0, hidden as i32, 0])
         );
         assert_eq!(call.in_bufs[0].len(), hidden);
         assert_eq!(call.in_bufs[0][0], 2); // 1.0 * act_scale 2.0
@@ -440,7 +441,7 @@ fn backend_attention_calls_attn_and_mirrors_host_kv() {
                 3,
                 0,
                 q_dim as i32,
-                1,
+                8, // cache_pages: the identity table keeps tbl_len constant
                 0,
                 1,
                 0,
@@ -450,7 +451,9 @@ fn backend_attention_calls_attn_and_mirrors_host_kv() {
             ])
         );
         assert_eq!(call.in_bufs[0].len(), q_dim);
-        assert_eq!(call.in_bufs[1], i32_bytes(&[0]));
+        // Identity table over the whole resident cache: `tbl_len` is
+        // `cache_pages`, not `pages` of this token.
+        assert_eq!(call.in_bufs[1], i32_bytes(&[0, 1, 2, 3, 4, 5, 6, 7]));
         let mut outp = Vec::with_capacity(q_dim * 4);
         for _ in 0..q_dim {
             outp.extend_from_slice(&4096i32.to_le_bytes());
@@ -687,4 +690,112 @@ fn backend_reset_zeroes_the_device_state() {
     assert_eq!(calls[2].prim_in, i32_bytes(&[0]));
     // reset_state: method 23, one scalar in, no sequences.
     assert_eq!(calls[2].scalars, 0x1701_0000);
+}
+
+/// O4 host side: with the fused path enabled, attention is `qkv` + one list
+/// (`KVSTORE + ATTN + ATTN_SCALE + o_proj`) instead of `qkv` + `ATTN` +
+/// `o_proj` (and no separate `kv_write`).
+#[test]
+fn fused_attention_costs_one_exec_after_qkv() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use myelin_core::backend::dsp::{AttentionFullStage, VQuant};
+
+    let mut spec = ModelSpec::placeholder();
+    spec.dims.hidden = 2048;
+    spec.dims.heads = 16;
+    spec.dims.head_dim = 128;
+    spec.dims.kv_heads = 4;
+    let hidden = spec.dims.hidden;
+    let kv_dim = spec.dims.kv_dim();
+    let kv = PagedKvCache::new(kv_dim, 64).expect("kv");
+
+    let mock = MockTransport::new();
+    mock.set_handler(method_id::MAP_ARENA, |_| {
+        Ok(reply(1i32.to_le_bytes().to_vec(), Vec::new()))
+    });
+    let exec_calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&exec_calls);
+    mock.set_handler(method_id::EXEC, move |call| {
+        let index = counter.fetch_add(1, Ordering::SeqCst);
+        let commands = read_i32(&call.prim_in[8..12]);
+        let act_len = read_i32(&call.prim_in[12..16]);
+        let rt_len = read_i32(&call.prim_in[16..20]);
+        let out_len = read_i32(&call.prim_in[20..24]);
+        if index == 0 {
+            // q | k | v | gate projections, one per command.
+            assert_eq!(commands, 4);
+            assert_eq!(rt_len, 0);
+            assert_eq!(out_len as usize, hidden + 2 * kv_dim + 32);
+            Ok(reply(Vec::new(), vec![vec![0u8; out_len as usize]]))
+        } else {
+            assert_eq!(commands, 4, "KVSTORE + ATTN + ATTN_SCALE + o_proj");
+            // q(2048) + K(256) + KT(16) + V(512) + gate(64) + table(32).
+            assert_eq!(act_len as usize, 2928);
+            assert_eq!(rt_len, 5, "pos, seq, window, reps, slot");
+            assert_eq!(call.in_bufs[1], i32_bytes(&[0, 1, 0, 1, 0]));
+            assert_eq!(out_len as usize, hidden);
+            Ok(reply(Vec::new(), vec![vec![0u8; hidden]]))
+        }
+    });
+
+    let executor: Arc<dyn myelin_core::backend::dsp::DspExecutor> =
+        Arc::new(Executor::new(Arc::new(mock)));
+    let mut backend = DspBackend::attach(spec.clone(), executor, "lfmgemv").expect("attach");
+    backend
+        .stage_attention_full(
+            0,
+            AttentionFullStage {
+                caches: AttentionStage {
+                    keys: 1,
+                    key_scales: 2,
+                    values: 3,
+                    value_scales: 4,
+                    q_scale: 1.0,
+                    out_scale: 1.0 / 4096.0,
+                    reps: 1,
+                    cache_pages: 8,
+                    preprojected: true,
+                },
+                query: 10,
+                key: 11,
+                value: 12,
+                output: 13,
+                gate: Some(14),
+                query_norm: vec![1.0; spec.dims.head_dim],
+                key_norm: vec![1.0; spec.dims.head_dim],
+                act_scale: 1.0,
+                q_scale: 1.0,
+                k_scale: 1.0,
+                v_scale: 1.0,
+                gate_scale: 1.0,
+                attn_q_scale: 0.25,
+                attn_out_scale: 1.0 / 4096.0,
+                o_act_scale: 1.0,
+                out_scale: 1.0,
+                v_quant: VQuant::Channel(vec![1.0; kv_dim]),
+                reps: 1,
+            },
+        )
+        .expect("stage");
+    backend.set_attention_fused(true);
+
+    let mut kv = kv;
+    let input = vec![0.0f32; hidden];
+    let mut out = vec![1.0f32; hidden];
+    backend
+        .attention_layer(
+            AttentionCall {
+                layer: 0,
+                position: 0,
+                start: 0,
+                kind: AttentionKind::Full,
+                input: &input,
+            },
+            &mut kv,
+            &mut out,
+        )
+        .expect("attention");
+    assert_eq!(exec_calls.load(Ordering::SeqCst), 2, "qkv + one fused exec");
+    assert_eq!(kv.len(), 1);
 }

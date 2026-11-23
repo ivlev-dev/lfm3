@@ -452,7 +452,13 @@ impl ModelPack {
                         zero_image(&format!("blk.{index}.k"), self.dims.kv_heads * slots * 128)?,
                         zero_image(&format!("blk.{index}.kt"), self.dims.kv_heads * slots * 4)?,
                         zero_image(&format!("blk.{index}.v"), self.dims.kv_heads * slots * 128)?,
-                        None,
+                        // Resident per-channel V scale table (512 f32): the
+                        // `ATTN_SCALE` command reads it by handle, so a fused
+                        // attention layer needs no host copy of it.
+                        Some(f32_image(
+                            &format!("blk.{index}.vscale"),
+                            &attention.v_channel,
+                        )?),
                         AttentionParams {
                             q_scale: attention.attn_q_scale,
                             out_scale: attention.attn_out_scale,
@@ -593,6 +599,17 @@ fn zero_image(label: &str, bytes: usize) -> Result<ResidentImage, ModelPackError
     // per-token scale table is only 4-byte aligned.
     let padded = bytes.max(1).div_ceil(128) * 128;
     Ok(ResidentImage::new(label, vec![0u8; padded])?)
+}
+
+/// Little-endian f32 table padded to the 128-byte `alloc_in` alignment.
+fn f32_image(label: &str, values: &[f32]) -> Result<ResidentImage, ModelPackError> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let padded = bytes.len().max(1).div_ceil(128) * 128;
+    bytes.resize(padded, 0);
+    Ok(ResidentImage::new(label, bytes)?)
 }
 
 /// Map a GGML type name to the enum used by the checkpoint readers.

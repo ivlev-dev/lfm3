@@ -67,7 +67,7 @@ fn main() -> ExitCode {
     }
 
     let transport = select_transport(&options);
-    let mut client = match HvxClient::open(transport, &options.module) {
+    let mut client = match HvxClient::open(Arc::clone(&transport), &options.module) {
         Ok(client) => client,
         Err(error) => {
             eprintln!("open {} failed: {error}", options.module);
@@ -120,6 +120,17 @@ fn main() -> ExitCode {
             failure = true;
         }
     }
+
+    // O1 measurement: the Rust `exec` path with a stable command list. The
+    // difference between wall and `times[0]` is everything the host and the
+    // FastRPC driver spend per call around the DSP commands.
+    if let Some(handle) = client.handle() {
+        if let Err(error) = bench_exec(&transport, handle, options.iterations) {
+            eprintln!("exec bench failed: {error}");
+            failure = true;
+        }
+    }
+
     if let Err(error) = client.close() {
         eprintln!("close failed: {error}");
         failure = true;
@@ -130,6 +141,144 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// One-command `exec` through the Rust executor: the cheapest possible list.
+///
+/// Prints wall min/median/p95 and the DSP microseconds reported by the
+/// skeleton, so the difference is the per-call host/driver cost.
+fn bench_exec(
+    transport: &Arc<dyn Transport>,
+    handle: myelin_core::backend::dsp::DspHandle,
+    iterations: usize,
+) -> Result<(), String> {
+    use myelin_core::backend::dsp::{exec, DspExecutor, ExecRun};
+
+    let executor = myelin_npu::Executor::new(Arc::clone(transport));
+    executor
+        .reserve_scratch(handle, 1 << 20)
+        .map_err(|error| format!("reserve_scratch: {error}"))?;
+    let rt = [0i32; 4];
+    // 1, 8 and 32 commands: the overhead should stay constant if it is
+    // per-call, and grow if the uncounted part is DSP-time dependent.
+    for commands in [1usize, 8, 32] {
+        let mut list = exec::List::new(1 << 20);
+        for index in 0..commands {
+            list.push(
+                exec::Command::quant(0, index as i32 * 256, 256, 4096)
+                    .with_dst(exec::dst::OUT, index as i32 * 256),
+            );
+        }
+        let encoded = list.to_bytes();
+        let act = vec![0u8; 256 * 4];
+        let out_len = commands * 256;
+        for (label, rt) in [
+            (format!("exec QUANT x{commands} +rt"), &rt[..]),
+            (format!("exec QUANT x{commands}"), &rt[..0]),
+        ] {
+            let mut wall = Vec::with_capacity(iterations);
+            let mut dsp = Vec::with_capacity(iterations);
+            for _ in 0..3 {
+                executor
+                    .exec(
+                        handle,
+                        ExecRun {
+                            list: &encoded,
+                            commands: list.commands.len(),
+                            scratch_bytes: list.scratch_bytes,
+                            act: &act,
+                            rt,
+                            out_len,
+                        },
+                    )
+                    .map_err(|error| format!("exec: {error}"))?;
+            }
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let result = executor
+                    .exec(
+                        handle,
+                        ExecRun {
+                            list: &encoded,
+                            commands: list.commands.len(),
+                            scratch_bytes: list.scratch_bytes,
+                            act: &act,
+                            rt,
+                            out_len,
+                        },
+                    )
+                    .map_err(|error| format!("exec: {error}"))?;
+                wall.push(start.elapsed().as_secs_f64() * 1e6);
+                dsp.push(f64::from(result.times[0]));
+            }
+            wall.sort_by(f64::total_cmp);
+            dsp.sort_by(f64::total_cmp);
+            let median = wall[wall.len() / 2];
+            let dsp_median = dsp[dsp.len() / 2];
+            let p95 = wall[(wall.len() * 95 / 100).min(wall.len() - 1)];
+            println!(
+                "{label:<24} min {:9.1} us  median {median:9.1} us  p95 {p95:9.1} us  \
+             dsp {dsp_median:7.1} us  overhead {:7.1} us",
+                wall[0],
+                median - dsp_median
+            );
+        }
+    }
+
+    // Does the host gap between two execs cost extra? The model does 50-200
+    // microseconds of host work between calls; `rpc_test`/`exec_test` run
+    // back-to-back. A 1 ms sleep makes the difference visible.
+    {
+        let mut list = exec::List::new(1 << 20);
+        list.push(exec::Command::quant(0, 0, 256, 4096).with_dst(exec::dst::OUT, 0));
+        let encoded = list.to_bytes();
+        let act = vec![0u8; 256 * 4];
+        let mut wall = Vec::with_capacity(iterations);
+        let mut dsp = Vec::with_capacity(iterations);
+        for _ in 0..3 {
+            executor
+                .exec(
+                    handle,
+                    ExecRun {
+                        list: &encoded,
+                        commands: 1,
+                        scratch_bytes: list.scratch_bytes,
+                        act: &act,
+                        rt: &[],
+                        out_len: 256,
+                    },
+                )
+                .map_err(|error| format!("exec: {error}"))?;
+        }
+        for _ in 0..iterations {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let start = Instant::now();
+            let result = executor
+                .exec(
+                    handle,
+                    ExecRun {
+                        list: &encoded,
+                        commands: 1,
+                        scratch_bytes: list.scratch_bytes,
+                        act: &act,
+                        rt: &[],
+                        out_len: 256,
+                    },
+                )
+                .map_err(|error| format!("exec: {error}"))?;
+            wall.push(start.elapsed().as_secs_f64() * 1e6);
+            dsp.push(f64::from(result.times[0]));
+        }
+        wall.sort_by(f64::total_cmp);
+        dsp.sort_by(f64::total_cmp);
+        let median = wall[wall.len() / 2];
+        println!(
+            "{:<24} median {median:9.1} us  dsp {:7.1} us  (1 ms sleep between calls, not counted)",
+            "exec QUANT gap 1ms",
+            dsp[dsp.len() / 2]
+        );
+    }
+    Ok(())
 }
 
 fn bench(

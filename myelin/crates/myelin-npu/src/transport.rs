@@ -204,6 +204,26 @@ pub trait Transport: Send + Sync {
     fn invoke(&self, handle: Handle, call: Call<'_, '_>) -> Result<(), TransportError>;
     /// Allocate memory shared with the DSP.
     fn alloc_shared(&self, len: usize) -> Result<SharedBuffer, TransportError>;
+
+    /// Pin a long-lived shared buffer so the driver keeps its mapping.
+    ///
+    /// FastRPC maps every argument sequence for the duration of a call unless
+    /// the buffer is registered; `remote_register_buf_attr` with
+    /// `FASTRPC_ATTR_KEEP_MAP` turns that into a one-time cost. Transports
+    /// without registration keep the default no-op, so a `Vec` argument still
+    /// works.
+    fn register_shared(&self, buffer: &SharedBuffer) {
+        let _ = buffer;
+    }
+
+    /// Drop a mapping created by [`Transport::register_shared`].
+    ///
+    /// Best effort: the FastRPC build on the device has no
+    /// `remote_deregister_buf`, so the C ABI is `remote_register_buf(ptr, len,
+    /// -1)`.
+    fn unregister_shared(&self, buffer: &SharedBuffer) {
+        let _ = buffer;
+    }
 }
 
 #[cfg(test)]
