@@ -58,6 +58,7 @@ struct Args {
     calib_tokens: usize,
     /// Keep the old one-scale-per-row int4 pack (no `<blob>.seg` sidecars).
     int4_row: bool,
+    rot: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -70,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
     let mut tokens = None;
     let mut calib_tokens = 8usize;
     let mut int4_row = false;
+    let mut rot = 0usize;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -80,6 +82,14 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "--calib-tokens must be a positive integer".to_owned())?;
             }
             "--int4-row" => int4_row = true,
+            "--rot" => {
+                rot = value()?
+                    .parse()
+                    .map_err(|_| "--rot must be 0 or 128".to_owned())?;
+                if rot != 0 && rot != myelin_core::ops::ROT_SIZE {
+                    return Err("--rot must be 0 or 128".to_owned());
+                }
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -92,6 +102,7 @@ fn parse_args() -> Result<Args, String> {
         tokens: tokens.ok_or("--tokens is required")?,
         calib_tokens,
         int4_row,
+        rot,
     })
 }
 
@@ -659,6 +670,7 @@ fn host_logits(
 
 fn main() {
     let args = parse_args().expect("arguments");
+    ROT.store(args.rot, std::sync::atomic::Ordering::Relaxed);
     std::fs::create_dir_all(&args.out).expect("pack directory");
 
     let text = std::fs::read_to_string(&args.tokens).expect("prompt token file");
@@ -1035,7 +1047,24 @@ fn pack_blobs(
     written
 }
 
+static ROT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn rotated(matrix: &Matrix) -> Matrix {
+    let rot = ROT.load(std::sync::atomic::Ordering::Relaxed);
+    if rot == 0 {
+        return matrix.clone();
+    }
+    let mut data = matrix.data().to_vec();
+    for row in 0..matrix.n() {
+        let values = &mut data[row * matrix.k()..(row + 1) * matrix.k()];
+        myelin_core::ops::rot_fwd_blocks(values);
+    }
+    Matrix::new(matrix.k(), matrix.n(), data).expect("rotated matrix")
+}
+
 fn write_gemv(dir: &Path, packed: &PackGemv, matrix: &Matrix, kind: &str) -> u64 {
+    let matrix_storage = rotated(matrix);
+    let matrix = &matrix_storage;
     let meta = PackMeta {
         tensor: format!("{kind}:{}", packed.file),
         source: None,

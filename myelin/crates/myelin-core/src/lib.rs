@@ -15,6 +15,7 @@
 
 pub mod arch;
 pub mod backend;
+pub mod batch;
 pub mod dequant;
 pub mod engine;
 pub mod error;
@@ -32,6 +33,7 @@ pub use backend::{
     AttentionCall, Backend, BackendError, CpuBackend, DspBackend, EmbeddingRows, HeadMode,
     HostWeights, LayerNorms, NormSlot, NormWeights, StageProvider,
 };
+pub use batch::{BatchError, BatchEvent, BatchScheduler, SeqId, SeqRequest};
 pub use engine::{Engine, StepOut};
 pub use error::{CoreError, RuntimeError};
 pub use gguf::{GgufMeta, MetaValue};

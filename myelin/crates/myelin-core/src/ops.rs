@@ -290,3 +290,53 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-6);
     }
 }
+
+
+/// Hadamard rotation used by the w4a8 packs (same constants as
+/// `myelin/dsp/quant/quant.h`): `R = (1/sqrt(128)) * H_128 * D`, applied to
+/// every 128-value block. Rotating both the weight row and the activation
+/// keeps every dot product unchanged while making the int4/int8 blocks
+/// Gaussian.
+pub const ROT_SIZE: usize = 128;
+pub const ROT_SCALE: f32 = 0.088_388_35;
+const ROT_SIGN: [u32; 4] = [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
+
+fn rot_sign(index: usize) -> f32 {
+    if (ROT_SIGN[index >> 5] >> (index & 31)) & 1 != 0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+/// In-place forward rotation of one 128-value block.
+pub fn rot_fwd_block(block: &mut [f32]) {
+    debug_assert_eq!(block.len(), ROT_SIZE);
+    for (index, value) in block.iter_mut().enumerate() {
+        *value *= rot_sign(index);
+    }
+    let mut step = 1;
+    while step < ROT_SIZE {
+        let mut base = 0;
+        while base < ROT_SIZE {
+            for offset in 0..step {
+                let a = block[base + offset];
+                let b = block[base + offset + step];
+                block[base + offset] = a + b;
+                block[base + offset + step] = a - b;
+            }
+            base += 2 * step;
+        }
+        step *= 2;
+    }
+    for value in block.iter_mut() {
+        *value *= ROT_SCALE;
+    }
+}
+
+/// Rotate every complete 128-value block of `values` in place.
+pub fn rot_fwd_blocks(values: &mut [f32]) {
+    for block in values.chunks_exact_mut(ROT_SIZE) {
+        rot_fwd_block(block);
+    }
+}

@@ -1668,7 +1668,7 @@ impl DspBackend {
             .ok_or_else(|| BackendError::Model(format!("no conv counter for layer {layer}")))?;
 
         let hidden = dims.hidden as i32;
-        let act = quantize(x, stage.act_scale);
+        let act = quantize_act(x, stage.act_scale);
         let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
         list.push(exec::Command::gemv(
             stage.in_proj,
@@ -1831,7 +1831,7 @@ impl DspBackend {
 
         // 1. q/k/v (and gate) projections in one list. Results travel back in
         // one `out` sequence: q | k | v | gate.
-        let act = quantize(call.input, stage.act_scale);
+        let act = quantize_act(call.input, stage.act_scale);
         let q_out: usize = 0;
         let k_out = hidden;
         let v_out = hidden + kv_dim;
@@ -2012,7 +2012,7 @@ impl DspBackend {
             }
             *slot = real;
         }
-        let attended_int8 = quantize(&attended, stage.o_act_scale);
+        let attended_int8 = quantize_act(&attended, stage.o_act_scale);
         let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
         list.push(
             exec::Command::gemv(
@@ -2596,6 +2596,26 @@ fn kv_slots(cache_pages: usize) -> Result<i32, BackendError> {
         })
 }
 
+/// w4a8 packs bake a 128-value Hadamard rotation into every weight row, so the
+/// activation has to be rotated the same way before int8 quantization.
+fn w4a8() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("MYELIN_W4A8")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn quantize_act(x: &[f32], scale: f32) -> Vec<u8> {
+    if !w4a8() || x.len() % crate::ops::ROT_SIZE != 0 {
+        return quantize(x, scale);
+    }
+    let mut rotated = x.to_vec();
+    crate::ops::rot_fwd_blocks(&mut rotated);
+    quantize(&rotated, scale)
+}
+
 fn quantize(x: &[f32], scale: f32) -> Vec<u8> {
     x.iter()
         .map(|value| {
@@ -2694,7 +2714,7 @@ impl Backend for DspBackend {
         // method; only the transport differs. Same act, same int8 dst, so the
         // result is bit-identical to the old path (exec_test checks that
         // directly on the device).
-        let act = quantize(x, stage.act_scale);
+        let act = quantize_act(x, stage.act_scale);
         let hidden = dims.hidden as i32;
         let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
         list.push(
