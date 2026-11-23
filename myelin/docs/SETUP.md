@@ -303,3 +303,53 @@ cd myelin/dsp/hmx && ./deploy.sh push && ./deploy.sh info
 - `myelin/docs/README.md` — индекс всей документации.
 - `myelin/docs/architecture.md` — слои и поток одного шага.
 - `myelin/dsp/*/research/REPORT*.md` — журнал экспериментов с числами.
+
+---
+
+## 11. CLI на телефоне и Android-приложение
+
+### 11.1. `myelin` (chat / serve) через adb
+
+Бинарь `myelin` (CPU-бэкенд, тот же `myelin-core`) собирается под
+`aarch64-linux-android` и запускается в adb shell:
+
+```bash
+cd myelin
+./scripts/deploy-phone.sh build        # кросс-компиляция
+./scripts/deploy-phone.sh push         # бинарь + tokenizer + template
+./scripts/deploy-phone.sh push-model   # GGUF (1.1 ГБ, лучше по USB)
+./scripts/deploy-phone.sh chat         # интерактивный чат
+./scripts/deploy-phone.sh gen "The capital of France is"
+./scripts/deploy-phone.sh serve        # http://127.0.0.1:8080 (adb forward)
+```
+
+`serve` отдаёт `POST /v1/chat/completions` (SSE, `data: {"delta": ...}`) и
+`GET /health`. Подстановка `<|im_end|>` = EOS, chat-шаблон из
+`models/hf/chat_template.jinja`.
+
+### 11.2. APK с моделью через FFI
+
+```bash
+cd myelin/android
+# модель кладём в filesDir (debug-приложение, root не нужен):
+adb push ../models/LFM3-1.7B-Q4_K_M.gguf /data/local/tmp/
+adb shell run-as dev.myelin.demo cp /data/local/tmp/LFM3-1.7B-Q4_K_M.gguf files/model.gguf
+JAVA_HOME=/opt/jdk17 ./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+`tokenizer.json` и `chat_template.jinja` лежат в `assets` и копируются в
+`filesDir` при первом запуске (`ModelStore`). `Engine(modelPath = ...)` в
+UniFFI теперь грузит реальный GGUF (`myelin-core`), а не заглушку; без пути
+остаётся stub-бэкенд для тестов.
+
+Сборка `.so` для устройства:
+
+```bash
+cargo build --release --target aarch64-linux-android -p myelin-ffi
+cp target/aarch64-linux-android/release/libmyelin.so \
+   android/myelin-sdk/src/main/jniLibs/arm64-v8a/
+```
+
+Требуется JDK 17 (`org.gradle.java.installations.paths=/opt/jdk17`) и
+`local.properties` с `sdk.dir`.

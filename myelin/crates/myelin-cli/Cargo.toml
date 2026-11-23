@@ -1,0 +1,18 @@
+[package]
+name = "myelin-cli"
+description = "Chat / server binary on the myelin CPU backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "myelin"
+path = "src/main.rs"
+
+[dependencies]
+myelin-core = { workspace = true, features = ["hf-tokenizer"] }
+lfm-chat = { path = "../../../crates/infra-chat" }
+lfm-domain = { path = "../../../crates/domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

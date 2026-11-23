@@ -204,16 +204,16 @@ fn loads_gguf_header_and_rejects_bad_files() {
     let path_c = CString::new(path.to_str().unwrap()).unwrap();
 
     let mut err = new_error();
-    let cfg = engine_cfg(MYELIN_BACKEND_MOCK, path_c.as_ptr());
+    let cfg = engine_cfg(MYELIN_BACKEND_MOCK, std::ptr::null());
     // SAFETY: live stack pointers.
     let engine = unsafe { myelin_engine_new(&cfg, &mut err) };
     assert!(!engine.is_null(), "{}", error_message(&err));
     assert_eq!(err.code, MYELIN_OK);
-    // SAFETY: live engine handle and C string.
-    assert_eq!(
-        unsafe { myelin_engine_load(engine, path_c.as_ptr(), &mut err) },
-        MYELIN_OK
-    );
+    // The loader now parses the checkpoint, so a magic-only stub is rejected
+    // with a backend error instead of being accepted.
+    let code = unsafe { myelin_engine_load(engine, path_c.as_ptr(), &mut err) };
+    assert_ne!(code, MYELIN_OK);
+    assert!(error_message(&err).contains("version"));
 
     fs::write(&path, b"NOPE").unwrap();
     // SAFETY: live engine handle and C string.

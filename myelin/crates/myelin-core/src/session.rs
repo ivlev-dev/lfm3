@@ -22,7 +22,7 @@ use crate::RuntimeError;
 /// A loaded checkpoint plus the backend that executes it.
 pub struct Model {
     spec: ModelSpec,
-    backend: Box<dyn Backend>,
+    backend: Box<dyn Backend + Send>,
 }
 
 impl Model {
@@ -43,7 +43,7 @@ impl Model {
     }
 
     /// Pair an already built backend with its spec.
-    pub fn from_backend(spec: ModelSpec, backend: Box<dyn Backend>) -> Result<Self, RuntimeError> {
+    pub fn from_backend(spec: ModelSpec, backend: Box<dyn Backend + Send>) -> Result<Self, RuntimeError> {
         spec.validate()?;
         if backend.spec() != &spec {
             return Err(RuntimeError::InvalidArgument(

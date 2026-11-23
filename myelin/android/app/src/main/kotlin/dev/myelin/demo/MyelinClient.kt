@@ -23,12 +23,13 @@ import uniffi.myelin.TokenSink
  * and executed on [Dispatchers.IO]. Cancelling the collector (or calling
  * [cancel]) makes the Rust side stop at the next token boundary.
  *
- * `Engine(modelPath = null)` selects the in-process mock backend, so the demo
- * needs no model file and no storage permission.
+ * `Engine(modelPath = null)` selects the in-process stub backend; a path to a
+ * GGUF whose folder also holds `tokenizer.json` and `chat_template.jinja`
+ * loads the real CPU backend.
  */
-class MyelinClient : AutoCloseable {
+class MyelinClient(modelPath: String? = null) : AutoCloseable {
 
-    private val engine: Engine = Engine(modelPath = null)
+    private val engine: Engine = Engine(modelPath = modelPath)
     private val session: Session = engine.newSession()
     private val closed = AtomicBoolean(false)
 

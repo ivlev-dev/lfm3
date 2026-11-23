@@ -13,6 +13,7 @@ class MyelinApp : Application() {
     override fun onCreate() {
         super.onCreate()
         System.setProperty(UNIFFI_LIBRARY_OVERRIDE, NATIVE_LIBRARY_NAME)
+        AppContext.set(this)
     }
 
     private companion object {

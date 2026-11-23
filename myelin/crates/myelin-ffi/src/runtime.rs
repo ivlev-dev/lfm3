@@ -10,8 +10,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use myelin_core::{Engine as CoreEngine, ModelSpec};
+use lfm_chat::ChatTemplate;
+use myelin_core::tokenizer::LfmTokenizer;
+use myelin_core::{
+    Engine as CoreEngine, GenerateConfig, Model, ModelSpec, SamplingParams,
+};
 use myelin_npu::{MockBackend, NpuBackend};
+
+/// A model loaded from disk plus everything needed to answer chat turns.
+struct RealEngine {
+    model: Model,
+    tokenizer: LfmTokenizer,
+    template: ChatTemplate,
+    context: usize,
+}
 
 /// Number of fake tokens emitted by one stub generation.
 pub const STUB_TOKEN_COUNT: u32 = 5;
@@ -135,6 +147,7 @@ impl BackendKind {
 pub struct EngineHandle {
     core: Mutex<CoreEngine>,
     backend: Mutex<Box<dyn NpuBackend>>,
+    real: Mutex<Option<RealEngine>>,
 }
 
 impl EngineHandle {
@@ -148,6 +161,7 @@ impl EngineHandle {
         Ok(Arc::new(Self {
             core: Mutex::new(core),
             backend: Mutex::new(backend),
+            real: Mutex::new(None),
         }))
     }
 
@@ -169,13 +183,36 @@ impl EngineHandle {
             )));
         }
 
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let tokenizer_path = dir.join("tokenizer.json");
+        let template_path = dir.join("chat_template.jinja");
+        let model = Model::load_gguf(path).map_err(runtime_err)?;
+        let tokenizer = LfmTokenizer::from_file(&tokenizer_path).map_err(|error| {
+            RuntimeError::Io(format!(
+                "{}: {error} (tokenizer.json must sit next to the model)",
+                tokenizer_path.display()
+            ))
+        })?;
+        let template = ChatTemplate::from_file(&template_path).map_err(|error| {
+            RuntimeError::Io(format!("{}: {error}", template_path.display()))
+        })?;
         let spec = ModelSpec::placeholder();
         let mut core = self.core.lock().map_err(poisoned)?;
-        *core = CoreEngine::load(spec).map_err(internal)?;
+        *core = CoreEngine::load(spec.clone()).map_err(internal)?;
         let mut backend = self.backend.lock().map_err(poisoned)?;
         backend
-            .prepare(core.spec())
+            .prepare(&spec)
             .map_err(|error| RuntimeError::Backend(error.to_string()))?;
+        drop(backend);
+        drop(core);
+        *self.real.lock().map_err(poisoned)? = Some(RealEngine {
+            model,
+            tokenizer,
+            template,
+            context: 2048,
+        });
         Ok(())
     }
 
@@ -228,6 +265,74 @@ impl SessionHandle {
         let _busy = BusyGuard(&self.busy);
         self.cancelled.store(false, Ordering::Release);
 
+        {
+            let mut guard = self.engine.real.lock().map_err(poisoned)?;
+            if let Some(real) = guard.as_mut() {
+                let mut dom: Vec<lfm_domain::Message> = Vec::with_capacity(messages.len());
+                for message in messages {
+                    let role = match message.role.as_str() {
+                        "system" => lfm_domain::Role::System,
+                        "assistant" => lfm_domain::Role::Assistant,
+                        "tool" => lfm_domain::Role::Tool,
+                        _ => lfm_domain::Role::User,
+                    };
+                    dom.push(lfm_domain::Message {
+                        role,
+                        content: Some(message.content.clone()),
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                }
+                let prompt = real
+                    .template
+                    .render(&dom, &[], true, false, false)
+                    .map_err(|error| RuntimeError::InvalidArgument(format!("template: {error}")))?;
+                let ids = real
+                    .tokenizer
+                    .encode(&prompt, false)
+                    .map_err(|error| RuntimeError::InvalidArgument(format!("tokenize: {error}")))?;
+                let eos = real.tokenizer.eos_id();
+                let ctx = real.context;
+                let cfg = GenerateConfig {
+                    max_tokens: sampling.max_tokens as usize,
+                    sampling: SamplingParams {
+                        temperature: sampling.temperature,
+                        top_p: sampling.top_p,
+                        top_k: sampling.top_k as usize,
+                        seed: sampling.seed,
+                    },
+                    eos: Some(eos),
+                    stop: Vec::new(),
+                };
+                let mut session = real.model.session(ctx).map_err(runtime_err)?;
+                let mut generated: Vec<u32> = Vec::new();
+                let mut printed = String::new();
+                let mut total: u32 = 0;
+                let mut stop = false;
+                session
+                    .generate(&ids, &cfg, |token| {
+                        if stop {
+                            return;
+                        }
+                        generated.push(token);
+                        if let Ok(text) = real.tokenizer.decode(&generated, true) {
+                            if text.len() > printed.len() && text.starts_with(&printed) {
+                                let delta = text[printed.len()..].to_string();
+                                printed = text;
+                                let index = total;
+                                total += 1;
+                                if !on_event(StreamEvent::Delta { index, token, text: delta }) {
+                                    stop = true;
+                                }
+                            }
+                        }
+                    })
+                    .map_err(runtime_err)?;
+                on_event(StreamEvent::Done { total });
+                return Ok(total);
+            }
+        }
         for index in 0..STUB_TOKEN_COUNT {
             if self.is_cancelled() {
                 return Err(RuntimeError::Cancelled);
@@ -297,6 +402,10 @@ fn validate_sampling(sampling: Sampling) -> Result<()> {
 
 fn poisoned<T>(_: std::sync::PoisonError<MutexGuard<'_, T>>) -> RuntimeError {
     RuntimeError::Internal("engine lock poisoned".to_owned())
+}
+
+fn runtime_err(error: myelin_core::RuntimeError) -> RuntimeError {
+    RuntimeError::Backend(error.to_string())
 }
 
 fn internal(error: myelin_core::CoreError) -> RuntimeError {

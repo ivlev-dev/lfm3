@@ -33,7 +33,11 @@ class ChatViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
-    private val clientResult: Result<MyelinClient> = runCatching { MyelinClient() }
+    private val clientResult: Result<MyelinClient> = runCatching {
+        val context = AppContext.get()
+        val path = ModelStore.prepare(context) ?: error(ModelStore.hint(context))
+        MyelinClient(path)
+    }
     private val client: MyelinClient? = clientResult.getOrNull()
 
     private var generationJob: Job? = null

@@ -553,6 +553,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfm-chat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lfm-domain",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "lfm-cpu"
 version = "0.1.0"
 dependencies = [
@@ -661,6 +673,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "minijinja"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "509eeb2603a84eccabb4d75f6ec8ba23b46bbf441aaeb863d6b83a5887fd51e4"
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -689,6 +707,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-cli"
+version = "0.1.0"
+dependencies = [
+ "lfm-chat",
+ "lfm-domain",
+ "myelin-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "myelin-core"
 version = "0.1.0"
 dependencies = [
@@ -704,6 +733,8 @@ dependencies = [
 name = "myelin-ffi"
 version = "0.1.0"
 dependencies = [
+ "lfm-chat",
+ "lfm-domain",
  "myelin-core",
  "myelin-npu",
  "uniffi",
