@@ -45,13 +45,14 @@ fi
 
 mkdir -p "$OUT"
 
-CFLAGS="-mv68 -mhvx -mhvx-length=128b -G0 -O2 -Wall \
+CFLAGS="-mv68 -mhvx -mhmx -mhvx-length=128b -G0 -O2 -Wall \
         -I$S/incs -I$S/incs/stddef -I$HVX -I$CONV -I$QU -I$QU/qurt -I$QU/posix"
 
 echo "CC=$CC"
 $CC $CFLAGS -c "$HVX/lfmgemv_impl.c" -o "$OUT/lfmgemv_impl.o"
 $CC $CFLAGS -c "$HVX/q4k_impl.c" -o "$OUT/q4k_impl.o"
 $CC $CFLAGS -c "$HVX/kvarn_impl.c" -o "$OUT/kvarn_impl.o"
+$CC $CFLAGS -c "$HVX/prefill_impl.c" -o "$OUT/prefill_impl.o"
 $CC $CFLAGS -c sim_main.c -o "$OUT/sim_main.o"
 $CC $CFLAGS -c shim_hap.c -o "$OUT/shim_hap.o"
 
@@ -63,6 +64,7 @@ $CC -mv68 -g -nodefaultlibs -nostdlib \
     -Wl,--dynamic-linker= -Wl,--force-dynamic -Wl,-E -Wl,-z,muldefs \
     -Wl,--whole-archive \
     "$G0/init.o" "$OUT/lfmgemv_impl.o" "$OUT/q4k_impl.o" "$OUT/kvarn_impl.o" \
+    "$OUT/prefill_impl.o" \
     "$OUT/shim_hap.o" "$OUT/sim_main.o" \
     "$QL/crt1.o" "$QL/debugmon.o" "$QL/libqurt.a" \
     "$G0/libc.a" "$G0/libqcc.a" "$G0/libhexagon.a" "$G0/libm.a" \

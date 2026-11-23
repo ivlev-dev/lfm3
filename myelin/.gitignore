@@ -17,6 +17,7 @@
 /dsp/**/kvarn_case.h
 /dsp/hvx/q4k_test
 /dsp/hvx/kvarn_test
+/dsp/hvx/prefill_test
 
 # host-бинарники стендов
 /dsp/hmx/mx4_test

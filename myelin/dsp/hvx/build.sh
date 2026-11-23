@@ -41,9 +41,9 @@ fi
 "$QAIC" -I$S/incs -I$S/incs/stddef lfmgemv.idl
 
 # DSP-скелет: GEMV + SiLU + FFN + attention + PV
-$CC -mv68 -mhvx -mhvx-length=128b -O3 -fPIC -shared -g -Wall \
+$CC -mv68 -mhvx -mhmx -mhvx-length=128b -O3 -fPIC -shared -g -Wall \
     -I$S/incs -I$S/incs/stddef -I. -I$QU -I$QU/qurt \
-    -o liblfmgemv_skel.so lfmgemv_skel.c lfmgemv_impl.c q4k_impl.c kvarn_impl.c \
+    -o liblfmgemv_skel.so lfmgemv_skel.c lfmgemv_impl.c q4k_impl.c kvarn_impl.c prefill_impl.c \
     -Wl,-Bsymbolic -Wl,--start-group -lc -lgcc -Wl,--end-group
 
 # Host-тесты
@@ -83,5 +83,9 @@ $HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o kvarn_test \
     kvarn_test.c kvarn_impl.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
 echo "KVARN OK"
 
+$HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o prefill_test \
+    prefill_test.c q4k_impl.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
+echo "PREFILL OK"
+
 echo "BUILD OK"
-ls -la liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test attach_test rpc_test exec_test q4k_test kvarn_test ffn_sim ffn_real_study
+ls -la liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test attach_test rpc_test exec_test q4k_test kvarn_test prefill_test ffn_sim ffn_real_study

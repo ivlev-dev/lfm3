@@ -65,8 +65,10 @@ pub mod method_id {
     pub const KVARN_COMMIT: u32 = 25;
     /// `kvarn_decode(in long v_bits, in sequence<octet> page, ...)`
     pub const KVARN_DECODE: u32 = 26;
+    /// `prefill(in long hw, in long hs, in sequence<octet> act, ...)`
+    pub const PREFILL: u32 = 27;
     /// `reset_state(in long flags)`
-    pub const RESET_STATE: u32 = 27;
+    pub const RESET_STATE: u32 = 28;
 }
 
 macro_rules! scalar_pack {
@@ -212,9 +214,9 @@ scalar_pack!(KvWriteWire {
 scalar_pack!(ResetStateScalars { flags: i32 } size = 4);
 
 /// `sizeof(_primIn)` per method, in method-ID order (`lfmgemv_stub.c`).
-pub const PRIM_IN_SIZES: [usize; 28] = [
+pub const PRIM_IN_SIZES: [usize; 29] = [
     4, 16, 12, 8, 24, 16, 32, 12, 4, 20, 28, 48, 4, 4, 12, 4, 8, 8, 4, 12, 4, 28, 32, 4,
-    20, 16, 24, 4,
+    20, 16, 24, 52, 4,
 ];
 
 /// Number of i32 values in the stand's `times[]` sequence.

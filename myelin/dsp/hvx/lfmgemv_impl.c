@@ -32,6 +32,7 @@
 #include "apps_mem.h"
 #include "q4k_impl.h"
 #include "kvarn_impl.h"
+#include "prefill_impl.h"
 #include "../quant/quant.h"
 
 typedef void *Address;
@@ -4330,4 +4331,52 @@ int lfmgemv_kvarn_decode(int v_bits, const unsigned char *page, int pageLen,
     memcpy(out, y, sizeof(y));
     if (times && timesLen >= 1) times[0] = 0;
     return 0;
+}
+
+
+/* ====================================================================== */
+/* HMX prefill (kernel: prefill_impl.c, stand: dsp/hmx)                   */
+/* ====================================================================== */
+
+int lfmgemv_prefill(int hw, int hs, int hq, const unsigned char *act,
+                    int actLen, int M, int N, int K, int G, int C0, int mode,
+                    int reps, unsigned char *out, int outLen, int *info,
+                    int infoLen)
+{
+    gbuf_t *bw, *bs, *bq;
+    float *C;
+    size_t ng, wneed, sneed;
+    int rc;
+
+    const float *Q = 0;
+    int st16 = ((mode >> 8) & 3) == 3;
+
+    if (hw < 0 || hs < 0 || hw >= MAXBUF || hs >= MAXBUF) return AEE_EBADPARM;
+    bw = &g_buf[hw];
+    bs = &g_buf[hs];
+    if (!bw->used || !bs->used || !bw->w || !bs->w) return AEE_EBADPARM;
+    if (!act || K < 32 || (K & 31) || N < 32 || (N & 31) || M < 1) return AEE_EBADPARM;
+    if (G < 1 || K % (32 * G)) return AEE_EBADPARM;
+    if (actLen < M * K) return AEE_EBADPARM;
+    ng = (size_t)(K / 32) / (size_t)G;
+    wneed = (size_t)(N / 32) * (size_t)(K / 32) * 512u;
+    sneed = (size_t)N * ng * sizeof(float);
+    if (wneed > bw->wbytes || sneed > bs->wbytes) return AEE_EBADPARM;
+    if (st16) {
+        if (hq < 0 || hq >= MAXBUF) return AEE_EBADPARM;
+        bq = &g_buf[hq];
+        if (!bq->used || !bq->w || sneed > bq->wbytes) return AEE_EBADPARM;
+        Q = (const float *)bq->w;
+    }
+    if ((mode & 8) && outLen < M * N * 4) return AEE_EBADPARM;
+
+    C = (float *)memalign(128, (size_t)M * N * sizeof(float));
+    if (!C) return AEE_ENOMEMORY;
+    rc = lfm_prefill((const int8_t *)act, bw->w, (const float *)bs->w, Q, M, N,
+                     K, G, C0, mode, reps, C, info, infoLen);
+    if (rc == 0 && (mode & 8) && out)
+        memcpy(out, C, (size_t)M * N * sizeof(float));
+
+    free(C);
+    return rc == 0 ? 0 : AEE_EBADPARM;
 }

@@ -147,6 +147,17 @@ interface lfmgemv {
                      in long is_v, rout sequence<octet> outp,
                      rout sequence<long> times);
 
+   /* ---- HMX prefill (kernel: prefill_impl.c, stand: dsp/hmx) --------------
+      int4 weights with per-group scales on the HMX array: the prefill GEMM
+      (decode stays on HVX).  hw = packed int4 blob, hs = f32 scales,
+      act = int8 M x K.  G = 32-K croutons per scale (4 = one scale per 128 K,
+      the REPORT24 compromise), C0 = 224*Aq offset, mode bit3 writes f32
+      M x N into outp, mode bit0 stages weights per N tile. */
+   long prefill(in long hw, in long hs, in long hq, in sequence<octet> act,
+                in long M, in long N, in long K, in long G, in long C0,
+                in long mode, in long reps,
+                rout sequence<octet> outp, rout sequence<long> info);
+
    /* ---- session state reset ---------------------------------------------
       Zero the DSP-heap scratch (which holds every CONV ring state) and the
       shared counters, so a new sequence starts from exactly the state of a
