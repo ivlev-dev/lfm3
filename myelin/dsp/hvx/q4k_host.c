@@ -468,6 +468,44 @@ static void rmsnorm(const float *v, const float *w, int n, float *out)
     for (i = 0; i < n; i++) out[i] = v[i] * inv * w[i];
 }
 
+/* --- KV cache quantisation, as the HVX attention kernel stores it --------
+ * K: int4 per token per head (one scale per 128-dim row, amax/7, signed)
+ * V: int2 per token per head (scale amax/2, two's complement -2..1)
+ * Used to test whether the *KV* stage, not the weight format, is what
+ * degenerates the text.  --kvq 1 = k4+v2, --kvq 2 = v2 only. */
+static int g_kvq;
+static void kv_q_k(float *v, int n)
+{
+    float amax = 0.0f, sc;
+    int i;
+    for (i = 0; i < n; i++) { float a = fabsf(v[i]); if (a > amax) amax = a; }
+    sc = amax / 7.0f;
+    if (sc <= 0.0f) return;
+    for (i = 0; i < n; i++) {
+        float t = roundf(v[i] / sc);
+        if (t > 7.0f) t = 7.0f;
+        if (t < -7.0f) t = -7.0f;
+        v[i] = t * sc;
+    }
+}
+/* bits: 2 -> levels -2..1 (amax/2), 4 -> amax/7, 8 -> amax/127 */
+static void kv_q_v(float *v, int n, int bits)
+{
+    float amax = 0.0f, sc, lim;
+    int i;
+    for (i = 0; i < n; i++) { float a = fabsf(v[i]); if (a > amax) amax = a; }
+    if (amax <= 0.0f) return;
+    if (bits == 2) { sc = amax / 2.0f; lim = 1.0f; }
+    else if (bits == 4) { sc = amax / 7.0f; lim = 7.0f; }
+    else { sc = amax / 127.0f; lim = 127.0f; }
+    for (i = 0; i < n; i++) {
+        float t = roundf(v[i] / sc);
+        if (t > lim) t = lim;
+        if (t < -lim - (bits == 2 ? 1.0f : 0.0f)) t = -lim - (bits == 2 ? 1.0f : 0.0f);
+        v[i] = t * sc;
+    }
+}
+
 static float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 static float siluf_(float x) { return x / (1.0f + expf(-x)); }
 
@@ -508,6 +546,8 @@ static state_t *st_new(void)
     }
     return s;
 }
+
+static float *g_logits_out;    /* if set, forward() copies the logits here */
 
 /* one token; top1 != NULL -> greedy argmax of the logits */
 static void forward(state_t *S, int tok, int *top1)
@@ -584,6 +624,14 @@ static void forward(state_t *S, int tok, int *top1)
                 rope_inplace(kk + h * D, pos, kind == 1 ? g_rope_full : g_rope_slide);
             }
             free(qn); free(kn);
+            if (g_kvq) {
+                int vbits = (g_kvq == 2) ? 2 : (g_kvq == 3) ? 4 : (g_kvq == 4) ? 8
+                          : (g_kvq == 6) ? 24 : 2;      /* 24 = leave V exact */
+                if (vbits != 24)
+                    for (h = 0; h < g_HKV; h++) kv_q_v(vv + h * D, D, vbits);
+                if (g_kvq == 1 || g_kvq == 5 || g_kvq == 6)
+                    for (h = 0; h < g_HKV; h++) kv_q_k(kk + h * D, D);
+            }
             memcpy(S->k[L] + (size_t)S->len[L] * KD, kk, (size_t)KD * 4);
             memcpy(S->v[L] + (size_t)S->len[L] * KD, vv, (size_t)KD * 4);
             S->len[L]++;
@@ -654,16 +702,20 @@ static void forward(state_t *S, int tok, int *top1)
     }
     S->pos++;
 
-    if (top1) {
+    if (top1 || g_logits_out) {
         float *logits = malloc((size_t)g_V * 4);
         float *onorm = gguf_vec_alloc("output_norm.weight", H);
-        int r, best = 0;
-        float bv = -1e38f;
+        int r;
         rmsnorm(x, onorm, H, nrm);
         free(onorm);
         matvec(W("token_embd.weight"), nrm, logits);
-        for (r = 0; r < g_V; r++) if (logits[r] > bv) { bv = logits[r]; best = r; }
-        *top1 = best;
+        if (top1) {
+            int best = 0;
+            float bv = -1e38f;
+            for (r = 0; r < g_V; r++) if (logits[r] > bv) { bv = logits[r]; best = r; }
+            *top1 = best;
+        }
+        if (g_logits_out) memcpy(g_logits_out, logits, (size_t)g_V * 4);
         free(logits);
     }
     free(x); free(res); free(nrm); free(blk); free(mrg); free(tmp);
@@ -901,7 +953,7 @@ static void selftest(void)
     /* the two requantised formats, same activation, same matrix */
     {
         float *yi8 = malloc((size_t)N * 4), *yi4 = malloc((size_t)N * 4);
-        int groups = K / 32, g, i2, G;
+        int groups = K / 32, g, i2;
         int32_t sums[64];
         int8_t qi8[8192]; float si8[256];
         int8_t qi4[8192]; float si4[256];
@@ -925,7 +977,6 @@ static void selftest(void)
             yi8[r] = a8;
             yi4[r] = a4;
         }
-        (void)G;
         metrics("i8/32 requant + q8act vs f32", yi8, yref, N);
         metrics("i4/32 requant + q8act vs f32", yi4, yref, N);
         {
@@ -1041,10 +1092,10 @@ static void emit_case(const char *path, int rows)
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
-    const char *model = "models/LFM3-1.7B-Q4_K_M.gguf";
+    const char *model = NULL;
     char prompt_ids[4096] = "597 5205 302 3980 355";   /* The capital of France is */
     int ntokens = 64, i, selft = 0, case_rows = 512;
-    const char *case_out = NULL;
+    const char *case_out = NULL, *logits_out = NULL;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model")) model = argv[++i];
@@ -1064,9 +1115,22 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--selftest")) selft = 1;
         else if (!strcmp(argv[i], "--emit-case")) case_out = argv[++i];
         else if (!strcmp(argv[i], "--case-rows")) case_rows = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--logits")) logits_out = argv[++i];
+        else if (!strcmp(argv[i], "--kvq")) g_kvq = atoi(argv[++i]);
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
     }
 
+    if (!model) {
+        static const char *cand[] = { "models/LFM3-1.7B-Q4_K_M.gguf",
+                                      "../../../models/LFM3-1.7B-Q4_K_M.gguf",
+                                      "../models/LFM3-1.7B-Q4_K_M.gguf" };
+        unsigned k;
+        for (k = 0; k < sizeof(cand) / sizeof(cand[0]); k++) {
+            FILE *f = fopen(cand[k], "rb");
+            if (f) { fclose(f); model = cand[k]; break; }
+        }
+        if (!model) { fprintf(stderr, "model not found (use --model)\n"); return 2; }
+    }
     model_init(model);
 
     if (selft) { selftest(); return 0; }
@@ -1084,11 +1148,21 @@ int main(int argc, char **argv)
             ids[nids++] = (int)strtol(p, &p, 10);
         }
         S = st_new();
+        if (logits_out) g_logits_out = malloc((size_t)g_V * 4);
         next = ids[0];
         for (t = 0; t < nids; t++) {
             int top = -1;
             forward(S, ids[t], &top);
             next = top;
+        }
+        if (logits_out) {
+            FILE *lf = fopen(logits_out, "wb");
+            if (!lf) { perror(logits_out); exit(1); }
+            fwrite(g_logits_out, 4, (size_t)g_V, lf);
+            fclose(lf);
+            fprintf(stderr, "[q4k] wrote logits %s (%d f32)\n", logits_out, g_V);
+            free(g_logits_out);
+            g_logits_out = NULL;
         }
         printf("ids:");
         for (t = 0; t < ntokens; t++) {
