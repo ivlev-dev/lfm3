@@ -38,3 +38,9 @@
 /dsp/hvx/probe_test
 /dsp/conv/conv_test
 /dsp/conv/conv_sim
+blkstat
+/dsp/hmx/sim/hmx_*
+/dsp/hvx/exec_test
+/dsp/hvx/ffn_real_study
+/dsp/hvx/ffn_sim
+/dsp/hvx/multi/multi_test

@@ -182,54 +182,54 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 6. DSP-стенды
 
-Все стенды — отдельные мини-проекты, SDK-зависимые. Собираются без телефона.
-
-### 6.1 HVX/exec на телефоне
+Слой ядер живёт в `myelin/dsp/` и имеет единую точку входа.
+Форматы и ABI — `myelin/dsp/CONTRACT.md`; что проверено и что заведомо не
+работает — `myelin/dsp/STATUS.md`.
 
 ```bash
-cd myelin/dsp/hvx
-HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT ./build.sh
-# появляются: liblfmgemv_skel.so, lfmgemv_test, exec_test, attn_test, ffn_test, ...
-adb push liblfmgemv_skel.so exec_test attn_test /data/local/tmp/lfmgemv/
-adb shell "cd /data/local/tmp/lfmgemv && ADSP_LIBRARY_PATH=\$PWD ./exec_test"
+cd myelin/dsp
+./run_tests.sh      # сгенерировать эталон из Rust, собрать и прогнать всё
+make test           # то же
+make host           # только хостовые стенды (системный cc, без SDK)
+make dsp            # только DSP-стенды (hexagon-sim)
+make clean
 ```
 
-### 6.2 HVX/exec в hexagon-sim (без телефона)
+| каталог | что |
+|---|---|
+| `common/` | header-only: `fp16.h`, `q4.h`, `quant.h`, `rot.h` (H32/H128), `kvarn.h`, `page.h` |
+| `hvx/` | GEMV/GEMM int4, FFN, flash-attention, kvcache, exec + стенды `*_main.c` |
+| `hmx/` | int4/int8 GEMM, prefill + стенд `gemm_main.c` |
+| `sim/` | общий стенд: QuRT/HVX shim, `sim_main.c`, `build.sh`, `runner.sh` |
+| `tests/` | `test_common.c`, эталон `kvarn_case.h` из Rust |
+
+### 6.1 На телефоне
+
+Отдельных `deploy.sh` больше нет: соберите нужный стенд его `build.sh`
+(например, `cd myelin/dsp/hvx && HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT ./build.sh`)
+и залейте `.so` и тест-бинарь вручную:
 
 ```bash
-cd myelin/dsp/sim
-HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT ./runner.sh   # маркер SIM RESULT: PASS
-```
-
-Стенд запускается через QuRT cosim: `hexagon-sim` + `runelf.pbn` +
-`osam.cfg`/`q6ss.cfg` (QuRT `qurt_model.so`, `qtimer.so`, `l2vic.so`).
-Старый путь `USE_QEMU=1 ./runner.sh` оставлен опцией.
-
-### 6.3 HMX на телефоне
-
-```bash
-cd myelin/dsp/hmx
-HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT ./build.sh
 export MADB=<серийник>
-./deploy.sh push
-./deploy.sh info
-./deploy.sh i4 32 32 2048 4 0x6000 -1 0 200     # int4 K=2048, ожидается MATCH
+adb -s "$MADB" push myelin/dsp/hvx/liblfmgemv_skel.so myelin/dsp/hvx/exec_test /data/local/tmp/lfmgemv/
+adb -s "$MADB" shell 'cd /data/local/tmp/lfmgemv && ADSP_LIBRARY_PATH=$PWD ./exec_test'
 ```
 
-### 6.4 HMX в hexagon-sim (без телефона)
+### 6.2 HMX в симуляторе
 
 ```bash
-cd myelin/dsp/hmx/sim
-./build.sh && ./run.sh
-# ожидается: RESULT: OK (VTCM + HMX functional)
+cd myelin/dsp/hmx/sim && ./build.sh && ./run.sh
 ```
 
-Три вещи, без которых HMX в симуляторе не работает:
+Три вещи, без которых HMX в `hexagon-sim` не работает:
 
-1. `--mhmx 1` у `hexagon-sim`;
+1. `--mhmx 1`;
 2. бит **SSR.XE2 = 26** в программе (`ssr = rN`);
 3. адреса буферов в окне VTCM **`0xd8400000…0xd87fffff`** и обязательный
    `bias = mxmem2()` с 32 словами `0x6000`, иначе конвертер пишет нули.
+
+QEMU (`-M V68N_1024`) остаётся опцией для QuRT/HVX (`USE_QEMU=1 ./sim/runner.sh`):
+**HMX в нём не эмулируется** (исключение 0x18).
 
 ---
 
@@ -302,7 +302,10 @@ cd myelin/dsp/hmx && ./deploy.sh push && ./deploy.sh info
 - `myelin/docs/HANDOVER.md` — состояние проекта, решения, открытые задачи.
 - `myelin/docs/README.md` — индекс всей документации.
 - `myelin/docs/architecture.md` — слои и поток одного шага.
-- `myelin/dsp/*/research/REPORT*.md` — журнал экспериментов с числами.
+- `myelin/dsp/STATUS.md` — что проверено в текущем слое ядер и что заведомо
+  не работает; `myelin/dsp/CONTRACT.md` — форматы и ABI.
+- Отчёты прошлых линий (`REPORT*.md`, `Q4K.md`, `docs/quality-int4-cpu.md`)
+  остались в истории git: `git log --all -- myelin/dsp/hmx/research`.
 
 ---
 
