@@ -73,9 +73,20 @@ typedef struct {
     int      arena;     /* arena index for an alloc_view handle, else -1 */
     float    sa, so;    /* activation / output scales last given to set_scale */
     int      wide;      /* 1 = m > 1 on some row: use the int64 pack path */
+    int      seg;       /* 1 = per-256 ratios present (pack v2) */
+    int      nseg;      /* K/256 ratio columns, == nvec */
+    int      zq;        /* 1 = acc[] holds the Q16 value directly (seg path) */
+    uint8_t *rseg;      /* N*nseg ratios, 127 = row scale (q = ratio+1) */
+    float   *mrow;      /* N multipliers sw*sa/so */
 } gbuf_t;
 
 static gbuf_t g_buf[MAXBUF];
+
+/* Pack v2 per-256 ratios: after the per-row f32 table `set_scale` may carry
+ * this word ("MSQ2" little endian), the segment count and `N * nseg` u8
+ * ratios.  The word after the table is what tells the two layouts apart, so
+ * an old (or int8) payload keeps its exact bytes and its per-row path. */
+#define LFM_SEG_MAGIC 0x3251534Du
 
 typedef struct {
     int32_t *acc2;
@@ -348,6 +359,137 @@ static void gemv_rows_m1_k2048_range(const gbuf_t *b, const int8_t *ae, const in
         }
         acc[r] = vsum_w(Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(e0, e1),
                                         Q6_Vw_vadd_VwVw(e2, e3))) + rowbias;
+    }
+}
+
+/* ---------------- per-256 int4 scales (pack v2) ----------------
+ *
+ * A pack-v2 GEMV carries one `absmax/7` scale per 256 inputs instead of one
+ * per row (the CPU control in `myelin/docs/quality-int4-cpu.md` shows why:
+ * per-row breaks text, per-256 does not).  The blob stays row-major int4, so
+ * the dot is still exact int32 and segment `s` of a row is exactly one
+ * 128-byte weight vector.  Only the dequant changes: every segment is
+ * multiplied by its own scale before the row is summed.
+ *
+ * The multiplier of segment s is `mrow[r] * q_s / 128`, q_s = ratio + 1 in
+ * 1..=128 (128 = the row scale).  The row multiplier is applied once per row
+ * after the horizontal sum, the segment ratio stays integer:
+ *
+ *   acc[r] = sum_s (dot_s - 8*sum_act_s) * q_s        (exact int32)
+ *   value  = mrow[r] * acc[r] / 128                   (one f32 op per row)
+ *
+ * Bounds: a lane of `dot` is at most 15*127*8 = 15240, the lane-0 nibble
+ * correction at most 8*127*256 = 260096, so |acc| <= 30 * 275336 * 128 =
+ * 1.06e9 < 2^31 for the widest LFM3 matrix (K = 7680, int4).  The nibble
+ * correction is folded into lane 0 of each segment, so a single horizontal
+ * sum per row still gives the whole dot.  Per-row packs (b->seg == 0) keep
+ * the old integer `pack_out_i8`/`qm` path untouched.
+ */
+
+/* Sum of the activation over each 256-input segment (deinterleaved planes:
+ * segment c is vector c of both ae and ao). */
+static void seg_act_sum(const int8_t *ae, const int8_t *ao, int nseg, float *out)
+{
+    const HVX_Vector one = Q6_V_vsplat_R(0x01010101u);
+    int c;
+    for (c = 0; c < nseg; c++) {
+        HVX_Vector ve = Q6_Vw_vrmpyacc_VwVubVb(Q6_V_vzero(), one,
+                                               ((const HVX_Vector *)ae)[c]);
+        HVX_Vector vo = Q6_Vw_vrmpyacc_VwVubVb(Q6_V_vzero(), one,
+                                               ((const HVX_Vector *)ao)[c]);
+        out[c] = (float)(vsum_w(ve) + vsum_w(vo));
+    }
+}
+
+/* floor(v + 0.5), the rounding of the existing `(acc*q + 32768) >> 16` path.
+ * `(int32_t)v` truncates toward zero, so the negative half is handled
+ * explicitly: -3.5 must become -3 (floor(-3.0)), -3.6 must become -4. */
+static inline int32_t round_half_up(float v)
+{
+    int32_t t;
+    float f;
+    if (v >= 2147483000.0f) return 0x7fffffff;
+    if (v <= -2147483000.0f) return (int32_t)0x80000000;
+    t = (int32_t)v;
+    f = v - (float)t;
+    if (f >= 0.5f) t++;
+    else if (f < -0.5f) t--;
+    return t;
+}
+
+static inline int8_t clampi8(int32_t v)
+{
+    if (v > 127) v = 127;
+    if (v < -127) v = -127;
+    return (int8_t)v;
+}
+
+/* Real value of one row of a per-256 accumulator. */
+static inline float seg_row_value(const gbuf_t *b, int32_t acc, int row)
+{
+    return b->mrow[row] * (float)acc * (1.0f / 128.0f);
+}
+
+/* GEMV output for a per-256 buffer. */
+static void pack_seg_i8(const gbuf_t *b, const int32_t *acc, int8_t *out, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        out[i] = clampi8(round_half_up(seg_row_value(b, acc[i], i)));
+}
+
+/* Rows [r0,r1) of the per-256 GEMV.  `segsum` are the activation sums per
+ * segment (-8*sum is applied here), so the same vectors serve every row. */
+static void gemv_rows_seg_range(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
+                                const float *segsum, int r0, int r1, int32_t *acc)
+{
+    const size_t ROW = (size_t)(b->nvec * 128);
+    const HVX_Vector *Ae = (const HVX_Vector *)ae;
+    const HVX_Vector *Ao = (const HVX_Vector *)ao;
+    const uint8_t *base = b->w;
+    const int nseg = b->nseg;
+    HVX_Vector bi[32];
+    int c, r;
+
+    if (nseg < 1 || nseg > 32) return;
+    for (c = 0; c < nseg; c++) {
+        union { HVX_Vector v; int32_t i[32]; } u;
+        u.v = Q6_V_vzero();
+        u.i[0] = (int32_t)(-8.0f * segsum[c]);
+        bi[c] = u.v;
+    }
+    for (r = r0; r < r1; r++) {
+        const HVX_Vector *wp = (const HVX_Vector *)(base + (size_t)r * ROW);
+        const uint8_t *rr = b->rseg + (size_t)r * nseg;
+        HVX_Vector sa = Q6_V_vzero(), sb = Q6_V_vzero();
+        int c;
+
+        for (c = 0; c + 1 < nseg; c += 2) {
+            int q0 = (int)rr[c] + 1;
+            int q1 = (int)rr[c + 1] + 1;
+            HVX_Vector d0 = Q6_Vw_vrmpyacc_VwVubVb(Q6_V_vzero(),
+                                                   vand_mask0f(wp[c]), Ae[c]);
+            HVX_Vector d1 = Q6_Vw_vrmpyacc_VwVubVb(Q6_V_vzero(),
+                                                   vand_mask0f(wp[c + 1]), Ae[c + 1]);
+            d0 = Q6_Vw_vrmpyacc_VwVubVb(d0, vlsr4b(wp[c]), Ao[c]);
+            d1 = Q6_Vw_vrmpyacc_VwVubVb(d1, vlsr4b(wp[c + 1]), Ao[c + 1]);
+            d0 = Q6_Vw_vadd_VwVw(d0, bi[c]);
+            d1 = Q6_Vw_vadd_VwVw(d1, bi[c + 1]);
+            sa = Q6_Vw_vmpyieacc_VwVwVuh(sa, d0,
+                    Q6_V_vsplat_R((unsigned)q0 | ((unsigned)q0 << 16)));
+            sb = Q6_Vw_vmpyieacc_VwVwVuh(sb, d1,
+                    Q6_V_vsplat_R((unsigned)q1 | ((unsigned)q1 << 16)));
+        }
+        for (; c < nseg; c++) {
+            int q0 = (int)rr[c] + 1;
+            HVX_Vector d0 = Q6_Vw_vrmpyacc_VwVubVb(Q6_V_vzero(),
+                                                   vand_mask0f(wp[c]), Ae[c]);
+            d0 = Q6_Vw_vrmpyacc_VwVubVb(d0, vlsr4b(wp[c]), Ao[c]);
+            d0 = Q6_Vw_vadd_VwVw(d0, bi[c]);
+            sa = Q6_Vw_vmpyieacc_VwVwVuh(sa, d0,
+                    Q6_V_vsplat_R((unsigned)q0 | ((unsigned)q0 << 16)));
+        }
+        acc[r] = vsum_w(Q6_Vw_vadd_VwVw(sa, sb));
     }
 }
 
@@ -661,6 +803,7 @@ typedef struct {
     int           r0, r1;
     volatile int  done_seq;
     int32_t      *acc;
+    const float  *segsum;    /* kind 3: per-segment activation sums */
     void         *ctx;       /* attention context (kind 2) */
 } m1job_t;
 
@@ -718,6 +861,8 @@ static void team_join(int total)
             if (j->kind == 2) atr(ATR_FB, i);
             if (j->kind == 0)
                 gemv_rows_m1_k2048_range(j->b, j->ae, j->ao, j->bias, j->r0, j->r1, j->acc);
+            else if (j->kind == 3)
+                gemv_rows_seg_range(j->b, j->ae, j->ao, j->segsum, j->r0, j->r1, j->acc);
             else if (j->kind == 1)
                 silu_range(j->r0, j->r1, j->b, (const gbuf_t *)j->ae, j->bias);
             else if (j->kind == 2) {
@@ -774,6 +919,11 @@ static void worker_body(thw_t *w)
                 qurt_hvx_unlock();
             } else if (j->kind == 1) {
                 silu_range(j->r0, j->r1, j->b, (const gbuf_t *)j->ae, j->bias);
+            } else if (j->kind == 3) {
+                qurt_hvx_lock(QURT_HVX_MODE_128B);
+                gemv_rows_seg_range(j->b, j->ae, j->ao, j->segsum, j->r0, j->r1, j->acc);
+                qurt_mem_syncht();
+                qurt_hvx_unlock();
             } else {
                 qurt_hvx_lock(QURT_HVX_MODE_128B);
                 gemv_rows_m1_k2048_range(j->b, j->ae, j->ao, j->bias, j->r0, j->r1, j->acc);
@@ -887,6 +1037,50 @@ static void run_split_m1(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
     {
         m1job_t *j = &g_team.job[0];
         gemv_rows_m1_k2048_range(j->b, j->ae, j->ao, j->bias, j->r0, j->r1, j->acc);
+    }
+    team_join(total);
+    __sync_synchronize();
+}
+
+/* split rows [0,N) over the team, per-256 path: acc[r] is the integer
+ * segment-weighted row sum (`seg_row_value` turns it into the real value). */
+static void run_split_seg(const gbuf_t *b, const int8_t *ae, const int8_t *ao,
+                          const float *segsum, int32_t *acc)
+{
+    int total = g_team.nwork + 1;
+    int i;
+
+    if (g_threads > 1 && g_team.state == 0) team_start(g_threads);
+    if (!g_team_warm && g_team.nwork > 0) {
+        int i;
+        g_team_warm = 1;
+        for (i = 1; i <= g_team.nwork; i++) {
+            m1job_t *jw = &g_team.job[i];
+            jw->kind = 3; jw->b = b; jw->ae = ae; jw->ao = ao;
+            jw->bias = 0; jw->r0 = 0; jw->r1 = 0; jw->acc = acc; jw->segsum = segsum;
+        }
+        team_kick(g_team.nwork + 1);
+        team_join(g_team.nwork + 1);
+    }
+    total = g_team.nwork + 1;
+    if (g_threads < total) total = g_threads;
+    if (total <= 1 || b->N < 512) {
+        gemv_rows_seg_range(b, ae, ao, segsum, 0, b->N, acc);
+        return;
+    }
+    for (i = 0; i < total; i++) {
+        int r0 = (int)((int64_t)b->N * i / total) & ~3;
+        int r1 = (int)((int64_t)b->N * (i + 1) / total) & ~3;
+        g_team.job[i].kind = 3;
+        g_team.job[i].b = b; g_team.job[i].ae = ae; g_team.job[i].ao = ao;
+        g_team.job[i].bias = 0; g_team.job[i].r0 = r0; g_team.job[i].r1 = r1;
+        g_team.job[i].acc = acc; g_team.job[i].segsum = segsum;
+    }
+    g_team.job[total - 1].r1 = b->N;
+    team_kick(total);
+    {
+        m1job_t *j = &g_team.job[0];
+        gemv_rows_seg_range(j->b, j->ae, j->ao, j->segsum, j->r0, j->r1, j->acc);
     }
     team_join(total);
     __sync_synchronize();
@@ -1106,8 +1300,9 @@ static void range_minmax(const int32_t *p, int i0, int i1, int32_t *mn, int32_t 
 /* One lane of the scalar chain, for heads/tails of a split range. */
 static inline int8_t silu_lane(int k, const gbuf_t *g, const gbuf_t *u, int32_t mq_mid)
 {
-    int32_t zg = deq_wide(g->acc[k], g->qm[k]);
-    int32_t zu = deq_wide(g_ffn.acc2[k], u->qm[k]);
+    /* zq: the per-256 GEMV already returned the real value in Q16 */
+    int32_t zg = g->zq ? g->acc[k] : deq_wide(g->acc[k], g->qm[k]);
+    int32_t zu = u->zq ? g_ffn.acc2[k] : deq_wide(g_ffn.acc2[k], u->qm[k]);
     int32_t pr = prod_p(silu_qk(zg, g->qshift), zu, u->qshift);
     return (int8_t)requant_mid(pr, mq_mid);
 }
@@ -1118,8 +1313,8 @@ static inline int8_t silu_lane(int k, const gbuf_t *g, const gbuf_t *u, int32_t 
  * mid16 = 128*hi + lo, so dot(w, mid16) = 128*dot(w, hi) + dot(w, lo). */
 static inline int32_t mid16_lane(int k, const gbuf_t *g, const gbuf_t *u, int32_t mq16)
 {
-    int32_t zg = deq_wide(g->acc[k], g->qm[k]);
-    int32_t zu = deq_wide(g_ffn.acc2[k], u->qm[k]);
+    int32_t zg = g->zq ? g->acc[k] : deq_wide(g->acc[k], g->qm[k]);
+    int32_t zu = u->zq ? g_ffn.acc2[k] : deq_wide(g_ffn.acc2[k], u->qm[k]);
     int32_t pr = prod_p(silu_qk(zg, g->qshift), zu, u->qshift);
     int64_t v = ((int64_t)pr * (int64_t)mq16 + ((int64_t)1 << 27)) >> 28;
     if (v > 32767) v = 32767;
@@ -1152,6 +1347,15 @@ static int silu_vec_guard(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
     if (!g_silu_vec) return 0;
     if (g->qshift != 0 || u->qshift != 0) return 0;
     if (mq_mid <= 0) return 0;
+    if (g->zq || u->zq) {
+        /* Segmented GEMV: acc[] is the Q16 value already, so only the SiLU
+         * product and the mid requant need the 32-bit partial products. */
+        if (!g->zq || !u->zq) return 0;
+        au = range_absmax(g_ffn.acc2, i0, i1);
+        bound_pr = ((int64_t)524271 * (int64_t)au + 32768) >> 16;
+        if (bound_pr * (int64_t)mq_mid > ((int64_t)1 << 46)) return 0;
+        return 1;
+    }
     ag = range_absmax(g->acc, i0, i1);
     au = range_absmax(g_ffn.acc2, i0, i1);
     qgn = 0; qg = 0;
@@ -1180,35 +1384,51 @@ static inline HVX_Vector silu_vec32(const int32_t *ag, const int32_t *qg,
     return vrequant_mid(pr, mq);
 }
 
+/* 32 lanes of the chain for the segmented path: acc[] is Q16 already. */
+static inline HVX_Vector silu_vec32_zq(const int32_t *ag, const int32_t *au,
+                                       HVX_Vector mq)
+{
+    HVX_Vector pr = vmul_q16_rnd(vsilu_q16(*(const HVX_Vector *)ag),
+                                 *(const HVX_Vector *)au);
+    pr = Q6_Vw_vmax_VwVw(pr, Q6_V_vsplat_R(-0x7fffffff));
+    pr = Q6_Vw_vmin_VwVw(pr, Q6_V_vsplat_R(0x7fffffff));
+    return vrequant_mid(pr, mq);
+}
+
+static inline HVX_Vector silu_vec32_any(const gbuf_t *g, const gbuf_t *u, int i,
+                                        HVX_Vector mq, int zq)
+{
+    if (zq)
+        return silu_vec32_zq(g->acc + i, g_ffn.acc2 + i, mq);
+    return silu_vec32(g->acc + i, g->qm + i, g_ffn.acc2 + i, u->qm + i, mq);
+}
+
 /* Vector SiLU pass; returns 0 if the range must stay scalar. */
 static int silu_range_vec(int i0, int i1, const gbuf_t *g, const gbuf_t *u,
                           int32_t mq_mid)
 {
     HVX_Vector mq = Q6_V_vsplat_R(mq_mid);
+    int zq;
     int i;
 
     if (!silu_vec_guard(i0, i1, g, u, mq_mid)) return 0;
+    zq = g->zq && u->zq;
 
     i = i0;
     for (; i < i1 && (i & 31); i++) g_ffn.h[i] = silu_lane(i, g, u, mq_mid);
 
     for (; i + 128 <= i1; i += 128) {
-        HVX_Vector r0 = silu_vec32(g->acc + i,      g->qm + i,
-                                   g_ffn.acc2 + i,      u->qm + i, mq);
-        HVX_Vector r1 = silu_vec32(g->acc + i + 32, g->qm + i + 32,
-                                   g_ffn.acc2 + i + 32, u->qm + i + 32, mq);
-        HVX_Vector r2 = silu_vec32(g->acc + i + 64, g->qm + i + 64,
-                                   g_ffn.acc2 + i + 64, u->qm + i + 64, mq);
-        HVX_Vector r3 = silu_vec32(g->acc + i + 96, g->qm + i + 96,
-                                   g_ffn.acc2 + i + 96, u->qm + i + 96, mq);
+        HVX_Vector r0 = silu_vec32_any(g, u, i +  0, mq, zq);
+        HVX_Vector r1 = silu_vec32_any(g, u, i + 32, mq, zq);
+        HVX_Vector r2 = silu_vec32_any(g, u, i + 64, mq, zq);
+        HVX_Vector r3 = silu_vec32_any(g, u, i + 96, mq, zq);
         *(HVX_Vector *)(g_ffn.h + i) =
             Q6_Vb_vpack_VhVh_sat(Q6_Vh_vpack_VwVw_sat(r3, r2),
                                  Q6_Vh_vpack_VwVw_sat(r1, r0));
     }
     for (; i + 32 <= i1; i += 32) {
         union { HVX_Vector v; int8_t b[128]; } p;
-        HVX_Vector r = silu_vec32(g->acc + i, g->qm + i,
-                                  g_ffn.acc2 + i, u->qm + i, mq);
+        HVX_Vector r = silu_vec32_any(g, u, i, mq, zq);
         p.v = Q6_Vb_vpack_VhVh_sat(Q6_V_vzero(),
                                    Q6_Vh_vpack_VwVw_sat(Q6_V_vzero(), r));
         memcpy(g_ffn.h + i, p.b, 32);
@@ -2012,6 +2232,95 @@ static void attn_group(int kh)
 
 
 
+/* One-RPC FFN on per-256 packs.
+ *
+ * Same protocol as ffn_impl: gate/up are dequantised to Q16 and consumed by
+ * the integer SiLU, the mid buffer is int8, down is dequantised to
+ * `s_out` int8 codes.  The only difference is where the dequant happens:
+ * each 256-input segment is multiplied by its own scale and the partial sums
+ * are added in f32 before the Q16 round.  `b->zq` tells SiLU that acc[] is
+ * already that Q16 value. */
+static int ffn_seg(gbuf_t *g, gbuf_t *u, gbuf_t *d, const unsigned char *act,
+                   int reps, unsigned char *dst, unsigned char *mid,
+                   int *times, int timesLen, int use_resident)
+{
+    const int8_t *x = (const int8_t *)act;
+    int64_t t0, t1, ph[5] = { 0, 0, 0, 0, 0 };
+    int32_t mq_mid;
+    float segsum[32];
+    int i, rep;
+
+    if (!g->rseg || !u->rseg || !d->rseg) return AEE_EBADPARM;
+    if (!g->acc || !u->acc || !d->acc) return AEE_EBADPARM;
+    set_perf();
+    if (g_ffn.n != g->N) {
+        free(g_ffn.acc2); free(g_ffn.h); free(g_ffn.acc_lo);
+        free(g_ffn.hi); free(g_ffn.lo);
+        g_ffn.acc2   = (int32_t *)memalign(128, (size_t)g->N * sizeof(int32_t));
+        g_ffn.acc_lo = (int32_t *)memalign(128, (size_t)g->N * sizeof(int32_t));
+        g_ffn.h      = (int8_t *)memalign(128, (size_t)g->N + 128);
+        g_ffn.hi     = (int8_t *)memalign(128, (size_t)g->N + 128);
+        g_ffn.lo     = (int8_t *)memalign(128, (size_t)g->N + 128);
+        g_ffn.n = g->N;
+        if (!g_ffn.acc2 || !g_ffn.acc_lo || !g_ffn.h || !g_ffn.hi || !g_ffn.lo)
+            return AEE_ENOMEMORY;
+    }
+    mq_mid = (int32_t)(4096.0f / d->sa);
+    g_ffn_last_g = g;
+    g_ffn_last_u = u;
+    g_ffn_last_mq = mq_mid;
+
+    for (rep = 0; rep < reps; rep++) {
+        /* 1: deinterleave + gate */
+        t0 = HAP_perf_get_time_us();
+        deinterleave(x, g->ae, g->ao, g->K);
+        seg_act_sum(g->ae, g->ao, g->nseg, segsum);
+        run_split_seg(g, g->ae, g->ao, segsum, g->acc);
+        for (i = 0; i < g->N; i++)
+            g->acc[i] = round_half_up(seg_row_value(g, g->acc[i], i));
+        t1 = HAP_perf_get_time_us(); ph[0] += t1 - t0;
+
+        /* 2: up (same activations) */
+        t0 = HAP_perf_get_time_us();
+        run_split_seg(u, g->ae, g->ao, segsum, u->acc);
+        for (i = 0; i < u->N; i++)
+            g_ffn.acc2[i] = round_half_up(seg_row_value(u, u->acc[i], i));
+        t1 = HAP_perf_get_time_us(); ph[1] += t1 - t0;
+
+        /* 3: silu(gate) * up -> int8, same integer chain as ffn_impl */
+        t0 = HAP_perf_get_time_us();
+        run_split_silu(g, u, mq_mid);
+        t1 = HAP_perf_get_time_us(); ph[2] += t1 - t0;
+
+        /* 4: down */
+        t0 = HAP_perf_get_time_us();
+        deinterleave(g_ffn.h, d->ae, d->ao, d->K);
+        seg_act_sum(d->ae, d->ao, d->nseg, segsum);
+        run_split_seg(d, d->ae, d->ao, segsum, d->acc);
+        t1 = HAP_perf_get_time_us(); ph[3] += t1 - t0;
+
+        /* 5: dequant + clamp */
+        t0 = HAP_perf_get_time_us();
+        pack_seg_i8(d, d->acc,
+                    use_resident ? d->out_ptr : (int8_t *)dst, d->N);
+        t1 = HAP_perf_get_time_us(); ph[4] += t1 - t0;
+    }
+
+    if (mid) memcpy(mid, g_ffn.h, (size_t)g->N);
+    if (times && timesLen >= 8) {
+        times[0] = (int)((ph[0] + ph[1] + ph[2] + ph[3] + ph[4]) / reps);
+        times[1] = (int)(ph[0] / reps);
+        times[2] = (int)(ph[1] / reps);
+        times[3] = (int)(ph[2] / reps);
+        times[4] = (int)(ph[3] / reps);
+        times[5] = (int)(ph[4] / reps);
+        times[6] = g->N;
+        times[7] = d->N;
+        if (timesLen >= 9) times[8] = g_team_fallbacks;
+    }
+    return 0;
+}
+
 static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen, int reps,
                     unsigned char *dst, int dstLen, unsigned char *mid, int midLen,
                     int *times, int timesLen, int use_resident, int use16)
@@ -2035,6 +2344,14 @@ static int ffn_impl(int hg, int hu, int hd, const unsigned char *act, int actLen
     if (!g->qp || !u->qp || !d->qp || !g->qm || !u->qm || !d->sa) return AEE_EBADPARM;
     if (mid && midLen != g->N) return AEE_EBADPARM;
     if (reps < 1) reps = 1;
+
+    if (g->seg) {
+        /* Per-256 pack: dequant per 256-input segment.  The 16-bit mid path
+         * combines two int8 passes in integer units and does not apply. */
+        if (use16) return AEE_EBADPARM;
+        if (!u->seg || !d->seg) return AEE_EBADPARM;
+        return ffn_seg(g, u, d, act, reps, dst, mid, times, timesLen, use_resident);
+    }
 
     set_perf();
     if (g_ffn.n != g->N) {
@@ -2348,6 +2665,9 @@ int lfmgemv_set_shape(int h, int N, int K, int with_scale)
     b->nvec = K / 256;
     half = (size_t)(K / 2) + 128;
     free(b->acc); free(b->ae); free(b->ao); free(b->qp); free(b->qm);
+    free(b->rseg); free(b->mrow);
+    b->rseg = 0; b->mrow = 0;
+    b->seg = 0; b->nseg = 0; b->zq = 0;
     b->acc  = (int32_t *)memalign(128, (size_t)4 * N * sizeof(int32_t));
     b->ae   = (int8_t *)memalign(128, 8 * half);
     b->ao   = (int8_t *)memalign(128, 8 * half);
@@ -2457,6 +2777,36 @@ int lfmgemv_set_scale(int h, const unsigned char *scales, int scalesLen)
         if (q > 65535u) q = 65535u;
         b->qp[i] = (int32_t)(q | (q << 16));
     }
+
+    if (!b->w8 && scalesLen >= 16 + 4 * N + 8) {
+        const int tail = 16 + 4 * N;
+        uint32_t magic = 0, nseg = 0;
+        memcpy(&magic, scales + tail, 4);
+        memcpy(&nseg, scales + tail + 4, 4);
+        if (magic == LFM_SEG_MAGIC) {
+            if ((int)nseg != K / 256 || nseg < 1 || nseg > 32) return AEE_EBADPARM;
+            if (scalesLen < tail + 8 + N * (int)nseg) return AEE_EBADPARM;
+            free(b->rseg); free(b->mrow);
+            b->rseg = 0; b->mrow = 0; b->seg = 0; b->zq = 0;
+            b->rseg = (uint8_t *)memalign(128, (size_t)N * nseg);
+            b->mrow = (float *)memalign(128, (size_t)N * sizeof(float));
+            if (!b->rseg || !b->mrow) {
+                free(b->rseg); free(b->mrow);
+                b->rseg = 0; b->mrow = 0;
+                return AEE_ENOMEMORY;
+            }
+            memcpy(b->rseg, scales + tail + 8, (size_t)N * nseg);
+            for (i = 0; i < N; i++)
+                b->mrow[i] = (float)((double)sw[i] * (double)sa / (double)so);
+            b->nseg = (int)nseg;
+            b->seg = 1;
+            /* The segmented dot already returns the real value, so SiLU must
+             * treat acc[] as Q16 instead of multiplying it again. */
+            b->zq = 1;
+            b->qshift = 0;
+            for (i = 0; i < N; i++) b->qm[i] = 65536;
+        }
+    }
     return 0;
 }
 
@@ -2478,6 +2828,10 @@ static int gemv16_impl(int h, const int16_t *a16, int K, int8_t *dst, int N)
     if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
     b = &g_buf[h];
     if (!b->w || !b->qp) return AEE_EBADPARM;
+    /* 16-bit activations use two int8 passes combined in integer units; the
+     * per-256 dequant is per segment, so that combination does not exist.
+     * The production graph uses int8 activations (GEMV/FFN), not GEMV16. */
+    if (b->seg) return AEE_EBADPARM;
     if (K != b->K || N != b->N) return AEE_EBADPARM;
     if (g_acc2_n < N) {
         free(g_acc2);
@@ -2519,6 +2873,56 @@ static int gemv16_impl(int h, const int16_t *a16, int K, int8_t *dst, int N)
     return 0;
 }
 
+/* M-row GEMV on a per-256 pack: exact int32 dot per 256-input segment,
+ * per-segment f32 dequant, one clamp per output.  `pack_out_i8` is not used
+ * because the multiplier changes every 256 inputs. */
+static int gemv_seg(gbuf_t *b, int M, const int8_t *a, int reps,
+                    unsigned char *dst, int *times, int timesLen, int use_resident)
+{
+    int64_t t0, t1, best = 0, worst = 0, total = 0;
+    uint64 best_pc = 0;
+    float segsum[32];
+    int i, m, r;
+
+    if (!b->rseg || !b->mrow || !b->acc || b->nseg < 1 || b->nseg > 32)
+        return AEE_EBADPARM;
+    for (i = 0; i < reps; i++) {
+        for (m = 0; m < M; m++) {
+            const int8_t *am = a + (size_t)m * b->K;
+            int8_t *o = use_resident ? b->out_ptr : (int8_t *)dst;
+
+            if (!o) return AEE_EBADPARM;
+            o += (size_t)m * b->N;
+            uint64 pc0 = HAP_perf_get_pcycles();
+            t0 = HAP_perf_get_time_us();
+            deinterleave(am, b->ae, b->ao, b->K);
+            seg_act_sum(b->ae, b->ao, b->nseg, segsum);
+            run_split_seg(b, b->ae, b->ao, segsum, b->acc);
+            t1 = HAP_perf_get_time_us();
+            {
+                uint64 pc = HAP_perf_get_pcycles() - pc0;
+                int64_t dt = t1 - t0;
+                if (i == 0 || dt < best) { best = dt; best_pc = pc; }
+                if (dt > worst) worst = dt;
+                total += dt;
+            }
+            pack_seg_i8(b, b->acc, o, b->N);
+            (void)r;
+        }
+    }
+    if (times != 0 && timesLen >= 8) {
+        times[0] = (int)best;
+        times[1] = (int)worst;
+        times[2] = (int)(total / reps);
+        times[3] = 0;
+        times[4] = 0;
+        times[5] = (int)(best_pc & 0x7fffffff);
+        times[6] = b->N;
+        times[7] = b->K;
+    }
+    return 0;
+}
+
 static int gemv_impl(int h, int M, const unsigned char *act, int actLen, int reps,
                      unsigned char *dst, int dstLen, int *times, int timesLen,
                      int use_resident)
@@ -2547,6 +2951,13 @@ static int gemv_impl(int h, int M, const unsigned char *act, int actLen, int rep
     if (reps < 1) reps = 1;
     a = (const int8_t *)act;
     set_perf();
+
+    if (b->seg) {
+        /* Per-256 pack: the dequant happens per segment in f32, so the whole
+         * integer pack_out_i8/`qm` path is bypassed. */
+        if (!b->qp) return AEE_EBADPARM;
+        return gemv_seg(b, M, a, reps, dst, times, timesLen, use_resident);
+    }
 
     for (i = 0; i < reps; i++) {
         t0 = HAP_perf_get_time_us();
@@ -3267,6 +3678,8 @@ int lfmgemv_release_buf(int h)
     free(g_buf[h].w_heap);
     free(g_buf[h].qp);
     free(g_buf[h].qm);
+    free(g_buf[h].rseg);
+    free(g_buf[h].mrow);
     free(g_buf[h].acc);
     free(g_buf[h].ae);
     free(g_buf[h].ao);

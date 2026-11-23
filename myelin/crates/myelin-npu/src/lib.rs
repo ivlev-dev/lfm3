@@ -34,6 +34,7 @@ pub mod layer_fixture;
 pub mod method;
 pub mod mock;
 pub mod model_pack;
+pub mod segment;
 pub mod transport;
 pub mod weights;
 
@@ -49,6 +50,9 @@ pub use method::{
     FfnResponse, FfnScalars, GemvRequest, GemvResponse, GemvScalars,
 };
 pub use mock::{MockCall, MockReply, MockTransport, RecordedCall};
+pub use segment::{
+    SegPacked, SegmentError, Segments, RATIO_ONE, SEGMENT, SEG_HEADER_BYTES, SEG_MAGIC, SEG_VERSION,
+};
 pub use transport::{Call, Handle, SharedBuffer, SharedOwner, Transport};
 pub use weights::{
     AttentionFullPlan, AttentionParams, AttentionPlan, ConvPlan, FfnPlan, LayerPlan, LmHeadPlan,

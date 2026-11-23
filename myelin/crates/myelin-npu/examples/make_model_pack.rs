@@ -14,10 +14,12 @@
 //!    DSP kernel quantises: layer inputs, q/k/v/gate projections, post-rope q,
 //!    the gated attention output, conv `bcx`/`y`, FFN `silu(gate)*up`, every
 //!    layer output and the final logits.
-//! 2. **Packing.** It quantises every transformer matrix to int4 with
-//!    `myelin-pack gemv`, builds the quantised shortconv blobs with the
-//!    calibrated `s_bc`/`s_y`, copies the Q6_K token embedding unchanged and
-//!    packs the tied head.
+//! 2. **Packing.** It quantises every transformer matrix to int4 with one
+//!    `absmax/7` scale per 256 inputs (`crate::segment`), which keeps the
+//!    `myelin-pack gemv` blob layout but writes a `<blob>.seg` ratio sidecar;
+//!    `--int4-row` reverts to the old one-scale-per-row pack. It builds the
+//!    quantised shortconv blobs with the calibrated `s_bc`/`s_y`, copies the
+//!    Q6_K token embedding unchanged and packs the tied head.
 //!
 //! The pack is self-contained: the phone needs neither the GGUF nor a
 //! tokenizer, only `pack.json`, the blobs and the prompt token ids.
@@ -36,6 +38,7 @@ use myelin_npu::model_pack::{
     ModelPack, PackAttention, PackConv, PackDims, PackEmbed, PackFfn, PackGemv, PackLayer,
     PackLmHead, PackNorms, PackRope, PACK_VERSION,
 };
+use myelin_npu::segment;
 use myelin_pack::gemv::{self, GemvManifest};
 use myelin_pack::gguf_source;
 use myelin_pack::shortconv::{self, ActivationScales};
@@ -53,6 +56,8 @@ struct Args {
     out: PathBuf,
     tokens: PathBuf,
     calib_tokens: usize,
+    /// Keep the old one-scale-per-row int4 pack (no `<blob>.seg` sidecars).
+    int4_row: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -64,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
     let out = PathBuf::from(args.next().ok_or("missing OUT directory")?);
     let mut tokens = None;
     let mut calib_tokens = 8usize;
+    let mut int4_row = false;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -73,6 +79,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--calib-tokens must be a positive integer".to_owned())?;
             }
+            "--int4-row" => int4_row = true,
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -84,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
         out,
         tokens: tokens.ok_or("--tokens is required")?,
         calib_tokens,
+        int4_row,
     })
 }
 
@@ -715,15 +723,17 @@ fn build_pack(
     let dims = spec.dims;
     let mut pack_layers = Vec::with_capacity(layers.len());
     let mut conv_blobs = Vec::new();
+    let seg = !args.int4_row;
     for (index, layer) in layers.iter().enumerate() {
         let ffn_input = layer.ffn.input.step(ACT_TARGET);
         let ffn = PackFfn {
-            gate: pack_gemv(&format!("ffn_{index:02}_gate"), ffn_input, 1.0),
-            up: pack_gemv(&format!("ffn_{index:02}_up"), ffn_input, 1.0),
+            gate: pack_gemv(&format!("ffn_{index:02}_gate"), ffn_input, 1.0, seg),
+            up: pack_gemv(&format!("ffn_{index:02}_up"), ffn_input, 1.0, seg),
             down: pack_gemv(
                 &format!("ffn_{index:02}_down"),
                 layer.ffn.mid.step(127.0),
                 layer.ffn.out.step(ACT_TARGET),
+                seg,
             ),
             mid_scale: layer.ffn.mid.step(127.0),
             reps: 1,
@@ -761,12 +771,14 @@ fn build_pack(
                     &format!("conv_{index:02}_in"),
                     conv.input.step(ACT_TARGET),
                     mix_scale,
+                    seg,
                 ),
                 conv_file: file,
                 out_proj: pack_gemv(
                     &format!("conv_{index:02}_out"),
                     if per_channel { 1.0 } else { y_scale },
                     conv.out.step(ACT_TARGET),
+                    seg,
                 ),
                 mix_scale,
                 y_scale,
@@ -781,27 +793,32 @@ fn build_pack(
                     &format!("attn_{index:02}_q"),
                     input_scale,
                     attention.q.step(ACT_TARGET),
+                    seg,
                 ),
                 key: pack_gemv(
                     &format!("attn_{index:02}_k"),
                     input_scale,
                     attention.k.step(ACT_TARGET),
+                    seg,
                 ),
                 value: pack_gemv(
                     &format!("attn_{index:02}_v"),
                     input_scale,
                     attention.v.step(ACT_TARGET),
+                    seg,
                 ),
                 output: pack_gemv(
                     &format!("attn_{index:02}_o"),
                     attention.attended.step(127.0),
                     attention.out.step(ACT_TARGET),
+                    seg,
                 ),
                 gate: attention.weights.gate.as_ref().map(|_| {
                     pack_gemv(
                         &format!("attn_{index:02}_gate"),
                         input_scale,
                         attention.gate.step(ACT_TARGET),
+                        seg,
                     )
                 }),
                 query_norm: attention.query_norm.clone(),
@@ -880,6 +897,7 @@ fn build_pack(
         },
         lm_head: PackLmHead {
             file: "lm_head.gemv".to_string(),
+            seg_scales: seg.then(|| "lm_head.gemv.seg".to_string()),
             input_scale: head.input.step(ACT_TARGET),
             output_scale: head.logits.step(ACT_TARGET),
             reps: 1,
@@ -893,11 +911,12 @@ fn build_pack(
     (pack, conv_blobs)
 }
 
-fn pack_gemv(name: &str, input_scale: f32, output_scale: f32) -> PackGemv {
+fn pack_gemv(name: &str, input_scale: f32, output_scale: f32, seg256: bool) -> PackGemv {
     PackGemv {
         file: format!("{name}.gemv"),
         input_scale,
         output_scale,
+        seg_scales: seg256.then(|| format!("{name}.gemv.seg")),
     }
 }
 
@@ -1010,6 +1029,7 @@ fn pack_blobs(
         file: pack.lm_head.file.clone(),
         input_scale: pack.lm_head.input_scale,
         output_scale: pack.lm_head.output_scale,
+        seg_scales: pack.lm_head.seg_scales.clone(),
     };
     written += write_gemv(&args.out, &head, &embedding, "lm_head");
     written
@@ -1020,15 +1040,38 @@ fn write_gemv(dir: &Path, packed: &PackGemv, matrix: &Matrix, kind: &str) -> u64
         tensor: format!("{kind}:{}", packed.file),
         source: None,
     };
+    let path = dir.join(&packed.file);
+    // Per-256 is the production format: one `absmax/7` per 256 inputs, nibble
+    // layout and blob header unchanged, scales described by the sidecar.
+    if let Some(seg_file) = &packed.seg_scales {
+        let seg = segment::build(matrix).expect("pack gemv per-256");
+        let manifest = GemvManifest::from_blob(&meta, &seg.gemv_blob());
+        std::fs::write(&path, &seg.blob).expect("write gemv");
+        manifest
+            .write(&path.with_extension("json"))
+            .expect("write gemv manifest");
+        let seg_path = dir.join(seg_file);
+        std::fs::write(&seg_path, seg.segments.encode()).expect("write gemv segments");
+        println!(
+            "  {}: {}x{} per-256 cos {:.6} relRMSE {:.4}, {:.2} MiB (+{:.0} KiB)",
+            packed.file,
+            matrix.n(),
+            matrix.k(),
+            seg.quality.cos_total,
+            seg.rel_rmse,
+            seg.blob.len() as f64 / (1u64 << 20) as f64,
+            seg.segments.ratios().len() as f64 / 1024.0
+        );
+        return (seg.blob.len() + seg.segments.encode().len()) as u64;
+    }
     let blob = gemv::build(matrix, &meta).expect("pack gemv");
     let manifest = GemvManifest::from_blob(&meta, &blob);
-    let path = dir.join(&packed.file);
     std::fs::write(&path, &blob.blob).expect("write gemv");
     manifest
         .write(&path.with_extension("json"))
         .expect("write gemv manifest");
     println!(
-        "  {}: {}x{} cos {:.6}, {:.2} MiB",
+        "  {}: {}x{} per-row cos {:.6}, {:.2} MiB",
         packed.file,
         matrix.n(),
         matrix.k(),

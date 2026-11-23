@@ -496,7 +496,8 @@ out:
 #define LFM_EXEC_VERSION 1u
 #define LFM_CMD_MAX 256
 enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
-       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5 };
+       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5,
+       LFM_CMD_KVZERO = 22 };
 enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
 enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
 
@@ -725,6 +726,289 @@ static lfm_cmd *cmd_at(list_t *l, int index)
     c->tbl_h = -1;
     c->rt_base = -1;
     return c;
+}
+
+/* ============ KV pages + reset identity (the device attention path) ===== */
+
+/* Mirrors `DspBackend::attention_layer_full` on the device:
+ *
+ *   kv_write  one token into the resident images at the *global* slot
+ *             `tbl[pos>>5]*32 + (pos&31)` (identity table -> `pos`);
+ *   exec      one ATTN command that takes q from scratch[0] and the identity
+ *             block table from scratch[tbl_off], `tbl_len = cache_pages` (O2).
+ *
+ * The device layer fixture (`attn_main.c`) calls `lfmgemv_attn` with a host
+ * table and the exec stand keeps the table in a *view*; neither crosses a page
+ * boundary through the scratch-table path, which is the one the model uses
+ * from position 32 on.  This group closes that gap and repeats the device
+ * `RESET_CHECK`: after `reset_state` (with and without `KVZERO`) the first
+ * tokens must be bit-identical to the first run.
+ */
+#define KV_PAGES   8
+#define KV_SLOTS   (KV_PAGES * 32)
+#define KV_POS     64            /* two full pages */
+#define KV_HEAD    8             /* tokens replayed after the reset */
+#define KV_Q       0             /* scratch: q 16x128 */
+#define KV_TBL     2048          /* scratch: identity table, KV_PAGES ints */
+#define KV_TBLP    4096          /* scratch: permuted table */
+#define KV_ACT     (KV_TBLP + KV_PAGES * 4)
+
+static void kv_q(int pos, int8_t *q)
+{
+    int i;
+    for (i = 0; i < EX_HQ * EX_HD; i++)
+        q[i] = (int8_t)(((pos * 37 + i * 11) % 61) - 30);
+}
+
+/* Per-token K (int4 nibbles), KT (Q16 scale) and V (int8), all distinct per
+ * position so a wrong slot shows up immediately. */
+static void kv_rows(int pos, uint8_t *k, uint32_t *kt, int8_t *v)
+{
+    int i;
+    for (i = 0; i < EX_HKV * 64; i++)
+        k[i] = (uint8_t)((pos * 131 + i * 17 + (i >> 3) * 29) & 0xff);
+    for (i = 0; i < EX_HKV; i++)
+        kt[i] = (uint32_t)(20000 + (pos * 7919 + i * 104729) % 40000);
+    for (i = 0; i < EX_HKV * EX_HD; i++)
+        v[i] = (int8_t)(((pos * 53 + i * 7) % 251) - 125);
+}
+
+/* Build and run the one-command ATTN list (`tbl_off` picks the block table). */
+static int kv_attn(int ah, uint8_t *arena, int hk, int hkt, int hv,
+                   const uint8_t *act, int tbl_off, int pos, uint8_t *out,
+                   int *times)
+{
+    list_t list;
+    lfm_cmd *c;
+
+    list_init(arena, 0, 1, &list);
+    c = cmd_at(&list, 0);
+    c->type = LFM_CMD_ATTN;
+    c->src = LFM_SRC_SCRATCH; c->dst = LFM_DST_OUT;
+    c->h0 = hk; c->h1 = hkt; c->h2 = hv; c->h3 = 0;
+    c->src_off = KV_Q; c->src_len = EX_HQ * EX_HD;
+    c->dst_off = 0;    c->dst_len = EX_HQ * EX_HD * 4;
+    c->tbl_h = -1; c->tbl_len = KV_PAGES; c->tbl_off = tbl_off;
+    c->a0 = pos; c->a1 = pos + 1; c->a2 = 0; c->a3 = 1;
+    c->rt_base = -1;
+    return lfmgemv_exec(ah, 0, 1, act, KV_ACT, 0, 0, out,
+                        EX_HQ * EX_HD * 4, times, 12);
+}
+
+static int test_kv_pipeline(void)
+{
+    const int kbytes = EX_HKV * KV_SLOTS * 128;
+    const int ktbytes = EX_HKV * KV_SLOTS * 4;
+    const int vbytes = EX_HKV * KV_SLOTS * 128;
+    size_t arena_bytes = 4096 + (size_t)kbytes + (size_t)ktbytes + (size_t)vbytes;
+    uint8_t *arena = NULL, *act = NULL, *out = NULL, *out_ref = NULL;
+    uint8_t *first = NULL, *replay = NULL;
+    int ah = -1, hk = -1, hkt = -1, hv = -1, rc = 0, bad = 0;
+    int pos, i, pass, times[12];
+    int table[KV_PAGES];
+    uint8_t krow[EX_HKV * 64];
+    uint32_t ktrow[EX_HKV];
+    int8_t vrow[EX_HKV * EX_HD];
+    int8_t q[EX_HQ * EX_HD];
+    int32_t *dev = NULL, *ref = NULL;
+    int page_bad[2] = { 0, 0 };
+    size_t off_k, off_kt, off_v;
+
+    arena_bytes = (arena_bytes + 4095u) & ~(size_t)4095u;
+    arena = (uint8_t *)memalign(4096, arena_bytes);
+    act = (uint8_t *)calloc(1, KV_ACT);
+    out = (uint8_t *)malloc((size_t)EX_HQ * EX_HD * 4);
+    out_ref = (uint8_t *)malloc((size_t)EX_HQ * EX_HD * 4);
+    dev = (int32_t *)malloc((size_t)EX_HQ * EX_HD * 4);
+    ref = (int32_t *)malloc((size_t)EX_HQ * EX_HD * 4);
+    first = (uint8_t *)malloc((size_t)KV_HEAD * EX_HQ * EX_HD * 4);
+    replay = (uint8_t *)malloc((size_t)KV_HEAD * EX_HQ * EX_HD * 4);
+    if (!arena || !act || !out || !out_ref || !dev || !ref || !first || !replay) {
+        printf("SIM [kv] host allocation failed\n");
+        bad = 1;
+        goto out;
+    }
+    memset(arena, 0, arena_bytes);
+    for (i = 0; i < KV_PAGES; i++) table[i] = i;
+    printf("SIM [kv] kv_write + exec ATTN: %d pages (%d slots), %d positions\n",
+           KV_PAGES, KV_SLOTS, KV_POS);
+
+    off_k = 4096;
+    off_kt = off_k + (size_t)kbytes;
+    off_v = off_kt + (size_t)ktbytes;
+
+    {
+        int fd = sim_ion_register(arena, arena_bytes);
+        if (fd < 0) { printf("SIM [kv] fake fd registration failed\n"); bad = 1; goto out; }
+        rc = lfmgemv_map_arena(fd, (int)arena_bytes, &ah);
+        if (rc != 0) { printf("SIM [kv] map_arena rc=%d\n", rc); bad = 1; goto out; }
+        if ((rc = lfmgemv_alloc_view(ah, (int)off_k, kbytes, &hk)) != 0 ||
+            (rc = lfmgemv_alloc_view(ah, (int)off_kt, ktbytes, &hkt)) != 0 ||
+            (rc = lfmgemv_alloc_view(ah, (int)off_v, vbytes, &hv)) != 0) {
+            printf("SIM [kv] alloc_view rc=%d\n", rc);
+            bad = 1;
+            goto out;
+        }
+    }
+    if ((rc = lfmgemv_reserve_scratch(SCRATCH)) != 0) {
+        printf("SIM [kv] reserve_scratch rc=%d\n", rc);
+        bad = 1;
+        goto out;
+    }
+
+    for (pos = 0; pos < KV_POS; pos++) {
+        kv_rows(pos, krow, ktrow, vrow);
+        kv_q(pos, q);
+        if ((rc = lfmgemv_kv_write(hk, hkt, hv, KV_SLOTS, pos,
+                                   krow, EX_HKV * 64,
+                                   (const unsigned char *)ktrow, EX_HKV * 4,
+                                   (const unsigned char *)vrow, EX_HKV * EX_HD)) != 0) {
+            printf("SIM [kv] kv_write pos=%d rc=%d\n", pos, rc);
+            bad = 1;
+            goto out;
+        }
+
+        /* act = q | identity table | permuted table, copied to scratch by exec */
+        memcpy(act + KV_Q, q, EX_HQ * EX_HD);
+        for (i = 0; i < KV_PAGES; i++) {
+            int ident = i;
+            int permuted = (i + 1) % KV_PAGES;
+            memcpy(act + KV_TBL + 4 * i, &ident, 4);
+            memcpy(act + KV_TBLP + 4 * i, &permuted, 4);
+        }
+
+        rc = kv_attn(ah, arena, hk, hkt, hv, act, KV_TBL, pos, out, times);
+        if (rc != 0) {
+            printf("SIM [kv] exec ATTN pos=%d rc=0x%x cmd=%d\n", pos, rc, times[1]);
+            bad = 1;
+            goto out;
+        }
+        memcpy(dev, out, (size_t)EX_HQ * EX_HD * 4);
+
+        rc = lfmgemv_attn(hk, hkt, hv, 0, q, EX_HQ * EX_HD, table, KV_PAGES,
+                          pos, pos + 1, 0, 1, out_ref, EX_HQ * EX_HD * 4,
+                          times, 12);
+        if (rc != 0) {
+            printf("SIM [kv] direct ATTN pos=%d rc=%d\n", pos, rc);
+            bad = 1;
+            goto out;
+        }
+        memcpy(ref, out_ref, (size_t)EX_HQ * EX_HD * 4);
+        for (i = 0; i < EX_HQ * EX_HD; i++)
+            if (dev[i] != ref[i]) page_bad[pos >> 5]++;
+        if (pos < KV_HEAD)
+            memcpy(first + (size_t)pos * EX_HQ * EX_HD * 4, dev,
+                   (size_t)EX_HQ * EX_HD * 4);
+
+        /* The scratch table must really be read: a permuted table at the same
+         * position has to change the output, otherwise the check above would
+         * be vacuous (e.g. the kernel silently read a zeroed table). */
+        if (pos == 40) {
+            rc = kv_attn(ah, arena, hk, hkt, hv, act, KV_TBLP, pos, out, times);
+            if (rc != 0) {
+                printf("SIM [kv] exec ATTN permuted pos=%d rc=0x%x\n", pos, rc);
+                bad = 1;
+                goto out;
+            }
+            if (memcmp(out, out_ref, (size_t)EX_HQ * EX_HD * 4) == 0) {
+                printf("SIM [kv] permuted block table did not change the output\n");
+                bad = 1;
+            } else {
+                printf("SIM [kv] block table is live: other page id -> other out\n");
+            }
+        }
+    }
+    printf("SIM [kv] exec ATTN vs direct call: mismatches=%d/%d, page0=%d page1=%d\n",
+           page_bad[0] + page_bad[1], KV_POS * EX_HQ * EX_HD, page_bad[0],
+           page_bad[1]);
+    if (page_bad[0] || page_bad[1]) bad = 1;
+
+    /* ---- reset: replay the head of the sequence, twice, idempotently ---- */
+    for (pass = 0; pass < 2; pass++) {
+        int use_kvzero = (pass == 1);
+        int mismatches = 0;
+
+        if ((rc = lfmgemv_reset_state(0)) != 0) {
+            printf("SIM [kv] reset_state rc=%d\n", rc);
+            bad = 1;
+            goto out;
+        }
+        if (use_kvzero) {
+            list_t list;
+            lfm_cmd *c;
+
+            /* Second reset in a row: idempotence. */
+            if ((rc = lfmgemv_reset_state(0)) != 0) {
+                printf("SIM [kv] second reset_state rc=%d\n", rc);
+                bad = 1;
+                goto out;
+            }
+            list_init(arena, 0, 1, &list);
+            c = cmd_at(&list, 0);
+            c->type = LFM_CMD_KVZERO;
+            c->h0 = hk; c->h1 = hkt; c->h2 = hv;
+            c->a0 = KV_SLOTS;
+            rc = lfmgemv_exec(ah, 0, 1, act, KV_ACT, 0, 0, out,
+                              EX_HQ * EX_HD * 4, times, 12);
+            if (rc != 0) {
+                printf("SIM [kv] kvzero rc=0x%x cmd=%d\n", rc, times[1]);
+                bad = 1;
+                goto out;
+            }
+            for (i = 0; i < kbytes && !mismatches; i++)
+                mismatches += arena[off_k + i] != 0;
+            for (i = 0; i < ktbytes && !mismatches; i++)
+                mismatches += arena[off_kt + i] != 0;
+            for (i = 0; i < vbytes && !mismatches; i++)
+                mismatches += arena[off_v + i] != 0;
+            if (mismatches) {
+                printf("SIM [kv] KVZERO left nonzero bytes in the images\n");
+                bad = 1;
+            }
+        }
+
+        for (pos = 0; pos < KV_HEAD; pos++) {
+            kv_rows(pos, krow, ktrow, vrow);
+            kv_q(pos, q);
+            if ((rc = lfmgemv_kv_write(hk, hkt, hv, KV_SLOTS, pos,
+                                       krow, EX_HKV * 64,
+                                       (const unsigned char *)ktrow, EX_HKV * 4,
+                                       (const unsigned char *)vrow, EX_HKV * EX_HD)) != 0) {
+                printf("SIM [kv] replay kv_write pos=%d rc=%d\n", pos, rc);
+                bad = 1;
+                goto out;
+            }
+            memcpy(act + KV_Q, q, EX_HQ * EX_HD);
+            rc = kv_attn(ah, arena, hk, hkt, hv, act, KV_TBL, pos, out, times);
+            if (rc != 0) {
+                printf("SIM [kv] replay exec rc=0x%x pos=%d\n", rc, pos);
+                bad = 1;
+                goto out;
+            }
+            memcpy(replay + (size_t)pos * EX_HQ * EX_HD * 4, out,
+                   (size_t)EX_HQ * EX_HD * 4);
+        }
+        mismatches = 0;
+        for (i = 0; i < KV_HEAD * EX_HQ * EX_HD * 4; i++)
+            if (replay[i] != first[i]) mismatches++;
+        printf("SIM [kv] reset replay %-18s mismatches=%d/%d\n",
+               use_kvzero ? "+ KVZERO" : "(reset_state only)", mismatches,
+               KV_HEAD * EX_HQ * EX_HD * 4);
+        if (mismatches) bad = 1;
+    }
+
+out:
+    /* The scratch stays reserved: the `rot` group below reuses it. */
+    free(arena);
+    free(act);
+    free(out);
+    free(out_ref);
+    free(dev);
+    free(ref);
+    free(first);
+    free(replay);
+    group_result("kv-reset", bad);
+    return bad;
 }
 
 /* ================= activation rotation (Hadamard-32/128) ================ */
@@ -1382,6 +1666,7 @@ int main(void)
     test_gemv();
     test_ffn();
     test_exec();
+    test_kv_pipeline();
     test_rot();
     test_team();
 

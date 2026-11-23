@@ -41,6 +41,8 @@ use myelin_core::backend::dsp::{
 use myelin_core::backend::LmHeadStage;
 use myelin_pack::{Manifest, PackResult};
 
+use crate::segment::Segments;
+
 use crate::method::{
     method_id, octet_len, AllocBufScalars, AllocInScalars, LoadBufWire, ReleaseBufScalars,
     SetScaleWire, SetShapeScalars,
@@ -386,6 +388,9 @@ pub struct PackedMatrix {
     k_padded: usize,
     weights: Vec<u8>,
     scales: Vec<f32>,
+    /// Per-256 ratios when the pack carries them; `None` is the old per-row
+    /// format.
+    segments: Option<Segments>,
 }
 
 impl PackedMatrix {
@@ -415,7 +420,24 @@ impl PackedMatrix {
             k_padded,
             weights,
             scales,
+            segments: None,
         })
+    }
+
+    /// Attach a per-256 ratio table (`k_padded` must be a multiple of 256).
+    pub fn with_segments(mut self, segments: Segments) -> Result<Self, WeightError> {
+        if segments.n_padded() != self.n_padded || segments.nseg() * 256 != self.k_padded {
+            return Err(WeightError::Layout(format!(
+                "{}: segment table {}x{} does not match {}x{}",
+                self.name,
+                segments.nseg(),
+                segments.n_padded(),
+                self.k_padded,
+                self.n_padded
+            )));
+        }
+        self.segments = Some(segments);
+        Ok(self)
     }
 
     /// Wrap a crownstone [`PackedTensor`] unchanged.
@@ -444,6 +466,7 @@ impl PackedMatrix {
             k_padded: manifest.k_padded,
             weights,
             scales: manifest.scales_f32.clone(),
+            segments: packed.segments().cloned(),
         }
     }
 
@@ -470,6 +493,11 @@ impl PackedMatrix {
     /// Exact per-row int4 scales.
     pub fn scales(&self) -> &[f32] {
         &self.scales
+    }
+
+    /// Per-256 ratios, or `None` for a per-row pack.
+    pub fn segments(&self) -> Option<&Segments> {
+        self.segments.as_ref()
     }
 
     /// Resident bytes this matrix needs.
@@ -2156,6 +2184,12 @@ fn matrix_scale_payload(
     payload.extend_from_slice(&output_scale.to_le_bytes());
     for scale in matrix.scales() {
         payload.extend_from_slice(&scale.to_le_bytes());
+    }
+    // Per-256 packs append `"MSQ2"`, `nseg` and one `u8` ratio per segment.
+    // The kernel keys off the magic after the row table, so a per-row payload
+    // keeps its exact old bytes and old kernel path.
+    if let Some(segments) = matrix.segments() {
+        payload.extend_from_slice(&segments.payload_tail());
     }
     Ok(payload)
 }

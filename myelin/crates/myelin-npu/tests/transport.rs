@@ -692,6 +692,289 @@ fn backend_reset_zeroes_the_device_state() {
     assert_eq!(calls[2].scalars, 0x1701_0000);
 }
 
+/// Session reset must also drop the *sequence* part of the resident attention
+/// caches: `reset_state` only zeroes the DSP scratch (CONV rings), while the
+/// K/KT/V images live in the mapped weights and keep the tokens of the run
+/// that just ended. One `KVZERO` command per staged layer, in one exec list,
+/// and the same bytes on every reset (idempotent).
+#[test]
+fn reset_zeroes_the_resident_kv_images() {
+    use myelin_core::backend::dsp::{AttentionFullStage, VQuant};
+
+    let mock = MockTransport::new();
+    let executor: Arc<dyn myelin_core::backend::dsp::DspExecutor> =
+        Arc::new(Executor::new(Arc::new(mock.clone())));
+    let mut spec = ModelSpec::placeholder();
+    spec.dims.hidden = 2048;
+    spec.dims.heads = 16;
+    spec.dims.head_dim = 128;
+    spec.dims.kv_heads = 4;
+    let kv_dim = spec.dims.kv_dim();
+    let mut backend = DspBackend::attach(spec.clone(), executor, "lfmgemv").expect("attach");
+
+    let caches = AttentionStage {
+        keys: 21,
+        key_scales: 22,
+        values: 23,
+        value_scales: 24,
+        q_scale: 1.0,
+        out_scale: 1.0,
+        reps: 1,
+        cache_pages: 8,
+        preprojected: true,
+    };
+    backend
+        .stage_attention_full(
+            1,
+            AttentionFullStage {
+                caches,
+                query: 30,
+                key: 31,
+                value: 32,
+                output: 33,
+                gate: None,
+                query_norm: vec![1.0; spec.dims.head_dim],
+                key_norm: vec![1.0; spec.dims.head_dim],
+                act_scale: 1.0,
+                q_scale: 1.0,
+                k_scale: 1.0,
+                v_scale: 1.0,
+                gate_scale: 1.0,
+                attn_q_scale: 0.25,
+                attn_out_scale: 1.0,
+                o_act_scale: 1.0,
+                out_scale: 1.0,
+                v_quant: VQuant::Channel(vec![1.0; kv_dim]),
+                reps: 1,
+            },
+        )
+        .expect("stage attention_full");
+    // A pre-projected stage owns resident caches too, with fewer pages.
+    backend
+        .stage_attention(
+            0,
+            AttentionStage {
+                cache_pages: 4,
+                ..caches
+            },
+        )
+        .expect("stage attention");
+
+    backend.reset().expect("reset");
+
+    let calls = mock.calls();
+    let methods: Vec<u32> = calls.iter().map(|call| call.method).collect();
+    assert_eq!(
+        methods,
+        vec![
+            method_id::RESERVE_SCRATCH,
+            method_id::RESET_STATE,
+            method_id::RESET_STATE,
+            method_id::MAP_ARENA,
+            method_id::EXEC,
+        ],
+        "scratch, counters, then one KVZERO list for both staged layers"
+    );
+    let exec = calls.last().expect("exec");
+    assert_eq!(read_i32(&exec.prim_in[8..12]), 2, "one command per layer");
+    assert_eq!(read_i32(&exec.prim_in[16..20]), 0, "no rt for KVZERO");
+    assert_eq!(read_i32(&exec.prim_in[20..24]), 0, "no out sequence");
+    assert_eq!(
+        read_i32(&exec.prim_in[12..16]) as usize,
+        exec.in_bufs[0].len(),
+        "act block keeps the wire shape of other exec calls"
+    );
+
+    // A second reset must send exactly the same list: both steps are memsets.
+    let first = exec.prim_in.clone();
+    backend.reset().expect("second reset");
+    let calls = mock.calls();
+    let methods: Vec<u32> = calls.iter().map(|call| call.method).collect();
+    assert_eq!(
+        methods[5..],
+        [method_id::RESET_STATE, method_id::EXEC],
+        "no re-reserve, same two steps"
+    );
+    assert_eq!(calls.last().expect("exec").prim_in, first);
+}
+
+/// The host half of the device `RESET_CHECK`: run a sequence of layer calls,
+/// reset, run the head of the same sequence again, and require the *device
+/// traffic* to be identical call for call (method, scalars, `act`, `rt` and the
+/// packed KV rows). Any host-side leak — a conv counter, a stale block table, a
+/// `window` that still counts the old sequence — shows up as a diff here, with
+/// no phone and no DSP.
+#[test]
+fn reset_makes_the_second_sequence_identical_on_the_wire() {
+    use myelin_core::backend::dsp::{AttentionFullStage, ConvStage, VQuant, conv_state_offset};
+    use myelin_core::backend::Backend;
+
+    const TOKENS: usize = 40;
+    const REPLAY: usize = 5;
+
+    let mut spec = ModelSpec::placeholder();
+    spec.dims.hidden = 2048;
+    spec.dims.heads = 16;
+    spec.dims.head_dim = 128;
+    spec.dims.kv_heads = 4;
+    spec.dims.sliding_window = 128;
+    let hidden = spec.dims.hidden;
+    let kv_dim = spec.dims.kv_dim();
+
+    let mock = MockTransport::new();
+    mock.set_handler(method_id::MAP_ARENA, |_| {
+        Ok(reply(1i32.to_le_bytes().to_vec(), Vec::new()))
+    });
+    mock.set_handler(method_id::EXEC, |call| {
+        // `outp` is the only output sequence on the hot path; give it the
+        // length the caller asked for so the backend sees a full buffer.
+        let buffer = vec![0x5a; call.out_lens.first().copied().unwrap_or(0)];
+        Ok(reply(Vec::new(), vec![buffer]))
+    });
+
+    let executor: Arc<dyn myelin_core::backend::dsp::DspExecutor> =
+        Arc::new(Executor::new(Arc::new(mock.clone())));
+    let mut backend = DspBackend::attach(spec.clone(), executor, "lfmgemv").expect("attach");
+
+    backend
+        .stage_conv(
+            0,
+            ConvStage {
+                in_proj: 2,
+                conv: 3,
+                out_proj: 4,
+                ksh: 18,
+                act_scale: 100.0,
+                mix_scale: 1.0 / 4096.0,
+                y_scale: 1.0 / 4096.0,
+                out_scale: 1.0 / 4096.0,
+                reps: 1,
+                state_off: conv_state_offset(0),
+            },
+        )
+        .expect("stage conv");
+    backend
+        .stage_attention_full(
+            1,
+            AttentionFullStage {
+                caches: AttentionStage {
+                    keys: 21,
+                    key_scales: 22,
+                    values: 23,
+                    value_scales: 24,
+                    q_scale: 1.0 / 4096.0,
+                    out_scale: 1.0 / 4096.0,
+                    reps: 1,
+                    cache_pages: 8,
+                    preprojected: true,
+                },
+                query: 30,
+                key: 31,
+                value: 32,
+                output: 33,
+                gate: None,
+                query_norm: vec![1.0; spec.dims.head_dim],
+                key_norm: vec![1.0; spec.dims.head_dim],
+                act_scale: 1.0,
+                q_scale: 1.0 / 4096.0,
+                k_scale: 1.0 / 4096.0,
+                v_scale: 1.0 / 4096.0,
+                gate_scale: 1.0,
+                attn_q_scale: 1.0 / 4.0,
+                attn_out_scale: 1.0 / 4096.0,
+                o_act_scale: 1.0 / 4.0,
+                out_scale: 1.0 / 4096.0,
+                v_quant: VQuant::Channel(vec![1.0 / 4096.0; kv_dim]),
+                reps: 1,
+            },
+        )
+        .expect("stage attention");
+
+    fn token_input(position: usize, hidden: usize) -> Vec<f32> {
+        (0..hidden)
+            .map(|index| {
+                let seed = (position * 7919 + index * 104_729) % 2003;
+                (seed as f32 - 1000.0) / 1000.0
+            })
+            .collect()
+    }
+
+    let run = |backend: &mut DspBackend, kv: &mut PagedKvCache, tokens: usize| {
+        let mut state = vec![0.0f32; 2 * hidden];
+        let mut out = vec![0.0f32; hidden];
+        for position in 0..tokens {
+            let input = token_input(position, hidden);
+            backend
+                .conv_layer(0, &input, &mut state, &mut out)
+                .expect("conv layer");
+            let start = myelin_core::ops::window_start(
+                AttentionKind::Sliding,
+                position,
+                spec.dims.sliding_window,
+            );
+            backend
+                .attention_layer(
+                    AttentionCall {
+                        layer: 1,
+                        position,
+                        start,
+                        kind: AttentionKind::Sliding,
+                        input: &input,
+                    },
+                    kv,
+                    &mut out,
+                )
+                .expect("attention layer");
+        }
+    };
+
+    // Only the per-token RPCs matter: `map_arena`/`reserve_scratch` happen once
+    // per list and are not part of the sequence state.
+    fn hot_recorded(
+        calls: &[myelin_npu::RecordedCall],
+    ) -> Vec<(u32, Vec<u8>, Vec<Vec<u8>>)> {
+        calls
+            .iter()
+            .filter(|call| call.method == method_id::EXEC || call.method == method_id::KV_WRITE)
+            .map(|call| (call.method, call.prim_in.clone(), call.in_bufs.clone()))
+            .collect()
+    }
+    let mut kv = PagedKvCache::new(kv_dim, TOKENS).expect("kv");
+    run(&mut backend, &mut kv, TOKENS);
+    let first = hot_recorded(&mock.calls());
+    assert_eq!(first.len(), TOKENS * 5, "conv exec, qkv, kv_write, attn, o_proj");
+
+    backend.reset().expect("reset");
+    let mark = mock.calls().len();
+    let mut kv = PagedKvCache::new(kv_dim, TOKENS).expect("fresh kv");
+    run(&mut backend, &mut kv, REPLAY);
+
+    let second: Vec<_> = mock.calls()[mark..]
+        .iter()
+        .filter(|call| call.method == method_id::EXEC || call.method == method_id::KV_WRITE)
+        .map(|call| (call.method, call.prim_in.clone(), call.in_bufs.clone()))
+        .collect();
+    assert_eq!(
+        second.len(),
+        REPLAY * 5,
+        "the same five RPCs per token after a reset"
+    );
+    for (index, (before, after)) in first.iter().zip(&second).enumerate() {
+        assert_eq!(
+            before.0, after.0,
+            "call {index}: method changed after reset"
+        );
+        assert_eq!(
+            before.1, after.1,
+            "call {index}: scalars/act length changed after reset"
+        );
+        assert_eq!(
+            before.2, after.2,
+            "call {index}: sequence payload changed after reset"
+        );
+    }
+}
+
 /// O4 host side: with the fused path enabled, attention is `qkv` + one list
 /// (`KVSTORE + ATTN + ATTN_SCALE + o_proj`) instead of `qkv` + `ATTN` +
 /// `o_proj` (and no separate `kv_write`).

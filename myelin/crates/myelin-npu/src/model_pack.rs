@@ -31,13 +31,21 @@ use myelin_pack::gemv::GemvManifest;
 use serde::{Deserialize, Serialize};
 
 use crate::gemv_weights::PackedGemv;
+use crate::segment::Segments;
 use crate::weights::{
     AttentionFullPlan, AttentionParams, AttentionPlan, ConvPlan, FfnPlan, LmHeadPlan, PackedMatrix,
     ResidentImage, WeightBudget, WeightError, WeightPlan,
 };
 
-/// Format version this reader understands.
-pub const PACK_VERSION: u32 = 1;
+/// Format version this writer emits.
+///
+/// * 1: per-row int4 scales only.
+/// * 2: adds `<blob>.seg` per-256 ratio sidecars (`PackGemv::seg_scales`).
+///   Version 1 packs still load and keep the per-row kernel path.
+pub const PACK_VERSION: u32 = 2;
+
+/// Oldest pack version this reader understands.
+pub const MIN_PACK_VERSION: u32 = 1;
 
 /// Failure while reading or planning a model pack.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +127,10 @@ pub struct PackGemv {
     pub input_scale: f32,
     /// `s_out`: real units per int8 result code.
     pub output_scale: f32,
+    /// Per-256 ratio sidecar (`<file>.seg`) written by pack version 2.
+    /// Absent in version 1 packs, which stay on the per-row path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seg_scales: Option<String>,
 }
 
 /// Feed-forward stage.
@@ -194,6 +206,8 @@ pub struct PackEmbed {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PackLmHead {
     pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seg_scales: Option<String>,
     pub input_scale: f32,
     pub output_scale: f32,
     pub reps: i32,
@@ -252,9 +266,9 @@ impl ModelPack {
 
     /// Validate the cross-field invariants a plan depends on.
     pub fn check(&self) -> Result<(), ModelPackError> {
-        if self.version != PACK_VERSION {
+        if !(MIN_PACK_VERSION..=PACK_VERSION).contains(&self.version) {
             return Err(ModelPackError::Layout(format!(
-                "pack version {} is not {PACK_VERSION}",
+                "pack version {} is not {MIN_PACK_VERSION}..={PACK_VERSION}",
                 self.version
             )));
         }
@@ -484,7 +498,10 @@ impl ModelPack {
             }
         }
 
-        let head = PackedMatrix::from_gemv("lm_head", &self.read_gemv(dir, &self.lm_head.file)?);
+        let head = PackedMatrix::from_gemv(
+            "lm_head",
+            &self.read_gemv(dir, &self.lm_head.file, self.lm_head.seg_scales.as_deref())?,
+        );
         builder = builder.lm_head(LmHeadPlan::new(
             head,
             self.lm_head.input_scale,
@@ -576,11 +593,16 @@ impl ModelPack {
     }
 
     fn matrix(&self, dir: &Path, gemv: &PackGemv) -> Result<PackedMatrix, ModelPackError> {
-        let packed = self.read_gemv(dir, &gemv.file)?;
+        let packed = self.read_gemv(dir, &gemv.file, gemv.seg_scales.as_deref())?;
         Ok(PackedMatrix::from_gemv(gemv.file.clone(), &packed))
     }
 
-    fn read_gemv(&self, dir: &Path, file: &str) -> Result<PackedGemv, ModelPackError> {
+    fn read_gemv(
+        &self,
+        dir: &Path,
+        file: &str,
+        seg_scales: Option<&str>,
+    ) -> Result<PackedGemv, ModelPackError> {
         let blob_path = self.path(dir, file);
         let manifest_path = blob_path.with_extension("json");
         let blob = std::fs::read(&blob_path)
@@ -590,7 +612,21 @@ impl ModelPack {
         })?;
         let packed = PackedGemv::new(file.to_owned(), manifest, blob)
             .map_err(|error| ModelPackError::Layout(format!("{file}: {error}")))?;
-        Ok(packed)
+        match seg_scales {
+            Some(name) => {
+                let path = self.path(dir, name);
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    ModelPackError::Io(format!("{}: {error}", path.display()))
+                })?;
+                let segments = Segments::decode(&bytes).map_err(|error| {
+                    ModelPackError::Layout(format!("{name}: {error}"))
+                })?;
+                packed
+                    .with_segments(segments)
+                    .map_err(|error| ModelPackError::Layout(format!("{file}: {error}")))
+            }
+            None => Ok(packed),
+        }
     }
 }
 
@@ -634,6 +670,7 @@ mod tests {
             file: "ffn_00_gate.gemv".to_owned(),
             input_scale: 0.5,
             output_scale: 1.0,
+            seg_scales: None,
         };
         ModelPack {
             version: PACK_VERSION,
@@ -687,6 +724,7 @@ mod tests {
             },
             lm_head: PackLmHead {
                 file: "lm_head.gemv".to_owned(),
+                seg_scales: None,
                 input_scale: 0.5,
                 output_scale: 0.25,
                 reps: 1,

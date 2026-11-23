@@ -436,4 +436,60 @@ fn main() {
     println!("PV cos: global {:.6}", cosine(&pv_exact, &pv_global));
     println!("PV cos: channel {:.6}", cosine(&pv_exact, &pv_channel));
     println!("PV samples: {idx}");
+
+    // ---------- attended vector -> int8 before `o_proj` ----------
+    //
+    // This is the step the DSP adds and the study above did not cover:
+    // `attention_layer_full` quantises the 2048-wide attended vector with ONE
+    // scale (`o_act_scale`) and feeds `o_proj` int8 codes.  With a per-head
+    // scale each head keeps its own range; the format costs nothing else.
+    {
+        let width = dims.q_dim();
+        let mut exact_all: Vec<f64> = Vec::new();
+        let mut one_scale: Vec<f64> = Vec::new();
+        let mut head_scale: Vec<f64> = Vec::new();
+        let mut worst = (f64::MAX, 0usize);
+        for position in 0..TOKENS {
+            let base = position * width;
+            let slice = &pv_channel[base..base + width];
+            let max = slice.iter().fold(0.0f64, |acc, value| acc.max(value.abs()));
+            let step = if max > 0.0 { max / 127.0 } else { 1.0 };
+            let mut single = Vec::with_capacity(width);
+            let mut per_head = Vec::with_capacity(width);
+            for &value in slice {
+                single.push((value / step).round() * step);
+            }
+            for head in 0..heads {
+                let head_slice = &slice[head * head_dim..(head + 1) * head_dim];
+                let head_max = head_slice
+                    .iter()
+                    .fold(0.0f64, |acc, value| acc.max(value.abs()));
+                let head_step = if head_max > 0.0 {
+                    head_max / 127.0
+                } else {
+                    1.0
+                };
+                for &value in head_slice {
+                    per_head.push((value / head_step).round() * head_step);
+                }
+            }
+            let cos_one = cosine(slice, &single);
+            if cos_one < worst.0 {
+                worst = (cos_one, position);
+            }
+            exact_all.extend_from_slice(slice);
+            one_scale.extend_from_slice(&single);
+            head_scale.extend_from_slice(&per_head);
+        }
+        println!(
+            "attended int8 cos: one scale {:.6} (worst position {} -> {:.6})",
+            cosine(&exact_all, &one_scale),
+            worst.1,
+            worst.0
+        );
+        println!(
+            "attended int8 cos: per head  {:.6}",
+            cosine(&exact_all, &head_scale)
+        );
+    }
 }

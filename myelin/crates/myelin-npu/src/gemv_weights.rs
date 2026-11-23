@@ -12,6 +12,7 @@
 use crate::error::TransportError;
 use crate::hvx::HvxClient;
 use crate::method::method_id;
+use crate::segment::Segments;
 use myelin_pack::gemv::{GemvHeader, GemvManifest};
 
 /// Bytes per `load_buf` RPC. Large chunks amortise the ~150 µs RPC cost.
@@ -23,6 +24,8 @@ pub struct PackedGemv {
     name: String,
     manifest: GemvManifest,
     blob: Vec<u8>,
+    /// Per-256 ratios, when the pack was built with segment scales.
+    segments: Option<Segments>,
 }
 
 impl PackedGemv {
@@ -42,7 +45,26 @@ impl PackedGemv {
             name: name.into(),
             manifest,
             blob,
+            segments: None,
         })
+    }
+
+    /// Attach a per-256 ratio table read from the pack's `<blob>.seg` file.
+    pub fn with_segments(mut self, segments: Segments) -> Result<Self, TransportError> {
+        let header = self.header();
+        if segments.n_padded() != header.n_padded || segments.nseg() * 256 != header.k_padded {
+            return Err(TransportError::InvalidLength {
+                what: "gemv segment table does not match the blob shape",
+                len: segments.ratios().len(),
+            });
+        }
+        self.segments = Some(segments);
+        Ok(self)
+    }
+
+    /// Per-256 ratios, or `None` for a per-row pack.
+    pub fn segments(&self) -> Option<&Segments> {
+        self.segments.as_ref()
     }
 
     /// Read both files from disk.
@@ -104,6 +126,10 @@ impl PackedGemv {
     }
 
     /// `set_scale` payload: `N`, `K`, activation scale, output scale, `sw[N]`.
+    ///
+    /// With per-256 scales the ratio tail follows the row table:
+    /// `"MSQ2"`, `nseg`, then `n_padded * nseg` `u8` ratios. A per-row pack
+    /// keeps the old `16 + 4 * N` bytes, which the kernel reads unchanged.
     pub fn scale_payload(&self, act_scale: f32, out_scale: f32) -> Vec<u8> {
         let n = self.manifest.n_padded;
         let mut payload = Vec::with_capacity(16 + 4 * n);
@@ -113,6 +139,9 @@ impl PackedGemv {
         payload.extend_from_slice(&out_scale.to_le_bytes());
         for scale in &self.manifest.scales_f32 {
             payload.extend_from_slice(&scale.to_le_bytes());
+        }
+        if let Some(segments) = &self.segments {
+            payload.extend_from_slice(&segments.payload_tail());
         }
         payload
     }
