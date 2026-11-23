@@ -1738,13 +1738,8 @@ impl DspBackend {
                 "exec returned the wrong output length",
             ));
         }
-        let dequant = if std::env::var_os("MYELIN_CONV16").is_some() {
-            stage.out_scale / 256.0
-        } else {
-            stage.out_scale
-        };
         for (dst, &code) in out.iter_mut().zip(&result.out) {
-            *dst = (code as i8) as f32 * dequant;
+            *dst = (code as i8) as f32 * stage.out_scale;
         }
         if std::env::var_os("MYELIN_DUMP_CONV").is_some() {
             let already = self.conv_dumped.get(layer).copied().unwrap_or(true);

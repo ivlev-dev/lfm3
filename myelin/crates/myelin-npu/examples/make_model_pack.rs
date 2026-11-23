@@ -793,9 +793,15 @@ fn build_pack(
                 conv_file: file,
                 out_proj: pack_gemv(
                     &format!("conv_{index:02}_out"),
-                    if per_channel { 1.0 } else { y_scale },
+                    if per_channel {
+                        1.0
+                    } else if CONV16.load(std::sync::atomic::Ordering::Relaxed) {
+                        y_scale / 256.0
+                    } else {
+                        y_scale
+                    },
                     conv.out.step(ACT_TARGET),
-                    seg,
+                    seg && !CONV16.load(std::sync::atomic::Ordering::Relaxed),
                 ),
                 mix_scale,
                 y_scale,
@@ -1079,8 +1085,7 @@ fn write_gemv(dir: &Path, packed: &PackGemv, matrix: &Matrix, kind: &str) -> u64
     // `gemv16` (16-bit shortconv output) needs per-row scales, so the conv
     // out_proj skips the per-256 sidecar when `--conv16` is on.
     let force_row = CONV16.load(std::sync::atomic::Ordering::Relaxed)
-        && kind.contains("conv")
-        && kind.ends_with("_out");
+        && packed.file.ends_with("_out.gemv");
     // Per-256 is the production format: one `absmax/7` per 256 inputs, nibble
     // layout and blob header unchanged, scales described by the sidecar.
     if !force_row {
