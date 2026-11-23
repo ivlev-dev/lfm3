@@ -688,8 +688,8 @@ fn backend_reset_zeroes_the_device_state() {
     );
     // flags = 0: scratch and counters.
     assert_eq!(calls[2].prim_in, i32_bytes(&[0]));
-    // reset_state: method 27, one scalar in, no sequences.
-    assert_eq!(calls[2].scalars, 0x1b01_0000);
+    // reset_state: method 28 (after `prefill`), one scalar in, no sequences.
+    assert_eq!(calls[2].scalars, 0x1c01_0000);
 }
 
 /// Session reset must also drop the *sequence* part of the resident attention
