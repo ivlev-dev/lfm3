@@ -10,12 +10,17 @@
  *   s_j = (q . k_j) * qscale * ks[j] / sqrt(128)
  *   acc = sum_j exp(s_j - m) v_j,  l = sum_j exp(s_j - m),  out = acc / l
  *
+ * m, exp, l and the rescale factors are f32; the PV product enters the int32
+ * accumulator as Q12 (v68 has no f32 vector SIMD).  The Q12 weight scale is
+ * halved for windows longer than 2048 tokens, so `window` is bounded only by
+ * int32 (up to ~16k tokens).
+ *
  * All pointers are 128-byte aligned; the KV layout is the resident cache
  * layout written by LFM_CMD_KVSTORE (slot = page * 32 + token % 32):
  *
  *   q      int8    [16][128]
  *   qscale int32   [16]     Q16 dequant multiplier per q head, NULL = 1.0
- *   k      int4    [4][slots][128] B, 64 B nibbles (code+8) + 64 B pad
+ *   k      int4    [4][slots][128] B row: 64 B nibbles (code+8) + 64 B pad
  *   ks     int32   [4][slots]      Q16 dequant multiplier per token
  *   v      int8    [4][slots][128]
  *   vscale float   [4][128]        per-channel V dequant, NULL = 1.0

@@ -162,19 +162,53 @@ static void check(int pos, int window, const char *tag)
         }
     }
     cos = (da > 0.0 && db > 0.0) ? num / sqrt(da * db) : 0.0;
-    if (window == 0) {
-        int i;
-        for (i = 0; i < 8; i++)
-            printf("DBG h%d d%-3d out=%.7f ref=%.7f\n", i / D,
-                   i % D, (double)g_out[i / D][i % D], g_ref[i / D][i % D]);
-        for (i = 0; i < 8; i++)
-            printf("DBG v   d%-3d raw=%d vs=%.7f\n", i,
-                   (int)g_v[0][g_tbl[0] * PAGE][i],
-                   (double)g_v[0][g_tbl[0] * PAGE][i] * (double)g_vs[0][i]);
-    }
     printf("AF %-12s n=%-4d cos=%.9f maxabs=%.3e  %s\n", tag, n, cos, mx,
            (cos >= COS_MIN && mx <= ABS_MAX) ? "OK" : "FAIL");
     if (!(cos >= COS_MIN && mx <= ABS_MAX)) g_fail = 1;
+}
+
+/* qscale/vscale = NULL paths: reference with qs = 1.0 and vs = 1.0 */
+static void check_null_scales(void)
+{
+    double num = 0.0, da = 0.0, db = 0.0, mx = 0.0, cos;
+    int32_t sq[HQ];
+    float sv[KVH][D];
+    int h, d;
+    const int pos = 63, window = 64;
+    int n = 64;
+
+    for (h = 0; h < HQ; h++) {
+        sq[h] = g_qs[h];
+        g_qs[h] = 65536;
+    }
+    for (h = 0; h < KVH; h++) {
+        for (d = 0; d < D; d++) {
+            sv[h][d] = g_vs[h][d];
+            g_vs[h][d] = 1.0f;
+        }
+    }
+    ref_attn(pos, window);
+    attn_flash((const int8_t *)g_q, 0, (const int8_t *)g_k,
+               (const int32_t *)g_ks, (const int8_t *)g_v, 0, g_tbl,
+               CTXMAX, pos, window, 1, (float *)g_out);
+    for (h = 0; h < HQ; h++) {
+        for (d = 0; d < D; d++) {
+            double a = (double)g_out[h][d];
+            double b = g_ref[h][d];
+            double e = fabs(a - b);
+            num += a * b;
+            da += a * a;
+            db += b * b;
+            if (e > mx) mx = e;
+        }
+    }
+    cos = (da > 0.0 && db > 0.0) ? num / sqrt(da * db) : 0.0;
+    printf("AF %-12s n=%-4d cos=%.9f maxabs=%.3e  %s\n", "null scales", n, cos,
+           mx, cos >= COS_MIN ? "OK" : "FAIL");
+    if (cos < COS_MIN) g_fail = 1;
+    for (h = 0; h < HQ; h++) g_qs[h] = sq[h];
+    for (h = 0; h < KVH; h++)
+        for (d = 0; d < D; d++) g_vs[h][d] = sv[h][d];
 }
 
 static void bench(int pos, int window, int reps)
@@ -193,14 +227,15 @@ static void bench(int pos, int window, int reps)
                (float *)g_out);
     t1 = HAP_perf_get_pcycles();
     pc = (double)(t1 - t0) / (double)reps;
-    printf("AF ctx=%-4d reps=%-2d pcycles=%.0f per_token=%.1f us=%.1f\n",
+    printf("AF ctx=%-4d reps=%-2d pcycles=%.0f per_token=%.1f us@1.42GHz=%.1f\n",
            pos + 1, reps, pc, pc / (double)(pos + 1), pc / 1420.0);
 }
 
 int main(void)
 {
-    printf("ATTN FLASH stand: HQ=%d KV=%d D=%d page=%d slots=%d\n",
-           HQ, KVH, D, PAGE, CTXMAX);
+    printf("ATTN FLASH stand: HQ=%d KV=%d D=%d page=%d slots=%d "
+           "cos>=%.4f maxabs<=%.0e\n", HQ, KVH, D, PAGE, CTXMAX,
+           COS_MIN, ABS_MAX);
 
     gen_data();
     check(0, 0, "one token");
@@ -208,6 +243,8 @@ int main(void)
     check(255, 256, "ctx 256");
     check(511, 512, "ctx 512");
     check(511, 100, "window 100");
+    check(511, 0, "window none");
+    check_null_scales();
 
     bench(63, 64, 8);
     bench(255, 256, 4);

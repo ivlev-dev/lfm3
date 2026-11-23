@@ -1,13 +1,13 @@
 /*
  * attn_flash: fused paged attention, online softmax, one pass over KV.
- * Format and scales match attn_core (lfmgemv_impl.c): int4 K with per-token
+ * Format and scales follow attn_core (lfmgemv_impl.c): int4 K with per-token
  * Q16 scales, int8 V, 16 q heads / 4 kv heads, 32-token pages.
  *
  * The softmax (running max, exp, l, rescale factors, normalisation) is f32.
- * v68 has no IEEE f32 vector SIMD (vconv/sf add/sf mul are v73+, and the
- * qf32 accumulator does not survive a whole window), so acc = sum_j p_j v_j
- * is evaluated in int32: p is f32 and enters the MAC as Q12 (exact for the
- * int8 V of this model while window <= 2048), l stays f32.
+ * v68 has no IEEE f32 vector SIMD: sf vadd/vmpy and every vconv are v73+ and
+ * the qf32 accumulator does not hold a whole window, so acc = sum_j p_j v_j
+ * runs in int32.  p is f32 and enters the MAC as Q12, exact enough for the
+ * int8 V of this model; l stays f32.
  */
 #include "attn_flash.h"
 
@@ -27,9 +27,7 @@
 #define AF_INV_SQRT_D 0.08838834764831845f
 #define AF_MIN_EXP    (-87.0f)
 
-/* p fixed-point scale; |acc| <= AF_PS * 127 * window must stay in int32. */
-#define AF_PS     4096
-#define AF_PS_INV (1.0f / 4096.0f)
+#define AF_PS 4096              /* Q12 weight scale, halved for long windows */
 
 typedef union { HVX_Vector v; int32_t w[32]; float f[32]; } af_vec;
 typedef union { HVX_VectorPair p; HVX_Vector v[2]; } af_pair;
@@ -39,6 +37,7 @@ static int8_t  g_qo[AF_HQ][AF_D] __attribute__((aligned(128)));
 static int32_t g_sumq[AF_HQ];
 static float   g_qf[AF_HQ];
 
+/* lane gather after AF_VSUM5: keep word 0/1/2/3 of the rotated vectors */
 static const int32_t g_l1[32] __attribute__((aligned(128))) = { -1 };
 static const int32_t g_l2[32] __attribute__((aligned(128))) = { 0, -1 };
 static const int32_t g_l3[32] __attribute__((aligned(128))) = { 0, 0, -1 };
@@ -52,14 +51,13 @@ static const int32_t g_l4[32] __attribute__((aligned(128))) = { 0, 0, 0, -1 };
         (v) = Q6_Vw_vadd_VwVw((v), Q6_V_vror_VR((v), 4));      \
     } while (0)
 
-static inline uint32_t af_bits(float x)
+/* scalar -> both halfwords of every word (operand of vmpy(Vu.w, Vv.h)) */
+static inline HVX_Vector af_splat_h(int32_t v)
 {
-    af_vec u;
-    u.f[0] = x;
-    return (uint32_t)u.w[0];
+    return Q6_V_vsplat_R((uint32_t)v * 0x00010001u);
 }
 
-/* exp(x) for x <= 0: 2^rounded(y) * poly(2^frac), y = x * log2(e). */
+/* exp(x) for x <= 0: 2^round(y) * poly(2^frac), y = x * log2(e). */
 static inline float af_exp(float x)
 {
     union { float f; uint32_t u; } sc;
@@ -67,7 +65,6 @@ static inline float af_exp(float x)
     int i;
 
     if (x <= AF_MIN_EXP) return 0.0f;
-    if (x > 0.0f) x = 0.0f;
     y = x * AF_LOG2E;
     i = (int)(y + (y >= 0.0f ? 0.5f : -0.5f));
     f = (y - (float)i) * AF_LN2;
@@ -82,17 +79,6 @@ static inline float af_exp(float x)
     return p * sc.f;
 }
 
-/* int32 vector * Q15 factor without overflow: (a * f) >> 15, two halves. */
-static inline HVX_Vector af_scale(HVX_Vector a, int f15)
-{
-    HVX_Vector hi = Q6_Vw_vasr_VwR(a, 15);
-    HVX_Vector lo = Q6_Vw_vsub_VwVw(a, Q6_Vw_vasl_VwR(hi, 15));
-    HVX_Vector r = Q6_Vw_vmpyi_VwRh(hi, f15);
-    r = Q6_Vw_vadd_VwVw(r,
-            Q6_Vw_vasr_VwR(Q6_Vw_vmpyi_VwRh(lo, f15), 15));
-    return r;
-}
-
 static void af_group(int kh, const int8_t *k, const int32_t *ks,
                      const int8_t *v, const float *vscale,
                      const int *tbl, int slots, int tok0, int n, float *out)
@@ -104,11 +90,17 @@ static void af_group(int kh, const int8_t *k, const int32_t *ks,
     HVX_Vector qa[4][2], acc[4][4];
     float m[4], l[4];
     int32_t pq[4];
-    int h, q, t, d;
+    float pscale = (float)AF_PS;
+    int h, q, t, d, psh;
+
+    /* |acc| = pscale * 127 * n must stay inside int32 */
+    for (psh = 0; psh < 8 && (n >> psh) > 2048; psh++) pscale *= 0.5f;
 
     for (h = 0; h < 4; h++) {
-        qa[h][0] = *(const HVX_Vector *)(g_qe + (size_t)(kh * 4 + h) * AF_D);
-        qa[h][1] = *(const HVX_Vector *)(g_qo + (size_t)(kh * 4 + h) * AF_D);
+        qa[h][0] = *(const HVX_Vector *)((const int8_t *)g_qe +
+                                        (size_t)(kh * 4 + h) * AF_D);
+        qa[h][1] = *(const HVX_Vector *)((const int8_t *)g_qo +
+                                        (size_t)(kh * 4 + h) * AF_D);
         m[h] = -1.0e30f;
         l[h] = 0.0f;
         pq[h] = 0;
@@ -120,8 +112,8 @@ static void af_group(int kh, const int8_t *k, const int32_t *ks,
         int slot = (tbl[tok >> 5] << 5) | (tok & 31);
         HVX_Vector krow, lo, hi, a[4], g;
         af_vec u;
-        float kc, s;
-        int32_t d[4];
+        float kc, sc[4], pp[4];
+        int32_t d4[4];
 
         if (slot < 0 || slot >= slots) continue;
 
@@ -145,35 +137,45 @@ static void af_group(int kh, const int8_t *k, const int32_t *ks,
                           Q6_V_vand_VV(Q6_V_vror_VR(a[3], 116),
                                        *(const HVX_Vector *)g_l4)));
         u.v = g;
-        for (h = 0; h < 4; h++) d[h] = u.w[h];
+        for (h = 0; h < 4; h++) d4[h] = u.w[h];
+
+#pragma unroll
+        for (h = 0; h < 4; h++)
+            sc[h] = (float)(d4[h] - 8 * g_sumq[kh * 4 + h]) *
+                    g_qf[kh * 4 + h] * kc;
 
 #pragma unroll
         for (h = 0; h < 4; h++) {
-            float p;
-            s = (float)(d[h] - 8 * g_sumq[kh * 4 + h]) *
-                g_qf[kh * 4 + h] * kc;
-            if (s > m[h]) {
-                float c = af_exp(m[h] - s);
+            if (sc[h] > m[h]) {
+                float c = af_exp(m[h] - sc[h]);
                 int f15 = (int)(c * 32768.0f + 0.5f);
                 if (f15 > 32767) f15 = 32767;
                 l[h] *= c;
-                m[h] = s;
+                m[h] = sc[h];
                 if (f15 < 32767) {
+                    HVX_Vector cv = af_splat_h(f15);
 #pragma unroll
                     for (q = 0; q < 4; q++)
-                        acc[h][q] = af_scale(acc[h][q], f15);
+                        acc[h][q] = Q6_Vw_vmpyo_VwVh_s1_rnd_sat(acc[h][q], cv);
                 }
             }
-            p = af_exp(s - m[h]);
-            l[h] += p;
-            pq[h] = (int32_t)(p * (float)AF_PS + 0.5f);
+        }
+
+        pp[0] = af_exp(sc[0] - m[0]);
+        pp[1] = af_exp(sc[1] - m[1]);
+        pp[2] = af_exp(sc[2] - m[2]);
+        pp[3] = af_exp(sc[3] - m[3]);
+#pragma unroll
+        for (h = 0; h < 4; h++) {
+            l[h] += pp[h];
+            pq[h] = (int32_t)(pp[h] * pscale + 0.5f);
         }
 
         if (!(pq[0] | pq[1] | pq[2] | pq[3]))
             continue;
         {
-            HVX_Vector vw[4];
             af_pair b, w0, w1;
+            HVX_Vector vw[4];
             HVX_Vector vv = *(const HVX_Vector *)(vb + (size_t)slot * AF_D);
 
             b.p = Q6_Wh_vunpack_Vb(vv);
@@ -185,17 +187,19 @@ static void af_group(int kh, const int8_t *k, const int32_t *ks,
             vw[3] = w1.v[1];
 #pragma unroll
             for (h = 0; h < 4; h++) {
+                HVX_Vector ps;
                 if (!pq[h]) continue;
+                ps = af_splat_h(pq[h]);
 #pragma unroll
                 for (q = 0; q < 4; q++)
-                    acc[h][q] = Q6_Vw_vmpyiacc_VwVwRh(acc[h][q], vw[q], pq[h]);
+                    acc[h][q] = Q6_Vw_vmpyieacc_VwVwVh(acc[h][q], vw[q], ps);
             }
         }
     }
 
-    /* int32 -> f32 and scaling are scalar: v68 has no f32 vector conversion */
+    /* int32 -> f32 is scalar: v68 has no vector conversion */
     for (h = 0; h < 4; h++) {
-        float inv = l[h] > 0.0f ? (1.0f / l[h]) * AF_PS_INV : 0.0f;
+        float inv = l[h] > 0.0f ? (1.0f / l[h]) / pscale : 0.0f;
         float *dst = out + (size_t)(kh * 4 + h) * AF_D;
         for (q = 0; q < 4; q++) {
             af_vec u;
