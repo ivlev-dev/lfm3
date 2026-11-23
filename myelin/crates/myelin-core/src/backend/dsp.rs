@@ -591,6 +591,10 @@ const SCRATCH_ATTN_I8: i32 = 16384;
 const CONV_STATE_BASE: i32 = 1 << 20;
 const CONV_STATE_STRIDE: i32 = 1 << 18;
 
+/// `act` bytes of a `KVZERO` list. The commands address the images by handle,
+/// so the activation block only keeps the wire shape of an `exec` call.
+const KVZERO_ACT_BYTES: usize = 128;
+
 /// Scratch arena the backend reserves for `exec` (8 MiB).
 ///
 /// The CONV ring of layer `N` lives at [`conv_state_offset`], `1 MiB + N *
@@ -649,6 +653,9 @@ pub mod exec {
         KvStore = 20,
         /// `q12 * v_scale[dim] * gate[head]` -> int8 for `o_proj`.
         AttnScale = 21,
+        /// Zero the resident K/KT/V images of one attention layer: sequence
+        /// state, not weights, so `reset_state` alone leaves it behind.
+        KvZero = 22,
     }
 
     fn put_i32(out: &mut [u8], offset: usize, value: i32) {
@@ -940,6 +947,20 @@ pub mod exec {
             command
         }
 
+        /// `KVZERO`: zero the resident K/KT/V images of one attention layer.
+        ///
+        /// `args = [slots]` (`cache_pages * 32`, the same token capacity
+        /// `KVSTORE`/`kv_write` use). No source, no destination, no scratch:
+        /// the images are addressed by handle and sized from their own
+        /// `wbytes`. One command per cached layer is enough to make a session
+        /// reset equal to a fresh `reserve_scratch()` process.
+        pub const fn kvzero(keys: i32, key_scales: i32, values: i32, slots: i32) -> Self {
+            let mut command = Self::empty(Op::KvZero);
+            command.h = [keys, key_scales, values, -1];
+            command.args = [slots, 0, 0, 0];
+            command
+        }
+
         pub const fn with_dst(mut self, kind: u32, offset: i32) -> Self {
             self.dst = kind;
             self.dst_off = offset;
@@ -1073,6 +1094,10 @@ pub struct DspBackend {
     /// `MYELIN_ATTN_FUSED=1`: run `KVSTORE + ATTN + ATTN_SCALE + o_proj` as
     /// one `exec`. Cleared automatically if the deployed skeleton rejects it.
     attn_fused: bool,
+    /// `KVZERO` accepted by the deployed skeleton. A skeleton built before the
+    /// command rejects the reset list with `AEE_EBADPARM`; the reset then keeps
+    /// the versioned behaviour (scratch + counters) instead of failing.
+    kv_zero: bool,
     last_error: Option<DspError>,
     last_exec_times: Option<[i32; 8]>,
 }
@@ -1149,6 +1174,7 @@ impl DspBackend {
             host: None,
             lm_head: None,
             attn_fused: std::env::var_os("MYELIN_ATTN_FUSED").is_some(),
+            kv_zero: true,
             last_error: None,
             last_exec_times: None,
         }
@@ -1281,12 +1307,17 @@ impl DspBackend {
     }
 
     /// Reset the device session state: zero the CONV ring states in the DSP
-    /// scratch, the DSP counters and the host-side token counters.
+    /// scratch, the resident K/KT/V images of every staged attention layer,
+    /// the DSP counters and the host-side token counters.
     ///
     /// The mapped command arenas and the resident weights stay in place, so
     /// the next token reuses the same mappings and starts from a fresh
     /// sequence. [`Session::reset`](crate::Session::reset) calls this through
     /// [`Backend::reset`].
+    ///
+    /// Two resets in a row leave exactly the same state: both steps are plain
+    /// `memset` of memory the device owns (scratch, KV images) and neither
+    /// reads any previous content.
     pub fn reset_session(&mut self) -> Result<(), BackendError> {
         self.conv_counters.fill(0);
         self.last_exec_times = None;
@@ -1309,6 +1340,77 @@ impl DspBackend {
             return Err(self.fail("reset_state", error));
         }
         self.last_error = None;
+        if self.kv_zero {
+            match self.clear_kv_images() {
+                Ok(()) => {}
+                Err(error) => {
+                    // A skeleton built before `KVZERO` rejects the command;
+                    // the versioned part of the reset (scratch + counters)
+                    // already succeeded, so keep the session usable and say so
+                    // once instead of failing every reset.
+                    self.kv_zero = false;
+                    eprintln!(
+                        "kvzero unsupported by the deployed skeleton, resident KV images \
+                         keep the previous sequence: {error}"
+                    );
+                }
+            }
+        }
+        self.last_exec_times = None;
+        Ok(())
+    }
+
+    /// Zero the resident K/KT/V images of every staged attention layer.
+    ///
+    /// `reset_state` deliberately leaves the mapped weights alone, but the KV
+    /// images are *sequence* state: they hold the tokens of the run that just
+    /// ended. A fresh process starts with them zeroed (the plan uploads zero
+    /// images), so a reset has to reach the same place — otherwise a
+    /// `reset` + replay and a new process are not the same experiment.
+    fn clear_kv_images(&mut self) -> Result<(), BackendError> {
+        let mut layers: Vec<(i32, i32, i32, i32)> = Vec::new();
+        // `stage_attention_full` mirrors its caches into `self.attention`, so
+        // the same handles can appear in both lists: zero each image once.
+        for stage in self.attention_full.iter().flatten() {
+            let caches = &stage.caches;
+            let entry = (
+                caches.keys,
+                caches.key_scales,
+                caches.values,
+                kv_slots(caches.cache_pages)?,
+            );
+            if !layers.contains(&entry) {
+                layers.push(entry);
+            }
+        }
+        for stage in self.attention.iter().flatten() {
+            let entry = (
+                stage.keys,
+                stage.key_scales,
+                stage.values,
+                kv_slots(stage.cache_pages)?,
+            );
+            if !layers.contains(&entry) {
+                layers.push(entry);
+            }
+        }
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let mut list = exec::List::new(EXEC_SCRATCH_BYTES);
+        for (keys, key_scales, values, slots) in layers {
+            list.push(exec::Command::kvzero(keys, key_scales, values, slots));
+        }
+        // A zero-length `act` is legal in the IDL, but a small zero block keeps
+        // the wire shape of every other `exec` call identical.
+        let act = [0u8; KVZERO_ACT_BYTES];
+        let result = self.run_exec(&list, &act, &[], 0)?;
+        if let Some(failed) = result.failed_command() {
+            return Err(BackendError::Model(format!(
+                "kvzero: command {failed} was rejected (ACE 0x{:08x})",
+                result.times[1]
+            )));
+        }
         Ok(())
     }
 
@@ -1944,7 +2046,7 @@ impl DspBackend {
         position: usize,
         dims: &crate::spec::Dims,
     ) -> Result<(), BackendError> {
-        let slots = stage.caches.cache_pages * crate::kv::PAGE_TOKENS;
+        let slots = kv_slots(stage.caches.cache_pages)? as usize;
         let slot = kv_slot(table, position)?;
         if slot >= slots {
             return Err(BackendError::Kv(format!(
@@ -2014,7 +2116,7 @@ impl DspBackend {
             // the DSP yet; the legacy three-call path stays in charge.
             _ => return Ok(false),
         };
-        let slots = stage.caches.cache_pages * crate::kv::PAGE_TOKENS;
+        let slots = kv_slots(stage.caches.cache_pages)? as usize;
         let slot = kv_slot(table, position)?;
         if slot >= slots {
             return Err(BackendError::Kv(format!(
@@ -2475,6 +2577,20 @@ fn kv_slot(table: &[i32], position: usize) -> Result<usize, BackendError> {
         .ok_or_else(|| BackendError::Kv(format!("kv slot overflows usize for page {page}")))
 }
 
+/// Token slots per kv head of a stage: `cache_pages * 32`, the `slots`
+/// argument `kv_write`, `KVSTORE` and `KVZERO` share.
+fn kv_slots(cache_pages: usize) -> Result<i32, BackendError> {
+    cache_pages
+        .checked_mul(crate::kv::PAGE_TOKENS)
+        .and_then(|slots| i32::try_from(slots).ok())
+        .filter(|slots| *slots >= 1)
+        .ok_or_else(|| {
+            BackendError::Kv(format!(
+                "kv slots: {cache_pages} pages do not fit the 32-bit slot count"
+            ))
+        })
+}
+
 fn quantize(x: &[f32], scale: f32) -> Vec<u8> {
     x.iter()
         .map(|value| {
@@ -2750,6 +2866,20 @@ mod exec_encoder_tests {
             "tbl_len stays at cache_pages"
         );
         assert_eq!(&command[80..84], &0i32.to_le_bytes(), "rt_base is fixed");
+    }
+
+    #[test]
+    fn kvzero_is_one_handle_only_command() {
+        let command = Command::kvzero(21, 22, 23, 256).to_bytes();
+        assert_eq!(&command[0..4], &22u32.to_le_bytes(), "type 22");
+        assert_eq!(&command[16..28], &[21, 22, 23].map(i32::to_le_bytes).concat()[..]);
+        assert_eq!(&command[28..32], &(-1i32).to_le_bytes());
+        // No source, no destination, no scratch: the command is a memset of
+        // the three images, so only `a0 = slots` carries information.
+        assert_eq!(&command[36..52], &[0i32; 4].map(i32::to_le_bytes).concat()[..]);
+        assert_eq!(&command[64..68], &256i32.to_le_bytes());
+        assert_eq!(&command[68..80], &[0i32; 3].map(i32::to_le_bytes).concat()[..]);
+        assert_eq!(&command[80..84], &(-1i32).to_le_bytes(), "no rt");
     }
 
     #[test]

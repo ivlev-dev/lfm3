@@ -437,6 +437,8 @@ pub mod exec {
         KvStore = 20,
         /// `q12 * v_scale[dim] * gate[head]` -> int8 for `o_proj`.
         AttnScale = 21,
+        /// Zero the resident K/KT/V images of one attention layer.
+        KvZero = 22,
     }
 
     fn put_i32(out: &mut [u8], offset: usize, value: i32) {
@@ -642,6 +644,15 @@ pub mod exec {
             command
         }
 
+        /// `KVZERO`: zero the resident K/KT/V images of one attention layer
+        /// (`args = [slots]`, no source, no destination).
+        pub const fn kvzero(keys: i32, key_scales: i32, values: i32, slots: i32) -> Self {
+            let mut command = Self::empty(Op::KvZero);
+            command.h = [keys, key_scales, values, -1];
+            command.args = [slots, 0, 0, 0];
+            command
+        }
+
         /// Override the destination selector and offset.
         pub const fn with_dst(mut self, kind: u32, offset: i32) -> Self {
             self.dst = kind;
@@ -759,6 +770,7 @@ mod exec_tests {
             4096,
             16384,
         ));
+        ours.push(Command::kvzero(1, 2, 3, 256));
 
         let mut theirs = core_exec::List::new(1 << 20);
         theirs.push(core_exec::Command::quant(0, 1024, 2048, 4096));
@@ -783,6 +795,7 @@ mod exec_tests {
             4096,
             16384,
         ));
+        theirs.push(core_exec::Command::kvzero(1, 2, 3, 256));
         assert_eq!(ours.to_bytes(), theirs.to_bytes());
     }
 

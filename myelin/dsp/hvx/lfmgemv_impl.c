@@ -2153,6 +2153,12 @@ static int attn_core(int hk, int hkt, int hv, int hvs, const unsigned char *q, i
     if (!tbl || tblLen < 1 || outLen != ATTN_HQ * ATTN_D * 4) return AEE_EBADPARM;
     if (pos < 0 || seq < 1 || pos >= seq) return AEE_EBADPARM;
     if ((pos >> 5) >= tblLen) return AEE_EBADPARM;
+    /* The block table maps a logical page to a physical one; the resident
+       image must hold every page the table can name, otherwise `tbl[page]`
+       addresses a row past the end of the cache.  With the identity table
+       (O2) this is exactly `cache_pages * 32 <= slots`.  A division, not a
+       product: `tblLen` goes up to 2^20 and `size_t` is 32-bit here. */
+    if ((size_t)tblLen > g_buf[hk].wbytes / (32u * ATTN_KV * 128u)) return AEE_EBADPARM;
     if (reps < 1) reps = 1;
     set_perf();
 
@@ -3298,7 +3304,9 @@ int lfmgemv_release_buf(int h)
 #define LFM_CMD_MAX       256
 
 enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
-       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5, LFM_CMD_FFN16 = 6, LFM_CMD_CONV16 = 7, LFM_CMD_GEMV16 = 8, LFM_CMD_ROTQ = 9 };
+       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_DUMP = 5, LFM_CMD_FFN16 = 6, LFM_CMD_CONV16 = 7, LFM_CMD_GEMV16 = 8, LFM_CMD_ROTQ = 9,
+       /* 20/21 are reserved for the O4 `KVSTORE`/`ATTN_SCALE` contract. */
+       LFM_CMD_KVZERO = 22 };
 enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
 enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
 
@@ -3329,6 +3337,9 @@ typedef struct {
  *         a1=ksh, a2=slot, a3=token counter (or rt[rt_base] when
  *         rt_base >= 0); src int8[3H] -> dst int8[H];
  *         ring state at scratch[tbl_off], 2*H*8 bytes per slot
+ *   KVZERO h0/h1/h2=K/KT/V resident images; a0=slots (cache_pages*32);
+ *         zeroes the sequence state, so a reset sees the same caches a fresh
+ *         sequence does.  No src/dst, no scratch.
  */
 typedef struct {
     uint32_t type;
@@ -3515,7 +3526,7 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
     uint8_t *dp = 0;
     int rc, reps, n;
 
-    if (c->type > LFM_CMD_ROTQ) return AEE_EBADPARM;
+    if (c->type > LFM_CMD_ROTQ && c->type != LFM_CMD_KVZERO) return AEE_EBADPARM;
     rc = lfm_src_ptr(c, out, outLen, &sp);
     if (rc != 0) return rc;
     rc = lfm_dst_ptr(c, out, outLen, &dp);
@@ -3550,6 +3561,32 @@ static int lfm_run_cmd(const lfm_cmd *c, const int *rt, int rt_n,
         if (c->dst_len < K + (K / 32) * 4) return AEE_EBADPARM;
         rotq_f32(s, K, rot, d, (float *)(d + K));
         (void)i;
+        return 0;
+    }
+    case LFM_CMD_KVZERO: {
+        /* Sequence state, not weights: the resident K/KT/V images keep the
+           tokens of the previous sequence.  A reset must leave the caches in
+           the state a fresh `reserve_scratch()` process has (zeros), otherwise
+           "reset then replay" and "new process" do not start from the same
+           device state.  Sizes come from the images themselves; `slots` is the
+           token capacity the host sized them for, which is also the stride
+           `kv_write` and `attn_core` use (`wbytes / ATTN_KV`). */
+        gbuf_t *bk, *bt, *bv;
+        int slots = c->a0;
+        if (c->h0 < 0 || c->h1 < 0 || c->h2 < 0 ||
+            c->h0 >= MAXBUF || c->h1 >= MAXBUF || c->h2 >= MAXBUF)
+            return AEE_EBADPARM;
+        bk = &g_buf[c->h0]; bt = &g_buf[c->h1]; bv = &g_buf[c->h2];
+        if (!bk->used || !bt->used || !bv->used) return AEE_EBADPARM;
+        if (!bk->w || !bt->w || !bv->w) return AEE_EBADPARM;
+        if (slots < 1) return AEE_EBADPARM;
+        if ((size_t)slots * ATTN_KV * 128 > bk->wbytes ||
+            (size_t)slots * ATTN_KV * 4   > bt->wbytes ||
+            (size_t)slots * ATTN_KV * 128 > bv->wbytes)
+            return AEE_EBADPARM;
+        memset(bk->w, 0, (size_t)slots * ATTN_KV * 128);
+        memset(bt->w, 0, (size_t)slots * ATTN_KV * 4);
+        memset(bv->w, 0, (size_t)slots * ATTN_KV * 128);
         return 0;
     }
     case LFM_CMD_GEMV:

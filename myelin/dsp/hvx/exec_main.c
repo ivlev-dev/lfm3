@@ -65,7 +65,7 @@
 #define LFM_EXEC_VERSION 1u
 #define LFM_CMD_MAX 256
 enum { LFM_CMD_QUANT = 0, LFM_CMD_GEMV = 1, LFM_CMD_FFN = 2,
-       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4 };
+       LFM_CMD_ATTN = 3, LFM_CMD_CONV = 4, LFM_CMD_KVZERO = 22 };
 enum { LFM_SRC_SCRATCH = 0, LFM_SRC_OUT = 1 };
 enum { LFM_DST_SCRATCH = 0, LFM_DST_OUT = 1, LFM_DST_ATTACHED = 2 };
 
@@ -887,6 +887,194 @@ int main(int argc, char **argv)
             free(attn1); free(attn2);
         }
 
+        /* ---------- 6c. KV pages: scratch table, page crossing, reset ---------
+         * The model path (`DspBackend::attention_layer_full`) writes one token
+         * per `kv_write` at the *global* slot `pos`, then runs ATTN with
+         * `tbl_len = cache_pages` and the identity table in `act` (scratch),
+         * not in a view.  From position 32 on it crosses a page.  This section
+         * is the same path: it must match the direct call bit for bit and the
+         * head of the sequence must survive a `reset_state` (with and without
+         * `KVZERO`) unchanged. */
+        {
+            enum { KVP = 8, KVSL = KVP * 32, KVH = 4 };
+            const int kbytes2 = KVH * KVSL * 128;
+            const int ktbytes2 = KVH * KVSL * 4;
+            const int vbytes2 = KVH * KVSL * 128;
+            const int TBL2 = HQ * HD;          /* table right behind q in act */
+            const int POS2 = 64;               /* two full pages */
+            const int HEAD2 = 8;
+            int hkx = -1, hktx = -1, hvx = -1, ah2 = -1;
+            uint8_t *krow = NULL, *zeros = NULL, *act2 = NULL;
+            int32_t *ktrow = NULL, *dev2 = NULL, *ref2 = NULL;
+            int8_t *qrow = NULL, *vrow = NULL, *firstv = NULL, *replayv = NULL;
+            int tblhost[KVP];
+            int page_bad[2] = { 0, 0 };
+            int pass, pos2;
+            ionbuf_t cl;
+            int have_ion = 0;
+
+            memset(&cl, 0, sizeof(cl));
+            krow = (uint8_t *)calloc(1, KVH * 64);
+            ktrow = (int32_t *)calloc(1, KVH * sizeof(int32_t));
+            vrow = (int8_t *)calloc(1, KVH * HD);
+            qrow = (int8_t *)calloc(1, HQ * HD);
+            act2 = (uint8_t *)calloc(1, TBL2 + 64);
+            dev2 = (int32_t *)calloc(1, HQ * HD * sizeof(int32_t));
+            ref2 = (int32_t *)calloc(1, HQ * HD * sizeof(int32_t));
+            firstv = (int8_t *)calloc(1, HEAD2 * HQ * HD * 4);
+            replayv = (int8_t *)calloc(1, HEAD2 * HQ * HD * 4);
+            zeros = (uint8_t *)calloc(1, kbytes2);
+            if (!krow || !ktrow || !vrow || !qrow || !act2 || !dev2 || !ref2 ||
+                !firstv || !replayv || !zeros) {
+                printf("kv page test alloc failed\n");
+                return 1;
+            }
+            for (pos2 = 0; pos2 < KVP; pos2++) tblhost[pos2] = pos2;
+            /* identity table lives in the act blob, right behind q */
+            for (pos2 = 0; pos2 < KVP; pos2++) {
+                int32_t id = pos2;
+                memcpy(act2 + TBL2 + 4 * pos2, &id, 4);
+            }
+
+            rc = lfmgemv_alloc_buf(kbytes2, &hkx);
+            if (rc == 0) rc = lfmgemv_alloc_buf(ktbytes2, &hktx);
+            if (rc == 0) rc = lfmgemv_alloc_buf(vbytes2, &hvx);
+            if (rc == 0) rc = lfmgemv_load_buf(hkx, 0, zeros, kbytes2);
+            if (rc == 0) rc = lfmgemv_load_buf(hktx, 0, zeros, ktbytes2);
+            if (rc == 0) rc = lfmgemv_load_buf(hvx, 0, zeros, vbytes2);
+            if (rc == 0) { ion_alloc(&cl, 512); have_ion = 1; }
+            if (rc == 0) {
+                /* one ATTN command: q from act, table from scratch[TBL2] */
+                list_t list;
+                exec_cmd_t *cc;
+                list_init((uint8_t *)cl.p, 0, 1, &list);
+                cc = cmd_at(&list, 0);
+                mk_attn(cc, hkx, hktx, hvx, -1, KVP, -1, 0, 0, LFM_DST_OUT);
+                cc->tbl_off = TBL2;
+                rc = lfmgemv_map_arena(cl.fd, cl.bytes, &ah2);
+                if (rc == 0) {
+                    for (pos2 = 0; pos2 < POS2; pos2++) {
+                        int i2;
+                        for (i2 = 0; i2 < KVH * 64; i2++)
+                            krow[i2] = (uint8_t)(pos2 * 131 + i2 * 17 + (i2 >> 3) * 29);
+                        for (i2 = 0; i2 < KVH; i2++)
+                            ktrow[i2] = 20000 + (pos2 * 7919 + i2 * 104729) % 40000;
+                        for (i2 = 0; i2 < KVH * HD; i2++)
+                            vrow[i2] = (int8_t)((pos2 * 53 + i2 * 7) % 251 - 125);
+                        for (i2 = 0; i2 < HQ * HD; i2++)
+                            qrow[i2] = (int8_t)((pos2 * 37 + i2 * 11) % 61 - 30);
+                        memcpy(act2, qrow, HQ * HD);
+
+                        rc = lfmgemv_kv_write(hkx, hktx, hvx, KVSL, pos2,
+                                              krow, KVH * 64,
+                                              (const uint8_t *)ktrow, KVH * 4,
+                                              (const uint8_t *)vrow, KVH * HD);
+                        if (rc != 0) {
+                            printf("kv page kv_write pos=%d rc=0x%x\n", pos2, rc);
+                            break;
+                        }
+                        rc = exec_list(ah2, 0, &list, (const int8_t *)act2,
+                                       TBL2 + KVP * 4, 0, 0,
+                                       (unsigned char *)dev2, HQ * HD * 4, times);
+                        if (rc != 0) {
+                            printf("kv page exec pos=%d rc=0x%x cmd=%d\n",
+                                   pos2, rc, times[1]);
+                            break;
+                        }
+                        rc = lfmgemv_attn(hkx, hktx, hvx, 0,
+                                          (const unsigned char *)qrow, HQ * HD,
+                                          tblhost, KVP, pos2, pos2 + 1, 0, 1,
+                                          (unsigned char *)ref2, HQ * HD * 4,
+                                          times, 8);
+                        if (rc != 0) {
+                            printf("kv page direct pos=%d rc=0x%x\n", pos2, rc);
+                            break;
+                        }
+                        for (i2 = 0; i2 < HQ * HD; i2++)
+                            if (dev2[i2] != ref2[i2]) page_bad[pos2 >> 5]++;
+                        if (pos2 < HEAD2)
+                            memcpy(firstv + (size_t)pos2 * HQ * HD * 4, dev2,
+                                   HQ * HD * 4);
+                    }
+                }
+            }
+            if (rc == 0) {
+                printf("bit-exact KVPAGE: exec vs direct mismatches=%d page0=%d "
+                       "page1=%d (%d positions)\n",
+                       page_bad[0] + page_bad[1], page_bad[0], page_bad[1], POS2);
+                failures += (page_bad[0] + page_bad[1]) != 0;
+
+                for (pass = 0; pass < 2; pass++) {
+                    int mismatches = 0;
+                    int use_kvzero = (pass == 1);
+                    rc = lfmgemv_reset_state(0);
+                    if (rc == 0 && use_kvzero) {
+                        /* second reset in a row: idempotence */
+                        list_t list;
+                        exec_cmd_t *cc;
+                        rc = lfmgemv_reset_state(0);
+                        list_init((uint8_t *)cl.p, 0, 1, &list);
+                        cc = cmd_at(&list, 0);
+                        cc->type = LFM_CMD_KVZERO;
+                        cc->h0 = hkx; cc->h1 = hktx; cc->h2 = hvx;
+                        cc->a0 = KVSL;
+                        if (rc == 0)
+                            rc = exec_list(ah2, 0, &list, (const int8_t *)act2,
+                                           TBL2 + KVP * 4, 0, 0,
+                                           (unsigned char *)dev2, HQ * HD * 4, times);
+                    }
+                    if (rc != 0) { printf("kv page reset rc=0x%x\n", rc); break; }
+                    for (pos2 = 0; pos2 < HEAD2 && rc == 0; pos2++) {
+                        int i2;
+                        for (i2 = 0; i2 < KVH * 64; i2++)
+                            krow[i2] = (uint8_t)(pos2 * 131 + i2 * 17 + (i2 >> 3) * 29);
+                        for (i2 = 0; i2 < KVH; i2++)
+                            ktrow[i2] = 20000 + (pos2 * 7919 + i2 * 104729) % 40000;
+                        for (i2 = 0; i2 < KVH * HD; i2++)
+                            vrow[i2] = (int8_t)((pos2 * 53 + i2 * 7) % 251 - 125);
+                        for (i2 = 0; i2 < HQ * HD; i2++)
+                            qrow[i2] = (int8_t)((pos2 * 37 + i2 * 11) % 61 - 30);
+                        memcpy(act2, qrow, HQ * HD);
+                        rc = lfmgemv_kv_write(hkx, hktx, hvx, KVSL, pos2,
+                                              krow, KVH * 64,
+                                              (const uint8_t *)ktrow, KVH * 4,
+                                              (const uint8_t *)vrow, KVH * HD);
+                        {
+                            list_t list;
+                            exec_cmd_t *cc;
+                            list_init((uint8_t *)cl.p, 0, 1, &list);
+                            cc = cmd_at(&list, 0);
+                            mk_attn(cc, hkx, hktx, hvx, -1, KVP, -1, 0, 0, LFM_DST_OUT);
+                            cc->tbl_off = TBL2;
+                            if (rc == 0)
+                                rc = exec_list(ah2, 0, &list, (const int8_t *)act2,
+                                               TBL2 + KVP * 4, 0, 0,
+                                               (unsigned char *)replayv + (size_t)pos2 * HQ * HD * 4,
+                                               HQ * HD * 4, times);
+                        }
+                    }
+                    if (rc == 0) {
+                        int i2;
+                        for (i2 = 0; i2 < HEAD2 * HQ * HD * 4; i2++)
+                            if (replayv[i2] != firstv[i2]) mismatches++;
+                    }
+                    printf("bit-exact KVRESET: %-18s mismatches=%d/%d\n",
+                           use_kvzero ? "+ KVZERO" : "(reset_state only)",
+                           mismatches, HEAD2 * HQ * HD * 4);
+                    failures += (rc != 0) || mismatches != 0;
+                }
+            } else {
+                printf("kv page test rc=0x%x (skipped)\n", rc);
+                failures += 1;
+            }
+            if (ah2 >= 0) lfmgemv_unmap_arena(ah2);
+            if (have_ion) ion_free(&cl);
+            if (hkx >= 0) lfmgemv_release_buf(hkx);
+            if (hktx >= 0) lfmgemv_release_buf(hktx);
+            if (hvx >= 0) lfmgemv_release_buf(hvx);
+            free(krow); free(ktrow); free(vrow); free(qrow); free(act2);
+            free(dev2); free(ref2); free(firstv); free(replayv); free(zeros);
+        }
         /* ---------- 7. bit-exact: QUANT formula ---------- */
         {
             rc = exec_list(ah_cmd, OFF_QUANT, &one_quant, quant_src, HQ * HD * 4,

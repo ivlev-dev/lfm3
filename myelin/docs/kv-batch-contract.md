@@ -896,3 +896,76 @@ CPU уже на первом токене (`383` против `4741` у CPU), а
 KV-баг объясняет провал качества именно после 32 токенов, но не начальное
 расхождение с CPU.
 
+
+---
+
+## 10. Состояние сессии: что очищает `reset_state`, а что нет
+
+Проверка гипотез «reset не очищает» и «ATTN читает страницы ≥2» на стендах
+(телефон в тот момент был не в сети, поэтому — QEMU `dsp/sim` + host).
+
+**Что нашлось.** `lfmgemv_reset_state(0)` обнуляет весь scratch (в нём все
+CONV-кольца) и `g_team_fallbacks`; арена, резидентые веса и **резидентные
+образы K/KT/V** остаются как были. K/KT/V — это состояние
+последовательности, а не веса: свежий процесс стартует с нулями (zero_image
+в `weight_plan`), а процесс после `reset` — с токенами прошлого прогона.
+Поэтому добавлен `LFM_CMD_KVZERO = 22`
+(`h0/h1/h2` = K/KT/V, `a0` = slots) и `DspBackend::reset_session` шлёт один
+`exec`-список из одного `KVZERO` на каждый staged attention-слой. Оба шага
+— `memset`, поэтому два reset подряд дают одно и то же состояние.
+
+**Что проверено и оказалось в порядке.**
+
+* `dsp/sim` группа `kv-reset`: `kv_write` с глобальным slot + `ATTN` из
+  `exec` с identity-таблицей **в scratch** (`tbl_h = -1`, `tbl_off`,
+  `tbl_len = 8`), 64 позиции (две страницы) — бит-в-бит совпадает с прямым
+  `lfmgemv_attn` с host-таблицей: `mismatches=0/131072`, page0=0, page1=0.
+  Перестановка таблицы меняет выход, то есть таблица действительно читается
+  (проверка не вырождена). Значит O2-переход на `tbl_len = cache_pages` +
+  таблицу в `act` страницы ≥2 не сломал.
+* Там же: повтор головы последовательности (8 токенов) после `reset_state`
+  даёт `mismatches=0` и **без** `KVZERO`, и с ним. То есть ATTENTION не
+  читает слоты за пределами `[0, pos]`, и устройство `RESET_CHECK` не может
+  падать из-за «хвостов» KV на этом пути.
+* `tests/transport.rs::reset_makes_the_second_sequence_identical_on_the_wire`:
+  прогон «40 токенов → `reset` → те же 5» на mock-транспорте даёт побайтово
+  те же RPC (метод, скаляры, `act`, `rt`, строки `kv_write`). Утечки
+  host-состояния (счётчик CONV, таблица, `window`) нет.
+
+Итог: если `RESET_CHECK` продолжает падать на телефоне, это не scratch и не
+KV-образы, а транспорт (в §2.1 `transport-results.md` уже описан артефакт
+`FIRST_TOKEN 20` при `FASTRPC_ATTR_KEEP_MAP`) или недетерминизм
+`team_fallbacks`. Секция `6c` в `dsp/hvx/exec_main.c` повторяет эти же две
+проверки на устройстве.
+
+## 11. Почему текст вырождается в цикл (контрольный опыт)
+
+`MYELIN_CPU_INT4=1` в `CpuBackend` округляет **каждую** матрицу до per-row
+int4 (absmax/7) — ровно то, что `myelin-pack` кладёт на DSP. На том же
+промпте:
+
+```text
+f32            Paris, and the capital of Japan is Tokyo. The capital of Brazil is Brasília, …
+int8 акт.      Paris, and the capital of Japan is Tokyo. …            (тот же текст)
+int4 веса       the country, and the country is the **United States** of **the** **the** **the** …
+int4+int8       certainly the most prominent, and the answer is well known: the capital of France is …
+```
+
+Первый токен тоже уезжает (`278`/` the` вместо `4741`/` Paris`), а дальше
+идёт цикл из служебных слов — то же, что даёт DSP (`383 278 2690 2891 302
+278 5201 20 309 …`). Значит **вырождение — свойство формата per-row int4, а
+не дефект attention/KV/reset**: точная CPU-арифметика на тех же весах
+деградирует так же.
+
+Отдельно замерено на реальных данных (`examples/analyze_kv`, слой 2, 8
+позиций): `score cos` per-token 0.99920, V per-channel 0.99999, attended
+int8 с одним масштабом 0.99978 (per-head 0.99994). То есть ни K int4, ни V
+int8, ни int8-квантование attended по отдельности не объясняют 0.967
+фикстуры слоя attention, и тем более не объясняют цикл.
+
+**Что осталось измерить на устройстве:** разложение фикстуры слоя attention
+по стадиям (qkv int4 → q8/K → PV → gate → attended int8 → o_proj) — сейчас
+`attn_main.c`/`dsp-layer-check` дают только итоговый cos. Наибольшее
+измеренное отклонение в DSP-пути по-прежнему у слоя shortconv
+(`VERDICT PASS` при пороге 0.95 — то есть слой на границе), а он стоит в 13
+из 24 слоёв.
