@@ -38,7 +38,11 @@ pub const HVX_METHOD_LOAD_BUF: u32 = 2;
 /// Method ID of `lfmgemv.kv_write` in the HVX FastRPC skeleton.
 pub const HVX_METHOD_KV_WRITE: u32 = 22;
 /// Method ID of `lfmgemv.reset_state` in the HVX FastRPC skeleton.
-pub const HVX_METHOD_RESET_STATE: u32 = 23;
+pub const HVX_METHOD_SET_Q4K: u32 = 23;
+pub const HVX_METHOD_GEMV_Q4K: u32 = 24;
+pub const HVX_METHOD_KVARN_COMMIT: u32 = 25;
+pub const HVX_METHOD_KVARN_DECODE: u32 = 26;
+pub const HVX_METHOD_RESET_STATE: u32 = 27;
 
 /// FastRPC handle. 32-bit `remote_handle`, as used by the `qaic` stub.
 pub type DspHandle = i32;

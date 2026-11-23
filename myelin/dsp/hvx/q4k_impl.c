@@ -311,3 +311,140 @@ void q4k_gemv_hvx(const q4k_mat *m, const q4k_plan *pl, const int8_t *xq,
 }
 
 #endif /* __HVX__ */
+
+/* ------------------------------------------------------------------ */
+/* GGUF dequant and Q4_K requantisation (Hadamard weight rotation)     */
+/* ------------------------------------------------------------------ */
+
+void q4k_dequant_gguf(const uint8_t *blk, float *out)
+{
+    float d = q4k_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+    float dmin = q4k_f16_to_f32((uint16_t)(blk[2] | (blk[3] << 8)));
+    const uint8_t *sc = blk + 4, *qs = blk + 16;
+    int j, half, l, q_off = 0, is = 0;
+
+    for (j = 0; j < 256; j += 64) {
+        uint8_t s1, m1, s2, m2;
+        q4k_scale_min(sc, is, &s1, &m1);
+        q4k_scale_min(sc, is + 1, &s2, &m2);
+        for (l = 0; l < 32; l++)
+            out[j + l] = d * (float)s1 * (float)(qs[q_off + l] & 15) -
+                         dmin * (float)m1;
+        for (l = 0; l < 32; l++)
+            out[j + 32 + l] = d * (float)s2 * (float)(qs[q_off + l] >> 4) -
+                              dmin * (float)m2;
+        q_off += 32;
+        is += 2;
+    }
+}
+
+static void q4k_put_scale_min(uint8_t *q12, int j, int s, int m)
+{
+    int jm = j & 3;
+    if (s < 0) s = 0;
+    if (s > 63) s = 63;
+    if (m < 0) m = 0;
+    if (m > 63) m = 63;
+    if (j < 4) {
+        q12[jm] = (uint8_t)((q12[jm] & 0xc0u) | (s & 63));
+        q12[jm + 4] = (uint8_t)((q12[jm + 4] & 0xc0u) | (m & 63));
+    } else {
+        q12[jm] = (uint8_t)((q12[jm] & 0x3fu) | ((s >> 4) << 6));
+        q12[jm + 4] = (uint8_t)((q12[jm + 4] & 0x3fu) | ((m >> 4) << 6));
+        q12[jm + 8] = (uint8_t)((q12[jm + 8] & 0xf0u) | (s & 15));
+        q12[jm + 8] = (uint8_t)((q12[jm + 8] & 0x0fu) | ((m & 15) << 4));
+    }
+}
+
+static int q4k_iround(float x)
+{
+    return (int)roundf(x);
+}
+
+void q4k_quant_block(const float *x, uint8_t *blk)
+{
+    float scale[8], minv[8], max_scale = 0.0f, max_min = 0.0f;
+    uint8_t q12[12];
+    float d, dmin;
+    int j, l, q[256];
+
+    for (j = 0; j < 8; j++) {
+        float mn = x[32 * j], mx = x[32 * j];
+        for (l = 1; l < 32; l++) {
+            float v = x[32 * j + l];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        if (mn > 0.0f) mn = 0.0f;
+        if (mx < 0.0f) mx = 0.0f;
+        scale[j] = (mx - mn) / 15.0f;
+        minv[j] = -mn;
+        if (scale[j] > max_scale) max_scale = scale[j];
+        if (minv[j] > max_min) max_min = minv[j];
+    }
+    if (!(max_scale > 0.0f)) {
+        memset(blk, 0, Q4K_GGUF_BLOCK);
+        return;
+    }
+    {
+        uint16_t db = q4k_f32_to_f16(max_scale / 63.0f);
+        uint16_t mb = q4k_f32_to_f16(max_min / 63.0f);
+        blk[0] = (uint8_t)(db & 0xff);
+        blk[1] = (uint8_t)(db >> 8);
+        blk[2] = (uint8_t)(mb & 0xff);
+        blk[3] = (uint8_t)(mb >> 8);
+        d = q4k_f16_to_f32(db);
+        dmin = q4k_f16_to_f32(mb);
+    }
+    memset(q12, 0, sizeof(q12));
+    for (j = 0; j < 8; j++) {
+        int s = q4k_iround(scale[j] / d);
+        int m = q4k_iround(minv[j] / dmin);
+        q4k_put_scale_min(q12, j, s, m);
+        for (l = 0; l < 32; l++) {
+            float mn = -minv[j];
+            float inv = 1.0f / scale[j];
+            int v = q4k_iround((x[32 * j + l] - mn) * inv);
+            if (v < 0) v = 0;
+            if (v > 15) v = 15;
+            q[32 * j + l] = v;
+        }
+    }
+    memcpy(blk + 4, q12, 12);
+    for (j = 0; j < 4; j++)
+        for (l = 0; l < 32; l++)
+            blk[16 + 32 * j + l] = (uint8_t)(q[64 * j + l] |
+                                             (q[64 * j + 32 + l] << 4));
+}
+
+int q4k_pack_image_rotated(const uint8_t *src, int rows, int K, int rot,
+                           uint8_t *img)
+{
+    size_t blocks = (size_t)K / 256, n = (size_t)rows * blocks;
+    uint8_t *tmp;
+    float w[256];
+    int r, b, rc;
+
+    if (!src || !img || rows < 1 || K < 256 || (K & 255)) return -1;
+    if (rot != 0 && rot != 128) return -1;
+    tmp = (uint8_t *)malloc(n * Q4K_GGUF_BLOCK);
+    if (!tmp) return -1;
+    for (r = 0; r < rows; r++) {
+        for (b = 0; b < (int)blocks; b++) {
+            size_t idx = (size_t)r * blocks + (size_t)b;
+            const uint8_t *sb = src + idx * Q4K_GGUF_BLOCK;
+            uint8_t *db = tmp + idx * Q4K_GGUF_BLOCK;
+            if (rot == 0) {
+                memcpy(db, sb, Q4K_GGUF_BLOCK);
+                continue;
+            }
+            q4k_dequant_gguf(sb, w);
+            lfm_rot_fwd_f32(w, 128);
+            lfm_rot_fwd_f32(w + 128, 128);
+            q4k_quant_block(w, db);
+        }
+    }
+    rc = q4k_pack_image(tmp, rows, K, img);
+    free(tmp);
+    return rc;
+}

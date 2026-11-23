@@ -126,6 +126,27 @@ interface lfmgemv {
                  in sequence<octet> k, in sequence<octet> kt,
                  in sequence<octet> v);
 
+   /* ---- Q4_K weights (kernel: q4k_impl.c, contract: q4k.idl) -------------
+      alloc_buf(q4k_image_bytes(N, K)) + set_shape(N, K, 0) + load_buf, then
+      set_q4k.  gemv_q4k takes act = int8 xq[K] | f32 xs[K/32] (the same
+      quantiser as ROTQ with rot = 0) and returns f32[N].
+      Rotated weights (q4k_pack_image_rotated rot=128) work unchanged: the
+      caller must produce the activation with ROTQ a0 = 128, which applies the
+      matching forward Hadamard before int8/32. */
+   long set_q4k(in long h);
+   long gemv_q4k(in long h, in sequence<octet> act, in long reps,
+                 rout sequence<octet> dst, rout sequence<long> times);
+
+   /* ---- kvarn page codec (kernel: kvarn_impl.c) --------------------------
+      v_bits 2 (k4v2) or 4 (k4v4).  commit: rot = 32*128 f16 values already
+      rotated with the Hadamard pair, page = kvarn_page_bytes(v_bits).
+      decode: one token of a page -> f32[128], is_v selects K or V. */
+   long kvarn_commit(in long v_bits, in sequence<octet> rot,
+                     rout sequence<octet> page, rout sequence<long> times);
+   long kvarn_decode(in long v_bits, in sequence<octet> page, in long token,
+                     in long is_v, rout sequence<octet> outp,
+                     rout sequence<long> times);
+
    /* ---- session state reset ---------------------------------------------
       Zero the DSP-heap scratch (which holds every CONV ring state) and the
       shared counters, so a new sequence starts from exactly the state of a

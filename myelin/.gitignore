@@ -14,6 +14,9 @@
 /dsp/**/lfmgemv.h
 /dsp/**/lfmgemv_skel.c
 /dsp/**/lfmgemv_stub.c
+/dsp/**/kvarn_case.h
+/dsp/hvx/q4k_test
+/dsp/hvx/kvarn_test
 
 # host-бинарники стендов
 /dsp/hmx/mx4_test

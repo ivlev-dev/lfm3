@@ -14,6 +14,7 @@ cd "$(dirname "$0")"
 HEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT:-/opt/hexagon-sdk-6.7.0.0}
 HEXAGON_TOOLS_VERSION=${HEXAGON_TOOLS_VERSION:-21.0.04}
 QEMU_BIN=${QEMU_BIN:-/tmp/opencode/qemu/build/qemu-system-hexagon}
+SIM_BIN=${SIM_BIN:-$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/$HEXAGON_TOOLS_VERSION/Tools/bin/hexagon-sim}
 OUT=${OUT:-build}
 MODEL=${MODEL:-../../../models/LFM3-1.7B-Q4_K_M.gguf}
 CASE_ROWS=${CASE_ROWS:-512}
@@ -71,19 +72,24 @@ $CC -mv68 -g -nodefaultlibs -nostdlib \
 echo "      $OUT/q4k_main"
 
 # ---- 4. run -----------------------------------------------------------
-echo "[4/4] qemu"
+echo "[4/4] hexagon-sim"
 RUNELF=$S/rtos/qurt/computev68/sdksim_bin/runelf.pbn
-LOG=$OUT/qemu_q4k.log
+LOG=$OUT/sim_q4k.log
+QL=$S/rtos/qurt/computev68/lib
+printf '%s\n' "$QL/../debugger/lnx64/qurt_model.so" > "$OUT/osam.cfg"
+printf '%s\n' "$TD/lib/iss/qtimer.so --csr_base=0xFC900000 --irq_p=1 --freq=19200000 --cnttid=1" > "$OUT/q6ss.cfg"
+printf '%s\n' "$TD/lib/iss/l2vic.so 32 0xFC910000" >> "$OUT/q6ss.cfg"
 set +e
-"$QEMU_BIN" -M V68N_1024 -display none -kernel "$RUNELF" \
-    -append "./$OUT/q4k_main" > "$LOG" 2>&1
+"$SIM_BIN" -mv68 --simulated_returnval --usefs . \
+    --cosim_file "$OUT/q6ss.cfg" --l2tcm_base 0xd800 --rtos "$OUT/osam.cfg" \
+    "$RUNELF" -- "./$OUT/q4k_main" > "$LOG" 2>&1
 QRC=$?
 set -e
 grep -E '^Q4K ' "$LOG" || true
 if ! grep -q '^Q4K RESULT: PASS' "$LOG"; then
     echo "---- last qemu lines ----" >&2
     tail -25 "$LOG" >&2
-    echo "FAIL: no 'Q4K RESULT: PASS' (qemu rc=$QRC, log $LOG)" >&2
+    echo "FAIL: no 'Q4K RESULT: PASS' (sim rc=$QRC, log $LOG)" >&2
     exit 1
 fi
-echo "PASS (qemu rc=$QRC, log $LOG)"
+echo "PASS (sim rc=$QRC, log $LOG)"

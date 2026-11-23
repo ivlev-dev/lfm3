@@ -194,12 +194,16 @@ adb push liblfmgemv_skel.so exec_test attn_test /data/local/tmp/lfmgemv/
 adb shell "cd /data/local/tmp/lfmgemv && ADSP_LIBRARY_PATH=\$PWD ./exec_test"
 ```
 
-### 6.2 HVX/exec в QEMU (без телефона)
+### 6.2 HVX/exec в hexagon-sim (без телефона)
 
 ```bash
 cd myelin/dsp/sim
-QEMU_BIN=$QEMU_BIN ./runner.sh        # ~25 с, проверяет маркер SIM RESULT: PASS
+HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT ./runner.sh   # маркер SIM RESULT: PASS
 ```
+
+Стенд запускается через QuRT cosim: `hexagon-sim` + `runelf.pbn` +
+`osam.cfg`/`q6ss.cfg` (QuRT `qurt_model.so`, `qtimer.so`, `l2vic.so`).
+Старый путь `USE_QEMU=1 ./runner.sh` оставлен опцией.
 
 ### 6.3 HMX на телефоне
 
@@ -259,11 +263,13 @@ cd myelin && cargo test --workspace
 # 2. SDK
 ls $HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/21.0.04/Tools/bin/hexagon-clang
 
-# 3. QEMU
-$QEMU_BIN -M help | grep V68N_1024
+# 3. симулятор
+ls $HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/21.0.04/Tools/bin/hexagon-sim
 
 # 4. HVX без телефона
 cd myelin/dsp/sim && ./runner.sh | tail -1     # SIM RESULT: PASS
+cd myelin/dsp/hvx && ./q4k_build.sh | tail -1  # Q4K RESULT: PASS
+cd myelin/dsp/hvx && ./kvarn_build.sh | tail -1 # KVARN RESULT: PASS
 
 # 5. HMX без телефона
 cd myelin/dsp/hmx/sim && ./run.sh | tail -1    # RESULT: OK

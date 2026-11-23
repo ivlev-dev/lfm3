@@ -31,13 +31,19 @@ echo "HOST FFN SIM OK"
 ${HOSTCC:-cc} -O2 -Wall -o ffn_real_study ffn_real_study.c -lm
 echo "HOST FFN STUDY OK"
 
+# kvarn_test needs the Rust reference page; regenerate it when it is missing.
+if [ ! -f kvarn_case.h ]; then
+    echo "kvarn_case.h: generating from the Rust reference"
+    (cd ../.. && cargo run -q -p myelin-pack --example kvarn_dump -- dsp/hvx/kvarn_case.h)
+fi
+
 # IDL -> lfmgemv.h / lfmgemv_stub.c / lfmgemv_skel.c
 "$QAIC" -I$S/incs -I$S/incs/stddef lfmgemv.idl
 
 # DSP-скелет: GEMV + SiLU + FFN + attention + PV
 $CC -mv68 -mhvx -mhvx-length=128b -O3 -fPIC -shared -g -Wall \
     -I$S/incs -I$S/incs/stddef -I. -I$QU -I$QU/qurt \
-    -o liblfmgemv_skel.so lfmgemv_skel.c lfmgemv_impl.c \
+    -o liblfmgemv_skel.so lfmgemv_skel.c lfmgemv_impl.c q4k_impl.c kvarn_impl.c \
     -Wl,-Bsymbolic -Wl,--start-group -lc -lgcc -Wl,--end-group
 
 # Host-тесты
@@ -69,5 +75,13 @@ $HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o exec_test \
     exec_main.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
 echo "EXEC OK"
 
+$HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o q4k_test \
+    q4k_test.c q4k_impl.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
+echo "Q4K OK"
+
+$HCC -O2 -Wall -I$S/incs -I$S/incs/stddef -I. -o kvarn_test \
+    kvarn_test.c kvarn_impl.c lfmgemv_stub.c -L"$CDSPLIB" -lcdsprpc -llog -ldl -lm
+echo "KVARN OK"
+
 echo "BUILD OK"
-ls -la liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test attach_test rpc_test exec_test ffn_sim ffn_real_study
+ls -la liblfmgemv_skel.so lfmgemv_test ab_test ffn_test attn_test attach_test rpc_test exec_test q4k_test kvarn_test ffn_sim ffn_real_study

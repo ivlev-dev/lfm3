@@ -1,9 +1,9 @@
 #!/bin/bash
-# Build the lfmgemv exec stand as a QuRT qexe for the Hexagon v68 QEMU
-# machine.  No phone, no FastRPC, no Android NDK.
+# Build the lfmgemv exec stand as a QuRT qexe for hexagon-sim (QuRT cosim).
+# No phone, no FastRPC, no Android NDK.  The old QEMU path only changes the
+# runner, not this build.
 #
 #   HEXAGON_SDK_ROOT=/opt/hexagon-sdk-6.7.0.0 ./build.sh
-#   QEMU_BIN=/path/to/qemu-system-hexagon ./build.sh
 #
 # Output: build/lfmsim  (run it with ./runner.sh)
 set -e
@@ -37,10 +37,10 @@ if [ ! -f "$G0/libc.a" ]; then
     echo "тулчейн-библиотеки не найдены в $G0" >&2
     exit 1
 fi
-if [ ! -x "$QEMU_BIN" ]; then
-    echo "QEMU не найден: $QEMU_BIN" >&2
-    echo "соберите qemu-system-hexagon или укажите QEMU_BIN=... " >&2
-    exit 1
+QAIC=$S/ipc/fastrpc/qaic/bin/qaic
+if [ ! -f "$HVX/lfmgemv.h" ]; then
+    echo "qaic: generating lfmgemv.h"
+    (cd "$HVX" && "$QAIC" -I$S/incs -I$S/incs/stddef lfmgemv.idl)
 fi
 
 mkdir -p "$OUT"
@@ -50,17 +50,20 @@ CFLAGS="-mv68 -mhvx -mhvx-length=128b -G0 -O2 -Wall \
 
 echo "CC=$CC"
 $CC $CFLAGS -c "$HVX/lfmgemv_impl.c" -o "$OUT/lfmgemv_impl.o"
+$CC $CFLAGS -c "$HVX/q4k_impl.c" -o "$OUT/q4k_impl.o"
+$CC $CFLAGS -c "$HVX/kvarn_impl.c" -o "$OUT/kvarn_impl.o"
 $CC $CFLAGS -c sim_main.c -o "$OUT/sim_main.o"
 $CC $CFLAGS -c shim_hap.c -o "$OUT/shim_hap.o"
 
-# qexe link recipe (QuRT v68, sdksim runelf in QEMU):
+# qexe link recipe (QuRT v68, runelf.pbn under hexagon-sim):
 #   .interp is the fixed user image base, -force-dynamic keeps the ELF layout
 #   the runelf loader expects, --whole-archive pulls the QuRT/crt objects.
 $CC -mv68 -g -nodefaultlibs -nostdlib \
     -Wl,--section-start,.interp=0x23000000 \
     -Wl,--dynamic-linker= -Wl,--force-dynamic -Wl,-E -Wl,-z,muldefs \
     -Wl,--whole-archive \
-    "$G0/init.o" "$OUT/lfmgemv_impl.o" "$OUT/shim_hap.o" "$OUT/sim_main.o" \
+    "$G0/init.o" "$OUT/lfmgemv_impl.o" "$OUT/q4k_impl.o" "$OUT/kvarn_impl.o" \
+    "$OUT/shim_hap.o" "$OUT/sim_main.o" \
     "$QL/crt1.o" "$QL/debugmon.o" "$QL/libqurt.a" \
     "$G0/libc.a" "$G0/libqcc.a" "$G0/libhexagon.a" "$G0/libm.a" \
     "$QL/libqurtcfs.a" "$QL/libtimer_island.a" "$QL/libtimer_main.a" \

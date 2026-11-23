@@ -30,6 +30,8 @@
 #include "silu_lut.h"
 #include "exptab.h"
 #include "apps_mem.h"
+#include "q4k_impl.h"
+#include "kvarn_impl.h"
 #include "../quant/quant.h"
 
 typedef void *Address;
@@ -76,6 +78,7 @@ typedef struct {
     int      seg;       /* 1 = per-256 ratios present (pack v2) */
     int      nseg;      /* K/256 ratio columns, == nvec */
     int      zq;        /* 1 = acc[] holds the Q16 value directly (seg path) */
+    int      q4k;       /* 1 = w is a packed Q4_K image (q4k_impl.h) */
     uint8_t *rseg;      /* N*nseg ratios, 127 = row scale (q = ratio+1) */
     float   *mrow;      /* N multipliers sw*sa/so */
 } gbuf_t;
@@ -4195,5 +4198,136 @@ int lfmgemv_exec(int ah, int cmd_off, int n_cmds, const unsigned char *act, int 
         times[2] = done;
         times[3] = g_team_fallbacks;
     }
+    return 0;
+}
+
+/* ====================================================================== */
+/* Q4_K weights (kernel: q4k_impl.c, contract: q4k.idl / Q4K.md)          */
+/* ====================================================================== */
+
+static int8_t *g_q4k_xq;
+static float  *g_q4k_xs;
+static float  *g_q4k_y;
+static int     g_q4k_K;
+static int     g_q4k_N;
+
+static int q4k_scratch(int N, int K)
+{
+    if (g_q4k_xq && g_q4k_K >= K && g_q4k_N >= N)
+        return 0;
+    free(g_q4k_xq);
+    free(g_q4k_xs);
+    free(g_q4k_y);
+    g_q4k_xq = (int8_t *)memalign(128, (size_t)K + 128);
+    g_q4k_xs = (float *)memalign(128, (size_t)(K / 32) * sizeof(float));
+    g_q4k_y = (float *)memalign(128, (size_t)N * sizeof(float));
+    if (!g_q4k_xq || !g_q4k_xs || !g_q4k_y) {
+        free(g_q4k_xq); free(g_q4k_xs); free(g_q4k_y);
+        g_q4k_xq = 0; g_q4k_xs = 0; g_q4k_y = 0;
+        g_q4k_K = 0; g_q4k_N = 0;
+        return AEE_ENOMEMORY;
+    }
+    g_q4k_K = K;
+    g_q4k_N = N;
+    return 0;
+}
+
+/* Mark the resident image as packed Q4_K (q4k_pack_image output).  Alloc the
+ * buffer with q4k_image_bytes(N, K) and set_shape(N, K, 0) first. */
+int lfmgemv_set_q4k(int h)
+{
+    gbuf_t *b;
+    if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
+    b = &g_buf[h];
+    if (!b->w || b->N < 1 || b->K < 256 || (b->K & 255) != 0) return AEE_EBADPARM;
+    if (q4k_image_bytes(b->N, b->K) > b->wbytes) return AEE_EBADPARM;
+    b->q4k = 1;
+    return 0;
+}
+
+/* Q4_K GEMV: act = int8 xq[K] | f32 xs[K/32]; dst = f32[N] (row major). */
+int lfmgemv_gemv_q4k(int h, const unsigned char *act, int actLen, int reps,
+                     unsigned char *dst, int dstLen, int *times, int timesLen)
+{
+    gbuf_t *b;
+    q4k_mat m;
+    q4k_plan pl;
+    int rc, i, n;
+    int64_t t0, t1, best = 0, worst = 0, total = 0;
+
+    if (h < 0 || h >= MAXBUF || !g_buf[h].used) return AEE_EBADPARM;
+    b = &g_buf[h];
+    if (!b->q4k || !b->w) return AEE_EBADPARM;
+    if (!act || actLen != b->K + (b->K / 32) * 4) return AEE_EBADPARM;
+    if (!dst || dstLen < b->N * 4) return AEE_EBADPARM;
+    rc = q4k_scratch(b->N, b->K);
+    if (rc != 0) return rc;
+
+    memcpy(g_q4k_xq, act, (size_t)b->K);
+    memcpy(g_q4k_xs, act + b->K, (size_t)(b->K / 32) * sizeof(float));
+    q4k_mat_init(&m, b->w, b->N, b->K);
+    rc = q4k_plan_init(&pl, &m, g_q4k_xq, g_q4k_xs, 0);
+    if (rc != 0) {
+        q4k_plan_free(&pl);
+        return AEE_ENOMEMORY;
+    }
+    n = reps < 1 ? 1 : reps;
+    for (i = 0; i < n; i++) {
+        t0 = HAP_perf_get_time_us();
+        q4k_gemv_hvx(&m, &pl, g_q4k_xq, g_q4k_y, 0, b->N);
+        t1 = HAP_perf_get_time_us();
+        if (i == 0 || t1 - t0 < best) best = t1 - t0;
+        if (t1 - t0 > worst) worst = t1 - t0;
+        total += t1 - t0;
+    }
+    q4k_plan_free(&pl);
+    memcpy(dst, g_q4k_y, (size_t)b->N * sizeof(float));
+    if (times && timesLen >= 4) {
+        times[0] = (int)best;
+        times[1] = (int)worst;
+        times[2] = (int)(total / n);
+        times[3] = g_team_fallbacks;
+    }
+    return 0;
+}
+
+/* ====================================================================== */
+/* kvarn page codec (kernel: kvarn_impl.c, contract: docs/paged-kv.md)    */
+/* ====================================================================== */
+
+int lfmgemv_kvarn_commit(int v_bits, const unsigned char *rot, int rotLen,
+                         unsigned char *page, int pageLen, int *times,
+                         int timesLen)
+{
+    static uint16_t buf[KVARN_TOKENS * KVARN_DIM] __attribute__((aligned(128)));
+    size_t need = kvarn_page_bytes(v_bits);
+    int64_t t0;
+
+    if (!rot || !page) return AEE_EBADPARM;
+    if (rotLen != (int)sizeof(buf)) return AEE_EBADPARM;
+    if (pageLen < (int)need) return AEE_EBADPARM;
+    memcpy(buf, rot, sizeof(buf));
+    t0 = HAP_perf_get_time_us();
+    if (kvarn_commit(buf, v_bits, page) != 0) return AEE_EBADPARM;
+    if (times && timesLen >= 1) times[0] = (int)(HAP_perf_get_time_us() - t0);
+    return 0;
+}
+
+int lfmgemv_kvarn_decode(int v_bits, const unsigned char *page, int pageLen,
+                         int token, int is_v, unsigned char *out, int outLen,
+                         int *times, int timesLen)
+{
+    static float y[KVARN_DIM] __attribute__((aligned(128)));
+
+    if (!page || !out) return AEE_EBADPARM;
+    if (pageLen != (int)kvarn_page_bytes(v_bits)) return AEE_EBADPARM;
+    if (token < 0 || token >= KVARN_TOKENS) return AEE_EBADPARM;
+    if (outLen != KVARN_DIM * (int)sizeof(float)) return AEE_EBADPARM;
+    if (is_v)
+        kvarn_decode_v(page, v_bits, token, y);
+    else
+        kvarn_decode_k(page, token, y);
+    memcpy(out, y, sizeof(y));
+    if (times && timesLen >= 1) times[0] = 0;
     return 0;
 }

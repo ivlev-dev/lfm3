@@ -54,6 +54,21 @@ size_t q4k_image_bytes(int rows, int K);
  * img must be 128-B aligned and at least q4k_image_bytes() long. */
 int q4k_pack_image(const uint8_t *src, int rows, int K, uint8_t *img);
 
+/* GGUF 144-B block -> 256 f32, exactly infra-quant dequant_q4_k. */
+void q4k_dequant_gguf(const uint8_t *blk, float *out);
+
+/* f32 256 weights -> GGUF 144-B Q4_K block (llama.cpp reference recipe:
+ * 8 sub-blocks of 32, 6-bit sc/m, d = max_scale/63, dmin = max_min/63). */
+void q4k_quant_block(const float *x, uint8_t *blk);
+
+/* GGUF rows -> Hadamard-rotated and requantised packed image.
+ * rot = 0: identical to q4k_pack_image; rot = 128: every 128-weight chunk is
+ * multiplied by R (lfm_rot_fwd_f32) before the Q4_K quantiser, so the host
+ * must rotate the activation with the same R (lfm_rot_blocks_f32 / ROTQ
+ * a0=128): <R w, R x> = <w, x> because R^T R = I. */
+int q4k_pack_image_rotated(const uint8_t *src, int rows, int K, int rot,
+                           uint8_t *img);
+
 /* fill the view (img must be the one q4k_pack_image filled) */
 void q4k_mat_init(q4k_mat *m, const uint8_t *img, int N, int K);
 
@@ -121,6 +136,42 @@ static inline float q4k_f16_to_f32(uint16_t h)
         memcpy(&out, &f, 4);
         return out;
     }
+}
+
+/* f32 -> f16 (round to nearest even, as half::f16::from_f32). */
+static inline uint16_t q4k_f32_to_f16(float x)
+{
+    uint32_t u, sign, a, exp, mant, he, m, rem;
+    memcpy(&u, &x, 4);
+    sign = (u >> 16) & 0x8000u;
+    a = u & 0x7fffffffu;
+    if (a >= 0x7f800000u)
+        return (uint16_t)(sign | 0x7c00u | (a > 0x7f800000u ? 0x200u : 0u));
+    if (a >= 0x47800000u) return (uint16_t)(sign | 0x7c00u);
+    if (a < 0x33000000u) return (uint16_t)sign;
+    if (a < 0x38800000u) {
+        uint32_t shift;
+        exp = a >> 23;
+        mant = (a & 0x7fffffu) | 0x800000u;
+        shift = 126u - exp;
+        m = mant >> shift;
+        rem = mant & ((1u << shift) - 1u);
+        if (rem > (1u << (shift - 1u)) ||
+            (rem == (1u << (shift - 1u)) && (m & 1u)))
+            m++;
+        return (uint16_t)(sign | m);
+    }
+    exp = a >> 23;
+    mant = a & 0x7fffffu;
+    he = exp - 112u;
+    m = mant >> 13;
+    rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) {
+        m++;
+        if (m == 0x400u) { m = 0; he++; }
+    }
+    if (he >= 0x1fu) return (uint16_t)(sign | 0x7c00u);
+    return (uint16_t)(sign | (he << 10) | m);
 }
 
 /* 6-bit (sc,m) unpack, identical to prepack.rs:165-177 / infra-quant:30-38 */

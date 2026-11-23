@@ -16,7 +16,10 @@
  * q4k_main.c additionally checks HVX == the scalar twin bit for bit).
  *
  * Usage:
- *   --mode <f32|q4k|q4kf|i8|i4>   weight format              (default q4k)
+ *   --mode <f32|q4k|q4kf|q4kr|i8|i4>
+ *                                 weight format              (default q4k);
+ *                                 q4kr = Q4_K requantised after the H128
+ *                                 Hadamard rotation of every weight chunk
  *   --ids "597 5205 302 3980 355" prompt token ids
  *   --tokens N                    greedy continuation length (default 64)
  *   --selftest                    pack/dequant exactness + cos vs the f32 oracle
@@ -45,7 +48,7 @@
 #define MAXL 32
 #define KV_SLOTS 512
 
-enum { M_F32 = 0, M_Q4K, M_Q4KF, M_I8, M_I4, M_I4M, M_I4R };
+enum { M_F32 = 0, M_Q4K, M_Q4KF, M_I8, M_I4, M_I4M, M_I4R, M_Q4KR };
 
 static int g_mode = M_Q4K;
 
@@ -173,10 +176,11 @@ static void requant_i4m(const float *v, int K, int8_t *q, float *sc, float *mn)
 static void wmat_prepare(wmat *w)
 {
     int r;
-    if (g_mode == M_Q4K || g_mode == M_Q4KF) {
+    if (g_mode == M_Q4K || g_mode == M_Q4KF || g_mode == M_Q4KR) {
         if (w->packable) {
             w->img = xalloc(q4k_image_bytes(w->N, w->K), 128);
-            if (q4k_pack_image(g_map + w->off, w->N, w->K, w->img) != 0) {
+            if (q4k_pack_image_rotated(g_map + w->off, w->N, w->K,
+                                       g_mode == M_Q4KR ? 128 : 0, w->img) != 0) {
                 fprintf(stderr, "pack failed %d x %d\n", w->N, w->K);
                 exit(1);
             }
@@ -284,11 +288,11 @@ static void mv(const wmat *w, const float *x, float *y)
 
     if (g_mode == M_F32) { mv_exact(w, x, y); return; }
 
-    if (g_mode == M_Q4K || g_mode == M_Q4KF) {
+    if (g_mode == M_Q4K || g_mode == M_Q4KF || g_mode == M_Q4KR) {
         if (!w->packable) {
             /* Q6_K / F32 tensor: exact weights; q8 activations when the mode
              * quantises activations (q4k), plain f32 otherwise (q4kf) */
-            if (g_mode == M_Q4K && w->K % 32 == 0) {
+            if ((g_mode == M_Q4K || g_mode == M_Q4KR) && w->K % 32 == 0) {
                 int8_t *xq = xalloc(K, 64);
                 float *xs = xalloc((size_t)(K / 32) * 4, 64);
                 float *xr = malloc((size_t)K * 4);
@@ -309,13 +313,19 @@ static void mv(const wmat *w, const float *x, float *y)
         {
             int8_t *xq = xalloc(K, 128);
             float *xs = xalloc((size_t)(K / 32) * 4, 64);
+            float *xr = NULL;
             q4k_plan plan;
-            q4k_act_q8(x, K, xq, xs);
+            if (g_mode == M_Q4KR) {
+                xr = malloc((size_t)K * 4);
+                memcpy(xr, x, (size_t)K * 4);
+                lfm_rot_blocks_f32(xr, K, 128);
+            }
+            q4k_act_q8(xr ? xr : x, K, xq, xs);
             if (q4k_plan_init(&plan, &w->qm, xq, xs, NULL) != 0) { fprintf(stderr, "plan\n"); exit(1); }
 #pragma omp parallel for schedule(static)
             for (r = 0; r < w->N; r++) q4k_gemv_scalar(&w->qm, &plan, xq, y, r, r + 1);
             q4k_plan_free(&plan);
-            free(xq); free(xs);
+            free(xq); free(xs); free(xr);
         }
         return;
     }
@@ -1108,6 +1118,7 @@ int main(int argc, char **argv)
             else if (!strcmp(m, "i4")) g_mode = M_I4;
             else if (!strcmp(m, "i4m")) g_mode = M_I4M;
             else if (!strcmp(m, "i4r")) g_mode = M_I4R;
+            else if (!strcmp(m, "q4kr")) g_mode = M_Q4KR;
             else { fprintf(stderr, "bad mode %s\n", m); return 2; }
         }
         else if (!strcmp(argv[i], "--ids")) { i++; snprintf(prompt_ids, sizeof(prompt_ids), "%s", argv[i]); }
